@@ -45,8 +45,12 @@ h0x-core wait helper
 h0x-core send helper "Inspect x.rs only. No subagents. Report with h0x-core send $H0X_TERMINAL_ID when done or stuck."
 ```
 
+Template launches allow up to 60 seconds for readiness, retrying startup
+settle failures with the same safety rules as `send` (including its startup
+age limit). This covers slow startup without waiting forever on a dialog.
 Check `first_message.sent` in a launch with a task. If false, the task was
-NOT sent: `h0x-core read <t>`; resolve readiness first (a trust dialog may need
+NOT sent; `h0x-core get <t>` keeps `first_message: {sent: false, reason}` for later
+inspection, even after the core restarts. To recover: `h0x-core read <t>`; resolve readiness first (a trust dialog may need
 `h0x-core keys <t> down enter`), then send the task. Do not blindly resend after a
 failed send: it may still have arrived; read first.
 
