@@ -1,0 +1,171 @@
+# Every master push and PR: native Linux x86_64, macOS and Windows
+# clippy/tests, plus upgrade from the last release. Updates must keep terminals.
+#
+# Rust caches use one pinned toolchain and only master runs save, so PR
+# caches can't evict the ones everybody restores. Zig and old-release binary
+# caches save separately; libghostty-vt stays with the workspace crates.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  # No paths-ignore here: CI is required to merge, so every PR needs it.
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Only superseded PR runs share a group; every other commit runs independently.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  RUST_TOOLCHAIN: 1.95.0
+  # File/line backtraces without full debug info: smaller target, faster cache.
+  CARGO_PROFILE_DEV_DEBUG: "1"
+  CARGO_PROFILE_TEST_DEBUG: "1"
+  SAVE_CACHES: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' }}
+  # Each test binary aborts if it runs this long (a hang, not a slow test):
+  # 30 s on our machines; GitHub's runners are slower.
+  HC_TEST_WATCHDOG_S: "120"
+  # A test that checks hc keeps a fixed timing (50 ms to finish a key
+  # sequence) skips that check here: a loaded runner can't keep it.
+  HC_TEST_SLOW_RUNNER: "1"
+
+jobs:
+  # Fast formatting/advisory checks and Windows clippy from Linux
+  # (zig stubbed: type-checking needs no libghostty-vt).
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy, rustfmt
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: lint
+          cache-bin: false
+          save-if: ${{ env.SAVE_CACHES }}
+      - run: cargo fmt --all -- --check
+      # Advisories (RustSec), licenses, sources: deny.toml.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+      - run: mkdir -p vendor/ghostty
+      - run: cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets -- -D warnings
+        env:
+          ZIG: ${{ github.workspace }}/scripts/zig-stub.sh
+
+  test:
+    strategy:
+      fail-fast: false
+      # Linux tests the static musl build, which is what releases ship.
+      # macOS (3 cores): fewer tests at once, so each one's terminals keep
+      # their timing. Windows: Unix tests skip themselves; tests/windows.rs
+      # runs instead.
+      matrix:
+        include:
+          - { os: linux, runner: ubuntu-latest, target: x86_64-unknown-linux-musl, threads: 4 }
+          - { os: macos, runner: macos-15, target: aarch64-apple-darwin, threads: 2 }
+          - { os: windows, runner: windows-2025, target: x86_64-pc-windows-msvc, threads: 2 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+          targets: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}-dev
+          cache-workspace-crates: true
+          cache-bin: false
+          save-if: ${{ env.SAVE_CACHES }}
+      - run: cargo clippy --locked --target ${{ matrix.target }} --all-targets -- -D warnings
+      # Windows' own ConPTY swallows answers to programs: hc ships Microsoft's.
+      - if: matrix.os == 'windows'
+        shell: pwsh
+        run: scripts/fetch-conpty.ps1 -Dest target/${{ matrix.target }}/debug
+      # cli_docs runs the built binary's help: generated reference freshness
+      # and README/docs command/flag checks, with file:line failures.
+      - name: Tests (including human docs)
+        shell: bash
+        run: |
+          # Full-screen scrolling tests are disabled on macOS CI because runner timing is unreliable.
+          only=()
+          if [ "${{ matrix.os }}" = macos ]; then
+            for t in crates/herdr-core/tests/*.rs; do
+              name=$(basename "$t" .rs)
+              [ "$name" = stitch ] || only+=(--test "$name")
+            done
+            only+=(--lib --bins)
+          fi
+          cargo test --locked --no-fail-fast --target ${{ matrix.target }} "${only[@]}" -- --test-threads ${{ matrix.threads }}
+
+  upgrade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          fetch-depth: 0 # the release tags
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Upgrade builds native GNU, unlike the musl test jobs.
+          key: linux-upgrade-dev
+          cache-workspace-crates: true
+          cache-bin: false
+          save-if: ${{ env.SAVE_CACHES }}
+      - name: The last release
+        id: last
+        run: |
+          tag=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          [ -n "$tag" ] && echo "sha=$(git rev-parse --short "$tag")" >> "$GITHUB_OUTPUT" || true
+          # Releases before 0.2 built Ghostty for the building CPU: a copy
+          # cached on one runner can crash on another (SIGILL).
+          echo "cpu=$(grep -m1 '^flags' /proc/cpuinfo | sha256sum | cut -c1-12)" >> "$GITHUB_OUTPUT"
+      # A release's binary never changes: built once, kept by its tag (and CPU).
+      - if: steps.last.outputs.tag != ''
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /var/tmp/hc-upgrade/${{ steps.last.outputs.sha }}
+          key: upgrade-from-${{ steps.last.outputs.tag }}-${{ steps.last.outputs.sha }}-${{ steps.last.outputs.cpu }}
+      - name: Upgrade from the last release
+        run: |
+          tag=${{ steps.last.outputs.tag }}
+          if [ -z "$tag" ]; then echo "no release yet: nothing to upgrade from"; exit 0; fi
+          scripts/upgrade-test.sh "$tag"
+
+  # Keep the required check name stable; every platform and upgrade must pass.
+  ci-ok:
+    needs: [lint, test, upgrade]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: '[ "${{ needs.lint.result }}" = success ] && [ "${{ needs.test.result }}" = success ] && [ "${{ needs.upgrade.result }}" = success ]'

@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""The release manifest for the archives (.tar.gz, Windows .zip) in a folder (CI's publish step, and
+tests building a fake release):
+
+    scripts/manifest dist > dist/manifest.json
+
+{version, generation, notes, targets: {"<os>-<arch>": {url, sha256}}}.
+Version from crates/herdr-core/Cargo.toml, generation from api.rs; the
+notes line from $NOTES, else "herdr-core <version>". URLs under
+$RELEASES_URL (default https://releases.herdr.dev)/core/<version>/.
+"""
+import hashlib, json, os, pathlib, re, sys
+
+root = pathlib.Path(__file__).resolve().parent.parent
+cargo = (root / "crates/herdr-core/Cargo.toml").read_text()
+version = re.search(r'^version = "(.+)"', cargo, re.M).group(1)
+api = (root / "crates/herdr-core/src/api.rs").read_text()
+generation = int(re.search(r"pub const GENERATION: u32 = (\d+);", api).group(1))
+base = os.environ.get("RELEASES_URL", "https://releases.herdr.dev").rstrip("/")
+
+targets = {}
+for f in sorted([*pathlib.Path(sys.argv[1]).glob("herdr-core-*.tar.gz"), *pathlib.Path(sys.argv[1]).glob("herdr-core-*.zip")]):
+    name = f.name.removeprefix("herdr-core-").removesuffix(".tar.gz").removesuffix(".zip")
+    targets[name] = {"url": f"{base}/core/{version}/{f.name}", "sha256": hashlib.sha256(f.read_bytes()).hexdigest()}
+if not targets:
+    sys.exit(f"manifest: no herdr-core-*.tar.gz or .zip in {sys.argv[1]}")
+
+doc = {"version": version, "generation": generation, "notes": os.environ.get("NOTES") or f"herdr-core {version}", "targets": targets}
+print(json.dumps(doc, indent=2))

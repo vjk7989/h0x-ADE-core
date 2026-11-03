@@ -1,0 +1,6 @@
+/target
+/.local
+/AGENTS.local.md
+
+# code graph (local only)
+graphify-out/
