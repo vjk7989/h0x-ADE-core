@@ -11,9 +11,9 @@ use std::os::unix::net::UnixListener;
 fn an_up_to_date_binary_restarts_only_an_older_running_core() {
     let mut s = Session::new();
     let version = env!("CARGO_PKG_VERSION");
-    std::fs::create_dir_all(s.root.join("core")).unwrap();
+    std::fs::create_dir_all(s.root.join("latest/download")).unwrap();
     std::fs::write(
-        s.root.join("core/latest.json"),
+        s.root.join("latest/download/latest.json"),
         json!({"version": version, "generation": h0x_core::api::GENERATION, "targets": {}}).to_string(),
     )
     .unwrap();

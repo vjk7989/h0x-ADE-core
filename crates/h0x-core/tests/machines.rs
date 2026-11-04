@@ -245,7 +245,7 @@ fn a_windows_machine_with_git_sh_installs_the_native_build_when_missing() {
         let (_, ssh) = fake_ssh(&s, &[("rohan", &rohan)]);
         let bin = s.root.join("bin");
         std::fs::create_dir(&bin).unwrap();
-        let releases = s.root.join(format!("releases/core/{}", env!("CARGO_PKG_VERSION")));
+        let releases = s.root.join(format!("releases/download/v{}", env!("CARGO_PKG_VERSION")));
         std::fs::create_dir_all(&releases).unwrap();
         std::fs::write(releases.join("windows.zip"), b"windows test build").unwrap();
         std::fs::write(

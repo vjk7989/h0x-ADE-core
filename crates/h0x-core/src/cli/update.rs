@@ -55,11 +55,14 @@ pub(super) fn update(paths: &Paths, from: &std::path::Path, force: bool) -> Resu
     let dest = std::env::current_exe().and_then(|e| e.canonicalize()).map_err(|e| RpcError::internal(e.to_string()))?;
     let shown = dest.display().to_string();
     if let Some(manager) = client::installed_by() {
-        let how = match manager {
-            "nix" => "update it in your Nix configuration",
-            _ => "reinstall h0x-core from the GitHub release: https://github.com/vjk7989/h0x-ADE-core/releases",
-        };
-        return Err(refused(format!("{shown} belongs to {manager}"), how));
+        let reinstall = "reinstall h0x-core from the GitHub release: https://github.com/vjk7989/h0x-ADE-core/releases";
+        return Err(match manager {
+            "nix" => refused(format!("{shown} belongs to nix"), "update it in your Nix configuration"),
+            "system package manager" => {
+                refused(format!("{} isn't writable by you", dest.parent().unwrap().display()), reinstall)
+            }
+            _ => refused(format!("{shown} belongs to {manager}"), reinstall),
+        });
     }
     let was = format!("h0x-core {}", env!("CARGO_PKG_VERSION"));
     let now = version_of(from).ok_or_else(|| refused(format!("{} is not a working h0x-core", from.display()), ""))?;

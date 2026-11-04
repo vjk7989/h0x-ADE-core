@@ -36,9 +36,10 @@ fn headless_size_and_history_come_from_config() {
 
 #[test]
 fn long_session_names_fit_in_a_socket_path_or_say_so() {
-    // macOS allows 104 bytes for a socket path; the session name is in it twice.
+    // macOS allows 104 bytes for a socket path, and the test root, the runtime
+    // dir name (h0x-core) and the holder id take their share: 36 fits, 70 cannot.
     let mut s = Session::new();
-    s.env.push(("H0X_CORE_SESSION".into(), "a".repeat(40)));
+    s.env.push(("H0X_CORE_SESSION".into(), "a".repeat(36)));
     let t = run(&s, &["sleep", "100"]);
     assert_eq!(s.json(&["get", &t])["state"], "live");
     s.core(&["server", "stop"]);
