@@ -13,7 +13,7 @@ these secrets are set. With neither secret it uses ad-hoc signing; setting
 only one is an error. Manual/untagged builds always use ad-hoc signing, even
 if secrets exist.
 
-The Developer ID signature uses the stable identifier `dev.herdr.core` so
+The Developer ID signature uses the stable identifier `tech.pavii.h0xcore` so
 macOS privacy grants can survive updates once core runs as its own responsible
 process. Existing grants to ad-hoc builds may need to be granted again on the
 first Developer ID release. Keep the signing team and identifier stable.

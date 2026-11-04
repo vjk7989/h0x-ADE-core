@@ -1,14 +1,14 @@
-# Every master push and PR: native Linux x86_64, macOS and Windows
+# Every main or rebrand push and PR: native Linux x86_64, macOS and Windows
 # clippy/tests, plus upgrade from the last release. Updates must keep terminals.
 #
-# Rust caches use one pinned toolchain and only master runs save, so PR
+# Rust caches use one pinned toolchain and only main runs save, so PR
 # caches can't evict the ones everybody restores. Zig and old-release binary
 # caches save separately; libghostty-vt stays with the workspace crates.
 name: ci
 
 on:
   push:
-    branches: [master]
+    branches: [main, rebrand]
   # No paths-ignore here: CI is required to merge, so every PR needs it.
   pull_request:
   workflow_dispatch:
@@ -26,7 +26,7 @@ env:
   # File/line backtraces without full debug info: smaller target, faster cache.
   CARGO_PROFILE_DEV_DEBUG: "1"
   CARGO_PROFILE_TEST_DEBUG: "1"
-  SAVE_CACHES: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' }}
+  SAVE_CACHES: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
   # Each test binary aborts if it runs this long (a hang, not a slow test):
   # 30 s on our machines; GitHub's runners are slower.
   H0X_CORE_TEST_WATCHDOG_S: "120"

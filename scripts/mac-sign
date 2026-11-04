@@ -2,9 +2,9 @@
 # APPLE_CERTIFICATE_P12 is a base64-encoded Developer ID Application .p12.
 set -euo pipefail
 
-bin=${1:?usage: mac-sign herdr-core}
+bin=${1:?usage: mac-sign h0x-core}
 if [[ -z ${APPLE_CERTIFICATE_P12:-} && -z ${APPLE_CERTIFICATE_PASSWORD:-} ]]; then
-  codesign --force --sign - --identifier dev.herdr.core "$bin"
+  codesign --force --sign - --identifier tech.pavii.h0xcore "$bin"
   codesign --verify --strict "$bin"
   exit 0
 fi
@@ -40,5 +40,5 @@ identity=$(security find-identity -v -p codesigning "$keychain" | awk '/"Develop
 # No hardened runtime: it strips DYLD_* from core's environment, which agents
 # inherit. This curl-installed CLI is not quarantined and needs no notarization.
 # A stable identifier and Developer ID keep TCC grants valid across updates.
-codesign --force --timestamp --identifier dev.herdr.core --keychain "$keychain" --sign "$identity" "$bin"
+codesign --force --timestamp --identifier tech.pavii.h0xcore --keychain "$keychain" --sign "$identity" "$bin"
 codesign --verify --strict "$bin"
