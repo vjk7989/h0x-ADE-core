@@ -29,8 +29,8 @@ fn main() {
             Some(std::env::join_paths([zig.parent().unwrap().to_path_buf(), root.join("System32"), root]).unwrap());
     }
     let mut build = Command::new(&zig);
-    // Baseline CPU, never this machine's: hc is copied to other machines
-    // (releases, `hc machine add`), whose CPUs may lack this one's features.
+    // Baseline CPU, never this machine's: h0x-core is copied to other machines
+    // (releases, `h0x-core machine add`), whose CPUs may lack this one's features.
     build.current_dir(&src).args(["build", "-Demit-lib-vt", "-Doptimize=ReleaseFast", "-Dcpu=baseline"]);
     if let Some(path) = clean_path {
         build.env("PATH", path);

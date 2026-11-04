@@ -1,14 +1,14 @@
 #!/bin/sh
-# Regenerate the notices embedded by hc and shipped beside release binaries.
+# Regenerate the notices embedded by h0x-core and shipped beside release binaries.
 set -eu
 cd "$(dirname "$0")/.."
-out=crates/herdr-core/THIRD-PARTY-NOTICES
-work=$(mktemp -d "${TMPDIR:-/var/tmp}/hc-notices.XXXXXX")
+out=crates/h0x-core/THIRD-PARTY-NOTICES
+work=$(mktemp -d "${TMPDIR:-/var/tmp}/h0x-core-notices.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 cargo metadata --format-version 1 --locked >"$work/metadata"
 jq -r '.packages[] | select(.source != null) | "\(.name) \(.version)\t\(.license)\t\(.manifest_path)"' "$work/metadata" | sort >"$work/crates"
 {
-    echo "hc (herdr-core) is Apache-2.0. It includes the software below."
+    echo "h0x-core (HyperOx) is Apache-2.0. It includes the software below."
     echo "Not all components are used on every platform. See distribution/notices/README.md in the source."
     for part in ghostty:"Ghostty's libghostty-vt (MIT)" simdutf:"simdutf, in libghostty-vt (MIT, or Apache-2.0)" \
         highway:"Highway, in libghostty-vt (BSD-3-Clause, or Apache-2.0)" wuffs:"Wuffs, in libghostty-vt (MIT, or Apache-2.0)" \

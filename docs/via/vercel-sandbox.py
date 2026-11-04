@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Reach a Vercel Sandbox with hc: hc machine add --name box --via '/path/vercel-sandbox.py <sandbox>'
+"""Reach a Vercel Sandbox with h0x-core: h0x-core machine add --name box --via '/path/vercel-sandbox.py <sandbox>'
 
-hc needs a connection that carries bytes both ways untouched, like ssh. `sandbox exec`
+h0x-core needs a connection that carries bytes both ways untouched, like ssh. `sandbox exec`
 alone drops stdin, and `sandbox exec -i` wants a terminal and runs the command in a remote
 pty. This makes `-i` a clean pipe:
 - the CLI insists stdout is a terminal, so it gets a raw local pty that is copied out;

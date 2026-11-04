@@ -286,7 +286,7 @@ fn an_old_core_hands_over_to_an_independent_fixed_core() {
     let old_pid = s.json(&["server", "status"])["pid"].as_i64().unwrap();
     // The updater AND the serving core here are still the installed baseline.
     // The old CLI remembers this install path, replaces itself, then starts
-    // the new `serve` directly, exactly as Herdr.app's h0x-core update does.
+    // the new `serve` directly, exactly as HyperOx.app's h0x-core update does.
     let out = s.core(&["update", "--from", BIN]);
     assert!(out.status.success(), "{out:?}");
     wait_until("replacement core", || s.connect_ok() && s.json(&["server", "status"])["pid"].as_i64() != Some(old_pid));

@@ -1,6 +1,6 @@
-# Puts Microsoft's ConPTY beside herdr-core.exe: <Dest>\conpty\conpty.dll and
+# Puts Microsoft's ConPTY beside h0x-core.exe: <Dest>\conpty\conpty.dll and
 # <Dest>\conpty\x64\OpenConsole.exe. Windows' own ConPTY swallows the answers
-# hc gives programs (7501, DA), so hc ships this one. Pinned and checked.
+# h0x-core gives programs (7501, DA), so h0x-core ships this one. Pinned and checked.
 param([Parameter(Mandatory)][string]$Dest)
 $ErrorActionPreference = "Stop"
 $version = "1.24.260710001"
@@ -16,7 +16,7 @@ function Check($path, $want) {
     try { $got = -join ([Security.Cryptography.SHA256]::Create().ComputeHash($stream) | ForEach-Object { $_.ToString("x2") }) } finally { $stream.Close() }
     if ($got -ne $want) { throw "$path`: sha256 $got, expected $want" }
 }
-$work = Join-Path ([IO.Path]::GetTempPath()) "hc-conpty-$version"
+$work = Join-Path ([IO.Path]::GetTempPath()) "h0x-core-conpty-$version"
 $zip = "$work.zip"
 if (-not (Test-Path $zip)) {
     Invoke-WebRequest -UseBasicParsing $url -OutFile "$zip.part"

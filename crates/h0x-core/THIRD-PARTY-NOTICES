@@ -1,4 +1,4 @@
-hc (herdr-core) is Apache-2.0. It includes the software below.
+h0x-core (HyperOx) is Apache-2.0. It includes the software below.
 Not all components are used on every platform. See distribution/notices/README.md in the source.
 
 ==== Ghostty's libghostty-vt (MIT)
