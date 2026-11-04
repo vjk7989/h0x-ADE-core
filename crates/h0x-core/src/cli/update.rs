@@ -88,3 +88,24 @@ pub(super) fn update(paths: &Paths, from: &std::path::Path, force: bool) -> Resu
         human,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{older, release_version};
+
+    #[test]
+    fn a_release_name_is_three_numbers_with_no_v() {
+        assert_eq!(release_version("0.1.4").as_deref(), Ok("0.1.4"));
+        for bad in ["v0.1.4", "", "0.1", "0.1.4.5", "0.1.x", "0..4"] {
+            assert!(release_version(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_versioned_h0x_core_is_older_than_another() {
+        assert!(older("h0x-core 0.1.9", "h0x-core 0.2.0"));
+        assert!(!older("h0x-core 0.2.0", "h0x-core 0.2.0"));
+        assert!(!older("hc 0.1.0", "h0x-core 0.2.0"), "the old name is not a version at all");
+        assert!(!older("h0x-core 0.1.0", "h0x-core x.y.z"));
+    }
+}

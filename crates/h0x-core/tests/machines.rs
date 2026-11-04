@@ -304,7 +304,7 @@ touch '{root}/copied'
         }
         s.env.push(("PATH".into(), format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())));
         s.env.push(("H0X_CORE_SSH".into(), wrapper.display().to_string()));
-        s.env.push(("HERDR_RELEASES_URL".into(), format!("file://{}", s.root.join("releases").display())));
+        s.env.push(("H0X_CORE_RELEASES_URL".into(), format!("file://{}", s.root.join("releases").display())));
         let (_, missing) = s.err(&["--json", "machine", "add", "windows-msys"]);
         assert_eq!(missing["error"]["kind"], "h0x_core_missing", "{missing}");
         let added = s.json(&["machine", "add", "windows-msys", "--install"]);

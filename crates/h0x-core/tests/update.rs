@@ -17,7 +17,7 @@ fn an_up_to_date_binary_restarts_only_an_older_running_core() {
         json!({"version": version, "generation": h0x_core::api::GENERATION, "targets": {}}).to_string(),
     )
     .unwrap();
-    s.env.push(("HERDR_RELEASES_URL".into(), format!("file://{}", s.root.display())));
+    s.env.push(("H0X_CORE_RELEASES_URL".into(), format!("file://{}", s.root.display())));
     let args = ["update", "--version", version];
     assert_eq!(s.json(&args)["updated"], false);
     assert!(!s.connect_ok(), "checking an absent core must not start one");
@@ -125,4 +125,30 @@ fn update_from_a_file_swaps_hc_and_keeps_everything_running() {
         std::fs::read_dir(&dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains(".new")),
         "no leftovers"
     );
+}
+
+#[test]
+fn a_package_manager_install_is_sent_to_the_github_release_except_nix() {
+    let github = "reinstall h0x-core from the GitHub release: https://github.com/vjk7989/h0x-ADE-core/releases";
+    for (folder, manager, hint) in [
+        ("Cellar/h0x-core/0.2.0/bin", "homebrew", github),
+        ("mise/installs/h0x-core/0.2.0", "mise", github),
+        ("nix/store/abc-h0x-core/bin", "nix", "update it in your Nix configuration"),
+    ] {
+        let mut s = Session::new();
+        let dir = s.root.join(folder);
+        std::fs::create_dir_all(&dir).unwrap();
+        s.bin = dir.join("h0x-core");
+        std::fs::copy(BIN, &s.bin).unwrap();
+        let update = s.cmd().args(["update", "--from", BIN]).output().unwrap();
+        assert!(!update.status.success(), "{manager}");
+        let error: Value = serde_json::from_slice(&update.stderr).unwrap();
+        assert_eq!(error["error"]["kind"], "refused", "{error}");
+        assert_eq!(
+            error["error"]["message"],
+            format!("{} belongs to {manager}", s.bin.canonicalize().unwrap().display()),
+            "{error}"
+        );
+        assert_eq!(error["error"]["hint"], hint, "{error}");
+    }
 }

@@ -24,7 +24,9 @@ pub struct Target {
 
 fn base() -> String {
     std::env::var("H0X_CORE_RELEASES_URL")
-        .unwrap_or_else(|_| "https://github.com/vjk7989/h0x-ADE-core/releases".into())
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "https://github.com/vjk7989/h0x-ADE-core/releases".into())
         .trim_end_matches('/')
         .into()
 }
@@ -151,4 +153,28 @@ impl Drop for Scratch {
 /// This machine as release targets name it: `linux-x86_64`, `macos-aarch64`.
 pub fn this_target() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_release_base_drops_a_trailing_slash_and_defaults_to_github() {
+        // Only this test reads H0X_CORE_RELEASES_URL inside the unit-test binary.
+        unsafe { std::env::set_var("H0X_CORE_RELEASES_URL", "https://mirror.example/releases/") };
+        assert_eq!(super::base(), "https://mirror.example/releases");
+        unsafe { std::env::set_var("H0X_CORE_RELEASES_URL", " ") };
+        assert_eq!(super::base(), "https://github.com/vjk7989/h0x-ADE-core/releases", "empty counts as unset");
+        unsafe { std::env::remove_var("H0X_CORE_RELEASES_URL") };
+        assert_eq!(super::base(), "https://github.com/vjk7989/h0x-ADE-core/releases");
+    }
+
+    #[test]
+    fn an_unknown_target_is_refused_before_any_download() {
+        let m = super::Manifest { version: "1.2.3".into(), generation: 0, targets: Default::default() };
+        let scratch = std::env::temp_dir();
+        let err = super::fetch(&m, "plan9-mips", &scratch).unwrap_err();
+        assert_eq!(err.kind, "refused");
+        assert_eq!(err.message, "h0x-core 1.2.3 has no build for plan9-mips");
+        assert_eq!(err.hint, "install h0x-core there yourself");
+    }
 }

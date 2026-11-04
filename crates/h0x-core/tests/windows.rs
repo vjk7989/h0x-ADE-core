@@ -235,8 +235,7 @@ fn marked(file: &Path, mark: &str) -> bool {
 
 /// An installed h0x-core (no alias link: HyperOx ships none).
 fn installed(s: &Session) -> PathBuf {
-    let exe = release(&s.root.join("inst"), "old-build");
-    exe
+    release(&s.root.join("inst"), "old-build")
 }
 
 fn hc_at(s: &Session, exe: &Path, args: &[&str]) -> std::process::Output {
@@ -420,7 +419,7 @@ fn implicit_ssh_start_reports_desktop_conflict_or_starts_headless() {
     } else {
         let error: Value = serde_json::from_slice(&out.stderr).unwrap();
         assert!(error["error"]["message"].as_str().unwrap().contains("desktop session"), "{error}");
-        assert!(error["error"]["hint"].as_str().unwrap().contains("open Herdr on that Windows machine"), "{error}");
+        assert!(error["error"]["hint"].as_str().unwrap().contains("open HyperOx on that Windows machine"), "{error}");
         assert_ne!(s.out(&["server", "status"]).0, 0, "refused startup left a core");
     }
 }

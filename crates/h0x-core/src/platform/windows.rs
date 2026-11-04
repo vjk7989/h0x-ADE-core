@@ -1180,3 +1180,19 @@ pub mod console {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{RELEASE, endpoints};
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn a_release_ships_h0x_core_exe_and_no_hc_alias() {
+        assert_eq!(RELEASE[0], "h0x-core.exe");
+        assert!(RELEASE.iter().all(|f| !f.contains("hc.exe") && !f.contains("herdr")), "{RELEASE:?}");
+        let (namespace, prefix) = endpoints(Path::new(r"C:\state"));
+        assert_eq!(namespace, PathBuf::from(r"\\.\pipe\"));
+        let user = prefix.strip_prefix("h0x-core-").and_then(|p| p.strip_suffix('-')).expect(&prefix);
+        assert!(user.chars().all(|c| c.is_ascii_alphanumeric()), "{prefix:?}");
+    }
+}

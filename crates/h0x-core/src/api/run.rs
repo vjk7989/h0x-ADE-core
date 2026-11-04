@@ -249,4 +249,34 @@ mod tests {
         assert!(cut.starts_with("[h0x-core] earlier output cut: h0x-core read t7") && cut.ends_with("\nlast line"));
         assert_eq!(super::tail("short".into(), 7), "short");
     }
+
+    #[test]
+    fn a_child_never_inherits_the_cores_own_address_or_identity() {
+        let base = |pairs: &[(&str, &str)]| {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let core = base(&[
+            ("H0X_TERMINAL_ID", "t1"),
+            ("H0X_SCOPE", "1-abc"),
+            ("H0X_RUNTIME", "1"),
+            ("TERM_PROGRAM", "h0x"),
+            ("TERM_PROGRAM_VERSION", "0.9.3"),
+            ("PATH", "/usr/bin"),
+        ]);
+        let env = super::child_env(core.clone(), base(&[("TERM_PROGRAM", "WezTerm"), ("TERM_PROGRAM_VERSION", "1")]));
+        for stale in ["H0X_TERMINAL_ID", "H0X_SCOPE", "H0X_RUNTIME"] {
+            assert!(!env.contains_key(stale), "{stale} leaked from the core");
+        }
+        assert_eq!(env["TERM_PROGRAM"], "WezTerm", "another terminal is left alone");
+        assert_eq!(env["TERM_PROGRAM_VERSION"], "1");
+        assert_eq!(env["PATH"], "/usr/bin");
+        assert_eq!(env["TERM"], "xterm-256color");
+        assert_eq!(env["COLORTERM"], "truecolor");
+
+        let env = super::child_env(core, base(&[("TERM_PROGRAM", "h0x"), ("TERM_PROGRAM_VERSION", "0.9.3")]));
+        assert_eq!(env["TERM_PROGRAM"], "ghostty", "the sentinel is rewritten");
+        assert!(!env.contains_key("TERM_PROGRAM_VERSION"), "the version belonged to h0x");
+        let env = super::child_env(base(&[]), base(&[]));
+        assert_eq!(env["TERM_PROGRAM"], "ghostty", "no terminal at all");
+    }
 }
