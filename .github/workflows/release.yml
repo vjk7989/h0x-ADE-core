@@ -1,8 +1,10 @@
 # A release: push a tag `v<version>` matching crates/h0x-core/Cargo.toml.
 # Five builds: Linux x86_64/aarch64, macOS x86_64/aarch64, and Windows x86_64.
 # Linux uses static musl for compatibility with older distros.
-# Assets go to the tag's GitHub Release, unsigned: versioned files first,
-# latest.json last, so nobody sees a version whose files aren't up yet.
+# Assets go to the tag's GitHub Release, each with a minisign signature
+# (`<asset>.minisig`, secret MINISIGN_SECRET_KEY) that h0x-core checks before
+# using it: versioned files first, latest.json last, so nobody sees a version
+# whose files aren't up yet.
 name: release
 
 on:
@@ -152,6 +154,21 @@ jobs:
           version=${GITHUB_REF_NAME#v}
           awk -v heading="## [$version] - " 'index($0, heading) == 1 { found = 1; next } found && /^## / { exit } found { print }' CHANGELOG.md > RELEASE_NOTES.md
           [ -s RELEASE_NOTES.md ] || echo "$GITHUB_REF_NAME" > RELEASE_NOTES.md
+      - name: Sign assets
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y minisign
+          [ -n "$MINISIGN_SECRET_KEY" ] || { echo "MINISIGN_SECRET_KEY is not set" >&2; exit 1; }
+          (umask 077 && printf '%s\n' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key")
+          # The key has no password; an empty line answers a prompt if one comes.
+          for f in dist/h0x-core-*.tar.gz dist/h0x-core-*.zip dist/manifest.json dist/latest.json \
+            distribution/install.sh distribution/install.ps1; do
+            printf '\n' | minisign -S -s "$RUNNER_TEMP/minisign.key" -m "$f"
+          done
+      - name: Delete the signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/minisign.key"
       - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           name: h0x-core ${{ github.ref_name }}
@@ -162,4 +179,6 @@ jobs:
             dist/manifest.json
             distribution/install.sh
             distribution/install.ps1
+            dist/*.minisig
+            distribution/*.minisig
             dist/latest.json
