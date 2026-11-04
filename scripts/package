@@ -1,0 +1,14 @@
+#!/bin/sh
+# Package a built Unix binary with its redistribution notices.
+set -eu
+if [ "$#" -ne 2 ]; then
+    echo "usage: scripts/package <h0x-core binary> <output.tar.gz>" >&2
+    exit 2
+fi
+root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
+work=$(mktemp -d "${TMPDIR:-/var/tmp}/h0x-core-package.XXXXXX")
+trap 'rm -rf "$work"' EXIT HUP INT TERM
+cp "$1" "$work/h0x-core"
+cp "$root/LICENSE" "$work/LICENSE"
+cp "$root/crates/h0x-core/THIRD-PARTY-NOTICES" "$work/THIRD-PARTY-NOTICES"
+tar -czf "$2" -C "$work" h0x-core LICENSE THIRD-PARTY-NOTICES

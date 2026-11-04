@@ -1,0 +1,7 @@
+HyperOx core
+Copyright 2026 PAVii
+
+This product includes software developed by the herdr project
+(https://github.com/herdrdev/herdr-core), licensed under the Apache License, Version 2.0.
+It includes libghostty-vt from Ghostty (https://github.com/ghostty-org/ghostty), MIT License.
+See LICENSE and the third-party notices shipped with this distribution.

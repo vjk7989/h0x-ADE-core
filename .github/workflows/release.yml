@@ -1,0 +1,165 @@
+# A release: push a tag `v<version>` matching crates/h0x-core/Cargo.toml.
+# Five builds: Linux x86_64/aarch64, macOS x86_64/aarch64, and Windows x86_64.
+# Linux uses static musl for compatibility with older distros.
+# Assets go to the tag's GitHub Release, unsigned: versioned files first,
+# latest.json last, so nobody sees a version whose files aren't up yet.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  # Builds only; publishing needs a tag.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never cancel: a cancelled tag run is a half release.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_TOOLCHAIN: 1.95.0
+
+jobs:
+  # A tag must name the crate's version; manual builds have no tag to check.
+  version:
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Version matches the tag
+        run: |
+          want="v$(sed -n 's/^version = "\(.*\)"/\1/p' crates/h0x-core/Cargo.toml | head -1)"
+          [ "$want" = "$GITHUB_REF_NAME" ] || { echo "tag $GITHUB_REF_NAME but Cargo.toml says $want"; exit 1; }
+
+  build:
+    needs: version
+    # version is skipped on manual builds and fails only when the tag is wrong.
+    if: ${{ !cancelled() && needs.version.result != 'failure' }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { name: linux-x86_64, target: x86_64-unknown-linux-musl, runner: ubuntu-latest }
+          - { name: linux-aarch64, target: aarch64-unknown-linux-musl, runner: ubuntu-22.04-arm }
+          - { name: macos-aarch64, target: aarch64-apple-darwin, runner: macos-15 }
+          # Cross-build on Apple Silicon; verify the Intel binary under Rosetta.
+          - { name: macos-x86_64, target: x86_64-apple-darwin, runner: macos-15 }
+          - { name: windows-x86_64, target: x86_64-pc-windows-msvc, runner: windows-2025 }
+    runs-on: ${{ matrix.runner }}
+    # Only tag pushes can use the release environment's Apple certificate.
+    environment: ${{ github.event_name == 'push' && github.ref_type == 'tag' && 'release' || 'build' }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.target }}-release
+          cache-workspace-crates: true
+          cache-bin: false
+          # Tags can't share their caches; only manual builds on main save one.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p h0x-core
+      # Ad-hoc signed unless the release environment holds an Apple certificate.
+      - name: Sign macOS binary
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE_P12: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_CERTIFICATE_P12 || '' }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
+        run: scripts/mac-sign target/${{ matrix.target }}/release/h0x-core
+      - name: Pack
+        if: runner.os != 'Windows'
+        run: |
+          bin=target/${{ matrix.target }}/release/h0x-core
+          "$bin" --version # it runs on its own platform
+          if [ "${{ runner.os }}" = Linux ]; then file "$bin" | grep -q 'static' || { file "$bin"; echo "not static"; exit 1; }; fi
+          mkdir -p dist
+          sh scripts/package "$bin" dist/h0x-core-${{ matrix.name }}.tar.gz
+      # Windows: a zip of the exe, Microsoft's ConPTY (Windows' own swallows
+      # answers to programs) and its notices. Zipped by Windows' tar, which
+      # is also what unpacks it.
+      - name: Pack (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = "target/${{ matrix.target }}/release/h0x-core.exe"
+          & $bin --version
+          if ($LASTEXITCODE) { throw "it does not run" }
+          # A clean Windows has no Visual C++ runtime.
+          $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($bin)).ToLower()
+          foreach ($dll in "vcruntime140", "msvcp140", "api-ms-win-crt-") { if ($text.Contains($dll)) { throw "h0x-core.exe imports $dll" } }
+          New-Item -ItemType Directory -Force stage/THIRD-PARTY-NOTICES, dist | Out-Null
+          Copy-Item $bin stage/
+          Copy-Item LICENSE stage/
+          Copy-Item crates/h0x-core/THIRD-PARTY-NOTICES stage/THIRD-PARTY-NOTICES/h0x-core.txt
+          scripts/fetch-conpty.ps1 -Dest stage
+          Copy-Item distribution/windows/* stage/THIRD-PARTY-NOTICES/
+          tar -a -cf dist/h0x-core-${{ matrix.name }}.zip -C stage h0x-core.exe conpty LICENSE THIRD-PARTY-NOTICES
+          if ($LASTEXITCODE) { throw "zip failed" }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: h0x-core-${{ matrix.name }}
+          path: dist/h0x-core-${{ matrix.name }}.*
+          if-no-files-found: error
+          retention-days: 7
+
+  # The tag's GitHub Release: archives, the manifest, the installers, and
+  # latest.json last. Re-running an old tag's run republishes that version.
+  release:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Manifest
+        env:
+          H0X_CORE_RELEASES_URL: https://github.com/vjk7989/h0x-ADE-core/releases
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          export NOTES="$(awk -v heading="## [$version] - " 'index($0, heading) == 1 { found = 1; next } found && /^## / { exit } found && /^- / { sub(/^- /, ""); print; exit }' CHANGELOG.md)"
+          scripts/manifest dist > dist/manifest.json && cat dist/manifest.json
+          cp dist/manifest.json dist/latest.json
+      - name: Release notes from the changelog
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          awk -v heading="## [$version] - " 'index($0, heading) == 1 { found = 1; next } found && /^## / { exit } found { print }' CHANGELOG.md > RELEASE_NOTES.md
+          [ -s RELEASE_NOTES.md ] || echo "$GITHUB_REF_NAME" > RELEASE_NOTES.md
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          name: h0x-core ${{ github.ref_name }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            dist/h0x-core-*.tar.gz
+            dist/h0x-core-*.zip
+            dist/manifest.json
+            distribution/install.sh
+            distribution/install.ps1
+            dist/latest.json
