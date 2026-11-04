@@ -140,7 +140,7 @@ const RESTORE_MAX: Duration = Duration::from_secs(10);
 const MAX_PACE: Duration = Duration::from_secs(1);
 
 fn limit() -> Duration {
-    Duration::from_millis(std::env::var("HC_STITCH_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(15_000))
+    Duration::from_millis(std::env::var("H0X_CORE_STITCH_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(15_000))
 }
 
 /// What a stitched read captured: the rows (history, then the screen), how

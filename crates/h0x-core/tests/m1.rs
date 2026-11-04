@@ -3,7 +3,7 @@
 mod common;
 
 use common::*;
-use herdr_core::holder_proto as proto;
+use h0x_core::holder_proto as proto;
 use serde_json::Value;
 use std::time::Duration;
 
@@ -21,12 +21,12 @@ fn wait_finished(s: &Session, t: &str) -> Value {
 fn default_shells_load_the_login_environment_but_explicit_programs_do_not() {
     let mut s = Session::new();
     s.env.push(("SHELL".into(), "/bin/zsh".into()));
-    std::fs::write(s.root.join(".zprofile"), "export HC_LOGIN_TEST=loaded\n").unwrap();
+    std::fs::write(s.root.join(".zprofile"), "export H0X_CORE_LOGIN_TEST=loaded\n").unwrap();
     let t = run(&s, &[]);
-    s.json(&["send", &t, "print -r -- login=$options[login] profile=$HC_LOGIN_TEST"]);
+    s.json(&["send", &t, "print -r -- login=$options[login] profile=$H0X_CORE_LOGIN_TEST"]);
     wait_text(&s, &t, "login=on profile=loaded");
 
-    let t = run(&s, &["/bin/zsh", "-c", "print -r -- login=$options[login] profile=$HC_LOGIN_TEST"]);
+    let t = run(&s, &["/bin/zsh", "-c", "print -r -- login=$options[login] profile=$H0X_CORE_LOGIN_TEST"]);
     wait_finished(&s, &t);
     assert!(text(&s, &t).contains("login=off profile="), "explicit argv stays unchanged");
 }
@@ -75,7 +75,7 @@ fn piped_ls_says_what_runs_where_so_agents_find_each_other() {
 #[test]
 fn finished_terminals_expire_even_when_nothing_else_happens() {
     let mut s = Session::new();
-    s.env.push(("HC_RETAIN_MS".into(), "300".into()));
+    s.env.push(("H0X_CORE_RETAIN_MS".into(), "300".into()));
     let t = run(&s, &["true"]);
     wait_finished(&s, &t);
     std::thread::sleep(Duration::from_millis(600));
@@ -117,7 +117,7 @@ fn read_prints_plain_text_even_when_piped() {
     let s = Session::new();
     let t = run(&s, &["sh", "-c", "echo 'say \"hi\"'; echo second; sleep 100"]);
     wait_text(&s, &t, "second");
-    let out = String::from_utf8(s.hc(&["read", &t]).stdout).unwrap();
+    let out = String::from_utf8(s.core(&["read", &t]).stdout).unwrap();
     assert!(out.starts_with("say \"hi\"\nsecond\n"), "{out:?}");
 }
 
@@ -163,7 +163,7 @@ fn child_gets_core_env_caller_identity_cwd_and_its_own_address() {
     s.json(&["server", "start"]);
     let out = s
         .cmd()
-        .args(["run", "--bg", "sh", "-c", "echo id=$HC_TERMINAL_ID foo=$FOO tp=$TERM_PROGRAM pwd=$PWD; sleep 100"])
+        .args(["run", "--bg", "sh", "-c", "echo id=$H0X_TERMINAL_ID foo=$FOO tp=$TERM_PROGRAM pwd=$PWD; sleep 100"])
         .env("FOO", "bar")
         .env("TERM_PROGRAM", "WezTerm")
         .current_dir("/var/tmp")
@@ -173,11 +173,11 @@ fn child_gets_core_env_caller_identity_cwd_and_its_own_address() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     wait_text(&s, "t1", "id=t1 foo= tp=WezTerm pwd=/var/tmp");
 
-    // Never herdr: a program started from inside Herdr sees plain ghostty.
+    // Never h0x: a program started from inside HyperOx sees plain ghostty.
     let out = s
         .cmd()
         .args(["run", "--bg", "sh", "-c", "echo tp=$TERM_PROGRAM v=$TERM_PROGRAM_VERSION.; sleep 100"])
-        .env("TERM_PROGRAM", "herdr")
+        .env("TERM_PROGRAM", "h0x")
         .env("TERM_PROGRAM_VERSION", "0.9.3")
         .output()
         .unwrap();
@@ -220,8 +220,8 @@ fn labels_are_stored_filtered_and_removed() {
     let a = run(&s, &["--label", "rex.role=reviewer", "--label", "empty=", "sleep", "100"]);
     assert!(get(&s, &a)["labels"].get("empty").is_none(), "key= means no label, at run too");
     let _b = run(&s, &["sleep", "100"]);
-    s.json(&["label", &a, "herdr.pane=3"]);
-    let only = s.json(&["ls", "--label", "herdr.pane=3", "--label", "rex.role=reviewer"]);
+    s.json(&["label", &a, "h0x.pane=3"]);
+    let only = s.json(&["ls", "--label", "h0x.pane=3", "--label", "rex.role=reviewer"]);
     let only = only["terminals"].as_array().unwrap();
     assert_eq!(only.len(), 1);
     assert_eq!(only[0]["address"], a.as_str());
@@ -340,11 +340,11 @@ fn a_failed_registry_write_does_not_break_get_or_stop() {
     let pid = get(&s, &terminal)["pid"].as_i64().unwrap();
     let core = status(&s)["pid"].as_i64().unwrap();
     // A directory in place of the temporary file fails even when tests run as root.
-    let tmp = s.root.join("state/herdr-core/test/terminals.tmp");
+    let tmp = s.root.join("state/h0x-core/test/terminals.tmp");
     std::fs::create_dir(&tmp).unwrap();
-    let label = s.hc(&["label", &terminal, "disk=failed"]);
-    let get = s.hc(&["get", &terminal]);
-    let stop = s.hc(&["server", "stop"]);
+    let label = s.core(&["label", &terminal, "disk=failed"]);
+    let get = s.core(&["get", &terminal]);
+    let stop = s.core(&["server", "stop"]);
     std::fs::remove_dir(tmp).unwrap();
     for (command, output) in [("label", label), ("get", get), ("stop", stop)] {
         assert!(output.status.success(), "{command}: {}", String::from_utf8_lossy(&output.stderr));
@@ -357,7 +357,7 @@ fn a_failed_registry_write_does_not_break_get_or_stop() {
 fn server_stop_typed_inside_a_terminal_still_stops_the_core() {
     let s = Session::new();
     let core = status(&s)["pid"].as_i64().unwrap();
-    // Stopping ends this terminal, and with it the hc waiting for the reply.
+    // Stopping ends this terminal, and with it the h0x-core waiting for the reply.
     run(&s, &["sh", "-c", &format!("{} server stop; sleep 100", s.bin.display())]);
     wait_until("core exits", || !pid_alive(core));
     let t = run(&s, &["sh", "-c", "echo again"]);
@@ -415,13 +415,13 @@ fn a_turn_that_starts_and_ends_in_one_burst_survives_losing_the_holder() {
 #[test]
 fn holder_restarts_a_crashed_core_even_after_an_update() {
     let mut s = Session::new();
-    s.env.push(("HC_HOLDER_GRACE_MS".into(), "100".into()));
-    s.bin = s.root.join("herdr-core");
+    s.env.push(("H0X_CORE_HOLDER_GRACE_MS".into(), "100".into()));
+    s.bin = s.root.join("h0x-core");
     std::fs::copy(BIN, &s.bin).unwrap();
     run(&s, &["sleep", "100"]);
     let core = status(&s)["pid"].as_i64().unwrap();
     // An update swaps the binary under the running holder.
-    let staged = s.root.join("herdr-core.new");
+    let staged = s.root.join("h0x-core.new");
     write_new_build(&staged);
     std::fs::rename(&staged, &s.bin).unwrap();
     kill9(core);
@@ -434,13 +434,13 @@ fn holder_restarts_a_crashed_core_even_after_an_update() {
 #[test]
 fn an_update_rolls_new_terminals_onto_a_new_holder_while_the_old_one_drains() {
     let mut s = Session::new();
-    s.bin = s.root.join("herdr-core");
+    s.bin = s.root.join("h0x-core");
     std::fs::copy(BIN, &s.bin).unwrap();
     let old = run(&s, &["sleep", "100"]);
     let old_holder = holder_pid(&s);
 
     // Install a new build, then restart the planned way.
-    let staged = s.root.join("herdr-core.new");
+    let staged = s.root.join("h0x-core.new");
     write_new_build(&staged);
     std::fs::rename(&staged, &s.bin).unwrap();
     s.json(&["server", "restart"]);
@@ -538,7 +538,8 @@ impl Drop for RawHolder {
 
 fn raw_holder(s: &Session, name: &str) -> (RawHolder, std::path::PathBuf) {
     let socket = s.root.join(format!("run/{name}.sock"));
-    let holder = s.cmd().env("HC_HOLDER_GRACE_MS", "60000").arg("hold").arg("--socket").arg(&socket).spawn().unwrap();
+    let holder =
+        s.cmd().env("H0X_CORE_HOLDER_GRACE_MS", "60000").arg("hold").arg("--socket").arg(&socket).spawn().unwrap();
     wait_until("holder listening", || std::os::unix::net::UnixStream::connect(&socket).is_ok());
     (RawHolder(holder), socket)
 }
@@ -573,7 +574,7 @@ fn title_changes_are_saved_shortly_after_not_right_away() {
     let t = run(&s, &["sh", "-c", "for i in 1 2 3 4 5 6 7 8 9; do printf '\\033]2;spin %s\\007' $i; done; sleep 100"]);
     wait_until("last title", || get(&s, &t)["title"] == "spin 9");
     let saved = || {
-        let file = std::fs::read(s.root.join("state/herdr-core/test/terminals.json")).unwrap();
+        let file = std::fs::read(s.root.join("state/h0x-core/test/terminals.json")).unwrap();
         serde_json::from_slice::<Value>(&file).unwrap()["terminals"]["1"]["title"].clone()
     };
     assert_eq!(saved(), "", "saved on a title change");

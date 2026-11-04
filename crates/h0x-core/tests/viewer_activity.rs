@@ -3,7 +3,7 @@ mod common;
 
 use common::framed::Viewer;
 use common::*;
-use herdr_core::wire;
+use h0x_core::wire;
 use serde_json::json;
 use std::time::Duration;
 

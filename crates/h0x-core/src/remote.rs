@@ -122,7 +122,7 @@ impl Line {
             return Err(RpcError::new(
                 "unavailable",
                 format!("{machine} didn't answer within {} s", deadline.as_secs()),
-                "it may be busy or stuck; hc machine ls shows its line",
+                "it may be busy or stuck; h0x-core machine ls shows its line",
             ));
         };
         let reply = reply.map_err(|_| {
@@ -161,7 +161,7 @@ pub enum LineState {
     NeedsLogin {
         since_ms: u64,
     },
-    /// Its hc speaks another protocol generation.
+    /// Its h0x-core speaks another protocol generation.
     NeedsUpdate {
         since_ms: u64,
     },
@@ -197,7 +197,7 @@ pub fn view(st: &State, m: &Machine) -> MachineView {
 }
 
 fn reconnect_max() -> Duration {
-    Duration::from_millis(std::env::var("HC_RECONNECT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(30_000))
+    Duration::from_millis(std::env::var("H0X_CORE_RECONNECT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(30_000))
 }
 
 /// Keeps the line to every added machine up.
@@ -822,20 +822,20 @@ async fn line(core: &Core, m: &Machine) -> Result<Arc<Line>, RpcError> {
             "unavailable",
             format!("{} needs a login typed by a person", m.name),
             if cfg!(windows) {
-                format!("set up its SSH keys, then: hc machine login {}", m.name)
+                format!("set up its SSH keys, then: h0x-core machine login {}", m.name)
             } else {
-                format!("in a terminal: hc machine login {}", m.name)
+                format!("in a terminal: h0x-core machine login {}", m.name)
             },
         )),
         Some(LineState::NeedsUpdate { .. }) => Err(RpcError::new(
             "needs_update",
-            format!("{}'s hc speaks another protocol generation", m.name),
-            format!("hc machine update {}", m.name),
+            format!("{}'s h0x-core speaks another protocol generation", m.name),
+            format!("h0x-core machine update {}", m.name),
         )),
         Some(LineState::Unreachable { why, .. }) => Err(RpcError::new(
             "unavailable",
             format!("{} is unreachable: {why}", m.name),
-            "hc machine ls shows when it comes back",
+            "h0x-core machine ls shows when it comes back",
         )),
         _ => Err(RpcError::new("unavailable", format!("still connecting to {}", m.name), "try again in a moment")),
     }
@@ -879,7 +879,7 @@ async fn forward_waiting(core: &Core, m: &Machine, method: &str, mut params: Val
     let deadline = tokio::time::Instant::now() + deadline_for(core, method, &params);
     let mark = (method == "terminal.run").then(crate::platform::random_hex);
     if let Some(mark) = &mark {
-        params["labels"]["hc.run"] = mark.clone().into();
+        params["labels"]["h0x.run"] = mark.clone().into();
     }
     let first = match forward_once(core, m, method, params.clone()).await {
         Err(e) if line_lost(&e) => e,
@@ -899,7 +899,7 @@ async fn forward_waiting(core: &Core, m: &Machine, method: &str, mut params: Val
         if target.is_none()
             && let Some(mark) = &mark
         {
-            let found = forward_once(core, m, "terminal.list", json!({"all": true, "labels": {"hc.run": mark}})).await;
+            let found = forward_once(core, m, "terminal.list", json!({"all": true, "labels": {"h0x.run": mark}})).await;
             target = found.ok().and_then(|r| r["terminals"][0]["address"].as_str().map(String::from));
             if target.is_none() {
                 return Err(first); // it never started there
@@ -949,15 +949,15 @@ async fn forward_once(core: &Core, m: &Machine, method: &str, mut params: Value)
     if method == "terminal.run" && own_shell && !line.features.iter().any(|f| f == "shell") {
         return Err(RpcError::new(
             "needs_update",
-            format!("{}'s hc is older and can't pick its own shell", m.name),
-            format!("hc machine update {}", m.name),
+            format!("{}'s h0x-core is older and can't pick its own shell", m.name),
+            format!("h0x-core machine update {}", m.name),
         ));
     }
     let reply = line.call(&m.name, method, params, deadline).await.map_err(|e| match e.kind.as_str() {
         "unknown_method" => RpcError::new(
             "needs_update",
-            format!("{}'s hc is older and has no {method}", m.name),
-            format!("hc machine update {}", m.name),
+            format!("{}'s h0x-core is older and has no {method}", m.name),
+            format!("h0x-core machine update {}", m.name),
         ),
         _ => e,
     })?;

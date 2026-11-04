@@ -14,7 +14,7 @@ fn an_up_to_date_binary_restarts_only_an_older_running_core() {
     std::fs::create_dir_all(s.root.join("core")).unwrap();
     std::fs::write(
         s.root.join("core/latest.json"),
-        json!({"version": version, "generation": herdr_core::api::GENERATION, "targets": {}}).to_string(),
+        json!({"version": version, "generation": h0x_core::api::GENERATION, "targets": {}}).to_string(),
     )
     .unwrap();
     s.env.push(("HERDR_RELEASES_URL".into(), format!("file://{}", s.root.display())));
@@ -70,7 +70,7 @@ fn an_install_in_a_read_only_folder_explains_how_to_update_it() {
     let mut s = Session::new();
     let dir = s.root.join("bin");
     std::fs::create_dir(&dir).unwrap();
-    s.bin = dir.join("herdr-core");
+    s.bin = dir.join("h0x-core");
     std::fs::copy(BIN, &s.bin).unwrap();
     s.json(&["server", "start"]);
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -83,7 +83,10 @@ fn an_install_in_a_read_only_folder_explains_how_to_update_it() {
     assert!(!update.status.success());
     assert_eq!(error["error"]["kind"], "refused", "{error}");
     assert_eq!(error["error"]["message"], format!("{} isn't writable by you", dir.canonicalize().unwrap().display()));
-    assert_eq!(error["error"]["hint"], "update herdr-core the way it was installed (package manager, or sudo)");
+    assert_eq!(
+        error["error"]["hint"],
+        "reinstall h0x-core from the GitHub release: https://github.com/vjk7989/h0x-ADE-core/releases"
+    );
 }
 
 #[test]
@@ -91,24 +94,27 @@ fn update_from_a_file_swaps_hc_and_keeps_everything_running() {
     let mut s = Session::new();
     let dir = s.root.join("bin");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::copy(BIN, dir.join("herdr-core")).unwrap();
-    std::os::unix::fs::symlink("herdr-core", dir.join("hc")).unwrap();
-    s.bin = dir.join("hc"); // run as `hc`, the way people do
+    std::fs::copy(BIN, dir.join("h0x-core")).unwrap();
+    std::os::unix::fs::symlink("h0x-core", dir.join("h0x-core-link")).unwrap();
+    s.bin = dir.join("h0x-core-link"); // run through a link, the way people do
     let t = run(&s, &["sh", "-c", "echo before; while read l; do echo got-$l; done"]);
     let pid = s.json(&["server", "status"])["pid"].clone();
 
     let r = s.json(&["update", "--from", BIN]);
-    let real = std::fs::canonicalize(dir.join("herdr-core")).unwrap(); // macOS: /var is /private/var
-    assert_eq!(r["path"], real.display().to_string(), "the file hc runs from, not the link: {r}");
-    assert!(r["was"].as_str().unwrap().starts_with("hc ") && r["now"].as_str().unwrap().starts_with("hc "), "{r}");
+    let real = std::fs::canonicalize(dir.join("h0x-core")).unwrap(); // macOS: /var is /private/var
+    assert_eq!(r["path"], real.display().to_string(), "the file h0x-core runs from, not the link: {r}");
+    assert!(
+        r["was"].as_str().unwrap().starts_with("h0x-core ") && r["now"].as_str().unwrap().starts_with("h0x-core "),
+        "{r}"
+    );
     assert_eq!(r["restarted"], true);
     assert_ne!(s.json(&["server", "status"])["pid"], pid, "a new core runs");
-    assert!(dir.join("hc").is_symlink(), "the link stays a link");
+    assert!(dir.join("h0x-core-link").is_symlink(), "the link stays a link");
     s.json(&["send", &t, "after"]);
     wait_until("the terminal still answers", || text(&s, &t).contains("got-after"));
 
     let older = s.root.join("older");
-    std::fs::write(&older, "#!/bin/sh\necho 'hc 0.0.1'\n").unwrap();
+    std::fs::write(&older, "#!/bin/sh\necho 'h0x-core 0.0.1'\n").unwrap();
     std::fs::set_permissions(&older, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let (_, e) = s.err(&["--json", "update", "--from", older.to_str().unwrap()]);
     assert_eq!(e["error"]["kind"], "refused", "never older by accident: {e}");

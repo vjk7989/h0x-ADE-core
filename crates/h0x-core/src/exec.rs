@@ -73,7 +73,7 @@ fn program(p: &ExecParams) -> Result<Vec<String>, RpcError> {
     }
 }
 
-/// The core's environment without hc's own marks, plus `extra`, plus its
+/// The core's environment without h0x-core's own marks, plus `extra`, plus its
 /// token; `PWD` is its folder as the caller named it (as for terminals).
 fn env(
     base: BTreeMap<String, String>,
@@ -81,7 +81,7 @@ fn env(
     token: &str,
     cwd: &str,
 ) -> BTreeMap<String, String> {
-    let hc_own = ["HC_TERMINAL_ID", crate::sweep::VAR, crate::sweep::RUNTIME];
+    let hc_own = ["H0X_TERMINAL_ID", crate::sweep::VAR, crate::sweep::RUNTIME];
     let mut env: BTreeMap<String, String> = base
         .into_iter()
         .filter(|(k, _)| !crate::api::IDENTITY_VARS.contains(&k.as_str()) && !hc_own.contains(&k.as_str()))

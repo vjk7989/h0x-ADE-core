@@ -1,114 +1,113 @@
-# herdr-core (`hc`)
+# HyperOx core (h0x-core)
 
-`hc` runs programs and coding agents in terminals that stay alive after you leave.
-Agents can start other agents, send them work, and hear back; you can attach to any terminal and take over.
-
-Core draws nothing. Use it from your shell, an agent, or your own app.
+`h0x-core` is a headless terminal runtime for coding agents. It runs programs
+and agents in terminals that stay alive after you leave; agents can start other
+agents, send them work, and wait on them; you can attach to any terminal and
+take over. It draws nothing: use it from your shell, an agent, or your own app.
 
 ## Install
 
 Linux and macOS:
 
 ```sh
-curl -fsSL https://releases.herdr.dev/core/install.sh | sh
+curl -fsSL https://github.com/vjk7989/h0x-ADE-core/releases/latest/download/install.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-powershell -c "irm https://releases.herdr.dev/core/install.ps1 | iex"
+powershell -c "irm https://github.com/vjk7989/h0x-ADE-core/releases/latest/download/install.ps1 | iex"
 ```
 
-Builds are available for Linux and macOS on x86_64 and aarch64, and Windows on x86_64.
-Linux builds are static. On Windows, templates and quoted shell commands need `sh` on PATH, such as Git for Windows provides.
+Or download a release asset for your platform (Linux and macOS on x86_64 and
+aarch64, Windows on x86_64) and put `h0x-core` on your PATH. Linux builds are
+static. On Windows, templates and quoted shell commands need `sh` on PATH, such
+as Git for Windows provides.
 
-Run `hc update` to update. Running terminals keep running.
+Run `h0x-core update` to update. Running terminals keep running.
 See [security](docs/security.md) for the trust and signing details.
 
-## Run it and come back
+## Quick start
 
 ```sh
-hc run cargo test                  # stream output and wait for it
-hc run --bg --name web bun dev     # start it and return
-hc ls                             # see live terminals
-hc attach web                     # take over; Ctrl+\ detaches
-hc read web --lines 100            # read without attaching
+h0x-core run cargo test                  # stream output and wait for it
+h0x-core run --bg --name web bun dev     # start it and return
+h0x-core ls                              # see live terminals
+h0x-core attach web                      # take over; Ctrl+\ detaches
+h0x-core read web --lines 100            # read without attaching
 ```
 
-Closing your viewer does not end the program.
-A waiting run checks in after 180 seconds by default, leaving the program running.
-It prints the terminal's address so you can read it or wait again.
+Closing your viewer does not end the program. A waiting run checks in after
+180 seconds by default, leaving the program running and printing the terminal's
+address so you can read it or wait again.
 
-For a terminal you want to keep even if its program is lost, use `hc run --keep`.
-Recovery starts a fresh shell, never reruns the task.
-A normal exit or an explicit kill still ends it.
+For a terminal you want to keep even if its program is lost, use `h0x-core run --keep`.
+Recovery starts a fresh shell, never reruns the task. A normal exit or an
+explicit kill still ends it.
 
 ## Default shell
 
-With no program, `hc run --bg` starts the machine's shell: `$SHELL` (or
+With no program, `h0x-core run --bg` starts the machine's shell: `$SHELL` (or
 `/bin/sh`) on Unix, PowerShell 7 on Windows if available, else Windows PowerShell.
-Override it in `~/.config/herdr-core/config.toml` (Windows:
-`%APPDATA%\herdr-core\config.toml`, or `$XDG_CONFIG_HOME/herdr-core/config.toml`
-when set):
+Override it in `~/.config/h0x-core/config.toml` (Windows:
+`%APPDATA%\h0x-core\config.toml`):
 
 ```toml
 shell = ["nu"]
-# Windows Git Bash (literal strings keep backslashes):
-# shell = ['C:\Program Files\Git\bin\bash.exe', '--login', '-i']
 ```
 
-The list is an executable followed by separate arguments, without extra path
-quoting. It must contain a nonempty executable. Changes apply to the next new
-shell or `keep` recovery, including recovery after a restart; no restart is
-needed. Running terminals, explicit programs, and quoted command lines keep
-their behavior. A bad setting reports a config error; a shell that cannot start
-reports `spawn_failed`. Recovery stays pending and retries, with errors in
-`core.log` (config) or `holder.log` (spawn); it never silently falls back to another shell.
+The list is an executable followed by separate arguments. Changes apply to the
+next new shell or recovery; running terminals keep their behavior.
 
 ## Agents run agents
 
-Give an agent `hc --skill`. It prints the agent docs in one read, including how to delegate, wait, report back, and clean up.
+Give an agent `h0x-core --skill`. It prints the agent manual in one read:
+how to delegate, wait, report back, and clean up.
 
-[Templates](docs/templates.md) give an agent a command and a role.
-After saving the reviewer example from that page:
-
-```sh
-hc templates
-hc run --bg --name review reviewer "Review src/x.rs. Read-only."
-hc send review "Focus on the error path."
-hc read review --lines 100
-```
-
-Agents started inside an hc terminal become its children.
-They can report back with `hc send` and wait for their children with `hc wait --children all`.
-The parent gets notes when a child needs attention or ends.
-Children end with their parent unless started with `--outlive-parent`.
-
-## Every machine
+[Templates](docs/templates.md) give an agent a command and a role:
 
 ```sh
-hc machine add my-ssh-host --name box
-hc run --on box --cwd /srv/app cargo test
-hc attach box/t3
+h0x-core templates
+h0x-core run --bg --name review reviewer "Review src/x.rs. Read-only."
+h0x-core send review "Focus on the error path."
+h0x-core read review --lines 100
 ```
 
-Use the address returned by your run, not the example's `box/t3`.
-Programs and files stay on that machine. Your local core brings its terminals into the same list.
+Agents started inside an `h0x-core` terminal become its children. They report
+back with `h0x-core send`; the parent waits with `h0x-core wait --children all`
+and gets a note when a child needs attention or ends. Children end with their
+parent unless started with `--outlive-parent`.
+
+## Machines
+
+```sh
+h0x-core machine add my-ssh-host --name box
+h0x-core run --on box --cwd /srv/app cargo test
+h0x-core attach box/t3
+```
+
+Use the address your run returns, not the example's `box/t3`. Programs and
+files stay on that machine; your local core lists its terminals beside yours.
 [Machines](docs/machines.md) covers SSH, custom connections, remote files, and reconnecting.
 
 ## Status comes from the program
 
-An agent can say it is working, done, blocked, or in error through OSC 7501, the Program Status Protocol.
-Core stores what it reports. It does not guess from screen text or recognize agent brands.
-A program that does not report status has none.
-
-Use `hc get review` for a snapshot or `hc events` to follow changes.
+A program can say it is working, done, blocked, or in error through OSC 7501,
+the Program Status Protocol. Core stores what it reports and never guesses from
+screen text. A program that does not report status has none.
+Use `h0x-core get review` for a snapshot or `h0x-core events` to follow changes.
 
 ## Build your own client
 
-`hc schema` prints the request/response API as OpenRPC with JSON Schema.
+`h0x-core schema` prints the request/response API as OpenRPC with JSON Schema.
 [The API docs](schema/README.md) cover connecting, terminal streams, events, and status.
-Use `hc connect` to carry the protocol over stdin and stdout, including through SSH.
+`h0x-core connect` carries the protocol over stdin and stdout, including through SSH.
+
+## Part of HyperOx
+
+The HyperOx desktop app, [`h0x-ade`](https://github.com/vjk7989/h0x-ADE-app),
+and the HyperOx terminal runtime, [`h0x`](https://github.com/vjk7989/h0x-ADE-Runtime),
+both run on this core.
 
 ## Docs
 
@@ -118,23 +117,22 @@ Use `hc connect` to carry the protocol over stdin and stdout, including through 
 - [Security](docs/security.md): access, state, and updates.
 - [API](schema/README.md): build a client.
 
-For a quick lookup, run `hc --help` or a command's help, such as `hc run --help`.
-For agents, use `hc --skill`.
+For a quick lookup, run `h0x-core --help` or a command's help, such as `h0x-core run --help`.
 
 ## Build from source
 
-You need Rust, Zig 0.16, and just. CI pins the Rust version in [.github/workflows/ci.yml](.github/workflows/ci.yml).
+You need Rust 1.95 or newer and Zig 0.16.0.
 
 ```sh
-git submodule update --init --depth 1
-cargo build --locked -p herdr-core
-just check
+git clone --recurse-submodules https://github.com/vjk7989/h0x-ADE-core
+cd h0x-ADE-core
+cargo build --release
+cargo test --locked
 ```
-
-`just install` installs this checkout and restarts your core. Running terminals keep running.
-`just docs` refreshes the command reference. `just docs-check` checks it and the examples; CI runs the same tests.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for contributor setup and checks.
 
-License: [Apache-2.0](LICENSE). `hc --licenses` prints the included third-party licenses.
-After a dependency change, regenerate them with `just notices`.
+## License
+
+[Apache-2.0](LICENSE); see [NOTICE](NOTICE) for attribution.
+`h0x-core --licenses` prints the included third-party licenses.

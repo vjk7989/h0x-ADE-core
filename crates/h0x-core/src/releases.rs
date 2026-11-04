@@ -1,7 +1,7 @@
-//! Released builds on releases.herdr.dev: the list (`core/latest.json`, or
-//! `core/<version>/manifest.json` for one version) and its checked
+//! Released builds on GitHub Releases: the list (`latest/download/latest.json`,
+//! or `download/v<version>/manifest.json` for one version) and its checked
 //! downloads. curl, sha256sum/shasum (Windows: its own crypto) and tar do
-//! the work: no HTTP or crypto code in hc for something run this rarely.
+//! the work: no HTTP or crypto code in h0x-core for something run this rarely.
 
 use crate::rpc::RpcError;
 use serde::Deserialize;
@@ -23,14 +23,18 @@ pub struct Target {
 }
 
 fn base() -> String {
-    std::env::var("HERDR_RELEASES_URL")
-        .unwrap_or_else(|_| "https://releases.herdr.dev".into())
+    std::env::var("H0X_CORE_RELEASES_URL")
+        .unwrap_or_else(|_| "https://github.com/vjk7989/h0x-ADE-core/releases".into())
         .trim_end_matches('/')
         .into()
 }
 
 fn unavailable(why: String) -> RpcError {
-    RpcError::new("unavailable", why, "check your connection; the releases are at releases.herdr.dev")
+    RpcError::new(
+        "unavailable",
+        why,
+        "check your connection; the releases are at github.com/vjk7989/h0x-ADE-core/releases",
+    )
 }
 
 fn curl(url: &str, to: &Path) -> Result<(), RpcError> {
@@ -50,8 +54,8 @@ fn curl(url: &str, to: &Path) -> Result<(), RpcError> {
 /// The latest release's list, or one version's.
 pub fn manifest(version: Option<&str>, scratch: &Path) -> Result<Manifest, RpcError> {
     let url = match version {
-        Some(v) => format!("{}/core/{v}/manifest.json", base()),
-        None => format!("{}/core/latest.json", base()),
+        Some(v) => format!("{}/download/v{v}/manifest.json", base()),
+        None => format!("{}/latest/download/latest.json", base()),
     };
     let file = scratch.join("manifest.json");
     curl(&url, &file)?;
@@ -81,19 +85,19 @@ fn sha256(file: &Path) -> Option<String> {
 }
 
 /// Downloads `m`'s build for `target` (`linux-x86_64`) into `scratch`,
-/// checks it against the list, unpacks it: the path of its herdr-core.
+/// checks it against the list, unpacks it: the path of its h0x-core.
 /// Windows builds are a zip (the exe and its ConPTY); Windows' own tar
 /// unpacks it.
 pub fn download(m: &Manifest, target: &str, scratch: &Path) -> Result<PathBuf, RpcError> {
     let tar = fetch(m, target, scratch)?;
-    let exe = if target.starts_with("windows") { "herdr-core.exe" } else { "herdr-core" };
+    let exe = if target.starts_with("windows") { "h0x-core.exe" } else { "h0x-core" };
     let ok =
         Command::new(tar_program()).arg("-xf").arg(&tar).arg("-C").arg(scratch).status().is_ok_and(|s| s.success());
     let bin = scratch.join(exe);
     if !ok || !bin.is_file() {
         return Err(RpcError::new(
             "refused",
-            format!("hc {}'s download for {target} holds no herdr-core", m.version),
+            format!("h0x-core {}'s download for {target} holds no h0x-core binary", m.version),
             "",
         ));
     }
@@ -104,15 +108,19 @@ pub fn download(m: &Manifest, target: &str, scratch: &Path) -> Result<PathBuf, R
 /// the list: its path, still packed.
 pub fn fetch(m: &Manifest, target: &str, scratch: &Path) -> Result<PathBuf, RpcError> {
     let t = m.targets.get(target).ok_or_else(|| {
-        RpcError::new("refused", format!("hc {} has no build for {target}", m.version), "install hc there yourself")
+        RpcError::new(
+            "refused",
+            format!("h0x-core {} has no build for {target}", m.version),
+            "install h0x-core there yourself",
+        )
     })?;
     let archive = if target.starts_with("windows") { "zip" } else { "tar.gz" };
-    let file = scratch.join(format!("herdr-core-{target}.{archive}"));
+    let file = scratch.join(format!("h0x-core-{target}.{archive}"));
     curl(&t.url, &file)?;
     if sha256(&file).as_deref() != Some(t.sha256.as_str()) {
         return Err(RpcError::new(
             "refused",
-            format!("the download of hc {} for {target} is damaged (checksum mismatch)", m.version),
+            format!("the download of h0x-core {} for {target} is damaged (checksum mismatch)", m.version),
             "try again",
         ));
     }
@@ -124,8 +132,11 @@ pub struct Scratch(pub PathBuf);
 
 impl Scratch {
     pub fn new() -> Result<Scratch, RpcError> {
-        let dir =
-            std::env::temp_dir().join(format!("hc-download-{}-{}", std::process::id(), crate::platform::random_hex()));
+        let dir = std::env::temp_dir().join(format!(
+            "h0x-core-download-{}-{}",
+            std::process::id(),
+            crate::platform::random_hex()
+        ));
         std::fs::create_dir_all(&dir).map_err(|e| RpcError::internal(e.to_string()))?;
         Ok(Scratch(dir))
     }

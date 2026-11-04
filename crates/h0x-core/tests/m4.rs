@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 fn session() -> Session {
     let mut s = Session::new();
-    s.env.push(("HC_QUIET_MS".into(), "600".into()));
-    s.env.push(("HC_STARTED_MS".into(), "1500".into()));
+    s.env.push(("H0X_CORE_QUIET_MS".into(), "600".into()));
+    s.env.push(("H0X_CORE_STARTED_MS".into(), "1500".into()));
     s
 }
 
@@ -30,7 +30,7 @@ fn status(s: &Session, t: &str) -> Value {
 #[test]
 fn a_send_into_a_starting_agent_waits_for_its_screen_to_settle() {
     let mut s = session();
-    s.env.push(("HC_SETTLE_MS".into(), "800".into()));
+    s.env.push(("H0X_CORE_SETTLE_MS".into(), "800".into()));
     // Like Pi: it reports at once, then keeps setting up and loses what is typed meanwhile.
     let t = s.json(&[
         "run",
@@ -50,7 +50,7 @@ fn a_send_into_a_starting_agent_waits_for_its_screen_to_settle() {
 #[test]
 fn an_immediate_send_waits_even_before_the_first_output() {
     let mut s = session();
-    s.env.push(("HC_SETTLE_MS".into(), "800".into()));
+    s.env.push(("H0X_CORE_SETTLE_MS".into(), "800".into()));
     let t = run(
         &s,
         "sleep 0.4; stty -echo; while read -r -t 0.01 l; do :; done; \
@@ -64,7 +64,7 @@ fn an_immediate_send_waits_even_before_the_first_output() {
 #[test]
 fn a_send_refuses_a_starting_program_that_never_settles() {
     let mut s = session();
-    s.env.push(("HC_SETTLE_MS".into(), "800".into()));
+    s.env.push(("H0X_CORE_SETTLE_MS".into(), "800".into()));
     let t = run(&s, "stty -echo; while :; do echo booting; sleep 0.1; done");
     shows(&s, &t, "booting");
     let (_, err) = s.err(&["send", &t, "hello"]);

@@ -5,13 +5,13 @@ Set-Location "$PSScriptRoot\.."
 cargo build --release --locked
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 & "$PSScriptRoot\fetch-conpty.ps1" -Dest target\release
-$tmp = Join-Path ([IO.Path]::GetTempPath()) "hc-local-$PID"
+$tmp = Join-Path ([IO.Path]::GetTempPath()) "h0x-core-local-$PID"
 New-Item -ItemType Directory -Force $tmp | Out-Null
 # The installer deletes the zip and itself when done: hand it copies.
 Copy-Item distribution\install.ps1 $tmp
-& "$env:SystemRoot\System32\tar.exe" -a -cf "$tmp\hc.zip" -C target\release herdr-core.exe conpty
+& "$env:SystemRoot\System32\tar.exe" -a -cf "$tmp\h0x-core.zip" -C target\release h0x-core.exe conpty
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
-powershell -NoProfile -ExecutionPolicy Bypass -File "$tmp\install.ps1" "$tmp\hc.zip"
+powershell -NoProfile -ExecutionPolicy Bypass -File "$tmp\install.ps1" "$tmp\h0x-core.zip"
 $code = $LASTEXITCODE
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 exit $code

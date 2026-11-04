@@ -16,7 +16,7 @@ impl RpcError {
         RpcError { code: -32000, kind: kind.into(), message: message.into(), hint: hint.into() }
     }
     fn protocol(code: i64, kind: &str, message: impl Into<String>) -> Self {
-        RpcError { code, kind: kind.into(), message: message.into(), hint: "see `hc schema`".into() }
+        RpcError { code, kind: kind.into(), message: message.into(), hint: "see `h0x-core schema`".into() }
     }
     pub fn parse_error(message: impl Into<String>) -> Self {
         Self::protocol(-32700, "parse_error", message)
@@ -131,9 +131,9 @@ pub fn openrpc(methods: Vec<Value>, defs: Map<String, Value>, version: &str, gen
     let doc = json!({
         "openrpc": "1.3.2",
         "info": {
-            "title": "herdr-core",
+            "title": "h0x-core",
             "version": version,
-            "description": format!("Terminal runtime for coding agents. JSON-RPC 2.0, one message per line on the hc socket \
+            "description": format!("Terminal runtime for coding agents. JSON-RPC 2.0, one message per line on the h0x-core socket \
                 (or framed after `hello`). Protocol generation {generation}. Errors carry a stable `data.kind`."),
             "license": {"name": "Apache-2.0"},
         },

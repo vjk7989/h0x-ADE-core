@@ -107,7 +107,7 @@ pub struct Terminal {
     /// viewer must hear it too.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub win32_input: bool,
-    /// The `HC_SCOPE` token everything it started carries, to end them all.
+    /// The `H0X_SCOPE` token everything it started carries, to end them all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
     #[serde(default)]
@@ -318,7 +318,7 @@ impl Registry {
         };
         found
             .map(Terminal::id)
-            .ok_or_else(|| RpcError::new("not_found", format!("no terminal {local:?}"), "see `hc ls --all`"))
+            .ok_or_else(|| RpcError::new("not_found", format!("no terminal {local:?}"), "see `h0x-core ls --all`"))
     }
 
     pub fn finish(&mut self, id: u32, code: Option<i32>, signal: Option<i32>, reason: &str, now_ms: u64) {
@@ -446,9 +446,9 @@ impl JsonSchema for Public {
     }
 }
 
-/// `RETAIN_MS`, or `HC_RETAIN_MS` (tests can't wait a day).
+/// `RETAIN_MS`, or `H0X_CORE_RETAIN_MS` (tests can't wait a day).
 fn retain_ms() -> u64 {
-    std::env::var("HC_RETAIN_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(RETAIN_MS)
+    std::env::var("H0X_CORE_RETAIN_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(RETAIN_MS)
 }
 
 fn is_zero(n: &u64) -> bool {

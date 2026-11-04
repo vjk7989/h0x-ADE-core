@@ -52,13 +52,13 @@ fn exec_returns_exactly_what_the_program_wrote_here_and_on_a_machine() {
     s.json(&["machine", "add", "rohan"]);
     for on in [&[][..], &["--on", "rohan"][..]] {
         let script = format!("awk '{TABLE}'; printf 'oops\\0\\377' >&2; exit 3");
-        let out = s.hc(&[&["exec"], on, &["sh", "-c", &script]].concat());
+        let out = s.core(&[&["exec"], on, &["sh", "-c", &script]].concat());
         assert!(out.stdout == table(), "{on:?}: every line, tabs and escapes kept");
         assert_eq!((out.stderr.as_slice(), out.status.code()), (&b"oops\0\xff"[..], Some(3)), "{on:?}");
     }
 
     // One string with shell signs is a shell line, run by that machine's shell.
-    let out = s.hc(&["exec", "--on", "rohan", "--env", "WHO=rohan", "echo $WHO | tr r R; pwd"]);
+    let out = s.core(&["exec", "--on", "rohan", "--env", "WHO=rohan", "echo $WHO | tr r R; pwd"]);
     assert_eq!(String::from_utf8_lossy(&out.stdout), format!("Rohan\n{}\n", rohan.root.display()), "its home");
     let here = s.json(&["exec", "--cwd", "/", "pwd"]);
     assert_eq!((here["code"].clone(), here["stdout"].clone()), (json!(0), json!("Lwo=")), "{here}");
@@ -81,11 +81,11 @@ fn a_relative_folder_there_starts_in_its_home_never_where_its_core_runs() {
     std::fs::create_dir_all(rohan.root.join("app")).unwrap();
     std::fs::write(rohan.root.join("app/x.txt"), "x\n").unwrap();
     let want = format!("{}/app\n", rohan.root.display());
-    let exec = s.hc(&["exec", "--on", "rohan", "--cwd", "app", "sh", "-c", "echo $PWD"]);
+    let exec = s.core(&["exec", "--on", "rohan", "--cwd", "app", "sh", "-c", "echo $PWD"]);
     assert_eq!(String::from_utf8_lossy(&exec.stdout), want, "exec");
-    let run = s.hc(&["run", "--on", "rohan", "--cwd", "app", "sh", "-c", "echo $PWD"]);
+    let run = s.core(&["run", "--on", "rohan", "--cwd", "app", "sh", "-c", "echo $PWD"]);
     assert!(String::from_utf8_lossy(&run.stdout).contains(want.trim()), "run");
-    let read = s.hc(&["file", "read", "--on", "rohan", "--cwd", "app", "x.txt"]);
+    let read = s.core(&["file", "read", "--on", "rohan", "--cwd", "app", "x.txt"]);
     assert_eq!(String::from_utf8_lossy(&read.stdout), "x\n", "file");
 }
 
@@ -109,13 +109,13 @@ fn exec_feeds_what_is_piped_with_stdin_flag_and_nothing_without() {
 fn exec_ends_everything_it_started_when_it_exits_or_times_out() {
     let s = Session::new();
     let start = Instant::now();
-    let out = s.hc(&["exec", "sh", "-c", &format!("{} echo ok", stubborn(&s, "left"))]);
+    let out = s.core(&["exec", "sh", "-c", &format!("{} echo ok", stubborn(&s, "left"))]);
     assert_eq!((out.stdout.as_slice(), out.status.code()), (&b"ok\n"[..], Some(0)));
     gone(pid_in(&s, "left"));
     assert!(start.elapsed() < Duration::from_secs(8), "a helper holding its output doesn't keep it waiting");
 
     let out =
-        s.hc(&["exec", "--timeout", "1", "sh", "-c", &format!("{} echo started; sleep 100", stubborn(&s, "slow"))]);
+        s.core(&["exec", "--timeout", "1", "sh", "-c", &format!("{} echo started; sleep 100", stubborn(&s, "slow"))]);
     assert_eq!((out.stdout.as_slice(), out.status.code()), (&b"started\n"[..], Some(124)), "what came so far");
     gone(pid_in(&s, "slow"));
 }
@@ -163,7 +163,7 @@ fn exec_ends_when_its_caller_goes_away_here_or_across_a_line() {
     for file in ["first", "second"] {
         let script = format!("{} sleep 100", stubborn(&s, file));
         let note = json!({"jsonrpc": "2.0", "method": "machine.exec", "params": {"argv": ["sh", "-c", script]}});
-        framed.send(0, herdr_core::wire::DATA, note.to_string().as_bytes());
+        framed.send(0, h0x_core::wire::DATA, note.to_string().as_bytes());
     }
     let pids = [pid_in(&s, "first"), pid_in(&s, "second")];
     drop(framed);
@@ -181,7 +181,7 @@ fn a_client_that_stops_reading_its_replies_is_disconnected_not_kept_in_memory() 
     for id in 1..=8 {
         let call = json!({"jsonrpc": "2.0", "id": id, "method": "machine.exec",
             "params": {"argv": ["head", "-c", "8388608", "/dev/zero"]}});
-        stream.write_all(&herdr_core::wire::encode(0, herdr_core::wire::DATA, call.to_string().as_bytes())).unwrap();
+        stream.write_all(&h0x_core::wire::encode(0, h0x_core::wire::DATA, call.to_string().as_bytes())).unwrap();
     }
     // Do not drain replies until the core closes: reading early can keep the queue below its cap.
     use std::os::fd::AsRawFd;

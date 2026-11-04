@@ -15,7 +15,7 @@ fn with_rohan_env(env: &[(&str, &str)]) -> (Session, Session) {
     let rohan = Session::new();
     let mut s = Session::new();
     s.env.push(fake_ssh(&s, &[("rohan", &rohan)]));
-    s.env.push(("HC_RECONNECT_MS".into(), "200".into()));
+    s.env.push(("H0X_CORE_RECONNECT_MS".into(), "200".into()));
     s.env.extend(env.iter().map(|(k, v)| (k.to_string(), v.to_string())));
     s.json(&["machine", "add", "rohan"]);
     (rohan, s)
@@ -25,12 +25,14 @@ fn with_rohan_env(env: &[(&str, &str)]) -> (Session, Session) {
 fn a_frozen_machine_never_freezes_hc() {
     // rohan answers heartbeats every 200 ms; here, 2 s is all a machine gets.
     let mut rohan = Session::new();
-    rohan.env.push(("HC_HEARTBEAT_MS".into(), "200".into()));
+    rohan.env.push(("H0X_CORE_HEARTBEAT_MS".into(), "200".into()));
     let pid = rohan.json(&["server", "status"])["pid"].as_i64().unwrap() as i32;
     let mut s = Session::new();
     s.env.push(fake_ssh(&s, &[("rohan", &rohan)]));
-    s.env.extend([("HC_RECONNECT_MS", "200"), ("HC_HEARTBEAT_MS", "200")].map(|(k, v)| (k.into(), v.into())));
-    let config = s.root.join("config/herdr-core/config.toml");
+    s.env.extend(
+        [("H0X_CORE_RECONNECT_MS", "200"), ("H0X_CORE_HEARTBEAT_MS", "200")].map(|(k, v)| (k.into(), v.into())),
+    );
+    let config = s.root.join("config/h0x-core/config.toml");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     std::fs::write(config, "machine_timeout = 2\n").unwrap();
     s.json(&["machine", "add", "rohan"]);
@@ -66,7 +68,7 @@ fn a_frozen_machine_never_freezes_hc() {
 #[test]
 fn a_big_answer_on_a_slow_link_is_not_mistaken_for_a_frozen_machine() {
     let mut rohan = Session::new();
-    rohan.env.push(("HC_HEARTBEAT_MS".into(), "200".into()));
+    rohan.env.push(("H0X_CORE_HEARTBEAT_MS".into(), "200".into()));
     let mut s = Session::new();
     let (var, fake) = fake_ssh(&s, &[("rohan", &rohan)]);
     // Everything rohan sends comes at ~320 KB/s; 0.7 s of silence is all a machine gets.
@@ -75,10 +77,10 @@ fn a_big_answer_on_a_slow_link_is_not_mistaken_for_a_frozen_machine() {
     std::fs::write(&slow, format!("#!/bin/sh\n{fake} \"$@\" | python3 -c '{throttle}'\n")).unwrap();
     std::fs::set_permissions(&slow, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     s.env.push((var, slow.display().to_string()));
-    let config = s.root.join("config/herdr-core/config.toml");
+    let config = s.root.join("config/h0x-core/config.toml");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     std::fs::write(config, "machine_timeout = 0.5\n").unwrap();
-    s.env.push(("HC_HEARTBEAT_MS".into(), "200".into()));
+    s.env.push(("H0X_CORE_HEARTBEAT_MS".into(), "200".into()));
     rohan.json(&["server", "start"]);
     s.json(&["machine", "add", "rohan"]);
 
@@ -141,7 +143,7 @@ fn two_machines_that_added_each_other_never_echo_events_back() {
 
 #[test]
 fn terminals_on_another_machine_work_like_local_ones() {
-    let (rohan, s) = with_rohan_env(&[("HC_TEST_SSH_DELAY", "0.4")]); // a login as slow as a real one
+    let (rohan, s) = with_rohan_env(&[("H0X_CORE_TEST_SSH_DELAY", "0.4")]); // a login as slow as a real one
     let local = run(&s, &["sh", "-c", "sleep 100"]);
     let t = run(&s, &["--on", "rohan", "--name", "echo", "sh", "-c", "pwd; while read l; do echo got-$l; done"]);
     assert_eq!(t, "rohan/t1");
@@ -157,7 +159,7 @@ fn terminals_on_another_machine_work_like_local_ones() {
     let w = s.json(&["wait", &done]);
     assert_eq!((w["terminal"].as_str(), w["exit_code"].as_i64()), (Some(done.as_str()), Some(3)), "{w}");
     // A restart there closes the line; a call right then waits for the redial.
-    rohan.hc(&["server", "restart"]);
+    rohan.core(&["server", "restart"]);
     assert!(text(&s, &t).contains("got-hello"), "no 'unreachable' in between");
     assert_eq!(s.json(&["kill", &t])["state"], "finished");
     s.json(&["rm", &t]);
@@ -171,7 +173,7 @@ fn parent_with_child_on_rohan(s: &Session, child: &str) -> (String, String) {
     wait_until("the parent reports", || get(s, &parent)["reported"] == true);
     let out = s
         .cmd()
-        .env("HC_TERMINAL_ID", &parent)
+        .env("H0X_TERMINAL_ID", &parent)
         .args(["--json", "run", "--bg", "--on", "rohan", "sh", "-c", child])
         .output()
         .unwrap();
@@ -183,14 +185,14 @@ fn parent_with_child_on_rohan(s: &Session, child: &str) -> (String, String) {
 
 #[test]
 fn a_child_on_another_machine_reports_back_to_its_parent() {
-    let (rohan, s) = with_rohan_env(&[("HC_QUIET_MS", "0")]);
+    let (rohan, s) = with_rohan_env(&[("H0X_CORE_QUIET_MS", "0")]);
     let (parent, child) = parent_with_child_on_rohan(&s, &script(&s, "r state=working; w go; exit 3"));
     let parent_there = get(&rohan, "t1")["parent"].as_str().unwrap().to_string();
     assert!(parent_there.ends_with(&format!("/{parent}")), "{parent_there}");
 
-    let said = rohan.cmd().env("HC_TERMINAL_ID", "t1").args(["send", &parent_there, "hi-parent"]).output().unwrap();
+    let said = rohan.cmd().env("H0X_TERMINAL_ID", "t1").args(["send", &parent_there, "hi-parent"]).output().unwrap();
     assert!(said.status.success(), "{}", String::from_utf8_lossy(&said.stderr));
-    wait_until("the child's message", || text(&s, &parent).contains(&format!("<hc from=\"{child}\">hi-parent</hc>")));
+    wait_until("the child's message", || text(&s, &parent).contains(&format!("<h0x from=\"{child}\">hi-parent</h0x>")));
 
     let other = run(&s, &["sh", "-c", &script(&s, "r state=idle; cat")]);
     let prefix = parent_there.split('/').next().unwrap();
@@ -199,7 +201,7 @@ fn a_child_on_another_machine_reports_back_to_its_parent() {
 
     touch(&s, "go");
     wait_until("the exit note", || {
-        text(&s, &parent).contains(&format!("<hc>{child} exited (exit 3). Read: hc read {child}</hc>"))
+        text(&s, &parent).contains(&format!("<h0x>{child} exited (exit 3). Read: h0x-core read {child}</h0x>"))
     });
 }
 
@@ -207,18 +209,24 @@ fn a_child_on_another_machine_reports_back_to_its_parent() {
 fn a_remote_templates_readiness_wait_leaves_its_child_able_to_report_back() {
     let mut rohan = Session::new();
     rohan.env.extend(
-        [("HC_READY_MS", "1500"), ("HC_STARTED_MS", "100"), ("HC_QUIET_MS", "0"), ("HC_HEARTBEAT_MS", "100")]
-            .map(|(k, v)| (k.into(), v.into())),
+        [
+            ("H0X_CORE_READY_MS", "1500"),
+            ("H0X_CORE_STARTED_MS", "100"),
+            ("H0X_CORE_QUIET_MS", "0"),
+            ("H0X_CORE_HEARTBEAT_MS", "100"),
+        ]
+        .map(|(k, v)| (k.into(), v.into())),
     );
     let mut s = Session::new();
     s.env.push(fake_ssh(&s, &[("rohan", &rohan)]));
     s.env.extend(
-        [("HC_READY_MS", "1500"), ("HC_QUIET_MS", "0"), ("HC_HEARTBEAT_MS", "100")].map(|(k, v)| (k.into(), v.into())),
+        [("H0X_CORE_READY_MS", "1500"), ("H0X_CORE_QUIET_MS", "0"), ("H0X_CORE_HEARTBEAT_MS", "100")]
+            .map(|(k, v)| (k.into(), v.into())),
     );
-    let config = s.root.join("config/herdr-core/config.toml");
+    let config = s.root.join("config/h0x-core/config.toml");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     std::fs::write(config, "machine_timeout = 0.5\n").unwrap();
-    let templates = rohan.root.join("config/herdr-core/templates");
+    let templates = rohan.root.join("config/h0x-core/templates");
     std::fs::create_dir_all(&templates).unwrap();
     rohan.json(&["server", "start"]);
     s.json(&["machine", "add", "rohan"]);
@@ -233,7 +241,7 @@ fn a_remote_templates_readiness_wait_leaves_its_child_able_to_report_back() {
             .unwrap();
         let out = s
             .cmd()
-            .env("HC_TERMINAL_ID", &parent)
+            .env("H0X_TERMINAL_ID", &parent)
             .args(["--json", "run", "--bg", "--on", "rohan", name, "task"])
             .output()
             .unwrap();
@@ -246,9 +254,9 @@ fn a_remote_templates_readiness_wait_leaves_its_child_able_to_report_back() {
         let child = started["address"].as_str().unwrap();
         let local = child.strip_prefix("rohan/").unwrap();
         let parent_there = get(&rohan, local)["parent"].as_str().unwrap().to_string();
-        let said = rohan.cmd().env("HC_TERMINAL_ID", local).args(["send", &parent_there, name]).output().unwrap();
+        let said = rohan.cmd().env("H0X_TERMINAL_ID", local).args(["send", &parent_there, name]).output().unwrap();
         assert!(said.status.success(), "{}", String::from_utf8_lossy(&said.stderr));
-        wait_until("child reports back", || text(&s, &parent).contains(&format!("<hc from=\"{child}\">{name}</hc>")));
+        wait_until("child reports back", || text(&s, &parent).contains(&format!("<h0x from=\"{child}\">{name}</h0x>")));
     }
 }
 
@@ -259,7 +267,7 @@ fn waiting_on_children_counts_the_ones_on_other_machines() {
     let wait = |mode: &str, timeout: &str| {
         let out = s
             .cmd()
-            .env("HC_TERMINAL_ID", &parent)
+            .env("H0X_TERMINAL_ID", &parent)
             .args(["--json", "wait", "--children", mode, "--timeout", timeout])
             .output()
             .unwrap();
@@ -285,8 +293,12 @@ fn a_child_ends_with_its_parent_on_another_machine_too() {
     let (rohan, s) = with_rohan();
     // `--rm`: the parent is forgotten at once, but its children there still hear.
     let parent = run(&s, &["--rm", "sh", "-c", &script(&s, "r state=idle; w go")]);
-    let out =
-        s.cmd().env("HC_TERMINAL_ID", &parent).args(["run", "--bg", "--on", "rohan", "sleep", "100"]).output().unwrap();
+    let out = s
+        .cmd()
+        .env("H0X_TERMINAL_ID", &parent)
+        .args(["run", "--bg", "--on", "rohan", "sleep", "100"])
+        .output()
+        .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     touch(&s, "go");
     wait_until("the child there ended", || get(&rohan, "t1")["state"] == "finished");
@@ -294,14 +306,14 @@ fn a_child_ends_with_its_parent_on_another_machine_too() {
 
 #[test]
 fn a_note_made_while_the_line_is_down_arrives_when_it_is_back() {
-    let (rohan, s) = with_rohan_env(&[("HC_QUIET_MS", "0")]);
+    let (rohan, s) = with_rohan_env(&[("H0X_CORE_QUIET_MS", "0")]);
     let (parent, child) = parent_with_child_on_rohan(&s, &script(&s, "r state=working; w go; exit 4"));
     std::fs::write(s.root.join("down"), "").unwrap();
-    rohan.hc(&["server", "restart"]);
+    rohan.core(&["server", "restart"]);
     wait_until("rohan unreachable", || s.json(&["machine", "ls"])["machines"][0]["state"] == "unreachable");
     touch(&s, "go");
     wait_until("it exited there", || get(&rohan, "t1")["state"] == "finished");
-    rohan.hc(&["server", "restart"]); // the note is kept across a restart there too
+    rohan.core(&["server", "restart"]); // the note is kept across a restart there too
     std::fs::remove_file(s.root.join("down")).unwrap();
     wait_until("the exit note", || text(&s, &parent).contains(&format!("{child} exited (exit 4)")));
 }
@@ -343,7 +355,7 @@ fn the_picker_starts_a_shell_on_another_machine() {
     v.shows("new on rohan");
     v.typed(b"on rohan\r");
     wait_until("a shell there", || addresses(&s.json(&["ls"])).contains(&"rohan/t1".to_string()));
-    v.typed(b"echo hi-from-$HC_TERMINAL_ID\r");
+    v.typed(b"echo hi-from-$H0X_TERMINAL_ID\r");
     v.shows("hi-from-t1"); // rohan's t1: here it would be t2
 }
 
@@ -398,7 +410,7 @@ fn attaching_to_a_terminal_on_another_machine() {
 
 #[test]
 fn remote_observer_receives_grid_and_paint_including_after_reconnect() {
-    use herdr_core::wire;
+    use h0x_core::wire;
     use std::time::Duration;
     let (rohan, s) = with_rohan();
     let t = run(&s, &["--on", "rohan", "sh", "-c", "echo retained; exec sleep 100"]);
@@ -449,7 +461,7 @@ fn a_viewer_there_keeps_up_past_one_window_of_output() {
     let mut v = Viewer::attach(&s, &t, 100, 30, json!({}));
     v.typed(b"go\r");
     v.shows("all-done");
-    assert!(v.received > herdr_core::wire::WINDOW, "more than a stream starts with");
+    assert!(v.received > h0x_core::wire::WINDOW, "more than a stream starts with");
 }
 
 #[test]
@@ -459,7 +471,7 @@ fn a_viewer_rides_out_a_dropped_line_without_reattaching() {
     let mut v = Viewer::attach(&s, &t, 100, 30, json!({}));
     v.shows("ready");
     std::fs::write(s.root.join("down"), "").unwrap();
-    rohan.hc(&["server", "restart"]); // the line drops; the program keeps running there
+    rohan.core(&["server", "restart"]); // the line drops; the program keeps running there
     wait_until("rohan unreachable", || s.json(&["machine", "ls"])["machines"][0]["state"] == "unreachable");
     v.shows("lost"); // the viewer hears it, and stays open
     assert!(v.closed.is_none(), "the stream stays open while the line is down");
@@ -482,11 +494,11 @@ fn a_viewer_back_after_a_dropped_line_does_not_take_the_size() {
     let t = run(&s, &["--on", "rohan", "sh", "-c", &shows_mark]);
     let size = |t: &str| (get(&rohan, t)["cols"].as_u64().unwrap(), get(&rohan, t)["rows"].as_u64().unwrap());
     let mut away = Viewer::attach(&s, &t, 100, 30, json!({}));
-    away.conn.send(away.channel, herdr_core::wire::RESIZE, &[120, 0, 40, 0]);
+    away.conn.send(away.channel, h0x_core::wire::RESIZE, &[120, 0, 40, 0]);
     wait_until("its latest size there", || size("t1") == (120, 40));
 
     std::fs::write(s.root.join("down"), "").unwrap();
-    rohan.hc(&["server", "restart"]);
+    rohan.core(&["server", "restart"]);
     wait_until("rohan unreachable", || s.json(&["machine", "ls"])["machines"][0]["state"] == "unreachable");
     let here = Viewer::attach(&rohan, "t1", 80, 24, json!({}));
     assert_eq!(size("t1"), (80, 24));
@@ -506,7 +518,7 @@ fn a_run_or_wait_there_rides_out_a_dropped_line() {
     let state = |s: &Session| s.json(&["machine", "ls"])["machines"][0]["state"].clone();
     let drop_line = || {
         std::fs::write(s.root.join("down"), "").unwrap();
-        rohan.hc(&["server", "restart"]);
+        rohan.core(&["server", "restart"]);
         wait_until("rohan unreachable", || state(&s) == "unreachable");
         std::fs::remove_file(s.root.join("down")).unwrap();
     };
@@ -547,7 +559,7 @@ fn a_machine_that_drops_off_is_shown_not_waited_on_and_comes_back() {
     assert_eq!(s.json(&["machine", "ls"])["machines"][0]["state"], "connected");
 
     std::fs::write(s.root.join("down"), "").unwrap();
-    rohan.hc(&["server", "restart"]); // drops the line; the terminal keeps running there
+    rohan.core(&["server", "restart"]); // drops the line; the terminal keeps running there
     wait_until("rohan unreachable", || s.json(&["machine", "ls"])["machines"][0]["state"] == "unreachable");
     let list = s.json(&["ls"]);
     assert_eq!(list["machines"][0]["state"], "unreachable", "{list}");

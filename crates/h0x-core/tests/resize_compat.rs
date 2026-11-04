@@ -4,18 +4,18 @@ mod common;
 
 use common::framed::{Framed, Viewer};
 use common::*;
-use herdr_core::wire;
+use h0x_core::wire;
 use serde_json::json;
 use std::time::{Duration, Instant};
 
 #[test]
-#[ignore = "set HC_OLD_CORE to the released 0.1.16 herdr-core binary"]
+#[ignore = "set H0X_CORE_OLD_CORE to the released 0.1.16 h0x-core binary"]
 fn capable_stream_closes_if_the_remote_is_downgraded_on_reconnect() {
     let mut far = Session::new();
     let t = run(&far, &["sleep", "100"]);
     let mut near = Session::new();
     near.env.push(fake_ssh(&near, &[("far", &far)]));
-    near.env.push(("HC_RECONNECT_MS".into(), "200".into()));
+    near.env.push(("H0X_CORE_RECONNECT_MS".into(), "200".into()));
     near.json(&["machine", "add", "far"]);
     let mut conn = Framed::open(&near);
     let reply = conn.call(
@@ -29,7 +29,7 @@ fn capable_stream_closes_if_the_remote_is_downgraded_on_reconnect() {
     let channel = reply["result"]["channel"].as_u64().unwrap() as u32;
     while conn.read(Duration::from_millis(100)).is_some() {}
     std::fs::write(near.root.join("down"), "").unwrap();
-    far.bin = std::env::var("HC_OLD_CORE").expect("HC_OLD_CORE").into();
+    far.bin = std::env::var("H0X_CORE_OLD_CORE").expect("H0X_CORE_OLD_CORE").into();
     far.json(&["server", "restart"]);
     wait_until("disconnected", || near.json(&["machine", "ls"])["machines"][0]["state"] == "unreachable");
     // Drain the line-loss notice before reconnecting: no stream data is valid after this point.
@@ -79,9 +79,9 @@ fn fallback(s: &Session, terminal: &str, leader: &mut Viewer) {
 }
 
 #[test]
-#[ignore = "set HC_OLD_CORE to the released 0.1.16 herdr-core binary"]
+#[ignore = "set H0X_CORE_OLD_CORE to the released 0.1.16 h0x-core binary"]
 fn mixed_version_observers_fall_back_without_replacement_paints() {
-    let old = std::env::var("HC_OLD_CORE").expect("HC_OLD_CORE");
+    let old = std::env::var("H0X_CORE_OLD_CORE").expect("H0X_CORE_OLD_CORE");
     // New local -> old owner.
     let mut far = Session::new();
     far.bin = old.clone().into();

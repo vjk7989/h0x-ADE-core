@@ -17,7 +17,7 @@ fn a_machine_is_added_renamed_kept_and_forgotten() {
     assert_eq!((&added["via"], &added["temporary"]), (&json!(false), &json!(false)), "ssh, kept: {added}");
 
     s.json(&["machine", "rename", "rohan", "vps"]);
-    s.hc(&["server", "restart"]);
+    s.core(&["server", "restart"]);
     let machines = s.json(&["machine", "ls"])["machines"].clone();
     assert_eq!((machines[0]["name"].as_str(), machines.as_array().unwrap().len()), (Some("vps"), 1), "{machines}");
 
@@ -63,7 +63,7 @@ fn concurrent_machine_adds_allocate_names_from_the_registered_machines() {
     )
     .unwrap();
     std::fs::set_permissions(&gate, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    s.env.push(("HC_SSH".into(), gate.display().to_string()));
+    s.env.push(("H0X_CORE_SSH".into(), gate.display().to_string()));
     let hosts = ["build-runner-staging-eu-west-3-node-07", "build-runner-staging-eu-west-3-node-08"];
     let children: Vec<_> = hosts
         .iter()
@@ -105,7 +105,7 @@ fn a_windows_shell_with_sh_on_path_retries_the_native_line() {
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    s.env.push(("HC_SSH".into(), wrapper.display().to_string()));
+    s.env.push(("H0X_CORE_SSH".into(), wrapper.display().to_string()));
     let peer = rohan.json(&["server", "status"])["core"]["id"].clone();
     let added = s.json(&["machine", "add", "windows-msys"]);
     assert_eq!(added["id"], peer, "{added}");
@@ -127,7 +127,7 @@ fn powershell_with_git_sh_retries_after_a_mangled_script() {
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    s.env.push(("HC_SSH".into(), wrapper.display().to_string()));
+    s.env.push(("H0X_CORE_SSH".into(), wrapper.display().to_string()));
     let added = s.json(&["machine", "add", "windows-powershell"]);
     assert_eq!(added["id"], rohan.json(&["server", "status"])["core"]["id"], "{added}");
     s.json(&["machine", "rm", "windows-powershell"]);
@@ -153,7 +153,7 @@ fn localized_windows_shells_connect_to_an_installed_core() {
         )
         .unwrap();
         std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-        s.env.push(("HC_SSH".into(), wrapper.display().to_string()));
+        s.env.push(("H0X_CORE_SSH".into(), wrapper.display().to_string()));
         let added = s.json(&["machine", "add", "localized-windows"]);
         assert_eq!(added["id"], rohan.json(&["server", "status"])["core"]["id"], "{added}");
         s.json(&["machine", "rm", "localized-windows"]);
@@ -167,16 +167,13 @@ fn a_missing_unix_core_does_not_try_the_windows_line() {
     let calls = s.root.join("calls");
     std::fs::write(
         &wrapper,
-        format!(
-            "#!/bin/sh\necho call >> '{}'\necho 'herdr-core is not installed here' >&2\nexit 127\n",
-            calls.display()
-        ),
+        format!("#!/bin/sh\necho call >> '{}'\necho 'h0x-core is not installed here' >&2\nexit 127\n", calls.display()),
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    s.env.push(("HC_SSH".into(), wrapper.display().to_string()));
+    s.env.push(("H0X_CORE_SSH".into(), wrapper.display().to_string()));
     let (_, missing) = s.err(&["--json", "machine", "add", "unix-no-core"]);
-    assert_eq!(missing["error"]["kind"], "hc_missing", "{missing}");
+    assert_eq!(missing["error"]["kind"], "h0x_core_missing", "{missing}");
     assert_eq!(std::fs::read_to_string(calls).unwrap(), "call\n");
 }
 
@@ -196,7 +193,7 @@ fn an_ssh_connection_failure_does_not_try_the_windows_line() {
         let args = if via {
             vec!["--json", "machine", "add", "--via", &wrapper, "--name", "offline"]
         } else {
-            s.env.push(("HC_SSH".into(), wrapper.clone()));
+            s.env.push(("H0X_CORE_SSH".into(), wrapper.clone()));
             vec!["--json", "machine", "add", "offline"]
         };
         let (_, error) = s.err(&args);
@@ -212,7 +209,7 @@ fn a_windows_probe_keeps_a_native_protocol_mismatch() {
     let wrapper = s.root.join("incompatible-ssh");
     std::fs::write(&wrapper, "#!/bin/sh\ncase \"$2\" in sh\\ *) exit 0;; esac\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"data\":{\"kind\":\"unsupported_generation\"}}}'\n").unwrap();
     std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    s.env.push(("HC_SSH".into(), wrapper.display().to_string()));
+    s.env.push(("H0X_CORE_SSH".into(), wrapper.display().to_string()));
     let (_, error) = s.err(&["--json", "machine", "add", "old-windows"]);
     assert_eq!(error["error"]["kind"], "incompatible", "{error}");
 }
@@ -223,7 +220,7 @@ fn a_windows_probe_keeps_native_core_errors() {
     let wrapper = s.root.join("unavailable-ssh");
     std::fs::write(&wrapper, "#!/bin/sh\ncase \"$2\" in sh\\ *) exit 0;; esac\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"message\":\"native startup failed\",\"data\":{\"kind\":\"unavailable\"}}}'\n").unwrap();
     std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    s.env.push(("HC_SSH".into(), wrapper.display().to_string()));
+    s.env.push(("H0X_CORE_SSH".into(), wrapper.display().to_string()));
     let (_, error) = s.err(&["--json", "machine", "add", "unavailable-windows"]);
     assert_eq!(error["error"]["kind"], "unavailable", "{error}");
     assert_eq!(error["error"]["message"], "native startup failed", "{error}");
@@ -271,13 +268,13 @@ case "$2" in
 ERROR
     exit {sh_code};;
   'uname -sm') [ -n '{uname}' ] || {{ echo '無法辨識 uname' >&2; exit 1; }}; echo '{uname}'; exit 0;;
-  'cmd /d /c "echo herdr-core-windows"') echo herdr-core-windows; exit 0;;
+  'cmd /d /c "echo h0x-core-windows"') echo h0x-core-windows; exit 0;;
   powershell\ *) [ -f '{root}/copied' ] || exit 1; touch '{root}/installed'; exit 0;;
-  *--version) echo 'herdr-core test'; exit 0;;
+  *--version) echo 'h0x-core test'; exit 0;;
 esac
 if [ ! -f '{root}/installed' ]; then
   case "$2" in
-    'cmd /d /c '*"if exist "*"herdr-core is not installed here"*"exit /b 127"*) echo 'herdr-core is not installed here' >&2; exit 127;;
+    'cmd /d /c '*"if exist "*"h0x-core is not installed here"*"exit /b 127"*) echo 'h0x-core is not installed here' >&2; exit 127;;
   esac
   echo '{missing_error}' >&2
   exit 1
@@ -291,8 +288,8 @@ exec {ssh} rohan '{core} connect'
                 r#"#!/bin/sh
 for arg do
   case "$arg" in
-    */hc-install.zip) [ "$(cat "$arg")" = 'windows test build' ] || exit 1; zip=yes;;
-    */hc-install.ps1) [ -s "$arg" ] || exit 1; script=yes;;
+    */h0x-core-install.zip) [ "$(cat "$arg")" = 'windows test build' ] || exit 1; zip=yes;;
+    */h0x-core-install.ps1) [ -s "$arg" ] || exit 1; script=yes;;
   esac
 done
 [ "$zip:$script" = yes:yes ] || exit 1
@@ -306,10 +303,10 @@ touch '{root}/copied'
             std::fs::set_permissions(file, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         }
         s.env.push(("PATH".into(), format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())));
-        s.env.push(("HC_SSH".into(), wrapper.display().to_string()));
+        s.env.push(("H0X_CORE_SSH".into(), wrapper.display().to_string()));
         s.env.push(("HERDR_RELEASES_URL".into(), format!("file://{}", s.root.join("releases").display())));
         let (_, missing) = s.err(&["--json", "machine", "add", "windows-msys"]);
-        assert_eq!(missing["error"]["kind"], "hc_missing", "{missing}");
+        assert_eq!(missing["error"]["kind"], "h0x_core_missing", "{missing}");
         let added = s.json(&["machine", "add", "windows-msys", "--install"]);
         assert_eq!(added["id"], rohan.json(&["server", "status"])["core"]["id"], "{added}");
         assert!(s.root.join("installed").exists(), "the native installer ran");
@@ -327,7 +324,7 @@ fn a_failed_windows_probe_keeps_the_original_posix_error() {
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    s.env.push(("HC_SSH".into(), wrapper.display().to_string()));
+    s.env.push(("H0X_CORE_SSH".into(), wrapper.display().to_string()));
     let (_, error) = s.err(&["--json", "machine", "add", "posix"]);
     assert_eq!(error["error"]["kind"], "unreachable", "{error}");
     assert!(error["error"]["message"].as_str().unwrap().ends_with("the connection closed"), "{error}");
@@ -336,13 +333,13 @@ fn a_failed_windows_probe_keeps_the_original_posix_error() {
 
 #[test]
 fn a_machine_shows_the_version_its_line_last_saw() {
-    // Updated there since it was added (hc machine update, or by hand).
+    // Updated there since it was added (h0x-core machine update, or by hand).
     let rohan = Session::new();
     let mut s = Session::new();
     s.env.push(fake_ssh(&s, &[("rohan", &rohan)]));
     s.json(&["machine", "add", "rohan"]);
-    s.hc(&["server", "stop"]);
-    let saved = s.root.join("state/herdr-core/test/machines.json");
+    s.core(&["server", "stop"]);
+    let saved = s.root.join("state/h0x-core/test/machines.json");
     let stale = std::fs::read_to_string(&saved).unwrap().replace(env!("CARGO_PKG_VERSION"), "0.0.1");
     std::fs::write(&saved, stale).unwrap();
     wait_until("version refreshed", || {
@@ -359,9 +356,9 @@ fn another_session_on_the_same_box_is_another_machine() {
     let other = s.json(&["machine", "add", "rohan", "--session", "scratch", "--name", "rohan-scratch"]);
     s.json(&["machine", "rm", "rohan-scratch"]); // else its line starts that core again
     // A dial already on its way when the machine was removed can still start
-    // that core (the fake ssh's `hc connect` outlives it): stop until none comes back.
+    // that core (the fake ssh's `h0x-core connect` outlives it): stop until none comes back.
     let stop = || {
-        let out = rohan.cmd().env("HC_SESSION", "scratch").args(["server", "stop"]).output().unwrap();
+        let out = rohan.cmd().env("H0X_CORE_SESSION", "scratch").args(["server", "stop"]).output().unwrap();
         serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["stopped"] == true
     };
     wait_until("no scratch core comes back", || {
@@ -388,10 +385,10 @@ fn a_box_that_asks_for_a_code_is_added_from_a_terminal() {
     assert_eq!(s.json(&["machine", "ls"])["machines"][0]["name"], "otp-rohan");
 
     // The login lapses and the line drops: the line waits for a person.
-    // (Connected first: the line's first dial is what starts hc there.)
+    // (Connected first: the line's first dial is what starts h0x-core there.)
     wait_until("connected", || s.json(&["machine", "ls"])["machines"][0]["state"] == "connected");
     std::fs::remove_file(s.root.join("otp-ok")).unwrap();
-    rohan.hc(&["server", "restart"]);
+    rohan.core(&["server", "restart"]);
     wait_until("needs login", || s.json(&["machine", "ls"])["machines"][0]["state"] == "needs_login");
     let t = run(&s, &["sh", "-c", &format!("{BIN} machine login otp-rohan; sleep 100")]);
     wait_until("the code prompt", || text(&s, &t).contains("Verification code:"));
@@ -402,24 +399,24 @@ fn a_box_that_asks_for_a_code_is_added_from_a_terminal() {
 #[test]
 fn a_box_without_hc_gets_this_one_when_you_say_yes() {
     let mut bare = Session::new();
-    bare.bin = bare.root.join("bin/herdr-core"); // nothing there: no hc on that box
+    bare.bin = bare.root.join("bin/h0x-core"); // nothing there: no h0x-core on that box
     let mut s = Session::new();
     s.env.push(fake_ssh(&s, &[("bare", &bare)]));
     let (_, piped) = s.err(&["--json", "machine", "add", "bare"]);
-    assert_eq!(piped["error"]["kind"], "hc_missing");
+    assert_eq!(piped["error"]["kind"], "h0x_core_missing");
     assert!(piped["error"]["hint"].as_str().unwrap().contains("in a terminal"), "{piped}");
 
     let t = run(&s, &["sh", "-c", &format!("{BIN} machine add bare; echo added-$?; sleep 100")]);
     wait_until("the offer", || text(&s, &t).contains("[Y/n]"));
     s.json(&["send", &t, "y"]);
     wait_until("added", || text(&s, &t).contains("added-0"));
-    bare.bin = bare.root.join(".local/bin/herdr-core");
-    assert!(bare.bin.exists() && bare.root.join(".local/bin/hc").exists(), "installed, with hc beside it");
+    bare.bin = bare.root.join(".local/bin/h0x-core");
+    assert!(bare.bin.exists(), "installed");
     wait_until("connected", || s.json(&["machine", "ls"])["machines"][0]["state"] == "connected");
 
     let before = bare.json(&["server", "status"])["pid"].clone();
     let updated = s.json(&["machine", "update", "bare"]);
-    assert!(updated["version"].as_str().is_some_and(|v| v.starts_with("hc ")), "{updated}");
+    assert!(updated["version"].as_str().is_some_and(|v| v.starts_with("h0x-core ")), "{updated}");
     assert_ne!(bare.json(&["server", "status"])["pid"], before, "its core restarted on the new binary");
     wait_until("connected again", || s.json(&["machine", "ls"])["machines"][0]["state"] == "connected");
 }
@@ -428,9 +425,9 @@ fn a_box_without_hc_gets_this_one_when_you_say_yes() {
 fn a_machine_reached_through_any_command_works_like_one_over_ssh() {
     let rohan = Session::new();
     let mut bare = Session::new();
-    bare.bin = bare.root.join("bin/herdr-core"); // no hc there
+    bare.bin = bare.root.join("bin/h0x-core"); // no h0x-core there
     let s = Session::new();
-    // The fake ssh stands in for a provider's own command; hc's ssh is not involved.
+    // The fake ssh stands in for a provider's own command; h0x-core's ssh is not involved.
     let (_, command) = fake_ssh(&s, &[("rohan", &rohan), ("bare", &bare)]);
     let via = format!("{command} rohan");
     let (_, nameless) = s.err(&["--json", "machine", "add", "--via", &via]);
@@ -439,21 +436,21 @@ fn a_machine_reached_through_any_command_works_like_one_over_ssh() {
     let added = s.json(&["machine", "add", "--via", &via, "--name", "box", "--temp"]);
     let reach = |m: &serde_json::Value| (m["target"].clone(), m["via"].clone(), m["temporary"].clone());
     assert_eq!(reach(&added), (json!(via), json!(true), json!(true)), "{added}");
-    let out = s.hc(&["exec", "--on", "box", "echo", "hi there"]);
+    let out = s.core(&["exec", "--on", "box", "echo", "hi there"]);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hi there\n");
-    s.hc(&["server", "restart"]);
+    s.core(&["server", "restart"]);
     wait_until("back, as it was", || {
         let m = s.json(&["machine", "ls"])["machines"][0].clone();
         m["state"] == "connected" && reach(&m) == reach(&added)
     });
 
     // Some connection wrappers collapse all remote failures to exit code 1.
-    // A box without hc still gets this one through that command; --install approves the copy.
+    // A box without h0x-core still gets this one through that command; --install approves the copy.
     let bare_via = format!("f() {{ {command} bare \"$@\" || exit 1; }}; f");
     let (_, missing) = s.err(&["--json", "machine", "add", "--via", &bare_via, "--name", "bare"]);
-    assert_eq!(missing["error"]["kind"], "hc_missing", "{missing}");
+    assert_eq!(missing["error"]["kind"], "h0x_core_missing", "{missing}");
     s.json(&["machine", "add", "--via", &bare_via, "--name", "bare", "--install"]);
-    bare.bin = bare.root.join(".local/bin/herdr-core"); // so it is stopped at the end
+    bare.bin = bare.root.join(".local/bin/h0x-core"); // so it is stopped at the end
     assert!(bare.bin.exists());
     s.json(&["machine", "rm", "box"]);
 }
@@ -474,7 +471,7 @@ fn adding_says_what_went_wrong_and_saves_nothing() {
     s.json(&["machine", "add", "rohan"]);
     let kind = |args: &[&str]| s.err(&[&["--json", "machine"], args].concat()).1["error"]["kind"].clone();
 
-    assert_eq!(kind(&["add", "nohc"]), "hc_missing");
+    assert_eq!(kind(&["add", "nohc"]), "h0x_core_missing");
     let (_, down) = s.err(&["--json", "machine", "add", "down"]);
     assert_eq!(down["error"]["kind"], "unreachable");
     assert!(down["error"]["message"].as_str().unwrap().contains("Could not resolve"), "{down}");

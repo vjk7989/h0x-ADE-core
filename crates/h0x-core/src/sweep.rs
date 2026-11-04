@@ -6,10 +6,10 @@
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
-pub const VAR: &str = "HC_SCOPE";
-/// Marks hc's own cores and holders: never swept, nor anything beneath them
+pub const VAR: &str = "H0X_SCOPE";
+/// Marks h0x-core's own cores and holders: never swept, nor anything beneath them
 /// (a terminal may start another session's core, which is not its own).
-pub const RUNTIME: &str = "HC_RUNTIME";
+pub const RUNTIME: &str = "H0X_RUNTIME";
 
 /// A fresh token for one terminal, stamped with when it was made: no process
 /// started before it can carry it, so a sweep need not read those.
@@ -18,7 +18,7 @@ pub fn token() -> String {
 }
 
 /// The oldest a process carrying one of `tokens` can be (`now()`'s clock); 0
-/// when one has no stamp (made by an older hc).
+/// when one has no stamp (made by an older h0x-core).
 #[cfg(unix)]
 fn oldest(tokens: &[String]) -> u64 {
     let stamp = |t: &String| t.split_once('-').and_then(|(s, _)| s.parse::<u64>().ok());
@@ -91,8 +91,8 @@ pub fn sweep(tokens: &[String]) {
     }
 }
 
-/// Live processes (zombies, us and hc's own processes excluded) whose
-/// environment holds `HC_SCOPE=<one of tokens>`, plus their descendants:
+/// Live processes (zombies, us and h0x-core's own processes excluded) whose
+/// environment holds `H0X_SCOPE=<one of tokens>`, plus their descendants:
 /// macOS hides the environment of its own binaries (an agent's `/bin/bash`
 /// tool shell), but not their parents.
 #[cfg(unix)]
@@ -104,14 +104,14 @@ pub fn members(tokens: &[String]) -> Vec<i32> {
         tokens.iter().map(|t| format!("{VAR}={t}").into_bytes()).collect();
     let runtime = format!("{RUNTIME}=1").into_bytes();
     let me = std::process::id() as i32;
-    let (mut set, mut hc) = (std::collections::HashSet::new(), std::collections::HashSet::new());
+    let (mut set, mut own) = (std::collections::HashSet::new(), std::collections::HashSet::new());
     let live: Vec<(i32, i32, u64)> = processes().into_iter().filter(|(pid, ..)| *pid != me).collect();
     let oldest = oldest(tokens);
     for &(pid, ..) in live.iter().filter(|(.., started)| *started >= oldest) {
         let Some(env) = environ(pid) else { continue };
         let mut vars = env.split(|b| *b == 0);
         if vars.clone().any(|e| e == runtime) {
-            hc.insert(pid);
+            own.insert(pid);
         } else if vars.any(|e| entries.contains(e)) {
             set.insert(pid);
         }
@@ -120,7 +120,7 @@ pub fn members(tokens: &[String]) -> Vec<i32> {
         let before = set.len();
         let children: Vec<i32> = live
             .iter()
-            .filter(|(pid, ppid, _)| set.contains(ppid) && !hc.contains(pid))
+            .filter(|(pid, ppid, _)| set.contains(ppid) && !own.contains(pid))
             .map(|(pid, ..)| *pid)
             .collect();
         set.extend(children);
@@ -201,7 +201,7 @@ mod tests {
     fn a_child_that_dropped_the_token_still_counts_while_its_parent_does() {
         let tokens = [token()];
         // Like an agent running a tool shell that no longer shows the token.
-        let child = "import os, subprocess; env = dict(os.environ); env.pop('HC_SCOPE'); subprocess.run(['sleep', '30'], env=env)";
+        let child = "import os, subprocess; env = dict(os.environ); env.pop('H0X_SCOPE'); subprocess.run(['sleep', '30'], env=env)";
         let mut parent = python(child).env(VAR, &tokens[0]).spawn().unwrap();
         assert_eq!(members_settled(&tokens, 2).len(), 2, "the shell and its sleep");
         sweep(&tokens);

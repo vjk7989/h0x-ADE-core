@@ -1,4 +1,4 @@
-//! `hc`: one API call per command. Tables for people, JSON when piped or `--json`.
+//! `h0x-core`: one API call per command. Tables for people, JSON when piped or `--json`.
 
 use crate::api::{
     AttachParams, ExecParams, InterruptParams, KeysParams, LabelParams, ListParams, PutParams, ReadParams, RunParams,
@@ -22,7 +22,7 @@ use output::*;
 use update::*;
 
 #[derive(Parser)]
-#[command(name = "hc", version, about = "herdr-core: a terminal runtime for coding agents")]
+#[command(name = "h0x-core", version, about = "HyperOx core: terminals for coding agents")]
 struct Cli {
     /// JSON output even in a terminal.
     #[arg(long, global = true)]
@@ -33,7 +33,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Start a program, or a template by name with its task: hc run reviewer "review src/x.rs".
+    /// Start a program, or a template by name with its task: h0x-core run reviewer "review src/x.rs".
     Run(RunParams),
     /// List live terminals.
     Ls(ListParams),
@@ -80,14 +80,14 @@ enum Cmd {
     },
     /// Follow fact changes as they happen (one JSON line each when piped).
     Events(SubscribeParams),
-    /// Templates you can run by name (~/.config/herdr-core/templates).
+    /// Templates you can run by name (~/.config/h0x-core/templates).
     Templates,
-    /// Swap this hc for another build and restart (terminals keep running).
+    /// Swap this h0x-core for another build and restart (terminals keep running).
     Update {
-        /// A herdr-core binary to use (default: download the latest release).
+        /// An h0x-core binary to use (default: download the latest release).
         #[arg(long, value_name = "FILE", conflicts_with = "version")]
         from: Option<std::path::PathBuf>,
-        /// At least this release (`0.1.4`): nothing changes when this hc is
+        /// At least this release (`0.1.4`): nothing changes when this h0x-core is
         /// already that or newer.
         #[arg(long, value_name = "X.Y.Z", value_parser = release_version)]
         version: Option<String>,
@@ -98,9 +98,9 @@ enum Cmd {
     },
     /// Every API method with its JSON Schema, for app builders.
     Schema,
-    /// Speak the protocol over stdin/stdout (`ssh box hc connect`).
+    /// Speak the protocol over stdin/stdout (`ssh box h0x-core connect`).
     Connect {
-        /// The hc session to reach, like HC_SESSION (one command that reads
+        /// The h0x-core session to reach, like H0X_CORE_SESSION (one command that reads
         /// the same in sh, cmd and PowerShell).
         #[arg(long)]
         session: Option<String>,
@@ -160,7 +160,7 @@ pub fn main() -> i32 {
     let cli = match Cli::try_parse_from(std::env::args_os().take(1).chain(args.iter().cloned())) {
         Ok(cli) => cli,
         Err(e) if !e.use_stderr() || !(piped || args.iter().any(|a| a == "--json")) => e.exit(),
-        Err(e) => return fail(&RpcError::new("usage", usage_message(&e), "see `hc --help`"), true),
+        Err(e) => return fail(&RpcError::new("usage", usage_message(&e), "see `h0x-core --help`"), true),
     };
     // A template's trailing flags may include --json: parse them before choosing how to print.
     let (cmd, asked) = match cli.cmd {
@@ -262,12 +262,18 @@ fn cancelled() -> RpcError {
     RpcError::new("cancelled", "", "")
 }
 
-/// Bare `hc`: a picker with "new" on top in a terminal, an overview when piped.
+/// Bare `h0x-core`: a picker with "new" on top in a terminal, an overview when piped.
 fn bare(paths: &Paths, json: bool) -> Result<Option<Out>, RpcError> {
     let list = call(paths, "terminal.list", json!({}))?;
     if !interactive(json) {
         let mut r = list;
-        r["commands"] = json!(["hc run <cmd>", "hc ls", "hc read <t>", "hc attach <t>", "hc --skill"]);
+        r["commands"] = json!([
+            "h0x-core run <cmd>",
+            "h0x-core ls",
+            "h0x-core read <t>",
+            "h0x-core attach <t>",
+            "h0x-core --skill"
+        ]);
         let human = table(&r);
         return Ok(Some(Out { json: r, human }));
     }
@@ -301,7 +307,7 @@ fn bare(paths: &Paths, json: bool) -> Result<Option<Out>, RpcError> {
         .into_iter()
         .map(|(name, ts)| (name, choices.iter().cloned().chain(items(&ts, false)).collect()))
         .collect();
-    let chosen = picker::pick("herdr-core", &orders).ok_or_else(cancelled)?;
+    let chosen = picker::pick("h0x-core", &orders).ok_or_else(cancelled)?;
     let address = if chosen.is_empty() {
         // Our shell if we have one, else the machine's own (Windows has no $SHELL).
         let argv: Vec<String> = std::env::var("SHELL").into_iter().filter(|s| !s.is_empty()).collect();
@@ -468,12 +474,13 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             let r = call("terminal.read", to(&p))?;
             let mut human = r["text"].as_str().unwrap_or_default().to_string();
             if r["why"] == "working" {
-                human.push_str("\n[hc] only its screen: it is working; read again once it stops for its history");
+                human.push_str("\n[h0x-core] only its screen: it is working; read again once it stops for its history");
             } else if let Some(state @ ("blocked" | "error")) = r["why"].as_str() {
-                human
-                    .push_str(&format!("\n[hc] only its screen: it is {state}; history is not scrolled in this state"));
+                human.push_str(&format!(
+                    "\n[h0x-core] only its screen: it is {state}; history is not scrolled in this state"
+                ));
             } else if r["complete"] == false {
-                human.push_str("\n[hc] incomplete: older output may be missing");
+                human.push_str("\n[h0x-core] incomplete: older output may be missing");
             }
             // Its output is text: plain even when piped, JSON only when asked.
             if !asked {
@@ -510,7 +517,7 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             let paths = match session {
                 Some(s) => {
                     // SAFETY: no other thread runs yet; a core this starts inherits it.
-                    unsafe { std::env::set_var("HC_SESSION", s) };
+                    unsafe { std::env::set_var("H0X_CORE_SESSION", s) };
                     Paths::from_env()?
                 }
                 None => paths,
@@ -576,15 +583,15 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
         }
         Cmd::Server { action: ServerCmd::Stop } => stop(&paths)?,
         Cmd::Update { from: None, version, force } => {
-            let this = format!("hc {}", env!("CARGO_PKG_VERSION"));
+            let this = format!("h0x-core {}", env!("CARGO_PKG_VERSION"));
             if let Some(v) = &version
                 && !force
-                && !older(&this, &format!("hc {v}"))
+                && !older(&this, &format!("h0x-core {v}"))
             {
                 let human = format!("{this} is already {v} or newer");
                 return Ok(Some(up_to_date(&paths, v, human)?));
             }
-            // Only when asked: hc never checks for updates on its own.
+            // Only when asked: h0x-core never checks for updates on its own.
             let scratch = crate::releases::Scratch::new()?;
             let m = crate::releases::manifest(version.as_deref(), &scratch.0)?;
             // Apps and scripts built for this generation would break on another one.
@@ -592,15 +599,15 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
                 return Err(RpcError::new(
                     "refused",
                     format!(
-                        "hc {} speaks protocol generation {}, this hc {}: apps built for it would stop working",
+                        "h0x-core {} speaks protocol generation {}, this h0x-core {}: apps built for it would stop working",
                         m.version,
                         m.generation,
                         crate::api::GENERATION
                     ),
-                    "update the apps that use hc first, then hc update --force",
+                    "update the apps that use h0x-core first, then h0x-core update --force",
                 ));
             }
-            if version.is_none() && !force && !older(&this, &format!("hc {}", m.version)) {
+            if version.is_none() && !force && !older(&this, &format!("h0x-core {}", m.version)) {
                 let human = format!("{this} is up to date (latest release: {})", m.version);
                 up_to_date(&paths, &m.version, human)?
             } else {
@@ -619,7 +626,7 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
     }))
 }
 
-/// A template's task is plain text, so `--name x` after it is hc's, not part
+/// A template's task is plain text, so `--name x` after it is h0x-core's, not part
 /// of the task. A program's arguments stay its own.
 /// Flags given before the program stay; flags after the task are added.
 /// Also says whether those flags asked for --json.
@@ -642,12 +649,12 @@ fn flags_after_task(paths: &Paths, p: RunParams) -> Result<(RunParams, bool), Rp
         ..p
     };
     if merged.parent.is_some() && merged.no_parent {
-        return Err(RpcError::new("usage", "--parent and --no-parent together", "see `hc run --help`"));
+        return Err(RpcError::new("usage", "--parent and --no-parent together", "see `h0x-core run --help`"));
     }
     Ok((merged, json))
 }
 
-/// The task with hc's flags moved out of it, parsed on their own (behind a
+/// The task with h0x-core's flags moved out of it, parsed on their own (behind a
 /// `--`, so a flag missing its value can't take the template's name).
 fn trailing_flags(paths: &Paths, argv: &[String]) -> Result<Option<(RunParams, bool)>, RpcError> {
     use clap::CommandFactory;
@@ -673,12 +680,15 @@ fn trailing_flags(paths: &Paths, argv: &[String]) -> Result<Option<(RunParams, b
     if flags.is_empty() {
         return Ok(None);
     }
-    let args =
-        ["hc".to_string(), "run".into()].into_iter().chain(flags).chain(["--".into(), argv[0].clone()]).chain(task);
+    let args = ["h0x-core".to_string(), "run".into()]
+        .into_iter()
+        .chain(flags)
+        .chain(["--".into(), argv[0].clone()])
+        .chain(task);
     match Cli::try_parse_from(args) {
         Ok(Cli { cmd: Some(Cmd::Run(q)), json, .. }) => Ok(Some((q, json))),
         Ok(_) => Ok(None),
-        Err(e) => Err(RpcError::new("usage", usage_message(&e), "see `hc run --help`")),
+        Err(e) => Err(RpcError::new("usage", usage_message(&e), "see `h0x-core run --help`")),
     }
 }
 
@@ -704,7 +714,7 @@ fn here() -> Option<String> {
     Some(logical.unwrap_or_else(|| real.display().to_string()))
 }
 
-/// A folder here as the caller means it: relative ones start where hc runs,
+/// A folder here as the caller means it: relative ones start where h0x-core runs,
 /// not where the core does.
 fn from_here(cwd: Option<String>) -> Option<String> {
     match (cwd, here()) {
@@ -713,7 +723,7 @@ fn from_here(cwd: Option<String>) -> Option<String> {
     }
 }
 
-/// Who is asking: this hc terminal, else the shell or script that ran us.
+/// Who is asking: this h0x-core terminal, else the shell or script that ran us.
 fn caller() -> String {
     client::terminal_id().unwrap_or_else(|| format!("ppid:{}", crate::platform::parent_pid()))
 }
@@ -768,35 +778,37 @@ fn stop(paths: &Paths) -> Result<Out, RpcError> {
 }
 
 /// A run that waited: its output as text (like read), a last line when there
-/// is more to say, and the program's exit code as hc's (124: still running).
+/// is more to say, and the program's exit code as h0x-core's (124: still running).
 fn ran(r: &Value) -> Result<Option<Out>, RpcError> {
     use std::io::Write;
     let t = r["address"].as_str().unwrap_or("?");
-    // An older hc (on another machine) ignores the wait: it only started it.
+    // An older h0x-core (on another machine) ignores the wait: it only started it.
     if r.get("wait").is_none() {
-        let fix = t.split_once('/').map(|(m, _)| format!(": hc machine update {m}")).unwrap_or_default();
-        println!("[hc] started as {t}, not waited on: that hc is older{fix}");
+        let fix = t.split_once('/').map(|(m, _)| format!(": h0x-core machine update {m}")).unwrap_or_default();
+        println!("[h0x-core] started as {t}, not waited on: that h0x-core is older{fix}");
         std::process::exit(0);
     }
     let w = &r["wait"];
     let status = w["status"].as_str().unwrap_or("no status");
     let (note, code) = match w["reason"].as_str() {
-        Some("timeout") => (Some(format!("still running as {t}: hc wait {t}, hc read {t}")), 124),
+        Some("timeout") => (Some(format!("still running as {t}: h0x-core wait {t}, h0x-core read {t}")), 124),
         Some("exit") => match (w["exit_code"].as_i64(), w["signal"].as_i64()) {
             (Some(0), _) => (None, 0),
             (Some(c), _) => (Some(format!("{t} exited (exit {c})")), c as i32),
             (_, Some(sig)) => (Some(format!("{t} ended by signal {sig}")), 128 + sig as i32),
             _ => (Some(format!("{t} ended")), 1),
         },
-        _ if status == "blocked" => (Some(format!("{t} is blocked: read it, then answer with hc send or hc keys")), 0),
-        _ => (Some(format!("{t} is {status}: hc send {t} <text>")), 0),
+        _ if status == "blocked" => {
+            (Some(format!("{t} is blocked: read it, then answer with h0x-core send or h0x-core keys")), 0)
+        }
+        _ => (Some(format!("{t} is {status}: h0x-core send {t} <text>")), 0),
     };
     let mut text = r["output"].as_str().unwrap_or_default().trim_end().to_string();
     if let Some(first) = r.get("first_message").filter(|f| f["sent"] != true) {
-        text.push_str(&format!("\n[hc] first message NOT sent: {}", first["reason"].as_str().unwrap_or("?")));
+        text.push_str(&format!("\n[h0x-core] first message NOT sent: {}", first["reason"].as_str().unwrap_or("?")));
     }
     if let Some(note) = note {
-        text.push_str(&format!("\n[hc] {note}"));
+        text.push_str(&format!("\n[h0x-core] {note}"));
     }
     let mut out = std::io::stdout();
     let _ = writeln!(out, "{}", text.trim_start_matches('\n')).and_then(|_| out.flush());
@@ -873,7 +885,7 @@ mod tests {
     use clap::CommandFactory;
 
     fn parsed(args: &[&str]) -> Cmd {
-        Cli::try_parse_from([&["hc"], args].concat()).unwrap().cmd.unwrap()
+        Cli::try_parse_from([&["h0x-core"], args].concat()).unwrap().cmd.unwrap()
     }
 
     #[test]
@@ -918,11 +930,11 @@ mod tests {
             let item = items(&[t], false).remove(0);
             (picker::plain(&item.rest), item.short)
         };
-        let labels = serde_json::json!({"where": "herdr-core / review", "herdr.tab": "tab3", "ws": "x9"});
+        let labels = serde_json::json!({"where": "HyperOx / review", "h0x.tab": "tab3", "ws": "x9"});
         let (rest, short) = t(serde_json::json!({"labels": labels, "name": "rev"}));
-        assert_eq!(short, "rev \u{b7} herdr-core / review");
+        assert_eq!(short, "rev \u{b7} HyperOx / review");
         assert!(
-            rest.contains("herdr-core / review")
+            rest.contains("HyperOx / review")
                 && !rest.contains("bliss")
                 && !rest.contains("x9")
                 && !rest.contains("tab3"),
@@ -1006,14 +1018,18 @@ mod tests {
 
     #[test]
     fn older_compares_versions_as_numbers() {
-        assert!(older("hc 0.1.9", "hc 0.2.0") && older("hc 0.2.0", "hc 0.10.0"));
-        assert!(!older("hc 0.2.0", "hc 0.2.0") && !older("hc 0.10.0", "hc 0.9.9") && !older("hc dev", "hc 0.2.0"));
+        assert!(older("h0x-core 0.1.9", "h0x-core 0.2.0") && older("h0x-core 0.2.0", "h0x-core 0.10.0"));
+        assert!(
+            !older("h0x-core 0.2.0", "h0x-core 0.2.0")
+                && !older("h0x-core 0.10.0", "h0x-core 0.9.9")
+                && !older("h0x-core dev", "h0x-core 0.2.0")
+        );
     }
 
     #[test]
     fn labels_need_a_key() {
-        assert!(Cli::try_parse_from(["hc", "label", "t1", "nokey"]).is_err());
-        assert!(Cli::try_parse_from(["hc", "label", "t1", "=v"]).is_err());
+        assert!(Cli::try_parse_from(["h0x-core", "label", "t1", "nokey"]).is_err());
+        assert!(Cli::try_parse_from(["h0x-core", "label", "t1", "=v"]).is_err());
         let Cmd::Label(p) = parsed(&["label", "t1", "gone="]) else { panic!() };
         assert_eq!(to(&p)["labels"], json!({"gone": ""}), "an empty value removes it");
     }

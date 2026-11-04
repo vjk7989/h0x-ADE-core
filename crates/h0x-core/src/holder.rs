@@ -30,7 +30,7 @@ struct Term {
     /// Since when its output could drain; None while its reader waits for a
     /// core that fell behind. An exit waits for its output from then on.
     drains_since: Option<Instant>,
-    /// Its `HC_SCOPE` token: what it started carries it too.
+    /// Its `H0X_SCOPE` token: what it started carries it too.
     scope: Option<String>,
 }
 
@@ -95,7 +95,7 @@ pub fn run(socket: std::path::PathBuf) -> io::Result<()> {
     paths.create_dirs()?;
     // A taken path means another holder lives there; a stale file is removed by the core.
     let listener = platform::listen(&socket)?;
-    let grace = std::env::var("HC_HOLDER_GRACE_MS")
+    let grace = std::env::var("H0X_CORE_HOLDER_GRACE_MS")
         .ok()
         .and_then(|v| v.parse().ok())
         .map_or(Duration::from_secs(3), Duration::from_millis);

@@ -4,7 +4,7 @@ mod common;
 
 use common::framed::{Framed, Viewer};
 use common::*;
-use herdr_core::wire;
+use h0x_core::wire;
 use serde_json::{Value, json};
 use std::io::BufRead;
 use std::time::Duration;
@@ -105,7 +105,7 @@ fn filters_pick_terminals_by_address_or_label() {
 #[test]
 fn a_subscriber_that_falls_behind_gets_missed_and_a_snapshot() {
     let mut s = Session::new();
-    s.env.push(("HC_HEARTBEAT_MS".into(), "100".into()));
+    s.env.push(("H0X_CORE_HEARTBEAT_MS".into(), "100".into()));
     s.json(&["server", "start"]);
     let mut slow = s.connect();
     slow.call(1, "events.subscribe", json!({}));
@@ -128,7 +128,7 @@ fn a_subscriber_that_falls_behind_gets_missed_and_a_snapshot() {
             || (m["method"] == "missed" && m["params"]["terminals"].as_array().unwrap().iter().any(finished_here))
     });
     let missed_at = missed_at.expect("never told it missed events");
-    assert!(missed_at > herdr_core::events::PLAIN_QUEUE as u64, "behind too early: {missed_at}");
+    assert!(missed_at > h0x_core::events::PLAIN_QUEUE as u64, "behind too early: {missed_at}");
     let beat = next_event(&mut slow, |m| m["method"] == "heartbeat");
     assert!(beat["params"]["seq"].as_u64().unwrap() >= done["params"]["seq"].as_u64().unwrap());
 }

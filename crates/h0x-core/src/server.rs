@@ -168,7 +168,7 @@ async fn connection(core: Arc<Core>, read: platform::AsyncRead, mut write: Write
             Some(reply) => write.write_all(format!("{reply}\n").as_bytes()).await,
             None => Ok(()),
         };
-        // Even if the caller is gone: `hc server stop` typed in one of our
+        // Even if the caller is gone: `h0x-core server stop` typed in one of our
         // terminals ends its own caller before the reply.
         handled.after(&core);
         wrote?;
@@ -223,7 +223,7 @@ async fn closed(read: &mut Reader, ahead: &mut Vec<u8>) {
 }
 
 pub fn heartbeat_every() -> std::time::Duration {
-    let ms = std::env::var("HC_HEARTBEAT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(15_000);
+    let ms = std::env::var("H0X_CORE_HEARTBEAT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(15_000);
     std::time::Duration::from_millis(ms)
 }
 
@@ -420,7 +420,7 @@ async fn handle(
             None => Err(RpcError::new(
                 "needs_framed",
                 "attach needs a framed connection",
-                "send hello with framed: true first, or use `hc attach`",
+                "send hello with framed: true first, or use `h0x-core attach`",
             )),
         },
         Ok(Some((to, params))) => crate::remote::forward_to(core, &to, method, params).await,
@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn a_disk_under_another_machine_id_is_a_new_machine_without_the_old_ones_life() {
-        let dir = std::env::temp_dir().join(format!("hc-identity-{}", platform::random_hex()));
+        let dir = std::env::temp_dir().join(format!("h0x-core-identity-{}", platform::random_hex()));
         std::fs::create_dir_all(dir.join("screens")).unwrap();
         let id = |m: Option<&str>| load_identity(&dir, m.map(String::from)).unwrap().id;
         let first = id(Some("a"));

@@ -22,10 +22,10 @@ fn kept_terminals_close_only_on_exit_or_kill() {
 #[test]
 fn lost_kept_terminal_restarts_in_place_in_its_last_folder() {
     let mut s = Session::new();
-    s.env.push(("HC_FOREGROUND_MS".into(), "30".into()));
+    s.env.push(("H0X_CORE_FOREGROUND_MS".into(), "30".into()));
     s.env.push(("TERM".into(), "vt100".into()));
     s.env.push(("TERM_PROGRAM".into(), "keep-test".into()));
-    s.env.push(("HC_KEEP_TEST".into(), "preserved".into()));
+    s.env.push(("H0X_CORE_KEEP_TEST".into(), "preserved".into()));
     let dir = s.root.join("last");
     std::fs::create_dir(&dir).unwrap();
     let canonical_dir = std::fs::canonicalize(&dir).unwrap();
@@ -53,7 +53,7 @@ fn lost_kept_terminal_restarts_in_place_in_its_last_folder() {
     assert_eq!(r["identity"], "keep-test");
     assert_eq!((r["cols"].as_u64(), r["rows"].as_u64()), (Some(91), Some(29)));
     let mut viewer = framed::Viewer::attach(&s, &t, 91, 29, serde_json::json!({}));
-    s.json(&["send", &t, "printf 'kept-env:%s:%s\\n' \"$TERM\" \"$HC_KEEP_TEST\""]);
+    s.json(&["send", &t, "printf 'kept-env:%s:%s\\n' \"$TERM\" \"$H0X_CORE_KEEP_TEST\""]);
     viewer.shows("kept-env:vt100:preserved");
     assert_eq!(s.json(&["ls"])["terminals"].as_array().unwrap().len(), 1);
     assert!(!pid_alive(old));
@@ -63,7 +63,7 @@ fn lost_kept_terminal_restarts_in_place_in_its_last_folder() {
 fn kept_terminal_survives_core_crash_and_recovers_if_its_holder_is_also_lost() {
     let s = Session::new();
     let t = run(&s, &["--keep", "sleep", "100"]);
-    let config = s.root.join("config/herdr-core/config.toml");
+    let config = s.root.join("config/h0x-core/config.toml");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     std::fs::write(&config, r#"shell = ["/bin/sh", "-c", "echo configured-restore; exec /bin/sh"]"#).unwrap();
     let old = get(&s, &t)["pid"].as_i64().unwrap();
@@ -110,7 +110,7 @@ fn failed_shell_restart_stays_live_and_retries() {
 #[test]
 fn recovery_saves_only_client_overrides_and_refreshes_the_core_environment() {
     let mut s = Session::new();
-    s.env.push(("HC_KEEP_BASE".into(), "old-secret".into()));
+    s.env.push(("H0X_CORE_KEEP_BASE".into(), "old-secret".into()));
     s.json(&["server", "start"]);
     let mut conn = s.connect();
     let started = conn.call(
@@ -118,22 +118,22 @@ fn recovery_saves_only_client_overrides_and_refreshes_the_core_environment() {
         "terminal.run",
         serde_json::json!({
             "argv": ["sleep", "100"], "keep": true,
-            "env": {"HC_KEEP_OVERRIDE": "saved", "TERM": "vt100"}
+            "env": {"H0X_CORE_KEEP_OVERRIDE": "saved", "TERM": "vt100"}
         }),
     );
     let t = started["result"]["address"].as_str().unwrap();
-    let state = std::fs::read_to_string(s.root.join("state/herdr-core/test/terminals.json")).unwrap();
-    assert!(!state.contains("HC_KEEP_BASE") && !state.contains("old-secret"), "{state}");
+    let state = std::fs::read_to_string(s.root.join("state/h0x-core/test/terminals.json")).unwrap();
+    assert!(!state.contains("H0X_CORE_KEEP_BASE") && !state.contains("old-secret"), "{state}");
     let state: serde_json::Value = serde_json::from_str(&state).unwrap();
     assert_eq!(
         state["terminals"]["1"]["restart_env"],
-        serde_json::json!({"HC_KEEP_OVERRIDE": "saved", "TERM": "vt100"})
+        serde_json::json!({"H0X_CORE_KEEP_OVERRIDE": "saved", "TERM": "vt100"})
     );
     s.json(&["server", "stop"]);
-    s.env.retain(|(k, _)| k != "HC_KEEP_BASE");
-    s.env.push(("HC_KEEP_BASE".into(), "fresh".into()));
+    s.env.retain(|(k, _)| k != "H0X_CORE_KEEP_BASE");
+    s.env.push(("H0X_CORE_KEEP_BASE".into(), "fresh".into()));
     wait_until("recovery with fresh environment", || get(&s, t)["pid"].is_number());
-    s.json(&["send", t, "printf 'recovery:%s:%s:%s\\n' \"$HC_KEEP_BASE\" \"$HC_KEEP_OVERRIDE\" \"$TERM\""]);
+    s.json(&["send", t, "printf 'recovery:%s:%s:%s\\n' \"$H0X_CORE_KEEP_BASE\" \"$H0X_CORE_KEEP_OVERRIDE\" \"$TERM\""]);
     wait_until("fresh base and saved overrides", || text(&s, t).contains("recovery:fresh:saved:vt100"));
 }
 
@@ -187,8 +187,7 @@ fn paused_replacement() -> (Session, String, PausedHolder) {
     // about 5 s here, past wait_until's 10 s on a slow runner.
     let claimed = || {
         let state: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(s.root.join("state/herdr-core/test/terminals.json")).unwrap())
-                .unwrap();
+            serde_json::from_slice(&std::fs::read(s.root.join("state/h0x-core/test/terminals.json")).unwrap()).unwrap();
         state["terminals"]["1"]["holder"].is_string()
     };
     let start = std::time::Instant::now();
@@ -289,7 +288,7 @@ fn waits_end_when_a_kept_program_is_lost() {
 #[test]
 fn a_kept_run_timeout_retains_the_claim_until_the_holder_answers() {
     let mut s = Session::new();
-    s.env.push(("HC_SPAWN_MS".into(), "50".into()));
+    s.env.push(("H0X_CORE_SPAWN_MS".into(), "50".into()));
     run(&s, &["sleep", "100"]);
     let holder = s.json(&["server", "status"])["holder"]["pid"].as_i64().unwrap() as i32;
     unsafe {
@@ -336,7 +335,7 @@ fn children_waits_also_end_on_program_loss() {
 fn late_initial_spawn_failure_is_handled_after_timeout_even_after_keep_off() {
     for keep in [false, true] {
         let mut s = Session::new();
-        s.env.push(("HC_SPAWN_MS".into(), "50".into()));
+        s.env.push(("H0X_CORE_SPAWN_MS".into(), "50".into()));
         run(&s, &["sleep", "100"]);
         let holder = s.json(&["server", "status"])["holder"]["pid"].as_i64().unwrap() as i32;
         unsafe {

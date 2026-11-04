@@ -20,16 +20,16 @@ pub struct Machine {
     #[serde(default)]
     pub via: bool,
     /// Short-lived (a sandbox for a task): clients may show it apart from the
-    /// machines that stay. hc treats it like any other.
+    /// machines that stay. h0x-core treats it like any other.
     #[serde(default)]
     pub temporary: bool,
-    /// The hc session there (null: its default).
+    /// The h0x-core session there (null: its default).
     pub session: Option<String>,
     /// The other core's permanent id.
     pub id: String,
     /// What that core calls itself (its hostname).
     pub host: String,
-    /// Its hc version when last seen.
+    /// Its h0x-core version when last seen.
     pub version: String,
 }
 
@@ -39,7 +39,7 @@ impl Machine {
     }
 }
 
-/// How hc gets there: `ssh <target> <line>`, or `<target> <line>` (`via`).
+/// How h0x-core gets there: `ssh <target> <line>`, or `<target> <line>` (`via`).
 #[derive(Clone, Copy)]
 pub struct Reach<'a> {
     pub target: &'a str,
@@ -50,8 +50,8 @@ impl Reach<'_> {
     /// Says how to add it again, for hints.
     fn add(&self) -> String {
         match self.via {
-            true => format!("hc machine add --via '{}' --name <name>", self.target.replace('\'', r"'\''")),
-            false => format!("hc machine add {}", self.target),
+            true => format!("h0x-core machine add --via '{}' --name <name>", self.target.replace('\'', r"'\''")),
+            false => format!("h0x-core machine add {}", self.target),
         }
     }
 
@@ -69,7 +69,7 @@ impl Reach<'_> {
             // A pipe from the detached core must not open a console of its own.
             cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
         }
-        if std::env::var_os("HC_SSH").is_none() {
+        if std::env::var_os("H0X_CORE_SSH").is_none() {
             cmd.arg("-T");
         }
         cmd.arg(self.target).arg(line);
@@ -81,7 +81,7 @@ impl Reach<'_> {
 pub fn unknown(machines: &[Machine], name: &str) -> crate::rpc::RpcError {
     let names: Vec<&str> = machines.iter().map(|m| m.name.as_str()).collect();
     let hint = if names.is_empty() {
-        "no machines yet: hc machine add <ssh-target>".into()
+        "no machines yet: h0x-core machine add <ssh-target>".into()
     } else {
         format!("machines: {}", names.join(", "))
     };
@@ -160,12 +160,12 @@ fn control_path(paths: &crate::paths::Paths, target: &str) -> std::path::PathBuf
 }
 
 /// `ssh` riding the shared login when there is one, with `extra` options; or
-/// `$HC_SSH` in its place (tests), which takes only the target and the remote
+/// `$H0X_CORE_SSH` in its place (tests), which takes only the target and the remote
 /// command. Only `login` creates the shared login: one made by the line (or
 /// an install) would end with it, and take every connection riding it along
-/// (an update restarting hc there ended its own upload that way).
+/// (an update restarting h0x-core there ended its own upload that way).
 fn ssh(paths: &crate::paths::Paths, target: &str, extra: &[&str]) -> std::process::Command {
-    if let Some(fake) = std::env::var_os("HC_SSH") {
+    if let Some(fake) = std::env::var_os("H0X_CORE_SSH") {
         return std::process::Command::new(fake);
     }
     let mut ssh = std::process::Command::new("ssh");
@@ -204,7 +204,7 @@ pub fn login(paths: &crate::paths::Paths, to: Reach) -> Result<(), RpcError> {
 /// Ends the shared login to `target`, if one is up (a forgotten machine).
 pub fn logout(paths: &crate::paths::Paths, to: Reach) {
     let target = to.target;
-    if cfg!(unix) && std::env::var_os("HC_SSH").is_none() && !to.via {
+    if cfg!(unix) && std::env::var_os("H0X_CORE_SSH").is_none() && !to.via {
         let mut cmd = ssh(paths, target, &[]);
         cmd.args(["-O", "exit", target])
             .stdin(std::process::Stdio::null())
@@ -221,14 +221,14 @@ fn is_windows(target: &str) -> bool {
     WINDOWS.lock().unwrap_or_else(|p| p.into_inner()).iter().any(|t| t == target)
 }
 
-/// Where install.ps1 puts hc, from the home folder an ssh session starts in.
+/// Where install.ps1 puts h0x-core, from the home folder an ssh session starts in.
 /// Not PATH: sessions riding a shared login keep the PATH from before an
 /// install. `.\` reads the same in cmd and PowerShell.
-const WINDOWS_HC: &str = r".\AppData\Local\Programs\herdr-core\herdr-core.exe";
+const WINDOWS_HC: &str = r".\AppData\Local\Programs\h0x-core\h0x-core.exe";
 
-/// The pipe to the core there: `herdr-core connect`, found on PATH, else in
+/// The pipe to the core there: `h0x-core connect`, found on PATH, else in
 /// ~/.local/bin. On Windows, whose shell may be cmd or PowerShell, one line
-/// both read alike; the installer put hc on PATH. Never prompts: a login a
+/// both read alike; the installer put h0x-core on PATH. Never prompts: a login a
 /// person must type fails fast.
 fn pipe(paths: &crate::paths::Paths, to: Reach, session: Option<&str>, windows: bool) -> tokio::process::Command {
     let remote = if windows {
@@ -237,9 +237,9 @@ fn pipe(paths: &crate::paths::Paths, to: Reach, session: Option<&str>, windows: 
             "cmd /d /c \"if exist {WINDOWS_HC} ({WINDOWS_HC} connect{session}) else (echo {NOT_HERE} 1>&2 & exit /b 127)\""
         )
     } else {
-        let session = session.map(|s| format!("HC_SESSION={s} ")).unwrap_or_default();
+        let session = session.map(|s| format!("H0X_CORE_SESSION={s} ")).unwrap_or_default();
         format!(
-            "sh -c 'p=$(command -v herdr-core) || p=$HOME/.local/bin/herdr-core; [ -x \"$p\" ] || {{ echo \"{NOT_HERE}\" >&2; exit 127; }}; {session}exec \"$p\" connect'"
+            "sh -c 'p=$(command -v h0x-core) || p=$HOME/.local/bin/h0x-core; [ -x \"$p\" ] || {{ echo \"{NOT_HERE}\" >&2; exit 127; }}; {session}exec \"$p\" connect'"
         )
     };
     let options = ["BatchMode=yes", "ConnectTimeout=10", "ServerAliveInterval=15", "ServerAliveCountMax=4"];
@@ -249,8 +249,8 @@ fn pipe(paths: &crate::paths::Paths, to: Reach, session: Option<&str>, windows: 
     cmd
 }
 
-/// What the pipe's line says when there is no hc there.
-const NOT_HERE: &str = "herdr-core is not installed here";
+/// What the pipe's line says when there is no h0x-core there.
+const NOT_HERE: &str = "h0x-core is not installed here";
 
 fn unreachable(to: Reach, why: &str) -> RpcError {
     let target = to.target;
@@ -358,9 +358,9 @@ async fn dial_once(
             // Some connection wrappers collapse all remote failures to exit code 1.
             if status == Some(127) || err.contains(NOT_HERE) {
                 return Err(RpcError::new(
-                    "hc_missing",
-                    format!("hc is not installed on {target}"),
-                    format!("in a terminal, `{}` offers to copy this hc there", to.add()),
+                    "h0x_core_missing",
+                    format!("h0x-core is not installed on {target}"),
+                    format!("in a terminal, `{}` offers to copy this h0x-core there", to.add()),
                 ));
             }
             if wants_login(&err) {
@@ -387,7 +387,7 @@ async fn dial_once(
     match reply.get("error") {
         Some(e) if e["data"]["kind"] == "unsupported_generation" => Err(RpcError::new(
             "incompatible",
-            format!("hc on {target} speaks another protocol generation"),
+            format!("h0x-core on {target} speaks another protocol generation"),
             format!("in a terminal, `{}` offers to update it", to.add()),
         )),
         Some(e) => Err(RpcError::from_json(e)),
@@ -448,9 +448,9 @@ fn run_raw(
     Ok(out)
 }
 
-/// Copies this very hc to `target` (same OS and CPU only), swaps it in at
-/// ~/.local/bin/herdr-core (adding `hc` beside it only if there is none),
-/// and restarts hc there in `session`, so terminals there keep running.
+/// Copies this very h0x-core to `target` (same OS and CPU only), swaps it in at
+/// ~/.local/bin/h0x-core,
+/// and restarts h0x-core there in `session`, so terminals there keep running.
 /// Returns what the installed one says it is.
 pub fn install(paths: &crate::paths::Paths, to: Reach, session: Option<&str>) -> Result<String, RpcError> {
     check_target(to)?;
@@ -464,12 +464,16 @@ pub fn install(paths: &crate::paths::Paths, to: Reach, session: Option<&str>) ->
     let windows = if probe.status.success() {
         there.starts_with("windows ")
     } else {
-        let native = run_raw(paths, to, "cmd /d /c \"echo herdr-core-windows\"", b"")?;
-        native.status.success() && last_line(&native.stdout) == "herdr-core-windows"
+        let native = run_raw(paths, to, "cmd /d /c \"echo h0x-core-windows\"", b"")?;
+        native.status.success() && last_line(&native.stdout) == "h0x-core-windows"
     };
     if windows {
         if to.via {
-            return Err(RpcError::new("install_failed", format!("{target} runs Windows"), "install hc there yourself"));
+            return Err(RpcError::new(
+                "install_failed",
+                format!("{target} runs Windows"),
+                "install h0x-core there yourself",
+            ));
         }
         WINDOWS.lock().unwrap_or_else(|p| p.into_inner()).push(target.to_string());
         return install_windows(paths, target, session);
@@ -481,19 +485,19 @@ pub fn install(paths: &crate::paths::Paths, to: Reach, session: Option<&str>) ->
             "nothing was changed there",
         ));
     }
-    // Same OS and CPU: this very hc. Else this version's released build for it.
+    // Same OS and CPU: this very h0x-core. Else this version's released build for it.
     let exe = if there == here {
         std::env::current_exe()
             .and_then(std::fs::read)
-            .map_err(|e| RpcError::internal(format!("cannot read this hc: {e}")))?
+            .map_err(|e| RpcError::internal(format!("cannot read this h0x-core: {e}")))?
     } else {
         let scratch = crate::releases::Scratch::new()?;
         let version = env!("CARGO_PKG_VERSION");
         let not_released = |_| {
             RpcError::new(
                 "install_failed",
-                format!("{target} is {there}, and hc {version} has no release to download"),
-                "install hc there yourself",
+                format!("{target} is {there}, and h0x-core {version} has no release to download"),
+                "install h0x-core there yourself",
             )
         };
         let m = crate::releases::manifest(Some(version), &scratch.0).map_err(not_released)?;
@@ -501,36 +505,36 @@ pub fn install(paths: &crate::paths::Paths, to: Reach, session: Option<&str>) ->
         std::fs::read(bin).map_err(|e| RpcError::internal(e.to_string()))?
     };
     let n = exe.len();
-    let session = session.map(|s| format!("HC_SESSION={s} ")).unwrap_or_default();
+    let session = session.map(|s| format!("H0X_CORE_SESSION={s} ")).unwrap_or_default();
     // Into a temp file beside the target, checked whole and running, then swapped.
     let script = format!(
-        "set -e; d=$HOME/.local/bin; mkdir -p $d; rm -f $d/.herdr-core.new.*; t=$d/.herdr-core.new.$$; \
+        "set -e; d=$HOME/.local/bin; mkdir -p $d; rm -f $d/.h0x-core.new.*; t=$d/.h0x-core.new.$$; \
          head -c {n} > $t; [ $(($(wc -c < $t))) -eq {n} ] || {{ rm -f $t; echo \"the copy arrived incomplete\" >&2; exit 3; }}; \
-         chmod 755 $t; $t --version > /dev/null || {{ rm -f $t; echo \"this hc does not run there\" >&2; exit 4; }}; \
-         mv -f $t $d/herdr-core; command -v hc > /dev/null 2>&1 || [ -e $d/hc ] || ln -s herdr-core $d/hc; \
-         {session}$d/herdr-core server restart > /dev/null; $d/herdr-core --version"
+         chmod 755 $t; $t --version > /dev/null || {{ rm -f $t; echo \"this h0x-core does not run there\" >&2; exit 4; }}; \
+         mv -f $t $d/h0x-core; \
+         {session}$d/h0x-core server restart > /dev/null; $d/h0x-core --version"
     );
     run_there(paths, to, &format!("sh -c '{script}'"), &exe)
 }
 
 /// Windows there: this version's release zip and the installer go to its
 /// home folder, and the installer runs from them (no download there). It
-/// swaps an hc already there the planned way, so its terminals keep running.
+/// swaps an h0x-core already there the planned way, so its terminals keep running.
 fn install_windows(paths: &crate::paths::Paths, target: &str, session: Option<&str>) -> Result<String, RpcError> {
     let scratch = crate::releases::Scratch::new()?;
     let version = env!("CARGO_PKG_VERSION");
     let m = crate::releases::manifest(Some(version), &scratch.0).map_err(|_| {
         RpcError::new(
             "install_failed",
-            format!("{target} runs Windows, and hc {version} has no release to download"),
-            "install hc there yourself",
+            format!("{target} runs Windows, and h0x-core {version} has no release to download"),
+            "install h0x-core there yourself",
         )
     })?;
     let zip = crate::releases::fetch(&m, "windows-x86_64", &scratch.0)?;
-    let script = scratch.0.join("hc-install.ps1");
+    let script = scratch.0.join("h0x-core-install.ps1");
     std::fs::write(&script, include_str!("../../../distribution/install.ps1"))
         .map_err(|e| RpcError::internal(e.to_string()))?;
-    std::fs::copy(&zip, scratch.0.join("hc-install.zip")).map_err(|e| RpcError::internal(e.to_string()))?;
+    std::fs::copy(&zip, scratch.0.join("h0x-core-install.zip")).map_err(|e| RpcError::internal(e.to_string()))?;
     let mut scp = std::process::Command::new("scp");
     scp.arg("-q");
     #[cfg(unix)]
@@ -538,13 +542,13 @@ fn install_windows(paths: &crate::paths::Paths, target: &str, session: Option<&s
         .arg(format!("ControlPath={}", control_path(paths, target).display()))
         .args(["-o", "ControlMaster=no"]);
     scp.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);
-    scp.arg(scratch.0.join("hc-install.zip")).arg(&script).arg(format!("{target}:"));
+    scp.arg(scratch.0.join("h0x-core-install.zip")).arg(&script).arg(format!("{target}:"));
     let to = Reach { target, via: false };
     let out = scp.output().map_err(|e| unreachable(to, &format!("cannot run scp: {e}")))?;
     if !out.status.success() {
         return Err(RpcError::new(
             "install_failed",
-            format!("copying hc to {target}: {}", String::from_utf8_lossy(&out.stderr).trim()),
+            format!("copying h0x-core to {target}: {}", String::from_utf8_lossy(&out.stderr).trim()),
             "nothing was changed there",
         ));
     }
@@ -553,7 +557,9 @@ fn install_windows(paths: &crate::paths::Paths, target: &str, session: Option<&s
     run_there(
         paths,
         to,
-        &format!("powershell -NoProfile -ExecutionPolicy Bypass -File hc-install.ps1 hc-install.zip{session}"),
+        &format!(
+            "powershell -NoProfile -ExecutionPolicy Bypass -File h0x-core-install.ps1 h0x-core-install.zip{session}"
+        ),
         b"",
     )?;
     run_there(paths, to, &format!("{WINDOWS_HC} --version"), b"")

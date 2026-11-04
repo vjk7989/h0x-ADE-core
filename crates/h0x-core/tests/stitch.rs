@@ -10,8 +10,8 @@ use serde_json::{Value, json};
 /// A short read time limit makes the "never quiet" case fast; others get a real one.
 fn session_with_limit(ms: &str) -> Session {
     let mut s = Session::new();
-    s.env.push(("HC_STITCH_MS".into(), ms.into()));
-    let config = s.root.join("config/herdr-core/config.toml");
+    s.env.push(("H0X_CORE_STITCH_MS".into(), ms.into()));
+    let config = s.root.join("config/h0x-core/config.toml");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     std::fs::write(config, "headless = \"40x12\"\n").unwrap();
     s
@@ -90,7 +90,7 @@ fn pinned_headers_scrollbars_loading_frames_and_synchronized_output() {
 #[test]
 fn repainting_blocked_and_error_prompts_are_read_without_scrolling() {
     let s = session_with_limit("15000");
-    std::fs::write(s.root.join("config/herdr-core/config.toml"), "headless = \"200x120\"\n").unwrap();
+    std::fs::write(s.root.join("config/h0x-core/config.toml"), "headless = \"200x120\"\n").unwrap();
     for state in ["blocked", "error"] {
         let flag = format!("--{state}");
         let t = app(&s, &["--lines", "10", "--blink", "600", "--fixed", &flag]);
@@ -103,7 +103,7 @@ fn repainting_blocked_and_error_prompts_are_read_without_scrolling() {
         assert_eq!(r["why"], state, "{r}");
         assert!(elapsed < std::time::Duration::from_secs(1), "took {elapsed:?}");
         assert!(whole(r["text"].as_str().unwrap(), 10), "{r}");
-        let plain = String::from_utf8(s.hc(&["read", &t, "--lines", "30"]).stdout).unwrap();
+        let plain = String::from_utf8(s.core(&["read", &t, "--lines", "30"]).stdout).unwrap();
         assert!(plain.contains(&format!("only its screen: it is {state}")), "{plain}");
         let after = screen(&s, &t);
         assert!(whole(&after, 10));
@@ -183,7 +183,7 @@ fn any_doubt_returns_the_plain_screen_marked_incomplete() {
         // Only "it's working" is worth waiting for: say so, and when.
         let working = flags == ["--working"];
         assert_eq!(r["why"].as_str(), working.then_some("working"), "{flags:?}: {r}");
-        let plain = String::from_utf8(s.hc(&["read", &t, "--lines", "200"]).stdout).unwrap();
+        let plain = String::from_utf8(s.core(&["read", &t, "--lines", "200"]).stdout).unwrap();
         assert_eq!(plain.contains("read again once it stops"), working, "{flags:?}: {plain}");
         wait_until("still at the bottom", || screen(&s, &t).contains("line 050"));
     }

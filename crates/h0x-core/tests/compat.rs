@@ -127,7 +127,7 @@ fn the_api_only_grows_since_the_last_release() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../schema");
     let released: Value =
         serde_json::from_str(&std::fs::read_to_string(root.join("released.openrpc.json")).unwrap()).unwrap();
-    let now = herdr_core::api::openrpc();
+    let now = h0x_core::api::openrpc();
     let broken = breaks(&released, &now);
     assert!(broken.is_empty(), "these changes break clients of the released API:\n{}", broken.join("\n"));
 }

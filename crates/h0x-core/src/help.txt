@@ -1,7 +1,7 @@
-hc - run programs and coding agents in terminals that stay alive
+h0x-core - run programs and coding agents in terminals that stay alive
 
-Usage: hc <command> [options]
-       hc               pick a terminal and attach (new… on top)
+Usage: h0x-core <command> [options]
+       h0x-core               pick a terminal and attach (new… on top)
 
 Terminals
   run <cmd|template> [task]   run it and wait like a shell (--bg: don't wait)
@@ -38,22 +38,22 @@ More
   update [--version X|--from <file>]   latest release, at least X, or a build
   machine add|ls|login|update|rename|rm   other machines, over ssh or a command
                               (--via 'fly ssh console -a x --pty=false -C')
-  connect                     the API over stdin/stdout (ssh box hc connect)
+  connect                     the API over stdin/stdout (ssh box h0x-core connect)
   schema                      the API as JSON Schema, for app builders
 
 <t> is an address like t7 or t1b, or a name. In a terminal, attach, read, get,
 kill, rm, wait and interrupt pick one when it's left out.
 Options: --json (default when piped; run and read print text), -V --version,
---licenses (what hc includes, and their licenses).
-Per command: hc <command> --help
-Settings: ~/.config/herdr-core/config.toml. notes = false: hc types nothing
-on its own (no notes to parent agents, no <hc> tags on messages).
+--licenses (what h0x-core includes, and their licenses).
+Per command: h0x-core <command> --help
+Settings: ~/.config/h0x-core/config.toml. notes = false: h0x-core types nothing
+on its own (no notes to parent agents, no <h0x> tags on messages).
 shell = ["nu"] overrides the shell for new terminals and keep recovery.
 
 Examples
-  hc run --on vps "cd app && npm test"     like ssh, in a terminal that stays
-  hc run --bg claude                       Claude Code in a new terminal
-  hc attach t3                             take it over
-  hc run reviewer "review src/x.rs"        a template with a task
+  h0x-core run --on vps "cd app && npm test"     like ssh, in a terminal that stays
+  h0x-core run --bg claude                       Claude Code in a new terminal
+  h0x-core attach t3                             take it over
+  h0x-core run reviewer "review src/x.rs"        a template with a task
 
-Agent? Run: hc --skill
+Agent? Run: h0x-core --skill

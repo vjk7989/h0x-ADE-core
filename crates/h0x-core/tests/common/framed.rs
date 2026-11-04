@@ -1,7 +1,7 @@
 //! A framed-mode test client and a viewer that renders what it receives.
 
 use super::Session;
-use herdr_core::wire;
+use h0x_core::wire;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};

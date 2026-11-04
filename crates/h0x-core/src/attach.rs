@@ -1,4 +1,4 @@
-//! `hc attach`: puts this terminal on a core terminal. Raw bytes both ways;
+//! `h0x-core attach`: puts this terminal on a core terminal. Raw bytes both ways;
 //! the only key we look at is the detach chord.
 
 use crate::client;
@@ -94,7 +94,7 @@ fn shown(payload: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     const OFF: &[u8] = b"\x1b[?1004l";
     let mut out = Cow::Borrowed(payload);
     // ConPTY asks its viewer for win32-input-mode. A Windows console hosting
-    // hc would obey and send keys as key-event codes: no detach key, no replies.
+    // h0x-core would obey and send keys as key-event codes: no detach key, no replies.
     for mode in [&b"\x1b[?9001h"[..], b"\x1b[?9001l"] {
         while let Some(at) = out.windows(mode.len()).position(|w| w == mode) {
             out.to_mut().drain(at..at + mode.len());
@@ -332,7 +332,7 @@ pub fn run(paths: &Paths, terminal: &str, observe: bool, history: usize) -> Resu
     Ok(match ending {
         Some(end) => format!("[{address} finished: {}]", end["reason"].as_str().unwrap_or("ended")),
         None if detached => format!("[detached from {address}]"),
-        None => format!("[lost the core; it keeps {address} running: hc attach {address}]"),
+        None => format!("[lost the core; it keeps {address} running: h0x-core attach {address}]"),
     })
 }
 

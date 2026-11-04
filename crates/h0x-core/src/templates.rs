@@ -1,4 +1,4 @@
-//! Templates: `~/.config/herdr-core/templates/<name>.md`, read fresh on every
+//! Templates: `~/.config/h0x-core/templates/<name>.md`, read fresh on every
 //! use. Frontmatter says how to start the agent; the body is its first message.
 
 use crate::paths::Paths;
@@ -80,9 +80,9 @@ pub fn load(paths: &Paths, name: &str) -> Result<Option<Template>, RpcError> {
     }
     let path = dir(paths).join(format!("{name}.md"));
     match std::fs::read_to_string(&path) {
-        Ok(text) => parse(name, &text)
-            .map(Some)
-            .map_err(|e| RpcError::new("invalid_template", format!("{}: {e}", path.display()), "see hc templates")),
+        Ok(text) => parse(name, &text).map(Some).map_err(|e| {
+            RpcError::new("invalid_template", format!("{}: {e}", path.display()), "see h0x-core templates")
+        }),
         Err(_) => Ok(None),
     }
 }
@@ -125,7 +125,7 @@ pub struct FirstMessage {
 }
 
 pub(crate) fn ready_timeout() -> Duration {
-    let ms = std::env::var("HC_READY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(30_000);
+    let ms = std::env::var("H0X_CORE_READY_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(30_000);
     Duration::from_millis(ms)
 }
 
@@ -146,7 +146,7 @@ impl Core {
                 }
                 if tokio::time::Instant::now() >= deadline {
                     return not_sent(format!(
-                        "its output never went quiet; check its screen (hc read {0}), then hc send {0}",
+                        "its output never went quiet; check its screen (h0x-core read {0}), then h0x-core send {0}",
                         crate::terminals::address(id)
                     ));
                 }
@@ -160,7 +160,7 @@ impl Core {
                     return not_sent("it exited before it was ready".into());
                 }
                 return not_sent(format!(
-                    "it never reported its status, so it may be showing a dialog; check its screen (hc read {0}), then hc send {0}",
+                    "it never reported its status, so it may be showing a dialog; check its screen (h0x-core read {0}), then h0x-core send {0}",
                     crate::terminals::address(id)
                 ));
             }

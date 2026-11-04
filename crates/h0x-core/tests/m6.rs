@@ -8,8 +8,8 @@ use std::time::Duration;
 
 fn session() -> Session {
     let mut s = Session::new();
-    s.env.push(("HC_QUIET_MS".into(), "300".into()));
-    s.env.push(("HC_STARTED_MS".into(), "1000".into()));
+    s.env.push(("H0X_CORE_QUIET_MS".into(), "300".into()));
+    s.env.push(("H0X_CORE_STARTED_MS".into(), "1000".into()));
     s
 }
 
@@ -22,9 +22,9 @@ fn run(s: &Session, extra: &[&str], body: &str) -> String {
     s.json(&args)["address"].as_str().unwrap().to_string()
 }
 
-/// `hc` as if typed inside terminal `t` (its HC_TERMINAL_ID).
+/// `h0x-core` as if typed inside terminal `t` (its H0X_TERMINAL_ID).
 fn hc_in(s: &Session, t: &str, args: &[&str]) -> Value {
-    let out = s.cmd().env("HC_TERMINAL_ID", t).args(args).output().unwrap();
+    let out = s.cmd().env("H0X_TERMINAL_ID", t).args(args).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     serde_json::from_slice(&out.stdout).unwrap()
 }
@@ -32,7 +32,7 @@ fn hc_in(s: &Session, t: &str, args: &[&str]) -> Value {
 #[test]
 fn a_terminal_is_nobodys_caller_in_another_session() {
     let s = session();
-    let other = |args: &[&str]| s.cmd().env("HC_SESSION", "other").args(args).output().unwrap();
+    let other = |args: &[&str]| s.cmd().env("H0X_CORE_SESSION", "other").args(args).output().unwrap();
     let stranger = String::from_utf8(other(&["run", "--bg", "sleep", "100"]).stdout).unwrap();
     assert!(stranger.contains("\"t1\""), "the other session has its own t1: {stranger}");
     let bin = s.bin.display().to_string();
@@ -40,12 +40,12 @@ fn a_terminal_is_nobodys_caller_in_another_session() {
         &s,
         &[],
         &format!(
-            "{bin} run --bg --name same sleep 100; HC_SESSION=other {bin} run --bg --name across sleep 100; sleep 100"
+            "{bin} run --bg --name same sleep 100; H0X_CORE_SESSION=other {bin} run --bg --name across sleep 100; sleep 100"
         ),
     );
     assert_eq!(p, "t1");
     wait_until("both started", || {
-        other(&["get", "across"]).status.success() && s.hc(&["get", "same"]).status.success()
+        other(&["get", "across"]).status.success() && s.core(&["get", "same"]).status.success()
     });
     assert_eq!(get(&s, "same")["parent"], "t1");
     let across: Value = serde_json::from_slice(&other(&["get", "across"]).stdout).unwrap();
@@ -94,19 +94,22 @@ fn only_a_blocked_errored_or_exited_child_is_a_note() {
     touch(&s, "a");
     wait_until("done", || get(&s, &kid)["status"]["state"] == "done");
     std::thread::sleep(Duration::from_millis(800));
-    assert!(!text(&s, &p).contains("<hc>"), "a finished turn is the child's to report");
+    assert!(!text(&s, &p).contains("<h0x>"), "a finished turn is the child's to report");
     touch(&s, "b");
     wait_until("blocked note", || {
-        text(&s, &p)
-            .contains(&format!("parent-got:<hc>{kid} reviewer is blocked (permission). See: hc read {kid}</hc>"))
+        text(&s, &p).contains(&format!(
+            "parent-got:<h0x>{kid} reviewer is blocked (permission). See: h0x-core read {kid}</h0x>"
+        ))
     });
     touch(&s, "e");
     wait_until("error note", || {
-        text(&s, &p).contains(&format!("parent-got:<hc>{kid} reviewer hit an error: boom. See: hc read {kid}</hc>"))
+        text(&s, &p)
+            .contains(&format!("parent-got:<h0x>{kid} reviewer hit an error: boom. See: h0x-core read {kid}</h0x>"))
     });
     touch(&s, "c");
     wait_until("exit note", || {
-        text(&s, &p).contains(&format!("parent-got:<hc>{kid} reviewer exited (exit 3). Read: hc read {kid}</hc>"))
+        text(&s, &p)
+            .contains(&format!("parent-got:<h0x>{kid} reviewer exited (exit 3). Read: h0x-core read {kid}</h0x>"))
     });
     assert_eq!(text(&s, &p).matches("is blocked").count(), 1, "each piece of news once");
 }
@@ -120,8 +123,8 @@ fn a_plain_programs_end_is_a_note_with_its_last_lines_unless_the_parent_saw_it()
     let silent = run(&s, &["--parent", &p], "w b; exit 4");
     touch(&s, "a");
     wait_until("success note", || {
-        text(&s, &p).contains(&format!("parent-got:<hc>{ok} build exited (exit 0). Last lines:"))
-            && text(&s, &p).contains(&format!("parent-got:Read: hc read {ok}</hc>"))
+        text(&s, &p).contains(&format!("parent-got:<h0x>{ok} build exited (exit 0). Last lines:"))
+            && text(&s, &p).contains(&format!("parent-got:Read: h0x-core read {ok}</h0x>"))
     });
     let got: Vec<String> = text(&s, &p).lines().map(String::from).collect();
     let line = |n: u32| got.contains(&format!("parent-got:line{n}"));
@@ -130,7 +133,7 @@ fn a_plain_programs_end_is_a_note_with_its_last_lines_unless_the_parent_saw_it()
 
     touch(&s, "b");
     wait_until("failure note, nothing to show", || {
-        text(&s, &p).contains(&format!("parent-got:<hc>{silent} exited (exit 4). Read: hc read {silent}</hc>"))
+        text(&s, &p).contains(&format!("parent-got:<h0x>{silent} exited (exit 4). Read: h0x-core read {silent}</h0x>"))
     });
     // A program it waited for is no note: it has the result already.
     hc_in(&s, &p, &["--json", "run", "sh", "-c", "echo waited-for"]);
@@ -152,11 +155,11 @@ fn notes_reach_a_working_parent_but_never_a_blocked_one() {
     touch(&s, "a");
     touch(&s, "b");
     std::thread::sleep(Duration::from_millis(800));
-    assert!(!text(&s, &p).contains("<hc>"), "never typed into a blocked parent");
+    assert!(!text(&s, &p).contains("<h0x>"), "never typed into a blocked parent");
     touch(&s, "free");
     wait_until("both notes, while it works", || {
         let t = text(&s, &p);
-        t.contains(&format!("<hc>{a} exited (exit 0)")) && t.contains(&format!("<hc>{b} is blocked (permission)"))
+        t.contains(&format!("<h0x>{a} exited (exit 0)")) && t.contains(&format!("<h0x>{b} is blocked (permission)"))
     });
 }
 
@@ -177,7 +180,7 @@ fn only_news_the_parent_has_not_seen_becomes_a_note() {
 
     let waiting = {
         let mut cmd = s.cmd();
-        cmd.env("HC_TERMINAL_ID", &p).args(["wait", &waited, "--timeout", "10"]);
+        cmd.env("H0X_TERMINAL_ID", &p).args(["wait", &waited, "--timeout", "10"]);
         std::thread::spawn(move || cmd.output().unwrap())
     };
     std::thread::sleep(Duration::from_millis(300));
@@ -189,7 +192,7 @@ fn only_news_the_parent_has_not_seen_becomes_a_note() {
 
     touch(&s, "free");
     std::thread::sleep(Duration::from_millis(1500));
-    assert!(!text(&s, &p).contains("<hc>"), "nothing new to tell: {}", text(&s, &p));
+    assert!(!text(&s, &p).contains("<h0x>"), "nothing new to tell: {}", text(&s, &p));
 }
 
 #[test]
@@ -236,7 +239,7 @@ fn every_wait_wakes_when_someone_messages_the_waiter() {
     // The child keeps working but reports in: the parent can't read it until its wait ends.
     let one = {
         let mut cmd = s.cmd();
-        cmd.env("HC_TERMINAL_ID", &p).args(["wait", &kid, "--timeout", "10"]);
+        cmd.env("H0X_TERMINAL_ID", &p).args(["wait", &kid, "--timeout", "10"]);
         std::thread::spawn(move || serde_json::from_slice::<Value>(&cmd.output().unwrap().stdout).unwrap())
     };
     std::thread::sleep(Duration::from_millis(300));
@@ -283,7 +286,7 @@ fn messages_between_agents_say_who_sent_them() {
     wait_until("reported", || get(&s, &sender)["reported"] == true && get(&s, &agent)["reported"] == true);
 
     hc_in(&s, &sender, &["send", &agent, "review it"]);
-    wait_until("tagged", || text(&s, &agent).contains(&format!("got:<hc from=\"{sender} boss\">review it</hc>")));
+    wait_until("tagged", || text(&s, &agent).contains(&format!("got:<h0x from=\"{sender} boss\">review it</h0x>")));
     s.json(&["send", &agent, "from a person"]);
     let line = |t: &str, want: &str| text(&s, t).lines().any(|l| l.trim_end() == want);
     wait_until("a person's send is untouched", || line(&agent, "got:from a person"));
@@ -293,9 +296,9 @@ fn messages_between_agents_say_who_sent_them() {
 
 #[test]
 fn notes_off_means_plain_messages_too() {
-    // `notes = false`: nothing hc adds on its own, tags included.
+    // `notes = false`: nothing h0x-core adds on its own, tags included.
     let s = session();
-    let config = s.root.join("config/herdr-core/config.toml");
+    let config = s.root.join("config/h0x-core/config.toml");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     std::fs::write(config, "notes = false\n").unwrap();
     let echo = "stty -echo; r state=idle; while read -r l; do echo \"got:$l\"; done";
@@ -310,7 +313,7 @@ fn notes_off_means_plain_messages_too() {
     touch(&s, "a");
     wait_until("blocked", || get(&s, &kid)["status"]["state"] == "blocked");
     std::thread::sleep(Duration::from_millis(1000));
-    assert!(!text(&s, &sender).contains("<hc>"), "{}", text(&s, &sender));
+    assert!(!text(&s, &sender).contains("<h0x>"), "{}", text(&s, &sender));
 }
 
 #[test]
@@ -321,13 +324,13 @@ fn no_notes_into_programs_that_are_not_agents() {
     touch(&s, "a");
     wait_until("blocked", || get(&s, &kid)["status"]["state"] == "blocked");
     std::thread::sleep(Duration::from_millis(1000));
-    assert!(!text(&s, &p).contains("<hc>"));
+    assert!(!text(&s, &p).contains("<h0x>"));
 }
 
-/// `hc wait --children <mode>` inside `p`, in the background.
+/// `h0x-core wait --children <mode>` inside `p`, in the background.
 fn wait_children(s: &Session, p: &str, mode: &str) -> std::thread::JoinHandle<Value> {
     let mut cmd = s.cmd();
-    cmd.env("HC_TERMINAL_ID", p).args(["wait", "--children", mode, "--timeout", "10"]);
+    cmd.env("H0X_TERMINAL_ID", p).args(["wait", "--children", mode, "--timeout", "10"]);
     std::thread::spawn(move || serde_json::from_slice::<Value>(&cmd.output().unwrap().stdout).unwrap())
 }
 
@@ -421,16 +424,16 @@ fn rm_children_go_once_a_waiting_parent_has_the_exit_code() {
     let s = session();
     let p = run(&s, &[], "sleep 100");
     let gone = s.json(&["run", "--bg", "--rm", "true"])["address"].as_str().unwrap().to_string();
-    wait_until("removed", || s.hc(&["get", &gone]).status.code() == Some(3));
+    wait_until("removed", || s.core(&["get", &gone]).status.code() == Some(3));
 
     let kid = run(&s, &["--parent", &p, "--rm"], "w a; exit 5");
     let waiting = {
         let mut cmd = s.cmd();
-        cmd.env("HC_TERMINAL_ID", &p).args(["wait", &kid, "--timeout", "10"]);
+        cmd.env("H0X_TERMINAL_ID", &p).args(["wait", &kid, "--timeout", "10"]);
         std::thread::spawn(move || serde_json::from_slice::<Value>(&cmd.output().unwrap().stdout).unwrap())
     };
     std::thread::sleep(Duration::from_millis(300));
     touch(&s, "a");
     assert_eq!(waiting.join().unwrap()["exit_code"], 5);
-    wait_until("removed after the wait", || s.hc(&["get", &kid]).status.code() == Some(3));
+    wait_until("removed after the wait", || s.core(&["get", &kid]).status.code() == Some(3));
 }

@@ -1,6 +1,6 @@
-//! Releases: the install script, `hc update` from the release list, and hc
-//! on a machine of another OS or CPU, all against a fake releases site
-//! (python3's http.server) built from this very binary.
+//! Releases: the install script, `h0x-core update` from the release list, and
+//! h0x-core on a machine of another OS or CPU, all against a fake releases
+//! site (python3's http.server) built from this very binary.
 
 #![cfg(unix)] // Windows: tests/windows.rs
 
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
 const ROOT: &str = env!("CARGO_MANIFEST_DIR");
-/// This build's version: what scripts/manifest writes, what hc says it is.
+/// This build's version: what scripts/manifest writes, what h0x-core says it is.
 const THIS: &str = env!("CARGO_PKG_VERSION");
 /// A release newer than this build (it is this build inside, dressed up).
 const NEWER: &str = "9.9.9";
@@ -28,18 +28,18 @@ impl Releases {
         let root = s.root.join("releases");
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
         let url = format!("http://127.0.0.1:{port}");
-        let dir = root.join("core").join(version);
+        let dir = root.join("download").join(format!("v{version}"));
         std::fs::create_dir_all(&dir).unwrap();
         let bin_dir = Path::new(BIN).parent().unwrap();
         for t in targets {
-            let tar = dir.join(format!("herdr-core-{t}.tar.gz"));
+            let tar = dir.join(format!("h0x-core-{t}.tar.gz"));
             assert!(
                 Command::new("tar")
                     .arg("-czf")
                     .arg(&tar)
                     .arg("-C")
                     .arg(bin_dir)
-                    .arg("herdr-core")
+                    .arg("h0x-core")
                     .status()
                     .unwrap()
                     .success()
@@ -47,7 +47,7 @@ impl Releases {
         }
         let out = Command::new(format!("{ROOT}/../../scripts/manifest"))
             .arg(&dir)
-            .env("RELEASES_URL", &url)
+            .env("H0X_CORE_RELEASES_URL", &url)
             .output()
             .unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -55,9 +55,10 @@ impl Releases {
         let manifest = String::from_utf8(out.stdout)
             .unwrap()
             .replace(&format!("\"version\": \"{THIS}\""), &format!("\"version\": \"{version}\""))
-            .replace(&format!("/core/{THIS}/"), &format!("/core/{version}/"));
+            .replace(&format!("/download/v{THIS}/"), &format!("/download/v{version}/"));
         std::fs::write(dir.join("manifest.json"), &manifest).unwrap();
-        std::fs::write(root.join("core/latest.json"), &manifest).unwrap();
+        std::fs::create_dir_all(root.join("latest/download")).unwrap();
+        std::fs::write(root.join("latest/download/latest.json"), &manifest).unwrap();
         let server = Command::new("python3")
             .args(["-m", "http.server", "--bind", "127.0.0.1", &port.to_string()])
             .current_dir(&root)
@@ -89,10 +90,9 @@ fn the_install_script_installs_and_then_updates_without_stopping_anything() {
     let r = Releases::new(&s, THIS, &[&here()]);
     let bin = s.root.join("bin");
     let install = |s: &Session| {
-        // A PATH without the hc this machine already has: else no `hc` link is added.
         let mut cmd = s.program("sh");
         cmd.arg(format!("{ROOT}/../../distribution/install.sh")).env("PATH", "/usr/bin:/bin");
-        let out = cmd.env("HERDR_RELEASES_URL", &r.url).env("HC_INSTALL_DIR", &bin).output().unwrap();
+        let out = cmd.env("H0X_CORE_RELEASES_URL", &r.url).env("H0X_CORE_INSTALL_DIR", &bin).output().unwrap();
         assert!(
             out.status.success(),
             "{}{}",
@@ -102,9 +102,10 @@ fn the_install_script_installs_and_then_updates_without_stopping_anything() {
         String::from_utf8(out.stdout).unwrap()
     };
     assert!(install(&s).contains("installed"));
-    assert!(bin.join("herdr-core").is_file() && bin.join("hc").is_symlink());
+    assert!(bin.join("h0x-core").is_file());
+    assert!(std::fs::read_dir(&bin).unwrap().count() == 1, "only h0x-core is installed: no alias beside it");
 
-    s.bin = bin.join("hc");
+    s.bin = bin.join("h0x-core");
     let t = run(&s, &["sh", "-c", "while read l; do echo got-$l; done"]);
     let pid = s.json(&["server", "status"])["pid"].clone();
     assert!(install(&s).contains("updated"), "again: an update");
@@ -114,7 +115,7 @@ fn the_install_script_installs_and_then_updates_without_stopping_anything() {
     drop(r);
 }
 
-/// The URL the install script downloads hc from, for a list giving `url`,
+/// The URL the install script downloads h0x-core from, for a list giving `url`,
 /// with curl stubbed to record it (the download itself fails).
 fn install_script_downloads(s: &Session, url: &str, releases: &str, installed: bool) -> String {
     let dir = s.root.join(format!(
@@ -125,8 +126,8 @@ fn install_script_downloads(s: &Session, url: &str, releases: &str, installed: b
     std::fs::create_dir_all(&stub).unwrap();
     std::fs::create_dir_all(&bin).unwrap();
     if installed {
-        std::fs::write(bin.join("herdr-core"), "#!/bin/sh\n").unwrap();
-        Command::new("chmod").arg("755").arg(bin.join("herdr-core")).status().unwrap();
+        std::fs::write(bin.join("h0x-core"), "#!/bin/sh\n").unwrap();
+        Command::new("chmod").arg("755").arg(bin.join("h0x-core")).status().unwrap();
     }
     let list = dir.join("latest.json");
     std::fs::write(
@@ -148,8 +149,8 @@ fn install_script_downloads(s: &Session, url: &str, releases: &str, installed: b
     let out = Command::new("sh")
         .arg(format!("{ROOT}/../../distribution/install.sh"))
         .env("PATH", format!("{}:/usr/bin:/bin", stub.display()))
-        .env("HERDR_RELEASES_URL", releases)
-        .env("HC_INSTALL_DIR", &bin)
+        .env("H0X_CORE_RELEASES_URL", releases)
+        .env("H0X_CORE_INSTALL_DIR", &bin)
         .output()
         .unwrap();
     assert!(
@@ -160,43 +161,42 @@ fn install_script_downloads(s: &Session, url: &str, releases: &str, installed: b
     std::fs::read_to_string(log).unwrap().lines().last().unwrap().to_owned()
 }
 
-/// The download counter on releases.herdr.dev: plain release URLs say install
-/// or update; a mirror's query (a signed URL) or fragment, or another host,
-/// is fetched exactly as the list gives it.
+/// The install script fetches the list's URL exactly as given, installing or
+/// updating: a release file, a mirror's query (a signed URL) or fragment,
+/// or another host.
 #[test]
-fn the_install_script_marks_only_plain_release_downloads() {
+fn the_install_script_downloads_exactly_what_the_list_gives() {
     let s = Session::new();
     let r = "https://releases.example";
-    let tarball = format!("{r}/core/1.0.0/herdr-core-{}.tar.gz", here());
-    assert_eq!(install_script_downloads(&s, &tarball, r, false), format!("{tarball}?src=install"));
-    assert_eq!(install_script_downloads(&s, &tarball, r, true), format!("{tarball}?src=update"));
+    let tarball = format!("{r}/download/v1.0.0/h0x-core-{}.tar.gz", here());
+    assert_eq!(install_script_downloads(&s, &tarball, r, false), tarball);
+    assert_eq!(install_script_downloads(&s, &tarball, r, true), tarball);
     for url in [
         format!("{tarball}?sig=a%2Fb&exp=1"),
-        format!("{tarball}?src=install"),
         format!("{tarball}#x"),
-        "https://mirror.example/core/1.0.0/hc.tar.gz".to_owned(),
-        "https://releases.example.evil/core/1.0.0/hc.tar.gz".to_owned(),
+        "https://mirror.example/download/v1.0.0/h0x-core.tar.gz".to_owned(),
+        "https://releases.example.evil/download/v1.0.0/h0x-core.tar.gz".to_owned(),
     ] {
         assert_eq!(install_script_downloads(&s, &url, r, false), url);
     }
 }
 
 #[test]
-fn hc_update_downloads_checks_and_swaps() {
+fn update_downloads_checks_and_swaps() {
     let mut s = Session::new();
     let r = Releases::new(&s, NEWER, &[&here()]);
     let dir = s.root.join("bin");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::copy(BIN, dir.join("herdr-core")).unwrap();
-    s.bin = dir.join("herdr-core");
-    s.env.push(("HERDR_RELEASES_URL".into(), r.url.clone()));
+    std::fs::copy(BIN, dir.join("h0x-core")).unwrap();
+    s.bin = dir.join("h0x-core");
+    s.env.push(("H0X_CORE_RELEASES_URL".into(), r.url.clone()));
     let pid = s.json(&["server", "status"])["pid"].clone();
 
     let up = s.json(&["update"]);
     assert_eq!((up["restarted"].as_bool(), up["release"].as_str()), (Some(true), Some(NEWER)), "{up}");
     assert_ne!(s.json(&["server", "status"])["pid"], pid);
 
-    let tar = r.root.join(format!("core/{NEWER}/herdr-core-{}.tar.gz", here()));
+    let tar = r.root.join(format!("download/v{NEWER}/h0x-core-{}.tar.gz", here()));
     std::fs::write(&tar, b"not what the list says").unwrap();
     let (_, e) = s.err(&["--json", "update"]);
     assert_eq!(e["error"]["kind"], "refused", "a damaged download changes nothing: {e}");
@@ -204,14 +204,14 @@ fn hc_update_downloads_checks_and_swaps() {
 }
 
 #[test]
-fn hc_update_to_a_version_takes_at_least_that_one() {
+fn update_to_a_version_takes_at_least_that_one() {
     let mut s = Session::new();
     let r = Releases::new(&s, NEWER, &[&here()]);
     let dir = s.root.join("bin");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::copy(BIN, dir.join("herdr-core")).unwrap();
-    s.bin = dir.join("herdr-core");
-    s.env.push(("HERDR_RELEASES_URL".into(), r.url.clone()));
+    std::fs::copy(BIN, dir.join("h0x-core")).unwrap();
+    s.bin = dir.join("h0x-core");
+    s.env.push(("H0X_CORE_RELEASES_URL".into(), r.url.clone()));
     s.json(&["server", "status"]);
 
     let up = s.json(&["update", "--version", NEWER]);
@@ -227,17 +227,17 @@ fn hc_update_to_a_version_takes_at_least_that_one() {
 }
 
 #[test]
-fn hc_update_never_takes_a_release_of_another_generation() {
+fn update_never_takes_a_release_of_another_generation() {
     let mut s = Session::new();
     let r = Releases::new(&s, NEWER, &[&here()]);
-    let latest = r.root.join("core/latest.json");
+    let latest = r.root.join("latest/download/latest.json");
     let breaking = std::fs::read_to_string(&latest).unwrap().replace("\"generation\": 1", "\"generation\": 2");
     std::fs::write(&latest, breaking).unwrap();
     let dir = s.root.join("bin");
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::copy(BIN, dir.join("herdr-core")).unwrap(); // never the build under test
-    s.bin = dir.join("herdr-core");
-    s.env.push(("HERDR_RELEASES_URL".into(), r.url.clone()));
+    std::fs::copy(BIN, dir.join("h0x-core")).unwrap(); // never the build under test
+    s.bin = dir.join("h0x-core");
+    s.env.push(("H0X_CORE_RELEASES_URL".into(), r.url.clone()));
     let (_, e) = s.err(&["--json", "update"]);
     assert_eq!(e["error"]["kind"], "refused", "apps built for this generation must keep working: {e}");
     assert!(e["error"]["message"].as_str().unwrap().contains("generation"), "{e}");
@@ -247,7 +247,7 @@ fn hc_update_never_takes_a_release_of_another_generation() {
 #[test]
 fn a_machine_of_another_cpu_gets_the_released_build_for_it() {
     let mut odd = Session::new();
-    odd.bin = odd.root.join("bin/herdr-core"); // no hc there yet
+    odd.bin = odd.root.join("bin/h0x-core"); // no h0x-core there yet
     std::fs::create_dir_all(odd.root.join("fakebin")).unwrap();
     let other = if std::env::consts::ARCH == "aarch64" { "x86_64" } else { "aarch64" };
     let os = if std::env::consts::OS == "macos" { "Darwin" } else { "Linux" };
@@ -260,12 +260,12 @@ fn a_machine_of_another_cpu_gets_the_released_build_for_it() {
     let target = format!("{}-{other}", std::env::consts::OS);
     let r = Releases::new(&s, THIS, &[&target]);
     s.env.push(fake_ssh(&s, &[("odd", &odd)]));
-    s.env.push(("HERDR_RELEASES_URL".into(), r.url.clone()));
+    s.env.push(("H0X_CORE_RELEASES_URL".into(), r.url.clone()));
     let t = run(&s, &["sh", "-c", &format!("{BIN} machine add odd; echo added-$?; sleep 100")]);
     wait_until("the offer", || text(&s, &t).contains("[Y/n]"));
     s.json(&["send", &t, "y"]);
     wait_until("added", || text(&s, &t).contains("added-0"));
-    assert!(odd.root.join(".local/bin/herdr-core").is_file());
-    odd.bin = odd.root.join(".local/bin/herdr-core");
+    assert!(odd.root.join(".local/bin/h0x-core").is_file());
+    odd.bin = odd.root.join(".local/bin/h0x-core");
     drop(r);
 }

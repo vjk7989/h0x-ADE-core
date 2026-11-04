@@ -39,7 +39,7 @@ fn resolve(at: &FileAt, from_afar: bool) -> PathBuf {
 fn io(path: &Path, e: std::io::Error) -> RpcError {
     match e.kind() {
         std::io::ErrorKind::NotFound => {
-            RpcError::new("not_found", format!("no file {}", path.display()), "check the path, or hc exec ls")
+            RpcError::new("not_found", format!("no file {}", path.display()), "check the path, or h0x-core exec ls")
         }
         _ => RpcError::new("io", format!("{}: {e}", path.display()), ""),
     }
@@ -62,7 +62,7 @@ fn text_of(path: &Path) -> Result<String, RpcError> {
         return Err(RpcError::invalid_params(format!("{} is over {} MB", path.display(), MAX_FILE >> 20)));
     }
     String::from_utf8(bytes).map_err(|_| {
-        RpcError::new("not_text", format!("{} is not UTF-8 text", path.display()), "for bytes: hc exec cat")
+        RpcError::new("not_text", format!("{} is not UTF-8 text", path.display()), "for bytes: h0x-core exec cat")
     })
 }
 
@@ -158,7 +158,7 @@ fn swap_in(path: &Path, bytes: &[u8]) -> Result<FileResult, RpcError> {
     let dir = path.parent().ok_or_else(|| RpcError::invalid_params("a file, not a folder"))?;
     std::fs::create_dir_all(dir).map_err(|e| io(dir, e))?;
     let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-    let tmp = dir.join(format!(".{name}.{}.hc", crate::platform::random_hex()));
+    let tmp = dir.join(format!(".{name}.{}.h0x-core", crate::platform::random_hex()));
     let mode = std::fs::metadata(&path).ok().map(|m| m.permissions());
     let mut new = std::fs::OpenOptions::new();
     new.write(true).create_new(true);

@@ -101,7 +101,7 @@ pub fn endpoints(state: &Path) -> (PathBuf, String) {
         .map(PathBuf::from)
         // Logins without XDG_RUNTIME_DIR (some ssh setups) must still find the core.
         .or_else(|| Some(PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }))).filter(|p| p.is_dir()));
-    (run.map_or_else(|| state.to_path_buf(), |run| run.join("herdr-core")), String::new())
+    (run.map_or_else(|| state.to_path_buf(), |run| run.join("h0x-core")), String::new())
 }
 
 /// A directory only this user can enter.
@@ -144,10 +144,10 @@ pub fn spawn_detached(mut cmd: Command, log: std::fs::File) -> io::Result<()> {
     Ok(())
 }
 
-/// Puts the hc at `from` where `dest` is: a copy beside it that `works`,
+/// Puts the h0x-core at `from` where `dest` is: a copy beside it that `works`,
 /// then renamed over it (InvalidData: the copy doesn't run).
 pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::Result<()> {
-    let tmp = dest.with_file_name(format!(".herdr-core.new.{}", std::process::id()));
+    let tmp = dest.with_file_name(format!(".h0x-core.new.{}", std::process::id()));
     let staged = std::fs::copy(from, &tmp).and_then(|_| make_executable(&tmp));
     if staged.is_err() || !works(&tmp) {
         let _ = std::fs::remove_file(&tmp);
@@ -274,7 +274,7 @@ mod tests {
     use super::*;
 
     fn dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("hc-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("h0x-core-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -354,7 +354,7 @@ mod tests {
     fn a_missing_cookie_does_not_remove_a_host_display() {
         let mut env = std::collections::BTreeMap::from([
             ("DISPLAY".into(), "localhost:10.0".into()),
-            ("XAUTHORITY".into(), "/nonexistent/hc-cookie".into()),
+            ("XAUTHORITY".into(), "/nonexistent/h0x-core-cookie".into()),
         ]);
         let before = env.clone();
         drop_unreachable_displays(&mut env);

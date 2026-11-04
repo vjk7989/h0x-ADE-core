@@ -11,11 +11,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const DETACH: &str = "HC_LAUNCHD_DETACH";
-const SENTINEL: &str = "--hc-launchd";
-const DIRECT: &str = "HC_LAUNCHD_DIRECT";
+const DETACH: &str = "H0X_CORE_LAUNCHD_DETACH";
+const SENTINEL: &str = "--h0x-core-launchd";
+const DIRECT: &str = "H0X_CORE_LAUNCHD_DIRECT";
 const LAUNCHCTL: &str = "/bin/launchctl";
-const PREFIX: &str = "dev.herdr.core.";
+const PREFIX: &str = "tech.pavii.h0xcore.";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -108,7 +108,7 @@ pub fn startup() -> bool {
         return false;
     };
     if let Err(error) = result {
-        eprintln!("hc: launchd detach failed: {error}");
+        eprintln!("h0x-core: launchd detach failed: {error}");
         std::process::exit(1);
     }
     true
@@ -139,7 +139,7 @@ pub fn prepare_core() {
             if let Ok(paths) = crate::paths::Paths::from_env() {
                 fallback(&paths.state.join("core.log"), &error);
             } else {
-                eprintln!("hc: cannot move core startup to launchd: {error}");
+                eprintln!("h0x-core: cannot move core startup to launchd: {error}");
             }
         }
     }
@@ -167,7 +167,8 @@ pub fn spawn(cmd: &mut Command, log: &Path) -> bool {
 }
 
 fn fallback(log: &Path, error: &io::Error) {
-    let reason = format!("hc: launchd startup failed; starting directly (may end with the launching app): {error}");
+    let reason =
+        format!("h0x-core: launchd startup failed; starting directly (may end with the launching app): {error}");
     eprintln!("{reason}");
     if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
         let _ = writeln!(file, "{reason}");
@@ -181,8 +182,12 @@ fn launch(cmd: &Command, log: &Path) -> io::Result<()> {
     let domain = format!("gui/{}", unsafe { libc::getuid() });
     remove_stale(&domain, now);
     remove_stale_dirs(Path::new("/tmp"), now);
-    let dir =
-        PathBuf::from(format!("/tmp/hc-launchd-{}-{}-{}", std::process::id(), now.as_nanos(), super::random_hex()));
+    let dir = PathBuf::from(format!(
+        "/tmp/h0x-core-launchd-{}-{}-{}",
+        std::process::id(),
+        now.as_nanos(),
+        super::random_hex()
+    ));
     std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
     let mut job =
         Job { dir, target: format!("{domain}/{PREFIX}{}.{}", std::process::id(), now.as_nanos()), loaded: false };
@@ -289,7 +294,7 @@ impl Job {
 impl Drop for Job {
     fn drop(&mut self) {
         if let Err(error) = self.remove() {
-            eprintln!("hc: cannot remove launchd job {}: {error}", self.target);
+            eprintln!("h0x-core: cannot remove launchd job {}: {error}", self.target);
         }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
@@ -314,7 +319,7 @@ fn remove_stale(domain: &str, now: Duration) {
     for label in stale_labels(&list, now) {
         let target = format!("{domain}/{label}");
         if let Err(error) = launchctl(&[OsStr::new("bootout"), OsStr::new(&target)]) {
-            eprintln!("hc: cannot remove finished launchd job {target}: {error}");
+            eprintln!("h0x-core: cannot remove finished launchd job {target}: {error}");
         }
     }
 }
@@ -328,7 +333,7 @@ fn remove_stale_dirs(root: &Path, now: Duration) {
             continue;
         }
         let name = entry.file_name();
-        let Some(attempt) = name.to_str().and_then(|name| name.strip_prefix("hc-launchd-")) else { continue };
+        let Some(attempt) = name.to_str().and_then(|name| name.strip_prefix("h0x-core-launchd-")) else { continue };
         let mut fields = attempt.splitn(3, '-');
         let Some(pid) = fields.next().and_then(|p| p.parse::<libc::pid_t>().ok()).filter(|pid| *pid > 0) else {
             continue;
@@ -345,7 +350,7 @@ fn remove_stale_dirs(root: &Path, now: Duration) {
             continue;
         }
         if let Err(error) = std::fs::remove_dir_all(&path) {
-            eprintln!("hc: cannot remove abandoned launchd directory {}: {error}", path.display());
+            eprintln!("h0x-core: cannot remove abandoned launchd directory {}: {error}", path.display());
         }
     }
 }
@@ -425,10 +430,10 @@ mod tests {
 
     #[test]
     fn job_preserves_the_command_and_never_relaunches() {
-        let mut cmd = Command::new("/a<&>/hc");
+        let mut cmd = Command::new("/a<&>/h0x-core");
         cmd.arg("serve").env("LESS_TERMCAP_md", "\x1b[1m\r").env_remove("HOME");
         let job = plist(&cmd, Path::new("/state/core.log"), "test", Path::new("/private/job"), 0o027).unwrap();
-        assert!(job.contains("<string>/a&lt;&amp;&gt;/hc</string><string>--hc-launchd</string>"));
+        assert!(job.contains("<string>/a&lt;&amp;&gt;/h0x-core</string><string>--h0x-core-launchd</string>"));
         assert!(!job.contains("<string>serve</string>"));
         assert!(!job.contains("LESS_TERMCAP_md"));
         assert!(!job.contains("<key>HOME</key>"));
@@ -440,7 +445,7 @@ mod tests {
 
     #[test]
     fn environment_transfer_preserves_arbitrary_unix_bytes_and_removals() {
-        let mut cmd = Command::new("hc");
+        let mut cmd = Command::new("h0x-core");
         cmd.env("LESS_TERMCAP_md", OsStr::from_bytes(b"\x1b[1m\r\xff"))
             .env_remove("HOME")
             .env(DETACH, "old")
@@ -471,7 +476,7 @@ mod tests {
 
     #[test]
     fn stale_directories_need_a_dead_starter_and_never_follow_symlinks() {
-        let dir = PathBuf::from(format!("/var/tmp/hc-c-{}", &super::super::random_hex()[..8]));
+        let dir = PathBuf::from(format!("/var/tmp/h0x-core-c-{}", &super::super::random_hex()[..8]));
         super::super::private_dir(&dir).unwrap();
         let scratch = Job { dir, target: String::new(), loaded: false };
         let mut child = Command::new("/usr/bin/true").spawn().unwrap();
@@ -480,7 +485,7 @@ mod tests {
         let now = Duration::from_secs(1000);
         let make = |pid: u32, stamp: u64| {
             let path = scratch.dir.join(format!(
-                "hc-launchd-{pid}-{}-{}",
+                "h0x-core-launchd-{pid}-{}-{}",
                 Duration::from_secs(stamp).as_nanos(),
                 super::super::random_hex()
             ));
@@ -495,7 +500,7 @@ mod tests {
         let kept = scratch.dir.join("kept");
         super::super::private_dir(&kept).unwrap();
         let link = scratch.dir.join(format!(
-            "hc-launchd-{dead}-{}-{}",
+            "h0x-core-launchd-{dead}-{}-{}",
             Duration::from_secs(900).as_nanos(),
             super::super::random_hex()
         ));
@@ -509,12 +514,12 @@ mod tests {
 
     #[test]
     fn an_older_target_rejects_the_job_instead_of_starting_a_default_core() {
-        let Some(old) = std::env::var_os("HC_OLD_BIN") else { return };
+        let Some(old) = std::env::var_os("H0X_CORE_OLD_BIN") else { return };
         let domain = format!("gui/{}", unsafe { libc::getuid() });
         if launchctl(&[OsStr::new("print"), OsStr::new(&domain)]).is_err() {
             return;
         }
-        let dir = PathBuf::from(format!("/var/tmp/hc-old-launchd-{}", super::super::random_hex()));
+        let dir = PathBuf::from(format!("/var/tmp/h0x-core-old-launchd-{}", super::super::random_hex()));
         super::super::private_dir(&dir).unwrap();
         let scratch = Job { dir, target: String::new(), loaded: false };
         let log = scratch.dir.join("core.log");

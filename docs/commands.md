@@ -5,13 +5,13 @@ Run `just docs` to refresh it and `just docs-check` to check it.
 
 [Start here](../README.md) for a short tour.
 
-## hc
+## h0x-core
 
 ```text
-hc - run programs and coding agents in terminals that stay alive
+h0x-core - run programs and coding agents in terminals that stay alive
 
-Usage: hc <command> [options]
-       hc               pick a terminal and attach (new… on top)
+Usage: h0x-core <command> [options]
+       h0x-core               pick a terminal and attach (new… on top)
 
 Terminals
   run <cmd|template> [task]   run it and wait like a shell (--bg: don't wait)
@@ -48,33 +48,33 @@ More
   update [--version X|--from <file>]   latest release, at least X, or a build
   machine add|ls|login|update|rename|rm   other machines, over ssh or a command
                               (--via 'fly ssh console -a x --pty=false -C')
-  connect                     the API over stdin/stdout (ssh box hc connect)
+  connect                     the API over stdin/stdout (ssh box h0x-core connect)
   schema                      the API as JSON Schema, for app builders
 
 <t> is an address like t7 or t1b, or a name. In a terminal, attach, read, get,
 kill, rm, wait and interrupt pick one when it's left out.
 Options: --json (default when piped; run and read print text), -V --version,
---licenses (what hc includes, and their licenses).
-Per command: hc <command> --help
-Settings: ~/.config/herdr-core/config.toml. notes = false: hc types nothing
-on its own (no notes to parent agents, no <hc> tags on messages).
+--licenses (what h0x-core includes, and their licenses).
+Per command: h0x-core <command> --help
+Settings: ~/.config/h0x-core/config.toml. notes = false: h0x-core types nothing
+on its own (no notes to parent agents, no <h0x> tags on messages).
 shell = ["nu"] overrides the shell for new terminals and keep recovery.
 
 Examples
-  hc run --on vps "cd app && npm test"     like ssh, in a terminal that stays
-  hc run --bg claude                       Claude Code in a new terminal
-  hc attach t3                             take it over
-  hc run reviewer "review src/x.rs"        a template with a task
+  h0x-core run --on vps "cd app && npm test"     like ssh, in a terminal that stays
+  h0x-core run --bg claude                       Claude Code in a new terminal
+  h0x-core attach t3                             take it over
+  h0x-core run reviewer "review src/x.rs"        a template with a task
 
-Agent? Run: hc --skill
+Agent? Run: h0x-core --skill
 ```
 
-## hc attach
+## h0x-core attach
 
 ```text
 Put this terminal on a core terminal (detach: ctrl+\)
 
-Usage: hc attach [OPTIONS] [TERMINAL]
+Usage: h0x-core attach [OPTIONS] [TERMINAL]
 
 Arguments:
   [TERMINAL]  The terminal: `t7`, a name, or `machine/t7`
@@ -86,25 +86,25 @@ Options:
   -h, --help               Print help
 ```
 
-## hc connect
+## h0x-core connect
 
 ```text
-Speak the protocol over stdin/stdout (`ssh box hc connect`)
+Speak the protocol over stdin/stdout (`ssh box h0x-core connect`)
 
-Usage: hc connect [OPTIONS]
+Usage: h0x-core connect [OPTIONS]
 
 Options:
       --json               JSON output even in a terminal
-      --session <SESSION>  The hc session to reach, like HC_SESSION (one command that reads the same in sh, cmd and PowerShell)
+      --session <SESSION>  The h0x-core session to reach, like H0X_CORE_SESSION (one command that reads the same in sh, cmd and PowerShell)
   -h, --help               Print help
 ```
 
-## hc events
+## h0x-core events
 
 ```text
 Follow fact changes as they happen (one JSON line each when piped)
 
-Usage: hc events [OPTIONS]
+Usage: h0x-core events [OPTIONS]
 
 Options:
       --json                       JSON output even in a terminal
@@ -114,32 +114,32 @@ Options:
   -h, --help                       Print help
 ```
 
-## hc exec
+## h0x-core exec
 
 ```text
 Run one program without a terminal, here or on a machine: exactly what it wrote, and its exit code
 
-Usage: hc exec [OPTIONS] <ARGV>...
+Usage: h0x-core exec [OPTIONS] <ARGV>...
 
 Arguments:
   <ARGV>...  Program and arguments, run as given (no shell)
 
 Options:
       --json               JSON output even in a terminal
-      --on <MACHINE>       Run it on another machine (see `hc machine ls`)
-      --cwd <CWD>          Working directory (default: where hc runs; through the API, the core's; with --on, that machine's home)
+      --on <MACHINE>       Run it on another machine (see `h0x-core machine ls`)
+      --cwd <CWD>          Working directory (default: where h0x-core runs; through the API, the core's; with --on, that machine's home)
       --env <K=V>          Set on top of the core's environment, key=value (repeatable)
       --timeout <TIMEOUT>  Seconds before it and everything it started are ended (default 60, at most 600)
-  -i, --stdin              Feed what is piped into hc to its stdin
+  -i, --stdin              Feed what is piped into h0x-core to its stdin
   -h, --help               Print help
 ```
 
-## hc file
+## h0x-core file
 
 ```text
 Read, write or edit a file here or on a machine: an agent's hands there
 
-Usage: hc file [OPTIONS] <COMMAND>
+Usage: h0x-core file [OPTIONS] <COMMAND>
 
 Commands:
   read   Print a text file, or lines of it (--offset, --limit)
@@ -152,67 +152,67 @@ Options:
   -h, --help  Print help
 ```
 
-## hc file edit
+## h0x-core file edit
 
 ```text
 Replace exact text found once (--old X --new Y, repeatable); all or none
 
-Usage: hc file edit [OPTIONS] --old <OLD> --new <NEW> <PATH>
+Usage: h0x-core file edit [OPTIONS] --old <OLD> --new <NEW> <PATH>
 
 Arguments:
   <PATH>  The file: absolute, or from `cwd`
 
 Options:
       --json          JSON output even in a terminal
-      --on <MACHINE>  On another machine (see `hc machine ls`)
-      --cwd <CWD>     Where a relative path starts (default: where hc runs; through the API, the core's; with --on, that machine's home)
+      --on <MACHINE>  On another machine (see `h0x-core machine ls`)
+      --cwd <CWD>     Where a relative path starts (default: where h0x-core runs; through the API, the core's; with --on, that machine's home)
       --old <OLD>     Exact text found once in the file (repeatable, paired with --new in order)
       --new <NEW>     What replaces it
   -h, --help          Print help
 ```
 
-## hc file read
+## h0x-core file read
 
 ```text
 Print a text file, or lines of it (--offset, --limit)
 
-Usage: hc file read [OPTIONS] <PATH>
+Usage: h0x-core file read [OPTIONS] <PATH>
 
 Arguments:
   <PATH>  The file: absolute, or from `cwd`
 
 Options:
       --json             JSON output even in a terminal
-      --on <MACHINE>     On another machine (see `hc machine ls`)
-      --cwd <CWD>        Where a relative path starts (default: where hc runs; through the API, the core's; with --on, that machine's home)
+      --on <MACHINE>     On another machine (see `h0x-core machine ls`)
+      --cwd <CWD>        Where a relative path starts (default: where h0x-core runs; through the API, the core's; with --on, that machine's home)
       --offset <OFFSET>  The first line to give, from 1
       --limit <LIMIT>    At most this many lines (default: all, up to 8 MB)
   -h, --help             Print help
 ```
 
-## hc file write
+## h0x-core file write
 
 ```text
 Write what is piped in as the file, making missing folders
 
-Usage: hc file write [OPTIONS] <PATH>
+Usage: h0x-core file write [OPTIONS] <PATH>
 
 Arguments:
   <PATH>  The file: absolute, or from `cwd`
 
 Options:
       --json          JSON output even in a terminal
-      --on <MACHINE>  On another machine (see `hc machine ls`)
-      --cwd <CWD>     Where a relative path starts (default: where hc runs; through the API, the core's; with --on, that machine's home)
+      --on <MACHINE>  On another machine (see `h0x-core machine ls`)
+      --cwd <CWD>     Where a relative path starts (default: where h0x-core runs; through the API, the core's; with --on, that machine's home)
   -h, --help          Print help
 ```
 
-## hc get
+## h0x-core get
 
 ```text
 Show one terminal
 
-Usage: hc get [OPTIONS] [TERMINAL]
+Usage: h0x-core get [OPTIONS] [TERMINAL]
 
 Arguments:
   [TERMINAL]  The terminal: `t7`, a name, or `machine/t7`
@@ -222,12 +222,12 @@ Options:
   -h, --help  Print help
 ```
 
-## hc interrupt
+## h0x-core interrupt
 
 ```text
 Press the stop key and report what happened
 
-Usage: hc interrupt [OPTIONS] [TERMINAL]
+Usage: h0x-core interrupt [OPTIONS] [TERMINAL]
 
 Arguments:
   [TERMINAL]  The terminal: `t7`, a name, or `machine/t7`
@@ -238,12 +238,12 @@ Options:
   -h, --help               Print help
 ```
 
-## hc keep
+## h0x-core keep
 
 ```text
 Keep a live terminal after loss (--off disables)
 
-Usage: hc keep [OPTIONS] <TERMINAL>
+Usage: h0x-core keep [OPTIONS] <TERMINAL>
 
 Arguments:
   <TERMINAL>  The terminal: `t7`, a name, or `machine/t7`
@@ -254,12 +254,12 @@ Options:
   -h, --help  Print help
 ```
 
-## hc keys
+## h0x-core keys
 
 ```text
 Press named keys (enter, esc, up, ctrl+c, alt+x, f5, a...)
 
-Usage: hc keys [OPTIONS] <TERMINAL> <KEYS>...
+Usage: h0x-core keys [OPTIONS] <TERMINAL> <KEYS>...
 
 Arguments:
   <TERMINAL>  The terminal: `t7`, a name, or `machine/t7`
@@ -270,12 +270,12 @@ Options:
   -h, --help  Print help
 ```
 
-## hc kill
+## h0x-core kill
 
 ```text
 End a terminal's program (hangup, then escalate)
 
-Usage: hc kill [OPTIONS] [TERMINAL]
+Usage: h0x-core kill [OPTIONS] [TERMINAL]
 
 Arguments:
   [TERMINAL]  The terminal: `t7`, a name, or `machine/t7`
@@ -285,12 +285,12 @@ Options:
   -h, --help  Print help
 ```
 
-## hc label
+## h0x-core label
 
 ```text
 Set labels (key=value; key= removes)
 
-Usage: hc label [OPTIONS] <TERMINAL> <K=V>...
+Usage: h0x-core label [OPTIONS] <TERMINAL> <K=V>...
 
 Arguments:
   <TERMINAL>  The terminal: `t7`, a name, or `machine/t7`
@@ -301,12 +301,12 @@ Options:
   -h, --help  Print help
 ```
 
-## hc ls
+## h0x-core ls
 
 ```text
 List live terminals
 
-Usage: hc ls [OPTIONS]
+Usage: h0x-core ls [OPTIONS]
 
 Options:
       --all          Include finished terminals
@@ -315,18 +315,18 @@ Options:
   -h, --help         Print help
 ```
 
-## hc machine
+## h0x-core machine
 
 ```text
 Other machines, reached over ssh
 
-Usage: hc machine [OPTIONS] <COMMAND>
+Usage: h0x-core machine [OPTIONS] <COMMAND>
 
 Commands:
-  add     Add a machine you reach with ssh: hc machine add vps
+  add     Add a machine you reach with ssh: h0x-core machine add vps
   ls      List the machines added here
   login   Log in again (a password or code) after the machine says it needs one. On Windows: reconnect once its SSH keys work
-  update  Copy this hc there and restart hc there (its terminals keep running)
+  update  Copy this h0x-core there and restart h0x-core there (its terminals keep running)
   rename  Give a machine a new name here
   rm      Forget a machine (its terminals keep running there)
   help    Print this message or the help of the given subcommand(s)
@@ -336,12 +336,12 @@ Options:
   -h, --help  Print help
 ```
 
-## hc machine add
+## h0x-core machine add
 
 ```text
-Add a machine you reach with ssh: hc machine add vps
+Add a machine you reach with ssh: h0x-core machine add vps
 
-Usage: hc machine add [OPTIONS] [TARGET]
+Usage: h0x-core machine add [OPTIONS] [TARGET]
 
 Arguments:
   [TARGET]  How ssh reaches it: `vps`, `can@10.0.0.7`, `can@10.0.0.7:2222`, a Host from ~/.ssh/config
@@ -349,19 +349,19 @@ Arguments:
 Options:
       --json               JSON output even in a terminal
       --via <COMMAND>      Reach it with this command instead of ssh: it is given a shell line to run there as its last argument, like ssh (`ssh -p 2222 -i key user@ip`, `fly ssh console -a app --pty=false -C`). It must pass bytes both ways untouched and ask nothing. Needs --name
-      --temp               Mark it short-lived (a sandbox for a task), so clients can show it apart from machines that stay. hc treats it like any other; remove it with `hc machine rm`
-      --install            Copy this hc there when it has none or one too old, without asking (for scripts; in a terminal you are asked)
+      --temp               Mark it short-lived (a sandbox for a task), so clients can show it apart from machines that stay. h0x-core treats it like any other; remove it with `h0x-core machine rm`
+      --install            Copy this h0x-core there when it has none or one too old, without asking (for scripts; in a terminal you are asked)
       --name <NAME>        What to call it here (default: the target's host)
-      --session <SESSION>  The hc session on that machine (default: its default)
+      --session <SESSION>  The h0x-core session on that machine (default: its default)
   -h, --help               Print help
 ```
 
-## hc machine login
+## h0x-core machine login
 
 ```text
 Log in again (a password or code) after the machine says it needs one. On Windows: reconnect once its SSH keys work
 
-Usage: hc machine login [OPTIONS] <MACHINE>
+Usage: h0x-core machine login [OPTIONS] <MACHINE>
 
 Arguments:
   <MACHINE>  The machine's name
@@ -371,24 +371,24 @@ Options:
   -h, --help  Print help
 ```
 
-## hc machine ls
+## h0x-core machine ls
 
 ```text
 List the machines added here
 
-Usage: hc machine ls [OPTIONS]
+Usage: h0x-core machine ls [OPTIONS]
 
 Options:
       --json  JSON output even in a terminal
   -h, --help  Print help
 ```
 
-## hc machine rename
+## h0x-core machine rename
 
 ```text
 Give a machine a new name here
 
-Usage: hc machine rename [OPTIONS] <MACHINE> <NEW_NAME>
+Usage: h0x-core machine rename [OPTIONS] <MACHINE> <NEW_NAME>
 
 Arguments:
   <MACHINE>   The machine's name now
@@ -399,12 +399,12 @@ Options:
   -h, --help  Print help
 ```
 
-## hc machine rm
+## h0x-core machine rm
 
 ```text
 Forget a machine (its terminals keep running there)
 
-Usage: hc machine rm [OPTIONS] <MACHINE>
+Usage: h0x-core machine rm [OPTIONS] <MACHINE>
 
 Arguments:
   <MACHINE>  The machine's name
@@ -414,12 +414,12 @@ Options:
   -h, --help  Print help
 ```
 
-## hc machine update
+## h0x-core machine update
 
 ```text
-Copy this hc there and restart hc there (its terminals keep running)
+Copy this h0x-core there and restart h0x-core there (its terminals keep running)
 
-Usage: hc machine update [OPTIONS] <MACHINE>
+Usage: h0x-core machine update [OPTIONS] <MACHINE>
 
 Arguments:
   <MACHINE>  The machine's name
@@ -429,12 +429,12 @@ Options:
   -h, --help  Print help
 ```
 
-## hc put
+## h0x-core put
 
 ```text
 Send a local file beside a terminal (on its machine); prints where it landed
 
-Usage: hc put [OPTIONS] <TERMINAL> <FILE>
+Usage: h0x-core put [OPTIONS] <TERMINAL> <FILE>
 
 Arguments:
   <TERMINAL>  The terminal: `t7`, a name, or `machine/t7`
@@ -445,12 +445,12 @@ Options:
   -h, --help  Print help
 ```
 
-## hc read
+## h0x-core read
 
 ```text
 Print a terminal's screen and history
 
-Usage: hc read [OPTIONS] [TERMINAL]
+Usage: h0x-core read [OPTIONS] [TERMINAL]
 
 Arguments:
   [TERMINAL]  The terminal: `t7`, a name, or `machine/t7`
@@ -461,12 +461,12 @@ Options:
   -h, --help           Print help
 ```
 
-## hc rm
+## h0x-core rm
 
 ```text
 Remove a finished terminal
 
-Usage: hc rm [OPTIONS] [TERMINAL]
+Usage: h0x-core rm [OPTIONS] [TERMINAL]
 
 Arguments:
   [TERMINAL]  The terminal: `t7`, a name, or `machine/t7`
@@ -476,12 +476,12 @@ Options:
   -h, --help  Print help
 ```
 
-## hc run
+## h0x-core run
 
 ```text
-Start a program, or a template by name with its task: hc run reviewer "review src/x.rs"
+Start a program, or a template by name with its task: h0x-core run reviewer "review src/x.rs"
 
-Usage: hc run [OPTIONS] [ARGV]...
+Usage: h0x-core run [OPTIONS] [ARGV]...
 
 Arguments:
   [ARGV]...  Program and arguments, or a template name and its task. With neither argv nor line: that machine's own shell
@@ -489,8 +489,8 @@ Arguments:
 Options:
       --json               JSON output even in a terminal
       --name <NAME>        Name, unique among live terminals: 1-32 of a-z 0-9 - _ 
-      --cwd <CWD>          Working directory (default: where hc runs; through the API, the core's; with --on, that machine's home)
-      --on <MACHINE>       Run it on another machine (see `hc machine ls`); its address is `machine/t7`
+      --cwd <CWD>          Working directory (default: where h0x-core runs; through the API, the core's; with --on, that machine's home)
+      --on <MACHINE>       Run it on another machine (see `h0x-core machine ls`); its address is `machine/t7`
       --label <K=V>        Labels, key=value (repeatable)
       --parent <PARENT>    Parent terminal (default: the terminal it is started from)
       --no-parent          No parent, even when started from a terminal
@@ -503,24 +503,24 @@ Options:
   -h, --help               Print help
 ```
 
-## hc schema
+## h0x-core schema
 
 ```text
 Every API method with its JSON Schema, for app builders
 
-Usage: hc schema [OPTIONS]
+Usage: h0x-core schema [OPTIONS]
 
 Options:
       --json  JSON output even in a terminal
   -h, --help  Print help
 ```
 
-## hc send
+## h0x-core send
 
 ```text
 Paste text into a terminal and press Enter (waits for a person to pause)
 
-Usage: hc send [OPTIONS] <TERMINAL> <TEXT>
+Usage: h0x-core send [OPTIONS] <TERMINAL> <TEXT>
 
 Arguments:
   <TERMINAL>  The terminal: `t7`, a name, or `machine/t7`
@@ -535,12 +535,12 @@ Options:
   -h, --help               Print help
 ```
 
-## hc server
+## h0x-core server
 
 ```text
 Start, stop or inspect the core
 
-Usage: hc server [OPTIONS] <COMMAND>
+Usage: h0x-core server [OPTIONS] <COMMAND>
 
 Commands:
   start    
@@ -554,81 +554,81 @@ Options:
   -h, --help  Print help
 ```
 
-## hc server restart
+## h0x-core server restart
 
 ```text
 Restart the core (e.g. after an update); programs keep running
 
-Usage: hc server restart [OPTIONS]
+Usage: h0x-core server restart [OPTIONS]
 
 Options:
       --json  JSON output even in a terminal
   -h, --help  Print help
 ```
 
-## hc server start
+## h0x-core server start
 
 ```text
-Usage: hc server start [OPTIONS]
+Usage: h0x-core server start [OPTIONS]
 
 Options:
       --json  JSON output even in a terminal
   -h, --help  Print help
 ```
 
-## hc server status
+## h0x-core server status
 
 ```text
-Usage: hc server status [OPTIONS]
+Usage: h0x-core server status [OPTIONS]
 
 Options:
       --json  JSON output even in a terminal
   -h, --help  Print help
 ```
 
-## hc server stop
+## h0x-core server stop
 
 ```text
-Usage: hc server stop [OPTIONS]
+Usage: h0x-core server stop [OPTIONS]
 
 Options:
       --json  JSON output even in a terminal
   -h, --help  Print help
 ```
 
-## hc templates
+## h0x-core templates
 
 ```text
-Templates you can run by name (~/.config/herdr-core/templates)
+Templates you can run by name (~/.config/h0x-core/templates)
 
-Usage: hc templates [OPTIONS]
+Usage: h0x-core templates [OPTIONS]
 
 Options:
       --json  JSON output even in a terminal
   -h, --help  Print help
 ```
 
-## hc update
+## h0x-core update
 
 ```text
-Swap this hc for another build and restart (terminals keep running)
+Swap this h0x-core for another build and restart (terminals keep running)
 
-Usage: hc update [OPTIONS]
+Usage: h0x-core update [OPTIONS]
 
 Options:
-      --from <FILE>      A herdr-core binary to use (default: download the latest release)
+      --from <FILE>      An h0x-core binary to use (default: download the latest release)
       --json             JSON output even in a terminal
-      --version <X.Y.Z>  At least this release (`0.1.4`): nothing changes when this hc is already that or newer
+      --version <X.Y.Z>  At least this release (`0.1.4`): nothing changes when this h0x-core is already that or newer
       --force            Allow an older version (saved state only moves forward), or a release of another protocol generation
   -h, --help             Print help
 ```
 
-## hc wait
+## h0x-core wait
 
 ```text
 Wait for your children (--children any) or one terminal; a message to you also ends it
 
-Usage: hc wait [OPTIONS] [TERMINAL]
+Usage: h0x-core wait [OPTIONS] [TERMINAL]
 
 Arguments:
   [TERMINAL]

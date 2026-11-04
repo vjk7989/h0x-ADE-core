@@ -19,7 +19,7 @@ pub fn remember_exe() {
     build_id();
 }
 
-/// The package manager this hc came from, or "system package manager" as a
+/// The package manager this h0x-core came from, or "system package manager" as a
 /// compatibility marker when its folder isn't writable. None for a replaceable install.
 pub fn installed_by() -> Option<&'static str> {
     let exe = EXE.get().cloned().or_else(|| std::env::current_exe().ok())?;
@@ -37,10 +37,10 @@ fn manager_of(path: &str) -> Option<&'static str> {
 #[cfg(test)]
 #[test]
 fn the_package_manager_is_read_from_the_path() {
-    assert_eq!(manager_of("/opt/homebrew/Cellar/herdr-core/0.2.0/bin/herdr-core"), Some("homebrew"));
-    assert_eq!(manager_of("/nix/store/abc-herdr-core/bin/herdr-core"), Some("nix"));
-    assert_eq!(manager_of("/home/me/.local/share/mise/installs/herdr-core/0.2.0/herdr-core"), Some("mise"));
-    assert_eq!(manager_of("/home/me/.local/bin/herdr-core"), None);
+    assert_eq!(manager_of("/opt/homebrew/Cellar/h0x-core/0.2.0/bin/h0x-core"), Some("homebrew"));
+    assert_eq!(manager_of("/nix/store/abc-h0x-core/bin/h0x-core"), Some("nix"));
+    assert_eq!(manager_of("/home/me/.local/share/mise/installs/h0x-core/0.2.0/h0x-core"), Some("mise"));
+    assert_eq!(manager_of("/home/me/.local/bin/h0x-core"), None);
 }
 
 /// Which build this process runs: the linker's build id, so a copy of the same
@@ -109,7 +109,7 @@ fn listening_elsewhere(paths: &Paths) -> Option<RpcError> {
     Some(RpcError::new(
         "unavailable",
         format!("the core listens at {}, but this shell looks at {}", actual.display(), paths.socket.display()),
-        "XDG_RUNTIME_DIR or HC_SOCKET differs from where the core started; set HC_SOCKET to the first path",
+        "XDG_RUNTIME_DIR or H0X_CORE_SOCKET differs from where the core started; set H0X_CORE_SOCKET to the first path",
     ))
 }
 
@@ -168,7 +168,7 @@ pub fn spawn_core(paths: &Paths) -> Result<(), RpcError> {
     spawn_detached(paths, &["serve"], "core.log").map_err(|e| unavailable(format!("cannot start core: {e}")))
 }
 
-/// Starts `herdr-core <args>` on its own (Linux: as a user service), logging
+/// Starts `h0x-core <args>` on its own (Linux: as a user service), logging
 /// to the state dir.
 pub fn spawn_detached(paths: &Paths, args: &[&str], log: &str) -> std::io::Result<()> {
     paths.create_dirs()?;
@@ -247,10 +247,10 @@ pub fn call(stream: &Stream, method: &str, params: Value) -> Result<Value, RpcEr
     }
 }
 
-/// The hc terminal we run in, if it belongs to the core we talk to: its id
+/// The h0x-core terminal we run in, if it belongs to the core we talk to: its id
 /// means nothing to another session's core.
 pub fn terminal_id() -> Option<String> {
-    let own_core = std::env::var_os("HC_TERMINAL_SOCKET")
+    let own_core = std::env::var_os("H0X_TERMINAL_SOCKET")
         .is_none_or(|s| Paths::from_env().is_ok_and(|p| p.socket.as_os_str() == s));
-    std::env::var("HC_TERMINAL_ID").ok().filter(|_| own_core)
+    std::env::var("H0X_TERMINAL_ID").ok().filter(|_| own_core)
 }

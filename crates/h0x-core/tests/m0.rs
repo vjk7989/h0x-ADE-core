@@ -3,7 +3,7 @@
 mod common;
 
 use common::*;
-use herdr_core::wire;
+use h0x_core::wire;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::Stdio;
@@ -118,16 +118,16 @@ fn the_schema_is_openrpc_and_the_committed_file_matches_the_code() {
     assert_eq!(argv["required"], false, "none: that machine's own shell: {argv}");
 
     // The committed schema is the code's: an API change is always a visible diff.
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../schema/hc.openrpc.json");
-    let generated = serde_json::to_string_pretty(&herdr_core::api::openrpc()).unwrap() + "\n";
-    if std::env::var_os("HC_UPDATE_SCHEMA").is_some() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../schema/h0x-core.openrpc.json");
+    let generated = serde_json::to_string_pretty(&h0x_core::api::openrpc()).unwrap() + "\n";
+    if std::env::var_os("H0X_CORE_UPDATE_SCHEMA").is_some() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &generated).unwrap();
     }
     let committed = std::fs::read_to_string(&path).unwrap_or_default();
     assert!(
         committed == generated,
-        "schema/hc.openrpc.json is stale: review the API change, then HC_UPDATE_SCHEMA=1 cargo test"
+        "schema/h0x-core.openrpc.json is stale: review the API change, then H0X_CORE_UPDATE_SCHEMA=1 cargo test"
     );
     assert_eq!(full, serde_json::from_str::<Value>(&committed).unwrap(), "the core serves the same document");
 }
@@ -176,9 +176,9 @@ fn connect_carries_the_protocol_over_stdio() {
 #[test]
 fn help_is_for_people_and_points_agents_to_their_own() {
     let s = Session::new();
-    let out = |args: &[&str]| String::from_utf8(s.hc(args).stdout).unwrap();
+    let out = |args: &[&str]| String::from_utf8(s.core(args).stdout).unwrap();
     let help = out(&["--help"]);
-    assert!(help.trim_end().ends_with("Agent? Run: hc --skill"), "{help}");
+    assert!(help.trim_end().ends_with("Agent? Run: h0x-core --skill"), "{help}");
     assert_eq!(out(&["help"]), help);
     assert_eq!(out(&["-h"]), help);
     let agent = out(&["--skill"]);
@@ -188,18 +188,18 @@ fn help_is_for_people_and_points_agents_to_their_own() {
     let names =
         |text: &str, name: &str| text.split(|c: char| !c.is_ascii_alphanumeric() && c != '-').any(|word| word == name);
     let for_people = ["events", "connect", "server", "schema", "update"];
-    for name in herdr_core::cli::command_names() {
+    for name in h0x_core::cli::command_names() {
         assert!(names(&help, &name), "help misses `{name}`");
         assert!(for_people.contains(&name.as_str()) || names(&agent, &name), "skill misses `{name}`");
     }
     // Per-command help is still there.
-    assert!(String::from_utf8(s.hc(&["run", "--help"]).stdout).unwrap().contains("--outlive-parent"));
+    assert!(String::from_utf8(s.core(&["run", "--help"]).stdout).unwrap().contains("--outlive-parent"));
 }
 
 #[test]
 fn hc_carries_the_license_of_everything_it_includes() {
     let s = Session::new();
-    let notices = String::from_utf8(s.hc(&["--licenses"]).stdout).unwrap();
+    let notices = String::from_utf8(s.core(&["--licenses"]).stdout).unwrap();
     assert!(notices.contains("Mitchell Hashimoto, Ghostty contributors"), "libghostty-vt's own");
     let inputs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../distribution/notices");
     for entry in std::fs::read_dir(inputs).unwrap() {

@@ -1,3 +1,3 @@
 fn main() {
-    std::process::exit(herdr_core::cli::main());
+    std::process::exit(h0x_core::cli::main());
 }

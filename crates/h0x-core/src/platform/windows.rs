@@ -151,7 +151,7 @@ pub fn connect(path: &Path) -> io::Result<Stream> {
     for _ in 0..50 {
         let h = unsafe {
             // Identification only: whoever serves this name can't act as us
-            // (a fake core can't borrow an elevated hc's rights).
+            // (a fake core can't borrow an elevated h0x-core's rights).
             let flags = FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION;
             CreateFileW(name.as_ptr(), GENERIC_READ | GENERIC_WRITE, 0, null(), OPEN_EXISTING, flags, null_mut())
         };
@@ -170,7 +170,7 @@ pub fn connect(path: &Path) -> io::Result<Stream> {
 /// Who may open our pipes: this account and SYSTEM (the default also lets
 /// everyone read, and names Administrators as owner when elevated). The
 /// integrity label keeps lower processes out: an unelevated program can't
-/// drive an elevated hc.
+/// drive an elevated h0x-core.
 fn pipe_security() -> io::Result<*const SECURITY_ATTRIBUTES> {
     use windows_sys::Win32::Security::Authorization::*;
     use windows_sys::Win32::Security::*;
@@ -249,13 +249,13 @@ pub fn connect_error(error: &io::Error, existing_only: bool) -> Option<crate::rp
         Some(crate::rpc::RpcError::new(
             "unavailable",
             format!("the Windows core exists but this process cannot access its pipe: {error}"),
-            "if it was started elevated or over SSH, stop it with 'hc server stop' in an elevated terminal on that Windows machine, then open Herdr or run 'hc server start' in a normal desktop terminal",
+            "if it was started elevated or over SSH, stop it with 'h0x-core server stop' in an elevated terminal on that Windows machine, then open HyperOx or run 'h0x-core server start' in a normal desktop terminal",
         ))
     } else if existing_only {
         Some(crate::rpc::RpcError::new(
             "unavailable",
             format!("the Windows core is not reachable: {error}"),
-            "open Herdr on that Windows machine, or run 'hc server start' there",
+            "open HyperOx on that Windows machine, or run 'h0x-core server start' there",
         ))
     } else {
         None
@@ -349,7 +349,7 @@ pub const MAX_SOCKET_PATH: usize = 256;
 pub fn endpoints(_state: &Path) -> (PathBuf, String) {
     let user: String =
         std::env::var("USERNAME").unwrap_or_default().chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-    (PathBuf::from(r"\\.\pipe\"), format!("herdr-core-{user}-"))
+    (PathBuf::from(r"\\.\pipe\"), format!("h0x-core-{user}-"))
 }
 
 pub fn private_dir(path: &Path) -> io::Result<()> {
@@ -381,15 +381,14 @@ pub fn make_executable(_: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// The files of a release, as they sit beside herdr-core.exe.
-const RELEASE: [&str; 3] = ["herdr-core.exe", r"conpty\conpty.dll", r"conpty\x64\OpenConsole.exe"];
+/// The files of a release, as they sit beside h0x-core.exe.
+const RELEASE: [&str; 3] = ["h0x-core.exe", r"conpty\conpty.dll", r"conpty\x64\OpenConsole.exe"];
 
-/// Puts the release whose herdr-core.exe is `from` where `dest`'s folder
+/// Puts the release whose h0x-core.exe is `from` where `dest`'s folder
 /// is. Windows won't overwrite a running file but will rename one: every
 /// file is staged and checked first, then each old one is moved aside and
 /// the new one moved in; any failure moves everything back. Moved-aside
-/// files go on the next update. `hc.exe`, if it is a link to herdr-core.exe,
-/// is linked to the new one.
+/// files go on the next update.
 pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::Result<()> {
     let dir = dest.parent().ok_or_else(|| io::Error::other("no folder"))?;
     let src = from.parent().ok_or_else(|| io::Error::other("no folder"))?;
@@ -416,7 +415,7 @@ pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::R
                     && hex.bytes().all(|b| b.is_ascii_hexdigit())
             })
         };
-        let ours = ["herdr-core.exe", "conpty.dll", "openconsole.exe", "hc.exe"]
+        let ours = ["h0x-core.exe", "conpty.dll", "openconsole.exe"]
             .iter()
             .flat_map(|f| ["old", "new", "failed"].map(|w| format!("{f}.{w}-")))
             .any(|prefix| name.strip_prefix(&prefix).is_some_and(tagged));
@@ -426,10 +425,6 @@ pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::R
     }
     let tag = format!("{}-{}", std::process::id(), crate::platform::random_hex());
     let aside = |p: &Path, what: &str| PathBuf::from(format!("{}.{what}-{tag}", p.display()));
-    let exe = dir.join(RELEASE[0]);
-    let hc = dir.join("hc.exe");
-    let linked = |a: &Path, b: &Path| matches!((std::fs::metadata(a), std::fs::metadata(b)), (Ok(a), Ok(b)) if file_identity(&a) == file_identity(&b));
-    let hc_ours = linked(&hc, &exe);
 
     // (staged, final) pairs, all staged before anything moves.
     let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -450,10 +445,6 @@ pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::R
         staged = stage()?;
         if !staged.first().is_some_and(|(s, _)| works(s)) {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
-        }
-        if hc_ours {
-            std::fs::hard_link(&staged[0].0, aside(&hc, "new"))?;
-            staged.push((aside(&hc, "new"), hc.clone()));
         }
         Ok(())
     })();
@@ -593,7 +584,7 @@ pub fn spawn_detached(cmd: Command, log: File) -> io::Result<()> {
             if std::env::var_os("SSH_CONNECTION").is_some() && job_kills_on_close() {
                 DeleteProcThreadAttributeList(list);
                 return Err(io::Error::other(
-                    "this ssh session ends everything it started when you log out, and won't let hc leave: start hc once outside ssh (hc server start in a local terminal), then ssh in",
+                    "this ssh session ends everything it started when you log out, and won't let h0x-core leave: start h0x-core once outside ssh (h0x-core server start in a local terminal), then ssh in",
                 ));
             }
             started = start(flags);
@@ -701,7 +692,7 @@ struct ConPty {
     close: ClosePc,
 }
 
-/// The ConPTY shipped beside hc (`conpty\conpty.dll`): Windows' own drops
+/// The ConPTY shipped beside h0x-core (`conpty\conpty.dll`): Windows' own drops
 /// input escape sequences agents answer with. Windows' own if none is there.
 /// A broken or incompatible one fails each start, never the process.
 fn conpty() -> io::Result<&'static ConPty> {
@@ -944,7 +935,7 @@ pub fn spawn_pty(
         let console = Arc::new(PseudoConsole(std::sync::Mutex::new(Some(hpc as usize))));
 
         // Everything it starts goes with it: killed when the job's last handle
-        // closes (us, or the holder dying). Breakaway lets hc's own core and
+        // closes (us, or the holder dying). Breakaway lets h0x-core's own core and
         // holders, started from inside, outlive it.
         let job = CreateJobObjectW(null(), null());
         if job.is_null() {

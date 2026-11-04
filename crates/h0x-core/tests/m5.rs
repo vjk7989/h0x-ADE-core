@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 fn session() -> Session {
     let mut s = Session::new();
-    s.env.push(("HC_QUIET_MS".into(), "0".into()));
-    s.env.push(("HC_STARTED_MS".into(), "1500".into()));
+    s.env.push(("H0X_CORE_QUIET_MS".into(), "0".into()));
+    s.env.push(("H0X_CORE_STARTED_MS".into(), "1500".into()));
     s
 }
 
@@ -22,7 +22,7 @@ fn state(s: &Session, t: &str) -> Value {
     s.json(&["get", t])["status"]["state"].clone()
 }
 
-/// Starts `hc wait <args>` in the background; join to get its JSON reply.
+/// Starts `h0x-core wait <args>` in the background; join to get its JSON reply.
 fn wait_bg(s: &Session, args: &[&str]) -> std::thread::JoinHandle<Value> {
     let mut cmd = s.cmd();
     cmd.arg("wait").args(args).args(["--timeout", "10"]);

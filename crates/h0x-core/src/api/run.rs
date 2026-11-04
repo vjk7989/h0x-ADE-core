@@ -67,7 +67,7 @@ pub(crate) fn tail(text: String, id: u32) -> String {
     }
     let from = text[from..].find('\n').map_or(from, |at| from + at + 1);
     format!(
-        "[hc] earlier output cut: hc read {} --lines {FINISHED_LINES}\n{}",
+        "[h0x-core] earlier output cut: h0x-core read {} --lines {FINISHED_LINES}\n{}",
         crate::terminals::address(id),
         &text[from..]
     )
@@ -91,7 +91,7 @@ pub(super) async fn start(
         RpcError::new(
             "unavailable",
             format!("no holder: {e}"),
-            "run hc server restart on this machine, then retry; see holder.log and core.log in the state directory",
+            "run h0x-core server restart on this machine, then retry; see holder.log and core.log in the state directory",
         )
     })?;
     let settings = crate::config::load(&core.paths.config)?;
@@ -132,7 +132,7 @@ pub(super) async fn start(
                 RpcError::new(
                     "unavailable",
                     "no holder: the holder disconnected before the terminal could start",
-                    "retry; if it keeps failing, run hc server restart on this machine and check holder.log",
+                    "retry; if it keeps failing, run h0x-core server restart on this machine and check holder.log",
                 )
             })?
             .instance
@@ -168,7 +168,7 @@ pub(super) async fn start(
         st.link(id).expect("assigned holder").send(&proto::json_frame(proto::SPAWN, id, &spawn));
         (id, rx)
     };
-    let spawn_ms = std::env::var("HC_SPAWN_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(10_000);
+    let spawn_ms = std::env::var("H0X_CORE_SPAWN_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(10_000);
     let spawned = tokio::time::timeout(Duration::from_millis(spawn_ms), rx).await;
     let mut st = core.lock();
     match spawned {
@@ -205,8 +205,8 @@ pub(crate) fn terminal_env(
     cwd: &str,
     mut env: BTreeMap<String, String>,
 ) -> (BTreeMap<String, String>, String) {
-    env.insert("HC_TERMINAL_ID".into(), crate::terminals::address(id));
-    env.insert("HC_TERMINAL_SOCKET".into(), core.paths.socket.display().to_string());
+    env.insert("H0X_TERMINAL_ID".into(), crate::terminals::address(id));
+    env.insert("H0X_TERMINAL_SOCKET".into(), core.paths.socket.display().to_string());
     let scope = crate::sweep::token();
     env.insert(crate::sweep::VAR.into(), scope.clone());
     // Preserve the requested spelling, including symlinks.
@@ -221,19 +221,19 @@ pub(crate) fn child_env(base: BTreeMap<String, String>, extra: BTreeMap<String, 
         .into_iter()
         .filter(|(k, _)| {
             !IDENTITY_VARS.contains(&k.as_str())
-                && !["HC_TERMINAL_ID", crate::sweep::VAR, crate::sweep::RUNTIME].contains(&k.as_str())
+                && !["H0X_TERMINAL_ID", crate::sweep::VAR, crate::sweep::RUNTIME].contains(&k.as_str())
         })
         .collect();
     crate::platform::merge_env(&mut env, extra);
-    if let Ok(session) = std::env::var("HC_SESSION") {
-        env.insert("HC_SESSION".into(), session);
+    if let Ok(session) = std::env::var("H0X_CORE_SESSION") {
+        env.insert("H0X_CORE_SESSION".into(), session);
     }
     if let Some(lang) = crate::locale::for_programs(&env) {
         env.insert("LANG".into(), lang); // a core started from Finder has none
     }
     env.entry("TERM".into()).or_insert_with(|| "xterm-256color".into());
     env.entry("COLORTERM".into()).or_insert_with(|| "truecolor".into());
-    if env.get("TERM_PROGRAM").is_none_or(|p| p == "herdr") {
+    if env.get("TERM_PROGRAM").is_none_or(|p| p == "h0x") {
         env.insert("TERM_PROGRAM".into(), "ghostty".into());
         env.remove("TERM_PROGRAM_VERSION"); // the version belonged to whatever we replaced
     }
@@ -246,7 +246,7 @@ mod tests {
     fn a_long_output_keeps_whole_lines_from_its_end_even_mid_character() {
         let text = "é".repeat(30_000) + "\nlast line";
         let cut = super::tail(text, 7);
-        assert!(cut.starts_with("[hc] earlier output cut: hc read t7") && cut.ends_with("\nlast line"));
+        assert!(cut.starts_with("[h0x-core] earlier output cut: h0x-core read t7") && cut.ends_with("\nlast line"));
         assert_eq!(super::tail("short".into(), 7), "short");
     }
 }

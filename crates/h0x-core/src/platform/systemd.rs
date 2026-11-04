@@ -58,7 +58,7 @@ fn manager() -> Result<PathBuf, bool> {
     }
 }
 
-const NO_MANAGER: &str = "hc: no systemd user manager here: the core ends with whatever started it";
+const NO_MANAGER: &str = "h0x-core: no systemd user manager here: the core ends with whatever started it";
 
 /// Starts `cmd` as a user service with stderr appended to `log`. None: no
 /// user manager here, start it the plain way.
@@ -75,7 +75,7 @@ pub fn spawn(cmd: &Command, log: &Path) -> Option<io::Result<()>> {
     let guarded = match ensure_shutdown_guard(&run, log) {
         Ok(()) => true,
         Err(e) => {
-            eprintln!("hc: {e}; starting without shutdown ordering");
+            eprintln!("h0x-core: {e}; starting without shutdown ordering");
             false
         }
     };
@@ -94,7 +94,8 @@ pub fn spawn(cmd: &Command, log: &Path) -> Option<io::Result<()>> {
     let mut env = service_env(caller);
     env.insert("XDG_RUNTIME_DIR".into(), run.display().to_string());
     let args: Vec<&OsStr> = cmd.get_args().collect();
-    let name = format!("hc-{}-{}", args.first().and_then(|a| a.to_str()).unwrap_or("run"), &super::random_hex()[..8]);
+    let name =
+        format!("h0x-core-{}-{}", args.first().and_then(|a| a.to_str()).unwrap_or("run"), &super::random_hex()[..8]);
     let here = std::env::current_dir().ok().filter(|d| d.is_dir()).unwrap_or_else(|| PathBuf::from("/"));
     static VERSION: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let version = *VERSION.get_or_init(|| {
@@ -146,7 +147,7 @@ fn shutdown_guard(log: &Path) -> String {
         .as_encoded_bytes()
         .iter()
         .fold(0xcbf29ce484222325u64, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3));
-    format!("hc-shutdown-{hash:016x}.service")
+    format!("h0x-core-shutdown-{hash:016x}.service")
 }
 
 fn ensure_shutdown_guard(run: &Path, log: &Path) -> io::Result<()> {
@@ -229,7 +230,7 @@ fn service_env(mut env: BTreeMap<String, String>) -> BTreeMap<String, String> {
     env
 }
 
-/// systemd-run's arguments for one hc service, without environment values.
+/// systemd-run's arguments for one h0x-core service, without environment values.
 /// OOMPolicy: a program killed for memory must not stop the whole service.
 /// No ManagedOOMPreference: systemd rewrites its cgroup xattr on every property
 /// change, and uresourced < 0.5.5 answers each rewrite with another change,
@@ -270,7 +271,7 @@ fn literal(arg: &OsStr) -> OsString {
     arg.to_string_lossy().replace('$', "$$").into()
 }
 
-/// Without linger the user manager, and every hc service with it, stops when
+/// Without linger the user manager, and every h0x-core service with it, stops when
 /// the user's last login ends.
 fn linger() {
     let user = unsafe {
@@ -292,7 +293,7 @@ fn linger() {
 }
 
 fn enable_linger(mut command: Command, user: String) -> io::Result<std::thread::JoinHandle<()>> {
-    std::thread::Builder::new().name("hc-linger".into()).spawn(move || {
+    std::thread::Builder::new().name("h0x-core-linger".into()).spawn(move || {
         let enabled = command
             .args(["--no-ask-password", "enable-linger", &user])
             .stdin(Stdio::null())
@@ -301,9 +302,11 @@ fn enable_linger(mut command: Command, user: String) -> io::Result<std::thread::
             .status()
             .is_ok_and(|s| s.success());
         if enabled {
-            eprintln!("hc: turned on linger for {user}, so the core outlives your logins");
+            eprintln!("h0x-core: turned on linger for {user}, so the core outlives your logins");
         } else {
-            eprintln!("hc: the core stops when your last login ends; `sudo loginctl enable-linger {user}` keeps it");
+            eprintln!(
+                "h0x-core: the core stops when your last login ends; `sudo loginctl enable-linger {user}` keeps it"
+            );
         }
     })
 }
@@ -351,7 +354,7 @@ mod tests {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "sleep 1"]);
         let start = std::time::Instant::now();
-        let worker = super::enable_linger(command, "hc-test".into()).unwrap();
+        let worker = super::enable_linger(command, "h0x-core-test".into()).unwrap();
         let elapsed = start.elapsed();
         worker.join().unwrap();
         assert!(elapsed < std::time::Duration::from_millis(500), "loginctl blocked startup");
@@ -359,22 +362,23 @@ mod tests {
 
     #[test]
     fn missing_loginctl_is_best_effort() {
-        let worker = super::enable_linger(Command::new("/no-such-hc-test-loginctl"), "hc-test".into()).unwrap();
+        let worker =
+            super::enable_linger(Command::new("/no-such-h0x-core-test-loginctl"), "h0x-core-test".into()).unwrap();
         worker.join().unwrap();
     }
 
     #[test]
     fn a_service_keeps_the_callers_paths_but_not_its_ssh_login() {
         let ssh = super::service_env(map(&[
-            ("HC_SESSION", "dev"),
+            ("H0X_CORE_SESSION", "dev"),
             ("PATH", "/home/u/.local/bin"),
             ("SSH_CONNECTION", "100.1.1.1 1 100.2.2.2 22"),
             ("SSH_AUTH_SOCK", "/tmp/ssh-x/agent.1"),
             ("INVOCATION_ID", "abc"),
-            ("RUNTIME_DIRECTORY", "/run/user/1/hc-serve-12345678"),
+            ("RUNTIME_DIRECTORY", "/run/user/1/h0x-core-serve-12345678"),
             ("BASH_FUNC_f%%", "() { :; }"),
         ]));
-        assert_eq!(ssh.keys().collect::<Vec<_>>(), ["HC_SESSION", "PATH"]);
+        assert_eq!(ssh.keys().collect::<Vec<_>>(), ["H0X_CORE_SESSION", "PATH"]);
         let desktop = super::service_env(map(&[("DISPLAY", ":0"), ("PATH", "/usr/bin")]));
         assert!(desktop.contains_key("DISPLAY"), "a desktop that doesn't tell systemd keeps its display");
     }
@@ -383,9 +387,9 @@ mod tests {
     fn a_service_command_line_holds_no_values_and_no_expansions() {
         let socket = OsStr::new("/run/${USER}.sock");
         let args = super::unit_args(
-            "hc-hold-1",
-            Path::new("/run/user/1/hc-hold-1/environment"),
-            &["HC_SCOPE"],
+            "h0x-core-hold-1",
+            Path::new("/run/user/1/h0x-core-hold-1/environment"),
+            &["H0X_CORE_SCOPE"],
             Path::new("/s/x.log"),
             Path::new("/"),
             259,
@@ -393,11 +397,11 @@ mod tests {
         let args: Vec<String> = args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
         assert!(!args.iter().any(|a| a.contains("secret-canary")), "{args:?}");
         for want in [
-            "EnvironmentFile=/run/user/1/hc-hold-1/environment",
-            "RuntimeDirectory=hc-hold-1",
+            "EnvironmentFile=/run/user/1/h0x-core-hold-1/environment",
+            "RuntimeDirectory=h0x-core-hold-1",
             "RuntimeDirectoryMode=0700",
             "RuntimeDirectoryPreserve=restart",
-            "UnsetEnvironment=HC_SCOPE",
+            "UnsetEnvironment=H0X_CORE_SCOPE",
             "OOMPolicy=continue",
             "WorkingDirectory=/",
         ] {
@@ -410,8 +414,8 @@ mod tests {
     #[test]
     fn el8_services_keep_the_callers_directory_without_newer_options() {
         let args = super::unit_args(
-            "hc-serve-1",
-            Path::new("/run/user/1/hc-serve-1/environment"),
+            "h0x-core-serve-1",
+            Path::new("/run/user/1/h0x-core-serve-1/environment"),
             &[],
             Path::new("/s/x.log"),
             Path::new("/home/user/my project/a%hb"),
@@ -424,14 +428,15 @@ mod tests {
 
     #[test]
     fn shutdown_stops_every_core_before_its_holders_even_after_a_restart() {
-        let order =
-            |command: &str, log: &str| super::shutdown_order(Command::new("/bin/hc").arg(command), Path::new(log));
+        let order = |command: &str, log: &str| {
+            super::shutdown_order(Command::new("/bin/h0x-core").arg(command), Path::new(log))
+        };
         let first = order("serve", "/state/session/core.log");
         let next = order("serve", "/state/session/core.log");
         let holder = order("hold", "/state/session/holder.log");
-        let guard = first.to_str().unwrap().strip_prefix("After=hc-shutdown-").expect("core after guard");
+        let guard = first.to_str().unwrap().strip_prefix("After=h0x-core-shutdown-").expect("core after guard");
         assert_eq!(next, first, "new cores reuse the guard");
-        assert_eq!(holder, OsStr::new(&format!("Before=hc-shutdown-{guard}")), "holder stops last");
+        assert_eq!(holder, OsStr::new(&format!("Before=h0x-core-shutdown-{guard}")), "holder stops last");
         assert_ne!(order("serve", "/state/other/core.log"), first, "sessions stay separate");
     }
 
@@ -450,7 +455,7 @@ mod tests {
     #[test]
     fn environment_file_and_directory_are_private() {
         use std::os::unix::fs::PermissionsExt;
-        let name = format!("hc-env-test-{}", super::super::random_hex());
+        let name = format!("h0x-core-env-test-{}", super::super::random_hex());
         let dir =
             super::write_environment(Path::new("/var/tmp"), &name, &map(&[("API_KEY", "secret-canary")])).unwrap();
         let file = dir.join("environment");

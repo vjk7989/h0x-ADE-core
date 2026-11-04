@@ -66,7 +66,7 @@ pub fn who(t: &Terminal) -> String {
 }
 
 /// What a child can't say itself: it is blocked, it hit an error, or it is
-/// gone. Everything else it reports with hc send. `address`: the child as
+/// gone. Everything else it reports with h0x-core send. `address`: the child as
 /// its parent calls it (`rohan/t7` from another machine). `last`: the last
 /// lines of a plain program that ended, shown before where to read more.
 fn note(t: &Terminal, address: &str, last: &[String]) -> String {
@@ -92,7 +92,7 @@ fn note(t: &Terminal, address: &str, last: &[String]) -> String {
         true => ". ".to_string(),
         false => format!(". Last lines:\n{}\n", last.join("\n")),
     };
-    format!("<hc>{address}{name} {what}{gap}{look}: hc read {address}</hc>")
+    format!("<h0x>{address}{name} {what}{gap}{look}: h0x-core read {address}</h0x>")
 }
 
 impl Core {
@@ -140,7 +140,7 @@ impl Core {
     /// a tag that says who sent it. As is when either isn't an agent: a person,
     /// a shell, a dialog. `reach`: also say how to answer (a worker's first message).
     pub fn tagged(&self, from: Option<&str>, to: u32, text: &str, reach: bool) -> String {
-        // `notes = false`: nothing hc adds on its own, tags included.
+        // `notes = false`: nothing h0x-core adds on its own, tags included.
         if !self.notes_on() {
             return text.to_string();
         }
@@ -151,13 +151,17 @@ impl Core {
         if let Some(afar) = from.filter(|f| f.contains('/'))
             && target.is_some_and(|t| t.reported)
         {
-            return format!("<hc from=\"{afar}\">{text}</hc>");
+            return format!("<h0x from=\"{afar}\">{text}</h0x>");
         }
         match sender.filter(|s| s.reported && target.is_some_and(|t| t.reported)) {
             Some(s) if reach => {
-                format!("<hc from=\"{}\" reach=\"hc send {} when done or stuck\">{text}</hc>", who(s), s.address)
+                format!(
+                    "<h0x from=\"{}\" reach=\"h0x-core send {} when done or stuck\">{text}</h0x>",
+                    who(s),
+                    s.address
+                )
             }
-            Some(s) => format!("<hc from=\"{}\">{text}</hc>", who(s)),
+            Some(s) => format!("<h0x from=\"{}\">{text}</h0x>", who(s)),
             None => text.to_string(),
         }
     }
@@ -329,26 +333,26 @@ mod tests {
         });
         t.status.as_mut().unwrap().state = "blocked".into();
         t.status.as_mut().unwrap().kind = Some("permission".into());
-        assert_eq!(note(t, "t1", &[]), "<hc>t1 reviewer is blocked (permission). See: hc read t1</hc>");
+        assert_eq!(note(t, "t1", &[]), "<h0x>t1 reviewer is blocked (permission). See: h0x-core read t1</h0x>");
         t.status.as_mut().unwrap().state = "error".into();
         t.status.as_mut().unwrap().msg = format!("rate limited\n{}", "x".repeat(500));
         assert_eq!(
             note(t, "t1", &[]),
-            "<hc>t1 reviewer hit an error: rate limited. See: hc read t1</hc>",
+            "<h0x>t1 reviewer hit an error: rate limited. See: h0x-core read t1</h0x>",
             "its first line"
         );
         t.status.as_mut().unwrap().msg.clear();
-        assert_eq!(note(t, "t1", &[]), "<hc>t1 reviewer hit an error. See: hc read t1</hc>");
+        assert_eq!(note(t, "t1", &[]), "<h0x>t1 reviewer hit an error. See: h0x-core read t1</h0x>");
         r.finish(id, Some(3), None, "exited", 1);
         assert_eq!(
             note(&r.terminals[&id], "rohan/t1", &[]),
-            "<hc>rohan/t1 reviewer exited (exit 3). Read: hc read rohan/t1</hc>"
+            "<h0x>rohan/t1 reviewer exited (exit 3). Read: h0x-core read rohan/t1</h0x>"
         );
         let last = last_lines("a\n\n  \nb\x1b[201~\tc\n");
         assert_eq!(last, ["a", "b[201~\tc"], "blanks and control characters dropped");
         assert_eq!(
             note(&r.terminals[&id], "t1", &last),
-            "<hc>t1 reviewer exited (exit 3). Last lines:\na\nb[201~\tc\nRead: hc read t1</hc>"
+            "<h0x>t1 reviewer exited (exit 3). Last lines:\na\nb[201~\tc\nRead: h0x-core read t1</h0x>"
         );
     }
 }

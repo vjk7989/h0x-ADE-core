@@ -9,7 +9,7 @@ use std::io::BufRead;
 #[test]
 fn what_runs_in_a_terminal_and_where_is_on_its_record_and_evented() {
     let mut s = Session::new();
-    s.env.push(("HC_FOREGROUND_MS".into(), "50".into()));
+    s.env.push(("H0X_CORE_FOREGROUND_MS".into(), "50".into()));
     let sub = s.root.join("sub");
     std::fs::create_dir(&sub).unwrap();
     let t = run(&s, &["sh", "-c", &script(&s, &format!("w go; cd {}; exec sleep 100", sub.display()))]);

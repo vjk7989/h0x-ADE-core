@@ -1,12 +1,12 @@
-//! `hc update`: swap this hc for another build, keep the terminals running.
+//! `h0x-core update`: swap this h0x-core for another build, keep the terminals running.
 
 use super::*;
 
-/// What a binary says it is (`hc 0.2.0`), if it is a working hc.
+/// What a binary says it is (`h0x-core 0.2.0`), if it is a working h0x-core.
 pub(super) fn version_of(path: &std::path::Path) -> Option<String> {
     let out = std::process::Command::new(path).arg("--version").stdin(std::process::Stdio::null()).output().ok()?;
     let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (out.status.success() && v.starts_with("hc ")).then_some(v)
+    (out.status.success() && v.starts_with("h0x-core ")).then_some(v)
 }
 
 /// A release name for `--version`: `0.1.4` (it goes into a URL).
@@ -20,10 +20,10 @@ pub(super) fn release_version(s: &str) -> Result<String, String> {
     }
 }
 
-/// `hc 0.1.9` is older than `hc 0.2.0`; anything unparsed is not older.
+/// `h0x-core 0.1.9` is older than `h0x-core 0.2.0`; anything unparsed is not older.
 pub(super) fn older(a: &str, b: &str) -> bool {
     let parts = |v: &str| -> Option<Vec<u64>> {
-        v.strip_prefix("hc ")?.split(['.', '-']).take(3).map(|p| p.parse().ok()).collect()
+        v.strip_prefix("h0x-core ")?.split(['.', '-']).take(3).map(|p| p.parse().ok()).collect()
     };
     matches!((parts(a), parts(b)), (Some(a), Some(b)) if a < b)
 }
@@ -31,11 +31,11 @@ pub(super) fn older(a: &str, b: &str) -> bool {
 /// The installed binary can be current while a core started before it was
 /// replaced is still running. Do not start a core just to check its version.
 pub(super) fn up_to_date(paths: &Paths, release: &str, human: String) -> Result<Out, RpcError> {
-    let this = format!("hc {}", env!("CARGO_PKG_VERSION"));
+    let this = format!("h0x-core {}", env!("CARGO_PKG_VERSION"));
     let mut out = Out { json: json!({"release": release, "now": this, "updated": false}), human };
     if let Some(stream) = client::connect_existing(paths) {
         let status = client::call(&stream, "server.status", json!({}))?;
-        if older(&format!("hc {}", status["version"].as_str().unwrap_or_default()), &this) {
+        if older(&format!("h0x-core {}", status["version"].as_str().unwrap_or_default()), &this) {
             client::call(&stream, "server.restart", json!({}))?;
             wait_closed(&stream);
             let status = call(paths, "server.status", json!({}))?;
@@ -47,33 +47,26 @@ pub(super) fn up_to_date(paths: &Paths, release: &str, human: String) -> Result<
     Ok(out)
 }
 
-/// Swaps the binary this hc runs from for `from`, then restarts the core
+/// Swaps the binary this h0x-core runs from for `from`, then restarts the core
 /// the planned way: every terminal keeps running. One swap path, for people
-/// and for apps that bundle hc.
+/// and for apps that bundle h0x-core.
 pub(super) fn update(paths: &Paths, from: &std::path::Path, force: bool) -> Result<Out, RpcError> {
     let refused = |why: String, hint: &str| RpcError::new("refused", why, hint);
     let dest = std::env::current_exe().and_then(|e| e.canonicalize()).map_err(|e| RpcError::internal(e.to_string()))?;
     let shown = dest.display().to_string();
     if let Some(manager) = client::installed_by() {
         let how = match manager {
-            "homebrew" => "brew upgrade herdr-core",
             "nix" => "update it in your Nix configuration",
-            "mise" => "mise upgrade herdr-core",
-            _ => {
-                return Err(refused(
-                    format!("{} isn't writable by you", dest.parent().unwrap().display()),
-                    "update herdr-core the way it was installed (package manager, or sudo)",
-                ));
-            }
+            _ => "reinstall h0x-core from the GitHub release: https://github.com/vjk7989/h0x-ADE-core/releases",
         };
         return Err(refused(format!("{shown} belongs to {manager}"), how));
     }
-    let was = format!("hc {}", env!("CARGO_PKG_VERSION"));
-    let now = version_of(from).ok_or_else(|| refused(format!("{} is not a working hc", from.display()), ""))?;
+    let was = format!("h0x-core {}", env!("CARGO_PKG_VERSION"));
+    let now = version_of(from).ok_or_else(|| refused(format!("{} is not a working h0x-core", from.display()), ""))?;
     if older(&now, &was) && !force {
         return Err(refused(format!("{now} is older than this {was}"), "--force to go back anyway"));
     }
-    // Staged beside it, checked, then swapped in: never a half-written hc.
+    // Staged beside it, checked, then swapped in: never a half-written h0x-core.
     crate::platform::swap_in(from, &dest, |staged| version_of(staged).as_deref() == Some(now.as_str())).map_err(
         |e| match e.kind() {
             std::io::ErrorKind::InvalidData => refused(format!("the copy of {} does not run", from.display()), ""),

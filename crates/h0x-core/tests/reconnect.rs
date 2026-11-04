@@ -2,7 +2,7 @@
 mod common;
 
 use common::Session;
-use herdr_core::holder_proto as proto;
+use h0x_core::holder_proto as proto;
 use std::io::{self, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::{Arc, Mutex};
@@ -21,7 +21,7 @@ struct Fault {
 
 impl Fault {
     fn new(s: &Session, fail_handshake: bool) -> Self {
-        let dir = s.root.join("run/herdr-core");
+        let dir = s.root.join("run/h0x-core");
         let path = std::fs::read_dir(dir)
             .unwrap()
             .flatten()
@@ -115,13 +115,13 @@ fn alive(pid: u32) -> bool {
 #[test]
 fn reconnect_completes_a_launch_whose_acknowledgement_was_lost() {
     let mut s = Session::new();
-    s.env.push(("HC_SPAWN_MS".into(), "2000".into()));
+    s.env.push(("H0X_CORE_SPAWN_MS".into(), "2000".into()));
     s.json(&["run", "--bg", "sleep", "100"]);
     let fault = Fault::new(&s, false);
     s.json(&["server", "restart"]);
     let mut events = s.connect();
     events.call(1, "events.subscribe", serde_json::json!({}));
-    let run = s.hc(&["--json", "run", "--bg", "sleep", "100"]);
+    let run = s.core(&["--json", "run", "--bg", "sleep", "100"]);
     let pid = fault.spawned.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(run.status.success(), "{}", String::from_utf8_lossy(&run.stderr));
     assert_eq!(s.json(&["get", "t2"])["pid"], pid);
@@ -169,14 +169,14 @@ fn reconnect_completes_a_kept_replacement_whose_acknowledgement_was_lost() {
 #[test]
 fn explicit_stop_ends_programs_and_holder_after_a_failed_relink() {
     let mut s = Session::new();
-    s.env.push(("HC_SPAWN_MS".into(), "2000".into()));
-    s.env.push(("HC_HOLDER_GRACE_MS".into(), "60000".into()));
+    s.env.push(("H0X_CORE_SPAWN_MS".into(), "2000".into()));
+    s.env.push(("H0X_CORE_HOLDER_GRACE_MS".into(), "60000".into()));
     s.json(&["run", "--bg", "sleep", "100"]);
     let original = s.json(&["get", "t1"])["pid"].as_u64().unwrap() as u32;
     let holder = s.json(&["server", "status"])["holder"]["pid"].as_u64().unwrap() as u32;
     let fault = Fault::new(&s, true);
     s.json(&["server", "restart"]);
-    let run = s.hc(&["--json", "run", "--bg", "sleep", "100"]);
+    let run = s.core(&["--json", "run", "--bg", "sleep", "100"]);
     assert!(!run.status.success());
     let pending = fault.spawned.recv_timeout(Duration::from_secs(5)).unwrap();
     assert!(s.json(&["server", "status"])["holders"].as_array().unwrap().is_empty());

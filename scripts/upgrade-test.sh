@@ -6,9 +6,9 @@ set -eu
 ref=${1:?usage: scripts/upgrade-test.sh <git ref of the previous release>}
 root=$(git rev-parse --show-toplevel)
 sha=$(git -C "$root" rev-parse --short "$ref")
-bin=/var/tmp/hc-upgrade/$sha/herdr-core
+bin=/var/tmp/h0x-core-upgrade/$sha/h0x-core
 if [ ! -x "$bin" ]; then
-    src=/var/tmp/hc-upgrade/$sha-src
+    src=/var/tmp/h0x-core-upgrade/$sha-src
     rm -rf "$src"
     git -C "$root" worktree add --detach "$src" "$ref"
     # Ghostty: this checkout's when the ref pins the same commit, else fetched.
@@ -17,10 +17,10 @@ if [ ! -x "$bin" ]; then
     else
         git -C "$src" submodule update --init --depth 1 vendor/ghostty
     fi
-    (cd "$src" && CARGO_TARGET_DIR=/var/tmp/hc-upgrade/target cargo build -q --bin herdr-core)
+    (cd "$src" && CARGO_TARGET_DIR=/var/tmp/h0x-core-upgrade/target cargo build -q --bin h0x-core)
     mkdir -p "$(dirname "$bin")"
-    cp /var/tmp/hc-upgrade/target/debug/herdr-core "$bin"
+    cp /var/tmp/h0x-core-upgrade/target/debug/h0x-core "$bin"
     git -C "$root" worktree remove --force "$src"
 fi
 cd "$root"
-HC_OLD_BIN="$bin" cargo test -q --test upgrade -- --nocapture
+H0X_CORE_OLD_BIN="$bin" cargo test -q --test upgrade -- --nocapture

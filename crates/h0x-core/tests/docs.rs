@@ -24,7 +24,7 @@ fn documents_are_versioned_persisted_and_evented() {
     let stale = c.call(3, "doc.set", json!({"name": "app", "value": "stale", "version": 0}));
     assert_eq!(stale["error"]["data"]["kind"], "conflict");
     assert!(stale["error"]["message"].as_str().unwrap().contains('1'));
-    s.hc(&["server", "restart"]);
+    s.core(&["server", "restart"]);
     s.json(&["server", "status"]);
     let mut c = s.connect();
     assert_eq!(c.call(4, "doc.get", json!({"name": "app"}))["result"], json!({"value": value, "version": 1}));
@@ -33,7 +33,7 @@ fn documents_are_versioned_persisted_and_evented() {
         json!({"version": 2})
     );
     assert_eq!(c.call(6, "doc.get", json!({"name": "app"}))["result"], json!({"value": null, "version": 2}));
-    s.hc(&["server", "stop"]);
+    s.core(&["server", "stop"]);
     s.json(&["server", "status"]);
     assert_eq!(s.connect().call(7, "doc.get", json!({"name": "app"}))["result"]["version"], 2);
 }
@@ -41,7 +41,7 @@ fn documents_are_versioned_persisted_and_evented() {
 #[test]
 fn corrupt_documents_are_quarantined_without_stopping_the_core() {
     let s = Session::new();
-    let state = s.root.join("state/herdr-core/test");
+    let state = s.root.join("state/h0x-core/test");
     std::fs::create_dir_all(&state).unwrap();
     std::fs::write(state.join("docs.json"), b"{broken").unwrap();
     s.json(&["server", "status"]);
@@ -102,7 +102,7 @@ fn reconnecting_a_machine_tells_document_readers_to_refetch() {
     let remote = Session::new();
     let mut s = Session::new();
     s.env.push(fake_ssh(&s, &[("rohan", &remote)]));
-    s.env.push(("HC_RECONNECT_MS".into(), "200".into()));
+    s.env.push(("H0X_CORE_RECONNECT_MS".into(), "200".into()));
     s.json(&["machine", "add", "rohan"]);
     let mut events = s.connect();
     events.call(1, "events.subscribe", json!({}));
@@ -111,7 +111,7 @@ fn reconnecting_a_machine_tells_document_readers_to_refetch() {
     next_event(&mut events, |m| m["params"]["type"] == "doc");
 
     std::fs::write(s.root.join("down"), "").unwrap();
-    remote.hc(&["server", "restart"]);
+    remote.core(&["server", "restart"]);
     wait_until("remote unreachable", || s.json(&["machine", "ls"])["machines"][0]["state"] == "unreachable");
     remote.json(&["server", "status"]);
     assert_eq!(

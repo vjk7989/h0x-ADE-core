@@ -1,5 +1,5 @@
 //! A small fuzzy picker for commands run in a terminal without a target, and
-//! the row layout `hc ls` shares with it.
+//! the row layout `h0x-core ls` shares with it.
 
 use std::collections::HashSet;
 
@@ -122,7 +122,7 @@ fn draw(items: &[Item], rows: &[(Row, String)], cols: usize) -> Vec<String> {
     })
 }
 
-/// Every item as a tree, nothing folded: the `hc ls` table.
+/// Every item as a tree, nothing folded: the `h0x-core ls` table.
 pub fn table(items: &[Item], cols: usize) -> Vec<String> {
     let all: Vec<usize> = (0..items.len()).collect();
     draw(items, &layout(items, &all, None), cols)
@@ -360,13 +360,13 @@ mod tests {
     #[test]
     fn a_narrow_screen_shows_the_short_form_and_keeps_the_status() {
         let mut it = item("t1", "a-long-name  pi  some-folder  done", None);
-        (it.short, it.tail) = ("herdr-core / review".into(), "done".into());
+        (it.short, it.tail) = ("h0x-core / review".into(), "done".into());
         let rows = layout(std::slice::from_ref(&it), &[0], None);
         assert_eq!(draw(std::slice::from_ref(&it), &rows, 80), ["o t1  a-long-name  pi  some-folder  done"]);
         let narrow = draw(std::slice::from_ref(&it), &rows, 24).remove(0);
         assert_eq!(narrow.chars().count(), 24, "{narrow}");
         assert!(
-            narrow.starts_with("o t1  herdr-core") && narrow.contains('\u{2026}') && narrow.ends_with("  done"),
+            narrow.starts_with("o t1  h0x-core") && narrow.contains('\u{2026}') && narrow.ends_with("  done"),
             "{narrow}"
         );
         assert!(visible(std::slice::from_ref(&it), "review") == [0], "the short form is searched too");

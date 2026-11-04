@@ -29,10 +29,10 @@ env:
   SAVE_CACHES: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/master' }}
   # Each test binary aborts if it runs this long (a hang, not a slow test):
   # 30 s on our machines; GitHub's runners are slower.
-  HC_TEST_WATCHDOG_S: "120"
-  # A test that checks hc keeps a fixed timing (50 ms to finish a key
+  H0X_CORE_TEST_WATCHDOG_S: "120"
+  # A test that checks h0x-core keeps a fixed timing (50 ms to finish a key
   # sequence) skips that check here: a loaded runner can't keep it.
-  HC_TEST_SLOW_RUNNER: "1"
+  H0X_CORE_TEST_SLOW_RUNNER: "1"
 
 jobs:
   # Fast formatting/advisory checks and Windows clippy from Linux
@@ -98,7 +98,7 @@ jobs:
           cache-bin: false
           save-if: ${{ env.SAVE_CACHES }}
       - run: cargo clippy --locked --target ${{ matrix.target }} --all-targets -- -D warnings
-      # Windows' own ConPTY swallows answers to programs: hc ships Microsoft's.
+      # Windows' own ConPTY swallows answers to programs: h0x-core ships Microsoft's.
       - if: matrix.os == 'windows'
         shell: pwsh
         run: scripts/fetch-conpty.ps1 -Dest target/${{ matrix.target }}/debug
@@ -110,7 +110,7 @@ jobs:
           # Full-screen scrolling tests are disabled on macOS CI because runner timing is unreliable.
           only=()
           if [ "${{ matrix.os }}" = macos ]; then
-            for t in crates/herdr-core/tests/*.rs; do
+            for t in crates/h0x-core/tests/*.rs; do
               name=$(basename "$t" .rs)
               [ "$name" = stitch ] || only+=(--test "$name")
             done
@@ -153,7 +153,7 @@ jobs:
       - if: steps.last.outputs.tag != ''
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: /var/tmp/hc-upgrade/${{ steps.last.outputs.sha }}
+          path: /var/tmp/h0x-core-upgrade/${{ steps.last.outputs.sha }}
           key: upgrade-from-${{ steps.last.outputs.tag }}-${{ steps.last.outputs.sha }}-${{ steps.last.outputs.cpu }}
       - name: Upgrade from the last release
         run: |

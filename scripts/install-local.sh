@@ -4,9 +4,8 @@
 set -eu
 cd "$(dirname "$0")/.."
 cargo build --release
-bin="${HC_INSTALL_DIR:-$HOME/.local/bin}"
+bin="${H0X_CORE_INSTALL_DIR:-$HOME/.local/bin}"
 mkdir -p "$bin"
-install -m 755 target/release/herdr-core "$bin/herdr-core.new"
-mv -f "$bin/herdr-core.new" "$bin/herdr-core"
-[ -e "$bin/hc" ] || [ -L "$bin/hc" ] || ln -s herdr-core "$bin/hc"
-"$bin/herdr-core" server restart
+install -m 755 target/release/h0x-core "$bin/h0x-core.new"
+mv -f "$bin/h0x-core.new" "$bin/h0x-core"
+"$bin/h0x-core" server restart

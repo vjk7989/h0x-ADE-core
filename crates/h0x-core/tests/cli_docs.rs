@@ -6,18 +6,14 @@ use std::process::Command;
 type Reference = BTreeMap<String, String>;
 
 fn read_help(words: &[&str]) -> String {
-    let output = Command::new(env!("CARGO_BIN_EXE_herdr-core"))
+    let output = Command::new(env!("CARGO_BIN_EXE_h0x-core"))
         .args(words)
         .env("NO_COLOR", "1")
         .env("COLUMNS", "100")
         .output()
         .unwrap();
     assert!(output.status.success(), "help {words:?}: {}", String::from_utf8_lossy(&output.stderr));
-    String::from_utf8(output.stdout)
-        .unwrap()
-        .replace("\r\n", "\n")
-        .replace("Usage: herdr-core.exe", "Usage: hc")
-        .replace("Usage: herdr-core", "Usage: hc")
+    String::from_utf8(output.stdout).unwrap().replace("\r\n", "\n").replace("Usage: h0x-core.exe", "Usage: h0x-core")
 }
 
 fn reference() -> Reference {
@@ -61,7 +57,7 @@ fn render(reference: &Reference) -> String {
          [Start here](../README.md) for a short tour.\n",
     );
     for (path, help) in reference {
-        let title = format!("hc {path}").trim().to_owned();
+        let title = format!("h0x-core {path}").trim().to_owned();
         let help = if path.is_empty() { read_help(&["--help"]) } else { help.clone() };
         doc.push_str(&format!("\n## {title}\n\n```text\n{help}```\n"));
     }
@@ -74,7 +70,7 @@ fn check_span(span: &str, reference: &Reference) -> Result<(), String> {
         span.split(['\'', '"']).enumerate().map(|(i, s)| if i % 2 == 0 { s } else { "_" }).collect::<Vec<_>>().join("");
     let tokens: Vec<_> = unquoted.split_whitespace().collect();
     let start = tokens.iter().enumerate().position(|(i, w)| {
-        *w == "hc" && (tokens[..i].iter().all(|w| w.contains('=')) || i > 0 && tokens[i - 1] == "|")
+        *w == "h0x-core" && (tokens[..i].iter().all(|w| w.contains('=')) || i > 0 && tokens[i - 1] == "|")
     });
     if start.is_none() && !tokens.first().is_some_and(|w| w.starts_with("--") && *w != "---") {
         return Ok(());
@@ -95,7 +91,7 @@ fn check_span(span: &str, reference: &Reference) -> Result<(), String> {
             }
             .or_else(|| ["--skill", "--licenses"].contains(&flag).then_some(false));
             let Some(takes_value) = known else {
-                return Err(format!("unknown flag {flag} for hc {path}"));
+                return Err(format!("unknown flag {flag} for h0x-core {path}"));
             };
             if takes_value && !word.contains('=') {
                 i += 1;
@@ -107,7 +103,7 @@ fn check_span(span: &str, reference: &Reference) -> Result<(), String> {
                 }
                 path = format!("{path} {word}").trim().into();
                 if !reference.contains_key(&path) {
-                    return Err(format!("unknown command hc {path}"));
+                    return Err(format!("unknown command h0x-core {path}"));
                 }
             } else if matches!(path.as_str(), "run" | "exec") {
                 break;
@@ -136,7 +132,7 @@ fn help_reference_and_examples_are_current() {
     let reference = reference();
     let rendered = render(&reference);
     let generated = root.join("docs/commands.md");
-    if std::env::var_os("HC_UPDATE_DOCS").is_some() {
+    if std::env::var_os("H0X_CORE_UPDATE_DOCS").is_some() {
         std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
         std::fs::write(&generated, &rendered).unwrap();
     }
@@ -170,30 +166,34 @@ fn help_reference_and_examples_are_current() {
 fn checker_catches_drift_without_treating_program_arguments_as_hc_flags() {
     let reference = reference();
     for good in [
-        "hc machine add --via 'ssh -p 2222 host' --name box",
-        "hc run --bg pi --provider whatever",
-        "hc exec --on box git diff --stat",
-        "hc file read --on box /srv/app/a.rs --limit 10",
-        "hc send review 'check hc nonsense --not-an-hc-flag'",
+        "h0x-core machine add --via 'ssh -p 2222 host' --name box",
+        "h0x-core run --bg pi --provider whatever",
+        "h0x-core exec --on box git diff --stat",
+        "h0x-core file read --on box /srv/app/a.rs --limit 10",
+        "h0x-core send review 'check h0x-core nonsense --not-an-h0x-core-flag'",
         "--via",
         "--old X --new Y",
-        "HC_SESSION=scratch hc ls",
-        "printf hello | hc exec -i cat",
+        "H0X_CORE_SESSION=scratch h0x-core ls",
+        "printf hello | h0x-core exec -i cat",
     ] {
         assert!(check_span(good, &reference).is_ok(), "{good}");
     }
     for bad in [
-        "hc made-up",
-        "hc machine nope",
-        "hc run --bgg pi",
-        "hc ls --via box",
-        "hc --agent-help",
+        "h0x-core made-up",
+        "h0x-core machine nope",
+        "h0x-core run --bgg pi",
+        "h0x-core ls --via box",
+        "h0x-core --agent-help",
         "--agent-help",
         "--old X --typo Y",
     ] {
         assert!(check_span(bad, &reference).is_err(), "{bad}");
     }
-    let errors = check_markdown("README.md", "prose hc nonsense\n`hc nope`\n```sh\nhc ls --oops\n```", &reference);
+    let errors = check_markdown(
+        "README.md",
+        "prose h0x-core nonsense\n`h0x-core nope`\n```sh\nh0x-core ls --oops\n```",
+        &reference,
+    );
     assert_eq!(errors.len(), 2);
     assert!(errors[0].starts_with("README.md:2:"));
     assert!(errors[1].starts_with("README.md:4:"));

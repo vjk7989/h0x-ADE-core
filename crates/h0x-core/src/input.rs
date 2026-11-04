@@ -72,12 +72,12 @@ fn env_ms(var: &str, default: u64) -> Duration {
 
 /// How long a person must have stopped typing before an agent's send goes in.
 pub fn quiet() -> Duration {
-    env_ms("HC_QUIET_MS", 3000)
+    env_ms("H0X_CORE_QUIET_MS", 3000)
 }
 
 /// How long `send` watches for the program to start working.
 fn started_window() -> Duration {
-    env_ms("HC_STARTED_MS", 5000)
+    env_ms("H0X_CORE_STARTED_MS", 5000)
 }
 
 fn working(t: &Terminal) -> bool {
@@ -132,7 +132,7 @@ impl Core {
                 RpcError::new(
                     "finished",
                     format!("{} has finished", crate::terminals::address(id)),
-                    format!("hc read {}", crate::terminals::address(id)),
+                    format!("h0x-core read {}", crate::terminals::address(id)),
                 )
             })?;
             t.check_program()?;
@@ -178,7 +178,7 @@ impl Core {
                             t.status.as_ref().and_then(|s| s.kind.as_deref()).unwrap_or("waiting")
                         ),
                         format!(
-                            "typing would answer its dialog; read its screen first (hc read {}), or --force",
+                            "typing would answer its dialog; read its screen first (h0x-core read {}), or --force",
                             crate::terminals::address(id)
                         ),
                     ));
@@ -235,7 +235,7 @@ impl Core {
                     .map(|t| Duration::from_millis(crate::runtime::now_ms().saturating_sub(t.created_ms)));
                 age.is_none_or(|age| {
                     age >= Duration::from_millis(STARTUP_MS)
-                        || st.last_output.get(&id).map_or(age, Instant::elapsed) >= env_ms("HC_SETTLE_MS", 800)
+                        || st.last_output.get(&id).map_or(age, Instant::elapsed) >= env_ms("H0X_CORE_SETTLE_MS", 800)
                 })
             };
             if ready {
@@ -245,7 +245,7 @@ impl Core {
                 return Err(RpcError::new(
                     "unavailable",
                     format!("{} is still starting: its output has not settled", crate::terminals::address(id)),
-                    format!("nothing was typed; check hc read {}, then retry", crate::terminals::address(id)),
+                    format!("nothing was typed; check h0x-core read {}, then retry", crate::terminals::address(id)),
                 ));
             }
             tokio::time::sleep(Duration::from_millis(50)).await;

@@ -157,7 +157,7 @@ pub struct Registration {
 impl Registration {
     fn new(prefix: &str, watcher: Arc<Watcher>) -> io::Result<Self> {
         // A serial queue preserves the order in which libnotify forwards events.
-        let queue = unsafe { dispatch_queue_create(c"hc.host-shutdown".as_ptr(), std::ptr::null()) };
+        let queue = unsafe { dispatch_queue_create(c"h0x-core.host-shutdown".as_ptr(), std::ptr::null()) };
         if queue.is_null() {
             return Err(io::Error::other("dispatch_queue_create failed"));
         }
@@ -229,16 +229,16 @@ mod tests {
     #[test]
     fn private_loginwindow_notifications_keep_shutdown_exits_but_not_explicit_kills() {
         // Shutdown evidence is process-global; keep it out of the other tests.
-        if std::env::var_os("HC_MAC_SHUTDOWN_TEST_CHILD").is_none() {
+        if std::env::var_os("H0X_CORE_MAC_SHUTDOWN_TEST_CHILD").is_none() {
             assert!(std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "platform::macos_shutdown::tests::private_loginwindow_notifications_keep_shutdown_exits_but_not_explicit_kills", "--nocapture"])
-                .env("HC_MAC_SHUTDOWN_TEST_CHILD", "1")
+                .env("H0X_CORE_MAC_SHUTDOWN_TEST_CHILD", "1")
                 .status().unwrap().success());
             return;
         }
         let requested = SHUTDOWN.get_or_init(Default::default).clone();
         let watcher = Arc::new(Watcher { intent: Mutex::new(None), requested, seen: Default::default() });
-        let prefix = format!("dev.herdr.test.{}.", super::super::random_hex());
+        let prefix = format!("tech.pavii.h0xcore-test.{}.", super::super::random_hex());
         let registration = Registration::new(&prefix, watcher.clone()).unwrap();
         for (index, key) in
             ["restartinitiated", "logoutcancelled", "logoutNoReturn", "shutdownInitiated", "shutdownNoReturn"]
@@ -256,7 +256,7 @@ mod tests {
         }
         use crate::{api::CoreInfo, holder_proto::Exit, paths::Paths, runtime::Core, terminals::NewTerminal};
         use std::io::{BufRead, BufReader};
-        let root = std::path::PathBuf::from(format!("/var/tmp/hc-mac-shutdown-{}", super::super::random_hex()));
+        let root = std::path::PathBuf::from(format!("/var/tmp/h0x-core-mac-shutdown-{}", super::super::random_hex()));
         let paths = || Paths {
             state: root.join("state"),
             config: root.join("config.toml"),

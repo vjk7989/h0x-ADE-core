@@ -10,7 +10,7 @@ use common::*;
 fn a_program_gets_no_display_whose_server_is_gone() {
     let mut s = Session::new();
     s.env.push(("DISPLAY".into(), ":99999".into()));
-    let out = s.hc(&["exec", "echo \"[${DISPLAY-unset}]\""]);
+    let out = s.core(&["exec", "echo \"[${DISPLAY-unset}]\""]);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "[unset]\n", "the dead display was handed out");
 }
 
@@ -19,6 +19,6 @@ fn a_program_gets_no_display_whose_server_is_gone() {
 fn a_display_on_another_machine_stays() {
     let mut s = Session::new();
     s.env.push(("DISPLAY".into(), "otherhost:0".into()));
-    let out = s.hc(&["exec", "echo \"[${DISPLAY-unset}]\""]);
+    let out = s.core(&["exec", "echo \"[${DISPLAY-unset}]\""]);
     assert_eq!(String::from_utf8_lossy(&out.stdout), "[otherhost:0]\n");
 }

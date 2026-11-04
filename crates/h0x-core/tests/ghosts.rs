@@ -112,13 +112,13 @@ fn a_holder_dying_during_stop_still_has_its_programs_ended_before_stop_returns()
 #[test]
 fn a_terminal_that_started_another_hc_session_does_not_take_it_down() {
     let s = Session::new();
-    // An agent that runs hc for another session: that session's core is not the agent's.
-    // Its hc ignores hangup and terminate, so it lives until the KILL step.
-    let inner = format!("trap '' HUP TERM; HC_SESSION=inner {} events", s.bin.display());
+    // An agent that runs h0x-core for another session: that session's core is not the agent's.
+    // Its h0x-core ignores hangup and terminate, so it lives until the KILL step.
+    let inner = format!("trap '' HUP TERM; H0X_CORE_SESSION=inner {} events", s.bin.display());
     let t = run(&s, &format!("({inner}) & {}", python(&s, "leader", false, false)));
     started(&s, &["leader"]);
     let mut status = s.cmd();
-    status.env("HC_SESSION", "inner").args(["server", "status"]);
+    status.env("H0X_CORE_SESSION", "inner").args(["server", "status"]);
     wait_until("inner core", || status.output().unwrap().status.success());
     let inner_core =
         serde_json::from_slice::<serde_json::Value>(&status.output().unwrap().stdout).unwrap()["pid"].as_i64().unwrap();
@@ -126,7 +126,7 @@ fn a_terminal_that_started_another_hc_session_does_not_take_it_down() {
     std::thread::sleep(Duration::from_millis(1500));
     let alive = running(inner_core);
     let mut stop = s.cmd();
-    stop.env("HC_SESSION", "inner").args(["server", "stop"]);
+    stop.env("H0X_CORE_SESSION", "inner").args(["server", "stop"]);
     stop.output().unwrap();
     assert!(alive, "ending the terminal killed the other session's core");
 }
@@ -151,7 +151,7 @@ fn a_run_while_stopping_is_refused() {
 #[test]
 fn a_program_that_starts_after_its_run_gave_up_is_ended() {
     let mut s = Session::new();
-    s.env.push(("HC_SPAWN_MS".into(), "500".into()));
+    s.env.push(("H0X_CORE_SPAWN_MS".into(), "500".into()));
     s.json(&["run", "--bg", "true"]); // a holder now runs
     let holder = s.json(&["server", "status"])["holder"]["pid"].as_i64().unwrap();
     unsafe { libc::kill(holder as i32, libc::SIGSTOP) };

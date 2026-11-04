@@ -3,11 +3,11 @@
 Save a command and a role once, then start an agent by name with a task.
 Templates do not install agents or configure their status reporting.
 
-[Back to the README](../README.md) · [Command reference](commands.md#hc-templates)
+[Back to the README](../README.md) · [Command reference](commands.md#h0x-core-templates)
 
 ## Make a reviewer
 
-Save this as `~/.config/herdr-core/templates/reviewer.md` on Linux or macOS:
+Save this as `~/.config/h0x-core/templates/reviewer.md` on Linux or macOS:
 
 ```markdown
 ---
@@ -17,22 +17,22 @@ command: pi
 You are a focused review agent. Read the code before giving findings.
 Do not edit files or start other agents.
 Report bugs with file paths, lines, and a short reason.
-If a parent assigned the review, report back with hc send.
+If a parent assigned the review, report back with h0x-core send.
 ```
 
 Use an installed interactive agent command. Put model choices and other agent options in that command.
-On Windows, templates live under `%APPDATA%\herdr-core\templates` by default.
+On Windows, templates live under `%APPDATA%\h0x-core\templates` by default.
 Setting `XDG_CONFIG_HOME` changes the config home on either platform.
 
 ```sh
-hc templates
-hc run --bg --name review --cwd /path/to/repo reviewer "Review src/x.rs only."
-hc read review --lines 100
-hc send review "Recheck the error path."
+h0x-core templates
+h0x-core run --bg --name review --cwd /path/to/repo reviewer "Review src/x.rs only."
+h0x-core read review --lines 100
+h0x-core send review "Recheck the error path."
 ```
 
 Use background mode for agents so their screen does not stream into your caller's output.
-You can still attach and take over with `hc attach review`.
+You can still attach and take over with `h0x-core attach review`.
 
 ## File format
 
@@ -82,7 +82,7 @@ Stay within the assigned files. Ask when blocked.
 
 Quiet output is not proof that an agent is ready. Use this only when you know its startup flow.
 It does not give the program an agent status; core still never guesses status from the screen.
-See `hc keys --help` for key notation and `hc --skill` for the delegation workflow.
+See `h0x-core keys --help` for key notation and `h0x-core --skill` for the delegation workflow.
 
 When a terminal is launched on another machine, that machine resolves the template and runs its command.
 Put the template and agent there first.

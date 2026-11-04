@@ -1,7 +1,7 @@
 //! An update never breaks anything: terminals started by the previous release
 //! keep running, stay readable and typeable after the swap, and machines on
 //! different releases keep talking. Needs the previous release's binary in
-//! HC_OLD_BIN (scripts/upgrade-test.sh builds it); skipped without one.
+//! H0X_CORE_OLD_BIN (scripts/upgrade-test.sh builds it); skipped without one.
 
 #![cfg(unix)] // Windows: tests/windows.rs
 
@@ -10,19 +10,19 @@ mod common;
 use common::*;
 use serde_json::Value;
 
-/// Puts `bin` in place as this session's `herdr-core` (a rename, as an update does).
+/// Puts `bin` in place as this session's `h0x-core` (a rename, as an update does).
 fn install(s: &mut Session, bin: &std::path::Path) {
     let dir = s.root.join("bin");
     std::fs::create_dir_all(&dir).unwrap();
-    let tmp = dir.join("herdr-core.new");
+    let tmp = dir.join("h0x-core.new");
     std::fs::copy(bin, &tmp).unwrap();
-    std::fs::rename(&tmp, dir.join("herdr-core")).unwrap();
-    s.bin = dir.join("herdr-core");
+    std::fs::rename(&tmp, dir.join("h0x-core")).unwrap();
+    s.bin = dir.join("h0x-core");
 }
 
-/// `hc run` as the old release starts things: it returned at once (no --bg then).
+/// `h0x-core run` as the old release starts things: it returned at once (no --bg then).
 fn start(s: &Session, args: &[&str]) -> String {
-    let bg = String::from_utf8(s.hc(&["run", "--help"]).stdout).unwrap().contains("--bg");
+    let bg = String::from_utf8(s.core(&["run", "--help"]).stdout).unwrap().contains("--bg");
     let run: &[&str] = if bg { &["run", "--bg"] } else { &["run"] };
     s.json(&[run, args].concat())["address"].as_str().unwrap().to_string()
 }
@@ -36,7 +36,7 @@ fn says(s: &Session, t: &str, what: &str) {
 fn a_materialized_or_replaced_executable_can_start_its_first_holder() {
     for retain_old in [true, false] {
         let mut s = Session::new();
-        s.env.push(("HC_HOLDER_GRACE_MS".into(), "100".into()));
+        s.env.push(("H0X_CORE_HOLDER_GRACE_MS".into(), "100".into()));
         install(&mut s, std::path::Path::new(BIN));
         let pid = s.json(&["server", "status"])["pid"].clone();
         if retain_old {
@@ -67,8 +67,8 @@ fn a_materialized_or_replaced_executable_can_start_its_first_holder() {
 
 #[test]
 fn an_update_keeps_terminals_and_machines_running() {
-    let Some(old) = std::env::var_os("HC_OLD_BIN").map(std::path::PathBuf::from) else {
-        eprintln!("skipped: no HC_OLD_BIN (run scripts/upgrade-test.sh <previous release>)");
+    let Some(old) = std::env::var_os("H0X_CORE_OLD_BIN").map(std::path::PathBuf::from) else {
+        eprintln!("skipped: no H0X_CORE_OLD_BIN (run scripts/upgrade-test.sh <previous release>)");
         return;
     };
     let new = std::path::PathBuf::from(BIN);
@@ -77,7 +77,7 @@ fn an_update_keeps_terminals_and_machines_running() {
     install(&mut rohan, &old);
     install(&mut s, &old);
     s.env.push(fake_ssh(&s, &[("rohan", &rohan)]));
-    let help = String::from_utf8(s.hc(&["--help"]).stdout).unwrap();
+    let help = String::from_utf8(s.core(&["--help"]).stdout).unwrap();
     let machines = help.contains("machine add");
     let old_has_put = help.contains("put <t>");
 
@@ -96,7 +96,7 @@ fn an_update_keeps_terminals_and_machines_running() {
     // This machine updates; rohan stays on the old release.
     let old_pid = s.json(&["server", "status"])["pid"].clone();
     install(&mut s, &new);
-    s.hc(&["server", "restart"]);
+    s.core(&["server", "restart"]);
     assert_ne!(s.json(&["server", "status"])["pid"], old_pid, "a new core runs");
     let t = get(&s, &live);
     assert_eq!((t["state"].as_str(), t["name"].as_str()), (Some("live"), Some("echo")), "{t}");
@@ -111,10 +111,10 @@ fn an_update_keeps_terminals_and_machines_running() {
         wait_until("the line to the old rohan", || s.json(&["machine", "ls"])["machines"][0]["state"] == "connected");
         s.json(&["send", t, "mixed"]);
         says(&s, t, "got-mixed");
-        if !String::from_utf8(rohan.hc(&["run", "--help"]).stdout).unwrap().contains("--bg") {
-            let out = String::from_utf8(s.hc(&["run", "--on", "rohan", "echo there"]).stdout).unwrap();
+        if !String::from_utf8(rohan.core(&["run", "--help"]).stdout).unwrap().contains("--bg") {
+            let out = String::from_utf8(s.core(&["run", "--on", "rohan", "echo there"]).stdout).unwrap();
             assert!(
-                out.contains("not waited on") && out.contains("hc machine update rohan"),
+                out.contains("not waited on") && out.contains("h0x-core machine update rohan"),
                 "an older side's run is named: {out}"
             );
         }
@@ -126,10 +126,10 @@ fn an_update_keeps_terminals_and_machines_running() {
         }
         // Then rohan updates too, under its running terminal.
         install(&mut rohan, &new);
-        rohan.hc(&["server", "restart"]);
+        rohan.core(&["server", "restart"]);
         wait_until("the line back", || {
             s.json(&["machine", "ls"])["machines"][0]["state"] == "connected"
-                && s.hc(&["--json", "send", t, "both"]).status.success()
+                && s.core(&["--json", "send", t, "both"]).status.success()
         });
         says(&s, t, "got-both");
     }

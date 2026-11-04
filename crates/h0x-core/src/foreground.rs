@@ -153,7 +153,7 @@ pub fn procargs(pid: i32) -> Option<(Vec<String>, Vec<u8>)> {
 impl Core {
     /// Keeps every live terminal's `foreground` current, with an event on each change.
     pub async fn watch_foreground(self: Arc<Self>) {
-        let ms = std::env::var("HC_FOREGROUND_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(500);
+        let ms = std::env::var("H0X_CORE_FOREGROUND_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(500);
         loop {
             tokio::time::sleep(Duration::from_millis(ms)).await;
             let live: Vec<u32> = self.lock().reg.terminals.values().filter(|t| t.is_live()).map(|t| t.id()).collect();

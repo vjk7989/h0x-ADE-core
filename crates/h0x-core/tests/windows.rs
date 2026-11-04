@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-const BIN: &str = env!("CARGO_BIN_EXE_herdr-core");
+const BIN: &str = env!("CARGO_BIN_EXE_h0x-core");
 static LIVE: Mutex<Vec<(String, PathBuf)>> = Mutex::new(Vec::new());
 
 struct Session {
@@ -26,7 +26,7 @@ impl Session {
         // Abort a hung test binary after the watchdog deadline.
         WATCHDOG.call_once(|| {
             std::thread::spawn(|| {
-                let limit = std::env::var("HC_TEST_WATCHDOG_S").ok().and_then(|s| s.parse().ok()).unwrap_or(90);
+                let limit = std::env::var("H0X_CORE_TEST_WATCHDOG_S").ok().and_then(|s| s.parse().ok()).unwrap_or(90);
                 std::thread::sleep(Duration::from_secs(limit));
                 eprintln!("test binary still running after {limit} s: stopping its cores and aborting");
                 // Each stop gets 10 s: the hang may be in stop itself.
@@ -43,7 +43,7 @@ impl Session {
             });
         });
         let name = format!("test-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed));
-        let root = std::env::temp_dir().join(format!("hc-{name}"));
+        let root = std::env::temp_dir().join(format!("h0x-core-{name}"));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         LIVE.lock().unwrap().push((name.clone(), root.clone()));
@@ -110,12 +110,12 @@ fn cmd(session: &str, root: &Path) -> Command {
 fn cmd_at(exe: &Path, session: &str, root: &Path) -> Command {
     let mut cmd = Command::new(exe);
     cmd.current_dir(root)
-        .env("HC_SESSION", session)
+        .env("H0X_CORE_SESSION", session)
         .env("XDG_STATE_HOME", root.join("state"))
         .env("XDG_CONFIG_HOME", root.join("config"))
-        .env("HC_SETTLE_MS", "0")
-        .env_remove("HC_TERMINAL_ID")
-        .env_remove("HC_SOCKET")
+        .env("H0X_CORE_SETTLE_MS", "0")
+        .env_remove("H0X_TERMINAL_ID")
+        .env_remove("H0X_CORE_SOCKET")
         .env_remove("SSH_CONNECTION")
         .env_remove("SSH_CLIENT")
         .env_remove("SSH_TTY");
@@ -146,7 +146,7 @@ fn sessions_select_distinct_pipes_even_with_the_same_state_home() {
     };
     let first = status(&a.name);
     let second = status(&b.name);
-    assert_ne!(first["pid"], second["pid"], "HC_SESSION must select the pipe, not just state");
+    assert_ne!(first["pid"], second["pid"], "H0X_CORE_SESSION must select the pipe, not just state");
     assert_eq!(status(&a.name)["pid"], first["pid"]);
 }
 
@@ -173,7 +173,7 @@ fn ssh_reaches_the_host_without_a_control_socket() {
         }
         false
     });
-    let output = cmd(&s.name, &s.root).env_remove("HC_SSH").args(["machine", "add", &target]).output().unwrap();
+    let output = cmd(&s.name, &s.root).env_remove("H0X_CORE_SSH").args(["machine", "add", &target]).output().unwrap();
     finished.store(true, Ordering::Relaxed);
     assert!(server.join().unwrap(), "{}", String::from_utf8_lossy(&output.stderr));
 }
@@ -183,12 +183,12 @@ fn ssh_auth_failure_points_to_keys_instead_of_repeating_login() {
     let s = Session::new();
     let ssh =
         s.file("ssh-denied.cmd", "@echo off\r\necho Permission denied (publickey,password). 1>&2\r\nexit /b 255\r\n");
-    let output = cmd(&s.name, &s.root).env("HC_SSH", &ssh).args(["machine", "add", "example"]).output().unwrap();
+    let output = cmd(&s.name, &s.root).env("H0X_CORE_SSH", &ssh).args(["machine", "add", "example"]).output().unwrap();
     let error: Value = serde_json::from_slice(&output.stderr)
         .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&output.stderr)));
     assert_eq!(error["error"]["kind"], "needs_login", "{error}");
     let hint = error["error"]["hint"].as_str().unwrap();
-    assert!(hint.contains("keys or an agent") && !hint.contains("hc machine add"), "{hint}");
+    assert!(hint.contains("keys or an agent") && !hint.contains("h0x-core machine add"), "{hint}");
 }
 
 #[test]
@@ -208,14 +208,14 @@ if ($request.method -ne 'hello') { exit 2 }
         "ssh-console.cmd",
         &format!("@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{probe}\"\r\n"),
     );
-    let output = cmd(&s.name, &s.root).env("HC_SSH", &ssh).args(["machine", "add", "example"]).output().unwrap();
+    let output = cmd(&s.name, &s.root).env("H0X_CORE_SSH", &ssh).args(["machine", "add", "example"]).output().unwrap();
     let error: Value = serde_json::from_slice(&output.stderr)
         .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&output.stderr)));
     assert_eq!(error["error"]["kind"], "probe", "{error}");
     assert_eq!(std::fs::read_to_string(s.root.join("console-window.txt")).unwrap(), "0");
 }
 
-/// A release folder like the zip: herdr-core.exe + conpty, the exe marked
+/// A release folder like the zip: h0x-core.exe + conpty, the exe marked
 /// with `mark` at its end (a PE runs with bytes appended).
 fn release(dir: &Path, mark: &str) -> PathBuf {
     let built = Path::new(BIN).parent().unwrap();
@@ -225,18 +225,17 @@ fn release(dir: &Path, mark: &str) -> PathBuf {
     }
     let mut exe = std::fs::read(BIN).unwrap();
     exe.extend_from_slice(mark.as_bytes());
-    std::fs::write(dir.join("herdr-core.exe"), exe).unwrap();
-    dir.join("herdr-core.exe")
+    std::fs::write(dir.join("h0x-core.exe"), exe).unwrap();
+    dir.join("h0x-core.exe")
 }
 
 fn marked(file: &Path, mark: &str) -> bool {
     std::fs::read(file).unwrap().ends_with(mark.as_bytes())
 }
 
-/// An installed hc, with `hc.exe` linked to it.
+/// An installed h0x-core (no alias link: HyperOx ships none).
 fn installed(s: &Session) -> PathBuf {
     let exe = release(&s.root.join("inst"), "old-build");
-    std::fs::hard_link(&exe, s.root.join(r"inst\hc.exe")).unwrap();
     exe
 }
 
@@ -250,21 +249,20 @@ fn update_swaps_the_whole_release_while_its_terminals_run() {
     let exe = installed(&s);
     let run = hc_at(&s, &exe, &["run", "--bg", "ping", "-n", "120", "127.0.0.1"]);
     let t = serde_json::from_slice::<Value>(&run.stdout).unwrap()["address"].as_str().unwrap().to_string();
-    // Not hc's, even when named like hc's files: never cleaned up. An old
+    // Not h0x-core's, even when named like h0x-core's files: never cleaned up. An old
     // update's own leftover is.
-    let theirs = [s.root.join(r"inst\settings.old-backup"), s.root.join(r"inst\hc.exe.old-backup")];
+    let theirs = [s.root.join(r"inst\settings.old-backup"), s.root.join(r"inst\h0x-core-link.exe.old-backup")];
     for f in &theirs {
         std::fs::write(f, "keep").unwrap();
     }
-    let leftover = s.root.join(r"inst\herdr-core.exe.old-123-0123456789abcdef0123456789abcdef");
+    let leftover = s.root.join(r"inst\h0x-core.exe.old-123-0123456789abcdef0123456789abcdef");
     std::fs::write(&leftover, "old").unwrap();
     let new = release(&s.root.join("new"), "new-build");
     let out = hc_at(&s, &exe, &["update", "--from", new.to_str().unwrap()]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(theirs.iter().all(|f| f.is_file()), "update deleted a file that isn't hc's");
+    assert!(theirs.iter().all(|f| f.is_file()), "update deleted a file that isn't h0x-core's");
     assert!(!leftover.exists(), "an old update's leftover stays");
-    assert!(marked(&exe, "new-build"), "herdr-core.exe swapped");
-    assert!(marked(&s.root.join(r"inst\hc.exe"), "new-build"), "hc.exe follows it");
+    assert!(marked(&exe, "new-build"), "h0x-core.exe swapped");
     assert_eq!(s.json(&["get", &t])["state"], "live", "its terminal kept running");
 }
 
@@ -280,10 +278,9 @@ fn an_update_that_cannot_finish_puts_everything_back() {
     let out = hc_at(&s, &exe, &["update", "--from", new.to_str().unwrap()]);
     drop(held);
     assert!(!out.status.success(), "the update should have failed");
-    assert!(marked(&exe, "old-build"), "herdr-core.exe back");
-    assert!(marked(&s.root.join(r"inst\hc.exe"), "old-build"), "hc.exe back");
+    assert!(marked(&exe, "old-build"), "h0x-core.exe back");
     assert!(s.root.join(r"inst\conpty\conpty.dll").is_file());
-    assert!(hc_at(&s, &exe, &["--version"]).status.success(), "hc still runs");
+    assert!(hc_at(&s, &exe, &["--version"]).status.success(), "h0x-core still runs");
 }
 
 #[test]
@@ -319,7 +316,7 @@ fn the_exe_needs_no_visual_cpp_runtime_installed() {
     // Imported DLL names sit in the exe as plain text.
     let exe = String::from_utf8_lossy(&std::fs::read(BIN).unwrap()).to_ascii_lowercase();
     for dll in ["vcruntime140", "msvcp140", "api-ms-win-crt-"] {
-        assert!(!exe.contains(dll), "herdr-core.exe imports {dll}: a clean Windows can't run it");
+        assert!(!exe.contains(dll), "h0x-core.exe imports {dll}: a clean Windows can't run it");
     }
 }
 
@@ -328,7 +325,7 @@ fn only_this_account_may_open_the_cores_pipe() {
     let s = Session::new();
     s.out(&["server", "start"]);
     let user: String = std::env::var("USERNAME").unwrap().chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-    let pipe = format!(r"\\.\pipe\herdr-core-{user}-{}.sock", s.name);
+    let pipe = format!(r"\\.\pipe\h0x-core-{user}-{}.sock", s.name);
     // From Windows itself: Get-Acl sometimes answers for the pipe root instead.
     let sddl = unsafe {
         use windows_sys::Win32::Security::Authorization::*;
@@ -377,7 +374,7 @@ fn status_does_not_start_a_core() {
     let s = Session::new();
     let out = cmd(&s.name, &s.root).args(["server", "status"]).output().unwrap();
     assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("hc server start"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("h0x-core server start"));
     assert!(!s.root.join("state").exists(), "status created runtime state");
 }
 
@@ -385,16 +382,22 @@ fn status_does_not_start_a_core() {
 fn new_terminals_refresh_windows_settings_without_losing_runtime_variables() {
     let s = Session::new();
     let out = cmd(&s.name, &s.root)
-        .env("PATH", r"C:\Windows\System32;HC_STALE_PATH")
-        .env("HC_PROCESS_ONLY", "preserved")
+        .env("PATH", r"C:\Windows\System32;H0X_CORE_STALE_PATH")
+        .env("H0X_CORE_PROCESS_ONLY", "preserved")
         .args(["server", "start"])
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let (code, output) =
-        s.out(&["run", "--timeout", "20", "cmd", "/c", "echo %PATH% & echo %HC_PROCESS_ONLY% & echo %HC_SESSION%"]);
+    let (code, output) = s.out(&[
+        "run",
+        "--timeout",
+        "20",
+        "cmd",
+        "/c",
+        "echo %PATH% & echo %H0X_CORE_PROCESS_ONLY% & echo %H0X_CORE_SESSION%",
+    ]);
     assert_eq!(code, 0, "{output}");
-    assert!(!output.contains("HC_STALE_PATH"), "{output}");
+    assert!(!output.contains("H0X_CORE_STALE_PATH"), "{output}");
     assert!(output.contains("preserved"), "{output}");
     assert!(output.contains(&s.name), "{output}");
 }
@@ -454,7 +457,7 @@ fn registry_changes_after_start_are_seen_by_each_new_terminal() {
         }
     }
     let s = Session::new();
-    let setting = Setting(format!("HC_ENV_{}", s.name.replace('-', "_")));
+    let setting = Setting(format!("H0X_CORE_ENV_{}", s.name.replace('-', "_")));
     s.json(&["server", "start"]);
     for value in ["first", "second"] {
         setting.set(Some(&format!("%SystemRoot%\\{value}")));
@@ -467,7 +470,7 @@ fn registry_changes_after_start_are_seen_by_each_new_terminal() {
 
 #[test]
 fn a_core_that_would_die_at_ssh_logout_is_refused_not_started() {
-    // Cargo's job kills on close and won't let hc leave, like some ssh
+    // Cargo's job kills on close and won't let h0x-core leave, like some ssh
     // sessions: there, logging out would end every terminal.
     let s = Session::new();
     let out = cmd(&s.name, &s.root).env("SSH_CONNECTION", "10.0.0.1 50000 10.0.0.2 22").args(["ls"]).output().unwrap();
@@ -630,7 +633,7 @@ fn the_folder_a_shell_moves_to_is_seen_and_a_lost_kept_shell_returns_there() {
     s.out(&["send", &cmd, &format!("cd /d \"{dir}\"")]);
     wait_until("cmd's folder", || cwd(&cmd).as_ref() == Some(&expected));
 
-    // PowerShell keeps its location to itself: hc's own shell tells Windows.
+    // PowerShell keeps its location to itself: h0x-core's own shell tells Windows.
     let shell = s.bg(&["--keep"]);
     s.out(&["send", &shell, &format!("Set-Location '{dir}'")]);
     wait_until("PowerShell's folder", || cwd(&shell).as_ref() == Some(&expected));
@@ -680,7 +683,7 @@ fn a_terminal_started_from_inside_a_terminal_has_it_as_parent() {
 
 #[test]
 fn attach_types_into_the_program_and_detaches_on_its_key() {
-    // hc attach runs in a ConPTY console of its own, like over ssh.
+    // h0x-core attach runs in a ConPTY console of its own, like over ssh.
     let s = Session::new();
     let inner = s.bg(&["cmd"]);
     s.shows(&inner, ">");
@@ -699,7 +702,7 @@ fn attach_types_into_the_program_and_detaches_on_its_key() {
 #[test]
 fn configured_shell_uses_argv_and_is_read_live_for_new_and_recovered_terminals() {
     let s = Session::new();
-    let config = s.root.join("config/herdr-core/config.toml");
+    let config = s.root.join("config/h0x-core/config.toml");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     let exe = s.root.join("shell with spaces.exe");
     std::fs::copy(std::env::var("COMSPEC").unwrap(), &exe).unwrap();
@@ -724,7 +727,7 @@ fn configured_shell_uses_argv_and_is_read_live_for_new_and_recovered_terminals()
     Command::new("taskkill").args(["/F", "/PID", &holder.to_string()]).output().unwrap();
     wait_until("configured keep replacement", || s.json(&["get", &t])["pid"].as_u64().is_some_and(|p| p != pid));
     s.shows(&t, "configured-recovery");
-    for (value, kind) in [("[]", "config"), (r#"["hc-missing-shell-24"]"#, "spawn_failed")] {
+    for (value, kind) in [("[]", "config"), (r#"["h0x-core-missing-shell-24"]"#, "spawn_failed")] {
         std::fs::write(&config, format!("shell = {value}\n")).unwrap();
         let out = cmd(&s.name, &s.root).args(["run", "--bg"]).output().unwrap();
         assert!(!out.status.success());

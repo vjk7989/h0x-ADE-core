@@ -5,7 +5,7 @@ use crate::rpc::RpcError;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Where one core keeps its socket and state. `HC_SESSION` names an isolated core.
+/// Where one core keeps its socket and state. `H0X_CORE_SESSION` names an isolated core.
 pub struct Paths {
     pub socket: PathBuf,
     pub holder_socket: PathBuf,
@@ -15,17 +15,17 @@ pub struct Paths {
 
 impl Paths {
     pub fn from_env() -> Result<Paths, RpcError> {
-        let session = session(std::env::var("HC_SESSION").ok())?;
+        let session = session(std::env::var("H0X_CORE_SESSION").ok())?;
         let xdg = |var: &str, fallback: PathBuf| {
             std::env::var_os(var).filter(|v| !v.is_empty()).map_or(fallback, PathBuf::from)
         };
         let (state_home, config_home) = crate::platform::data_dirs();
-        let state = xdg("XDG_STATE_HOME", state_home).join("herdr-core").join(&session);
-        let config = xdg("XDG_CONFIG_HOME", config_home).join("herdr-core").join("config.toml");
+        let state = xdg("XDG_STATE_HOME", state_home).join("h0x-core").join(&session);
+        let config = xdg("XDG_CONFIG_HOME", config_home).join("h0x-core").join("config.toml");
         // Where sockets go (Windows: the named pipe namespace), and their name prefix.
         let (run, prefix) = crate::platform::endpoints(&state);
-        // HC_SOCKET, else `socket` in config, else the runtime dir. The holder sits beside it.
-        let chosen = std::env::var_os("HC_SOCKET")
+        // H0X_CORE_SOCKET, else `socket` in config, else the runtime dir. The holder sits beside it.
+        let chosen = std::env::var_os("H0X_CORE_SOCKET")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .or_else(|| crate::config::load(&config).ok()?.socket.map(PathBuf::from));
@@ -42,7 +42,7 @@ impl Paths {
                 format!(
                     "the socket path for session {session:?} is too long here ({longest} bytes; this system allows {max})"
                 ),
-                "use a shorter HC_SESSION (or socket in the config)",
+                "use a shorter H0X_CORE_SESSION (or socket in the config)",
             ));
         }
         Ok(Paths { socket, holder_socket, config, state })
@@ -85,7 +85,7 @@ fn session(raw: Option<String>) -> Result<String, RpcError> {
     if name == "." || name == ".." || name.chars().any(|c| c.is_control() || r#"/\:*?"<>|"#.contains(c)) {
         return Err(RpcError::new(
             "usage",
-            format!("HC_SESSION {name:?} can't be a folder name"),
+            format!("H0X_CORE_SESSION {name:?} can't be a folder name"),
             "use letters, digits, - _ .",
         ));
     }
@@ -96,7 +96,7 @@ fn session(raw: Option<String>) -> Result<String, RpcError> {
 mod tests {
     #[test]
     fn only_a_missing_state_file_starts_fresh() {
-        let dir = std::env::temp_dir().join(format!("hc-state-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("h0x-core-state-test-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("unreadable.json")).unwrap();
         assert_eq!(super::read_state::<Vec<u32>>(&dir.join("missing.json")).unwrap(), Vec::<u32>::new());
         let err = super::read_state::<Vec<u32>>(&dir.join("unreadable.json")).unwrap_err();

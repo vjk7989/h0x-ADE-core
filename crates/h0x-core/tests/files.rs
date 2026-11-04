@@ -27,11 +27,11 @@ fn files_are_written_read_and_edited_here_and_on_a_machine() {
         let w: serde_json::Value = serde_json::from_slice(&w.stdout).unwrap();
         assert_eq!((w["path"].as_str(), w["bytes"].as_u64()), (path.to_str(), Some(src.len() as u64)), "folder made");
 
-        let read = s.hc(&file(&["read", "src/lib.rs"]));
+        let read = s.core(&file(&["read", "src/lib.rs"]));
         assert!(read.stdout == src.as_bytes() && read.stderr.is_empty(), "{on:?}: all of it, as is");
-        let part = s.hc(&file(&["read", "src/lib.rs", "--offset", "4", "--limit", "3"]));
+        let part = s.core(&file(&["read", "src/lib.rs", "--offset", "4", "--limit", "3"]));
         assert_eq!(String::from_utf8_lossy(&part.stdout), "fn f2() -> u32 {\n    2\n}\n");
-        assert_eq!(String::from_utf8_lossy(&part.stderr).trim(), "[hc] lines 4-6 of 18000");
+        assert_eq!(String::from_utf8_lossy(&part.stderr).trim(), "[h0x-core] lines 4-6 of 18000");
 
         const NEW_FN: &str = "fn added() -> u32 {\n    0\n}\n\nfn f5000() -> u32 {";
         s.json(&file(&[
@@ -80,7 +80,7 @@ fn a_write_swaps_the_file_in_whole_and_keeps_what_it_was() {
     assert_eq!(std::fs::read_to_string(dir.join("later.sh")).unwrap(), "x", "made where the link points");
     assert!(dir.join("dangling").is_symlink());
 
-    // A relative --cwd starts where hc runs, not where the core does.
+    // A relative --cwd starts where h0x-core runs, not where the core does.
     let read = s.cmd().current_dir(&s.root).args(["file", "read", "--cwd", "w", "run.sh"]).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&read.stdout), "#!/bin/sh\n");
 

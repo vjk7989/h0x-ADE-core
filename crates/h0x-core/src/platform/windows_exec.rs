@@ -13,7 +13,7 @@ use windows_sys::Win32::System::JobObjects::*;
 use windows_sys::Win32::System::Threading::*;
 
 /// This machine's own shell: PowerShell 7 if installed, else Windows PowerShell.
-/// PowerShell's `cd` never tells Windows, so hc couldn't see its folder: each
+/// PowerShell's `cd` never tells Windows, so h0x-core couldn't see its folder: each
 /// prompt does, after the person's own prompt ran (it reads `$?`).
 pub fn own_shell() -> Vec<String> {
     let on_path = |exe: &str| {

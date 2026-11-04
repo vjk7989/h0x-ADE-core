@@ -1,4 +1,4 @@
-//! `~/.config/herdr-core/config.toml`. A missing file means defaults.
+//! `~/.config/h0x-core/config.toml`. A missing file means defaults.
 
 use crate::rpc::RpcError;
 use serde::Deserialize;
@@ -8,12 +8,12 @@ use std::path::Path;
 pub struct Config {
     /// Executable and arguments for new shells (default: this machine's shell).
     pub shell: Option<Vec<String>>,
-    /// The chord that detaches `hc attach`: `ctrl+<key>`, default `ctrl+\`.
+    /// The chord that detaches `h0x-core attach`: `ctrl+<key>`, default `ctrl+\`.
     pub detach_key: Option<String>,
     /// Seconds a `wait` runs before it checks in (default 180).
     pub wait_timeout: Option<f64>,
-    /// Notes to parent agents and `<hc>` tags on messages between agents, on
-    /// or off (default on). Off: hc types nothing on its own.
+    /// Notes to parent agents and `<h0x>` tags on messages between agents, on
+    /// or off (default on). Off: h0x-core types nothing on its own.
     pub notes: Option<bool>,
     /// Seconds without a person typing before a note goes in (default 3).
     pub notes_quiet: Option<f64>,
@@ -21,7 +21,7 @@ pub struct Config {
     pub headless: Option<String>,
     /// Scrollback kept per live terminal, in MB (default 5).
     pub history_mb: Option<f64>,
-    /// Where the core listens (default under $XDG_RUNTIME_DIR). `HC_SOCKET` wins.
+    /// Where the core listens (default under $XDG_RUNTIME_DIR). `H0X_CORE_SOCKET` wins.
     pub socket: Option<String>,
     /// Seconds another machine gets to answer a call (a wait gets its own
     /// timeout on top), and to send anything at all before its line is
@@ -56,7 +56,7 @@ impl Config {
 }
 
 fn invalid(message: String) -> RpcError {
-    RpcError::new("config", message, "fix ~/.config/herdr-core/config.toml")
+    RpcError::new("config", message, "fix ~/.config/h0x-core/config.toml")
 }
 
 pub fn load(path: &Path) -> Result<Config, RpcError> {

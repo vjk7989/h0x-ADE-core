@@ -118,7 +118,7 @@ mod tests {
 
     #[tokio::test]
     async fn flush_waits_for_the_atomic_replacement() {
-        let root = std::env::temp_dir().join(format!("hc-writer-{}", crate::platform::random_hex()));
+        let root = std::env::temp_dir().join(format!("h0x-core-writer-{}", crate::platform::random_hex()));
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("terminals.json");
         let writer = RegistryWriter::new(path.clone()).unwrap();

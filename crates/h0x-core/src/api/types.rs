@@ -22,7 +22,7 @@ pub struct Empty {}
 
 // Request types below are both the API's params (serde, schema) and the CLI's
 // arguments (clap): one definition, one doc comment for `--help` and schema.
-// `#[arg(skip)]` fields are filled in by hc itself.
+// `#[arg(skip)]` fields are filled in by h0x-core itself.
 
 /// A `key=value` label. The CLI takes it repeated (`--label k=v`); JSON takes
 /// an object.
@@ -144,8 +144,8 @@ pub struct StatusResult {
     pub holders: Vec<HolderInfo>,
     pub live: usize,
     pub finished: usize,
-    /// The package manager this hc came from (homebrew, nix, mise, or
-    /// system package manager): it updates hc, `hc update` won't.
+    /// The package manager this h0x-core came from (homebrew, nix, mise, or
+    /// system package manager): it updates h0x-core, `h0x-core update` won't.
     /// Null for a replaceable plain install.
     pub installed_by: Option<String>,
 }
@@ -216,11 +216,11 @@ pub struct RunParams {
     /// Name, unique among live terminals: 1-32 of a-z 0-9 - _ .
     #[arg(long)]
     pub name: Option<String>,
-    /// Working directory (default: where hc runs; through the API, the core's;
+    /// Working directory (default: where h0x-core runs; through the API, the core's;
     /// with --on, that machine's home).
     #[arg(long)]
     pub cwd: Option<String>,
-    /// Run it on another machine (see `hc machine ls`); its address is `machine/t7`.
+    /// Run it on another machine (see `h0x-core machine ls`); its address is `machine/t7`.
     #[arg(long, value_name = "MACHINE")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on: Option<String>,
@@ -275,7 +275,7 @@ pub struct RunParams {
     /// `wait_timeout`, else 180).
     #[arg(long, value_parser = cli_seconds)]
     pub timeout: Option<f64>,
-    /// Who is calling (`HC_TERMINAL_ID` inside a terminal).
+    /// Who is calling (`H0X_TERMINAL_ID` inside a terminal).
     #[arg(skip)]
     pub caller: Option<String>,
 }
@@ -397,7 +397,7 @@ pub struct AttachParams {
     #[arg(skip)]
     #[serde(default)]
     pub resumed: bool,
-    /// Who is calling (`HC_TERMINAL_ID` inside a terminal): never itself.
+    /// Who is calling (`H0X_TERMINAL_ID` inside a terminal): never itself.
     #[arg(skip)]
     #[serde(default)]
     pub caller: Option<String>,
@@ -472,7 +472,7 @@ pub struct SendParams {
     /// With wait: seconds before it checks in (default: config, else 180).
     #[arg(long, value_parser = cli_seconds)]
     pub timeout: Option<f64>,
-    /// Who is sending (`HC_TERMINAL_ID`, else the calling process's parent), so a
+    /// Who is sending (`H0X_TERMINAL_ID`, else the calling process's parent), so a
     /// bare wait from the same caller waits for this send's turn.
     #[arg(skip)]
     pub caller: Option<String>,
@@ -584,11 +584,11 @@ pub struct ExecParams {
     #[arg(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line: Option<String>,
-    /// Run it on another machine (see `hc machine ls`).
+    /// Run it on another machine (see `h0x-core machine ls`).
     #[arg(long, value_name = "MACHINE")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on: Option<String>,
-    /// Working directory (default: where hc runs; through the API, the core's;
+    /// Working directory (default: where h0x-core runs; through the API, the core's;
     /// with --on, that machine's home).
     #[arg(long)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -606,7 +606,7 @@ pub struct ExecParams {
     #[arg(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<String>,
-    /// Feed what is piped into hc to its stdin.
+    /// Feed what is piped into h0x-core to its stdin.
     #[arg(short = 'i', long)]
     #[serde(skip)]
     #[schemars(skip)]
@@ -636,11 +636,11 @@ pub struct ExecResult {
 pub struct FileAt {
     /// The file: absolute, or from `cwd`.
     pub path: String,
-    /// On another machine (see `hc machine ls`).
+    /// On another machine (see `h0x-core machine ls`).
     #[arg(long, value_name = "MACHINE")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on: Option<String>,
-    /// Where a relative path starts (default: where hc runs; through the API,
+    /// Where a relative path starts (default: where h0x-core runs; through the API,
     /// the core's; with --on, that machine's home).
     #[arg(long)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -731,12 +731,12 @@ pub struct MachineAddParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
     /// Mark it short-lived (a sandbox for a task), so clients can show it apart
-    /// from machines that stay. hc treats it like any other; remove it with
-    /// `hc machine rm`.
+    /// from machines that stay. h0x-core treats it like any other; remove it with
+    /// `h0x-core machine rm`.
     #[arg(long = "temp")]
     #[serde(default)]
     pub temporary: bool,
-    /// Copy this hc there when it has none or one too old, without asking
+    /// Copy this h0x-core there when it has none or one too old, without asking
     /// (for scripts; in a terminal you are asked).
     #[arg(long)]
     #[serde(skip)]
@@ -745,7 +745,7 @@ pub struct MachineAddParams {
     /// What to call it here (default: the target's host).
     #[arg(long)]
     pub name: Option<String>,
-    /// The hc session on that machine (default: its default).
+    /// The h0x-core session on that machine (default: its default).
     #[arg(long)]
     pub session: Option<String>,
 }

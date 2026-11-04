@@ -4,7 +4,7 @@ mod common;
 
 use common::framed::{Framed, Viewer};
 use common::*;
-use herdr_core::wire;
+use h0x_core::wire;
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
@@ -410,14 +410,14 @@ fn bare_hc_in_a_terminal_can_start_a_new_shell() {
     v.shows("new");
     v.typed(b"\r");
     wait_until("new shell", || s.json(&["ls"])["terminals"].as_array().unwrap().len() == 2);
-    v.typed(b"echo hi-from-$HC_TERMINAL_ID\r");
+    v.typed(b"echo hi-from-$H0X_TERMINAL_ID\r");
     v.shows("hi-from-t2");
 }
 
 #[test]
 fn the_detach_key_comes_from_the_config_file() {
     let s = Session::new();
-    let config = s.root.join("config/herdr-core/config.toml");
+    let config = s.root.join("config/h0x-core/config.toml");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     std::fs::write(&config, "detach_key = \"ctrl+]\"\n").unwrap();
     let inner = run(&s, &["sh", "-c", BYTES]);
@@ -461,7 +461,7 @@ fn a_terminal_cannot_attach_to_itself() {
     // It would show its own output inside itself, forever.
     let s = Session::new();
     let bin = s.bin.display().to_string();
-    let t = run(&s, &["sh", "-c", &format!("{bin} attach $HC_TERMINAL_ID; echo code-$?; sleep 100")]);
+    let t = run(&s, &["sh", "-c", &format!("{bin} attach $H0X_TERMINAL_ID; echo code-$?; sleep 100")]);
     wait_until("refused", || s.json(&["read", &t])["text"].as_str().unwrap().contains("code-"));
     let text = s.json(&["read", &t])["text"].as_str().unwrap().to_string();
     assert!(text.contains("itself") && !text.contains("code-0"), "{text}");
