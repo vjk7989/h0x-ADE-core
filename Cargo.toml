@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+# Release builds use LTO and strip symbols.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+
+# On top of clippy's defaults (CI denies warnings).
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+redundant_clone = "warn"
