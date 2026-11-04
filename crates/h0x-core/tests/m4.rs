@@ -217,10 +217,7 @@ fn keys_follow_the_programs_keyboard_modes() {
             .unwrap()
             .to_string();
     shows(&s, &t, "ready"); // raw mode is on: ctrl+c is a byte now, not a signal
-    // 20 bytes: od prints a line per 16, and uutils od (Ubuntu 26.04) reads 4
-    // more to peek at UTF-8 before it prints anything.
-    let a = ["a"; 16];
-    s.json(&[&["keys", &t, "up", "ctrl+c"], a.as_slice()].concat());
+    s.json(&["keys", &t, "up", "ctrl+c", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a", "a"]);
     shows(&s, &t, "033   O   A 003   a");
     let (code, err) = s.err(&["keys", &t, "hyper+q"]);
     assert_eq!((code, err["error"]["kind"].as_str()), (6, Some("invalid_params")));
