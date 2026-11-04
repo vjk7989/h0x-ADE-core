@@ -24,6 +24,10 @@ pub fn can_replace(path: &Path) -> bool {
 }
 
 pub fn connect(path: &Path) -> io::Result<Stream> {
+    // A socket in another user's directory could be anyone's.
+    if let Some(dir) = path.parent() {
+        dir_plan(dir, dir_owner(dir)?, unsafe { libc::getuid() })?;
+    }
     Stream::connect(path)
 }
 
@@ -47,7 +51,14 @@ pub fn merge_env(
 }
 
 pub fn listen(path: &Path) -> io::Result<Listener> {
-    Listener::bind(path)
+    let listener = Listener::bind(path)?;
+    owner_only(path, 0o600)?;
+    Ok(listener)
+}
+
+/// Only this user may read and write `path` (or enter it, for a directory).
+fn owner_only(path: &Path, mode: u32) -> io::Result<()> {
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(mode))
 }
 
 pub type AsyncRead = tokio::net::unix::OwnedReadHalf;
@@ -61,6 +72,7 @@ impl AsyncListener {
     pub fn bind(path: &Path) -> io::Result<std::os::unix::net::UnixListener> {
         let _ = std::fs::remove_file(path);
         let listener = std::os::unix::net::UnixListener::bind(path)?;
+        owner_only(path, 0o600)?;
         listener.set_nonblocking(true)?;
         Ok(listener)
     }
@@ -104,10 +116,52 @@ pub fn endpoints(state: &Path) -> (PathBuf, String) {
     (run.map_or_else(|| state.to_path_buf(), |run| run.join("h0x-core")), String::new())
 }
 
-/// A directory only this user can enter.
+/// A directory only this user can enter: made 0700, or one of ours put back
+/// to 0700. One owned by another user is refused, never used.
 pub fn private_dir(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)
+    let me = unsafe { libc::getuid() };
+    if dir_plan(path, dir_owner(path)?, me)? == DirPlan::Create {
+        if let Some(parent) = path.parent() {
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+        }
+        match std::fs::DirBuilder::new().mode(0o700).create(path) {
+            // Someone made it first: check whose it is.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            made => return made,
+        }
+    }
+    dir_plan(path, dir_owner(path)?, me)?;
+    owner_only(path, 0o700)
+}
+
+/// The uid owning the directory at `path`, or None when nothing is there.
+fn dir_owner(path: &Path) -> io::Result<Option<u32>> {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_dir() => Ok(Some(m.uid())),
+        Ok(_) => Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{} is not a directory", path.display()))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum DirPlan {
+    Create,
+    Restrict,
+}
+
+/// What to do with a private directory owned by `owner` (None: missing), as user `me`.
+fn dir_plan(path: &Path, owner: Option<u32>, me: u32) -> io::Result<DirPlan> {
+    match owner {
+        None => Ok(DirPlan::Create),
+        Some(uid) if uid == me => Ok(DirPlan::Restrict),
+        Some(uid) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} belongs to another user (uid {uid}, not {me}); h0x-core won't use it", path.display()),
+        )),
+    }
 }
 
 /// Takes the lock on `file` unless someone else holds it.
@@ -278,6 +332,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_private_dir_is_made_restricted_or_refused() {
+        let at = Path::new("/run/user/1000/h0x-core");
+        assert_eq!(dir_plan(at, None, 1000).unwrap(), DirPlan::Create, "missing: made 0700");
+        assert_eq!(dir_plan(at, Some(1000), 1000).unwrap(), DirPlan::Restrict, "ours: put back to 0700");
+        let err = dir_plan(at, Some(0), 1000).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("/run/user/1000/h0x-core") && err.to_string().contains("uid 0"), "{err}");
+    }
+
+    #[test]
+    fn sockets_and_their_dirs_are_for_this_user_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let root = dir("private");
+        let made = root.join("a/b");
+        private_dir(&made).unwrap();
+        assert_eq!(mode(&made), 0o700);
+        std::fs::set_permissions(&made, std::fs::Permissions::from_mode(0o755)).unwrap();
+        private_dir(&made).unwrap();
+        assert_eq!(mode(&made), 0o700, "an existing dir of ours is fixed");
+        let socket = made.join("core.sock");
+        let _listener = listen(&socket).unwrap();
+        assert_eq!(mode(&socket), 0o600);
+        connect(&socket).unwrap();
+        std::fs::write(root.join("file"), b"").unwrap();
+        assert!(private_dir(&root.join("file")).is_err(), "a file is not a dir");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn assert_display_gone(display: &str, sockets: &Path) {
