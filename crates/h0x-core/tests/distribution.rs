@@ -157,6 +157,7 @@ fn install_script_downloads(s: &Session, url: &str, releases: &str, installed: b
         .arg(format!("{ROOT}/../../distribution/install.sh"))
         .env("PATH", format!("{}:/usr/bin:/bin", stub.display()))
         .env("H0X_CORE_RELEASES_URL", releases)
+        .env_remove("H0X_CORE_VERSION")
         .env("H0X_CORE_INSTALL_DIR", &bin)
         .output()
         .unwrap();
