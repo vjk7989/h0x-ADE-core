@@ -156,7 +156,9 @@ pub fn connect(path: &Path) -> io::Result<Stream> {
             CreateFileW(name.as_ptr(), GENERIC_READ | GENERIC_WRITE, 0, null(), OPEN_EXISTING, flags, null_mut())
         };
         if h != INVALID_HANDLE_VALUE {
-            return Ok(Stream(Arc::new(Pipe { handle: unsafe { OwnedHandle::from_raw_handle(h as RawHandle) } })));
+            let pipe = Pipe { handle: unsafe { OwnedHandle::from_raw_handle(h as RawHandle) } };
+            served_by_this_account(&pipe, path)?;
+            return Ok(Stream(Arc::new(pipe)));
         }
         // Every instance busy: one frees up as soon as the server accepts.
         if unsafe { GetLastError() } != ERROR_PIPE_BUSY {
@@ -165,6 +167,48 @@ pub fn connect(path: &Path) -> io::Result<Stream> {
         unsafe { WaitNamedPipeW(name.as_ptr(), 100) };
     }
     Err(io::Error::from(io::ErrorKind::TimedOut))
+}
+
+/// Anyone may create a pipe name before our core does: only talk to one
+/// whose server runs as this account.
+fn served_by_this_account(pipe: &Pipe, path: &Path) -> io::Result<()> {
+    unsafe {
+        let mut pid = 0u32;
+        check(GetNamedPipeServerProcessId(pipe.raw(), &mut pid))?;
+        let server = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if server.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let server = OwnedHandle::from_raw_handle(server as RawHandle);
+        let theirs = token_user(server.as_raw_handle() as HANDLE)?;
+        let ours = token_user(GetCurrentProcess())?;
+        if windows_sys::Win32::Security::EqualSid(user_sid(&theirs), user_sid(&ours)) == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("{} is served by another account (process {pid}); h0x-core won't use it", path.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The TOKEN_USER of `process` (in usizes: the SID inside needs alignment).
+unsafe fn token_user(process: HANDLE) -> io::Result<Vec<usize>> {
+    use windows_sys::Win32::Security::*;
+    unsafe {
+        let mut token = null_mut();
+        check(OpenProcessToken(process, TOKEN_QUERY, &mut token))?;
+        let token = OwnedHandle::from_raw_handle(token as RawHandle);
+        let mut n = 0u32;
+        GetTokenInformation(token.as_raw_handle() as HANDLE, TokenUser, null_mut(), 0, &mut n);
+        let mut user = vec![0usize; (n as usize).div_ceil(size_of::<usize>())];
+        check(GetTokenInformation(token.as_raw_handle() as HANDLE, TokenUser, user.as_mut_ptr().cast(), n, &mut n))?;
+        Ok(user)
+    }
+}
+
+fn user_sid(token_user: &[usize]) -> windows_sys::Win32::Security::PSID {
+    unsafe { (*token_user.as_ptr().cast::<windows_sys::Win32::Security::TOKEN_USER>()).User.Sid }
 }
 
 /// Who may open our pipes: this account and SYSTEM (the default also lets
@@ -182,16 +226,13 @@ fn pipe_security() -> io::Result<*const SECURITY_ATTRIBUTES> {
         let mut token = null_mut();
         check(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token))?;
         let token = OwnedHandle::from_raw_handle(token as RawHandle);
-        let mut n = 0u32;
-        GetTokenInformation(token.as_raw_handle() as HANDLE, TokenUser, null_mut(), 0, &mut n);
-        let mut user = vec![0usize; (n as usize).div_ceil(size_of::<usize>())];
-        check(GetTokenInformation(token.as_raw_handle() as HANDLE, TokenUser, user.as_mut_ptr().cast(), n, &mut n))?;
         let mut sid = null_mut();
-        check(ConvertSidToStringSidW((*user.as_ptr().cast::<TOKEN_USER>()).User.Sid, &mut sid))?;
+        check(ConvertSidToStringSidW(user_sid(&token_user(GetCurrentProcess())?), &mut sid))?;
         let sid_text =
             String::from_utf16_lossy(std::slice::from_raw_parts(sid, (0..).take_while(|&i| *sid.add(i) != 0).count()));
         LocalFree(sid.cast());
         let mut elevation: TOKEN_ELEVATION = zeroed();
+        let mut n = 0u32;
         check(GetTokenInformation(
             token.as_raw_handle() as HANDLE,
             TokenElevation,
@@ -1185,6 +1226,13 @@ pub mod console {
 mod tests {
     use super::{RELEASE, endpoints};
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn a_pipe_we_create_is_one_we_may_connect_to() {
+        let name = format!(r"\\.\pipe\h0x-core-test-{}", crate::platform::random_hex());
+        let _listener = super::listen(Path::new(&name)).unwrap();
+        super::connect(Path::new(&name)).unwrap();
+    }
 
     #[test]
     fn a_release_ships_h0x_core_exe_and_no_hc_alias() {

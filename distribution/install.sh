@@ -38,9 +38,14 @@ sha256() {
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
+# https only, and the download on GitHub; a site set by H0X_CORE_RELEASES_URL
+# (tests: a local http one) is trusted as it is.
+proto='=https'
+[ -n "${H0X_CORE_RELEASES_URL:-}" ] && proto='=https,http'
+
 manifest="$releases/latest/download/latest.json"
 [ -n "${H0X_CORE_VERSION:-}" ] && manifest="$releases/download/v$H0X_CORE_VERSION/manifest.json"
-curl -fsSL "$manifest" -o "$tmp/manifest.json" || fail "cannot reach $manifest"
+curl -fsSL --proto "$proto" --proto-redir "$proto" "$manifest" -o "$tmp/manifest.json" || fail "cannot reach $manifest"
 # Read without jq: the manifest is flat enough for sed once spaces are gone.
 flat=$(tr -d '\n ' < "$tmp/manifest.json")
 entry=$(printf '%s' "$flat" | sed -n "s/.*\"$target\":{\([^}]*\)}.*/\1/p")
@@ -49,8 +54,14 @@ want=$(printf '%s' "$entry" | sed -n 's/.*"sha256":"\([^"]*\)".*/\1/p')
 version=$(printf '%s' "$flat" | sed -n 's/^{"version":"\([^"]*\)".*/\1/p')
 [ -n "$url" ] && [ -n "$want" ] || fail "no build for $target in $manifest"
 
+if [ -z "${H0X_CORE_RELEASES_URL:-}" ]; then
+  case $url in
+    https://github.com/* | https://objects.githubusercontent.com/* | https://release-assets.githubusercontent.com/*) ;;
+    *) fail "refusing to download $url: not an https link on GitHub" ;;
+  esac
+fi
 # Fetched exactly as the list gives it (a mirror's signed URL included).
-curl -fsSL "$url" -o "$tmp/h0x-core.tar.gz" || fail "download failed: $url"
+curl -fsSL --proto "$proto" --proto-redir "$proto" "$url" -o "$tmp/h0x-core.tar.gz" || fail "download failed: $url"
 [ "$(sha256 "$tmp/h0x-core.tar.gz")" = "$want" ] || fail "the download is damaged (checksum mismatch); try again"
 tar -xzf "$tmp/h0x-core.tar.gz" -C "$tmp"
 "$tmp/h0x-core" --version >/dev/null 2>&1 || fail "the downloaded h0x-core does not run on this machine"

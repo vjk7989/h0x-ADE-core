@@ -22,6 +22,13 @@ $ProgressPreference = "SilentlyContinue"
 
 # throw, not exit: under `irm | iex`, exit would close the person's window.
 function Fail($why) { throw "h0x-core: $why" }
+# https only, and the download on GitHub unless H0X_CORE_RELEASES_URL (tests) says where.
+function Check($url) {
+    if ($url -notlike "https://*") { Fail "refusing to download ${url}: not an https link" }
+    if (-not $env:H0X_CORE_RELEASES_URL -and ([Uri]$url).Host -notin "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com") {
+        Fail "refusing to download ${url}: not a link on GitHub"
+    }
+}
 
 $releases = if ($env:H0X_CORE_RELEASES_URL) { $env:H0X_CORE_RELEASES_URL.TrimEnd("/") } else { "https://github.com/vjk7989/h0x-ADE-core/releases" }
 $dir = if ($env:H0X_CORE_INSTALL_DIR) { $env:H0X_CORE_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "Programs\h0x-core" }
@@ -41,14 +48,16 @@ try {
     Copy-Item $zip "$tmp\h0x-core.zip"
   } else {
     $manifest = if ($env:H0X_CORE_VERSION) { "$releases/download/v$($env:H0X_CORE_VERSION)/manifest.json" } else { "$releases/latest/download/latest.json" }
-    curl.exe -fsSL $manifest -o "$tmp\manifest.json"
+    Check $manifest
+    curl.exe -fsSL --proto "=https" --proto-redir "=https" $manifest -o "$tmp\manifest.json"
     if ($LASTEXITCODE) { Fail "cannot reach $manifest" }
     $m = Get-Content -Raw "$tmp\manifest.json" | ConvertFrom-Json
     $t = $m.targets.$target
     if (-not $t.url -or -not $t.sha256) { Fail "no build for $target in $manifest" }
 
     # Fetched exactly as the list gives it (a mirror's signed URL included).
-    curl.exe -fsSL $t.url -o "$tmp\h0x-core.zip"
+    Check $t.url
+    curl.exe -fsSL --proto "=https" --proto-redir "=https" $t.url -o "$tmp\h0x-core.zip"
     if ($LASTEXITCODE) { Fail "download failed: $($t.url)" }
     # .NET, not Get-FileHash: that one fails when PowerShell 7 starts 5.1.
     $stream = [IO.File]::OpenRead("$tmp\h0x-core.zip")

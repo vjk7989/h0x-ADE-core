@@ -22,13 +22,38 @@ pub struct Target {
     pub sha256: String,
 }
 
+const GITHUB: &str = "https://github.com/vjk7989/h0x-ADE-core/releases";
+
+/// Hosts a download from the default releases site may come from: GitHub and
+/// the hosts its release downloads redirect to.
+const HOSTS: [&str; 3] = ["github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"];
+
+/// `H0X_CORE_RELEASES_URL` (a local test site): debug and test builds only.
+#[cfg(any(debug_assertions, test))]
+fn overridden() -> Option<String> {
+    std::env::var("H0X_CORE_RELEASES_URL").ok().filter(|v| !v.trim().is_empty()).map(|v| v.trim_end_matches('/').into())
+}
+
+#[cfg(not(any(debug_assertions, test)))]
+fn overridden() -> Option<String> {
+    None
+}
+
 fn base() -> String {
-    std::env::var("H0X_CORE_RELEASES_URL")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "https://github.com/vjk7989/h0x-ADE-core/releases".into())
-        .trim_end_matches('/')
-        .into()
+    overridden().unwrap_or_else(|| GITHUB.into())
+}
+
+/// Refuses a download link that is not https on GitHub.
+fn check_url(url: &str) -> Result<(), RpcError> {
+    let host = url.strip_prefix("https://").and_then(|rest| rest.split(['/', '?', '#']).next());
+    match host {
+        Some(h) if HOSTS.iter().any(|ok| h.eq_ignore_ascii_case(ok)) => Ok(()),
+        _ => Err(RpcError::new(
+            "refused",
+            format!("refusing to download {url:?}: not an https link on GitHub"),
+            "the release list is damaged or not from GitHub; try again",
+        )),
+    }
 }
 
 fn unavailable(why: String) -> RpcError {
@@ -40,9 +65,16 @@ fn unavailable(why: String) -> RpcError {
 }
 
 fn curl(url: &str, to: &Path) -> Result<(), RpcError> {
+    // A test site set by H0X_CORE_RELEASES_URL (debug builds) is trusted as it
+    // is, local http or file included; GitHub and its redirects are https only.
+    let pinned = overridden().is_none();
+    if pinned {
+        check_url(url)?;
+    }
+    let proto = if pinned { "=https" } else { "=https,http,file" };
     // Quiet: our error says what failed, and piped stderr is one JSON error.
     let ok = Command::new("curl")
-        .args(["-fsL", "--retry", "2", "--connect-timeout", "10", "-o"])
+        .args(["-fsL", "--proto", proto, "--proto-redir", proto, "--retry", "2", "--connect-timeout", "10", "-o"])
         .arg(to)
         .arg(url)
         .stderr(std::process::Stdio::null())
@@ -166,6 +198,33 @@ mod tests {
         assert_eq!(super::base(), "https://github.com/vjk7989/h0x-ADE-core/releases", "empty counts as unset");
         unsafe { std::env::remove_var("H0X_CORE_RELEASES_URL") };
         assert_eq!(super::base(), "https://github.com/vjk7989/h0x-ADE-core/releases");
+    }
+
+    #[test]
+    fn only_https_links_on_github_are_downloaded_from_the_default_site() {
+        for ok in [
+            "https://github.com/vjk7989/h0x-ADE-core/releases/download/v1.0.0/h0x-core-linux-x86_64.tar.gz",
+            "https://objects.githubusercontent.com/x?sig=a",
+            "https://release-assets.githubusercontent.com/x#y",
+            "https://GitHub.com/vjk7989/h0x-ADE-core/releases",
+        ] {
+            assert!(super::check_url(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "http://github.com/vjk7989/h0x-ADE-core/releases",
+            "https://evil.com/h0x-core.tar.gz",
+            "https://github.com.evil.com/h0x-core.tar.gz",
+            "https://evil.com/github.com",
+            "https://github.com@evil.com/x",
+            "https://github.com:8443/x",
+            "file:///etc/passwd",
+            "github.com/x",
+        ] {
+            let err = super::check_url(bad).unwrap_err();
+            assert_eq!(err.kind, "refused", "{bad}");
+            assert!(err.message.contains("not an https link on GitHub"), "{bad}: {}", err.message);
+        }
     }
 
     #[test]

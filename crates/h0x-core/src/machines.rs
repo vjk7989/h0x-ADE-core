@@ -69,8 +69,8 @@ impl Reach<'_> {
             // A pipe from the detached core must not open a console of its own.
             cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
         }
-        if std::env::var_os("H0X_CORE_SSH").is_none() {
-            cmd.arg("-T");
+        if fake_ssh().is_none() {
+            cmd.args(["-T", "--"]);
         }
         cmd.arg(self.target).arg(line);
         cmd
@@ -143,7 +143,13 @@ pub fn check_target(to: Reach) -> Result<(), RpcError> {
         }
         return Ok(());
     }
-    if target.is_empty() || target.starts_with('-') || target.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    let host = target.strip_prefix("ssh://").unwrap_or(target);
+    let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+    if target.is_empty()
+        || target.starts_with('-')
+        || host.starts_with('-')
+        || target.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
         return Err(RpcError::invalid_params(format!("bad ssh target {target:?}")));
     }
     Ok(())
@@ -159,13 +165,24 @@ fn control_path(paths: &crate::paths::Paths, target: &str) -> std::path::PathBuf
     paths.socket.parent().expect("socket has a dir").join(format!("ssh-{:012x}", h.finish() & 0xffff_ffff_ffff))
 }
 
+/// `$H0X_CORE_SSH`, a stand-in for ssh: debug and test builds only.
+#[cfg(any(debug_assertions, test))]
+fn fake_ssh() -> Option<std::ffi::OsString> {
+    std::env::var_os("H0X_CORE_SSH")
+}
+
+#[cfg(not(any(debug_assertions, test)))]
+fn fake_ssh() -> Option<std::ffi::OsString> {
+    None
+}
+
 /// `ssh` riding the shared login when there is one, with `extra` options; or
 /// `$H0X_CORE_SSH` in its place (tests), which takes only the target and the remote
 /// command. Only `login` creates the shared login: one made by the line (or
 /// an install) would end with it, and take every connection riding it along
 /// (an update restarting h0x-core there ended its own upload that way).
 fn ssh(paths: &crate::paths::Paths, target: &str, extra: &[&str]) -> std::process::Command {
-    if let Some(fake) = std::env::var_os("H0X_CORE_SSH") {
+    if let Some(fake) = fake_ssh() {
         return std::process::Command::new(fake);
     }
     let mut ssh = std::process::Command::new("ssh");
@@ -193,7 +210,11 @@ pub fn login(paths: &crate::paths::Paths, to: Reach) -> Result<(), RpcError> {
     }
     paths.create_dirs().map_err(|e| RpcError::internal(e.to_string()))?;
     let mut cmd = ssh(paths, target, &["BatchMode=no", "ControlPersist=600"]);
-    cmd.env_remove("SSH_ASKPASS").env("SSH_ASKPASS_REQUIRE", "never").arg(target).arg("exit");
+    cmd.env_remove("SSH_ASKPASS").env("SSH_ASKPASS_REQUIRE", "never");
+    if fake_ssh().is_none() {
+        cmd.arg("--");
+    }
+    cmd.arg(target).arg("exit");
     match cmd.status() {
         Ok(s) if s.success() => Ok(()),
         Ok(_) => Err(RpcError::new("needs_login", format!("logging in to {target} failed"), "ssh said why, above")),
@@ -204,9 +225,9 @@ pub fn login(paths: &crate::paths::Paths, to: Reach) -> Result<(), RpcError> {
 /// Ends the shared login to `target`, if one is up (a forgotten machine).
 pub fn logout(paths: &crate::paths::Paths, to: Reach) {
     let target = to.target;
-    if cfg!(unix) && std::env::var_os("H0X_CORE_SSH").is_none() && !to.via {
+    if cfg!(unix) && fake_ssh().is_none() && !to.via {
         let mut cmd = ssh(paths, target, &[]);
-        cmd.args(["-O", "exit", target])
+        cmd.args(["-O", "exit", "--", target])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -542,7 +563,7 @@ fn install_windows(paths: &crate::paths::Paths, target: &str, session: Option<&s
         .arg(format!("ControlPath={}", control_path(paths, target).display()))
         .args(["-o", "ControlMaster=no"]);
     scp.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);
-    scp.arg(scratch.0.join("h0x-core-install.zip")).arg(&script).arg(format!("{target}:"));
+    scp.arg("--").arg(scratch.0.join("h0x-core-install.zip")).arg(&script).arg(format!("{target}:"));
     let to = Reach { target, via: false };
     let out = scp.output().map_err(|e| unreachable(to, &format!("cannot run scp: {e}")))?;
     if !out.status.success() {
@@ -591,6 +612,23 @@ mod tests {
         assert_eq!(platform("Linux x86_64"), "linux x86_64");
         assert_eq!(platform("MINGW64_NT-10.0 x86_64"), "windows x86_64");
         assert_eq!(platform("MSYS_NT-10.0 x86_64"), "windows x86_64");
+    }
+
+    #[test]
+    fn a_target_never_reaches_ssh_as_an_option() {
+        let ssh = |target| Reach { target, via: false };
+        for bad in ["", "-oProxyCommand=x", "can@-oProxyCommand=x", "ssh://-oProxyCommand=x", "ssh://can@-p22"] {
+            assert!(check_target(ssh(bad)).is_err(), "{bad:?}");
+        }
+        for ok in ["rohan", "can@rohan", "ssh://can@rohan:2222", "can-1@rohan-2", "can@fe80::1"] {
+            assert!(check_target(ssh(ok)).is_ok(), "{ok:?}");
+        }
+        if fake_ssh().is_none() {
+            let paths = crate::paths::Paths::from_env().unwrap();
+            let cmd = ssh("rohan").command(&paths, &["BatchMode=yes"], "true");
+            let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+            assert_eq!(args[args.len() - 3..], ["--", "rohan", "true"], "{args:?}");
+        }
     }
 
     #[test]
