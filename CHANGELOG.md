@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-05
+
+### Changed
+
+- Faster terminal output: fewer copies and system calls between terminals and the apps watching them.
+- The notices readme names h0x-core.
+
 ## [0.1.2] - 2026-11-05
 
 ### Fixed
