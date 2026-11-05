@@ -106,3 +106,22 @@ fn a_session_resumes_and_goes_to_the_trash_here_and_on_a_machine() {
     s.json(&["session", "trash", "claude", ID]);
     assert!(ids(&s.json(&["session", "list", "/home/u/app"])).is_empty());
 }
+
+#[test]
+fn a_session_resume_or_trash_with_bad_params_names_what_is_wrong() {
+    const ID: &str = "0b5f3c3e-1d2a-4c4b-9e7f-2a1b3c4d5e6f";
+    let s = Session::new();
+    assert_eq!(s.json(&["session", "resume", "codex", ID]), json!({"argv": ["codex", "resume", ID]}));
+    let (_, e) = s.err(&["session", "resume", "--on", "nope", "claude", ID]);
+    assert_eq!(e["error"]["kind"], "machine_unknown", "{e}");
+    let mut conn = s.connect();
+    for (n, method, params) in [
+        (1, "session.resume_argv", json!({"agent": "claude"})),
+        (2, "session.trash", json!({"id": ID})),
+        (3, "session.trash", json!({"agent": "claude", "id": ID, "on": 7})),
+        (4, "session.resume_argv", json!({"agent": "claude", "id": null})),
+    ] {
+        let r = conn.call(n, method, params);
+        assert_eq!(r["error"]["data"]["kind"], "invalid_params", "{method}: {r}");
+    }
+}
