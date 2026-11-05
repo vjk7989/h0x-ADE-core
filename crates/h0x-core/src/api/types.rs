@@ -798,3 +798,62 @@ pub struct RunResult {
 pub struct TemplatesResult {
     pub templates: Vec<crate::templates::TemplateInfo>,
 }
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct SessionListParams {
+    /// The folder they ran in: absolute, or from where h0x-core runs (through
+    /// the API, the core's folder; with --on, that machine's home).
+    #[arg(default_value = ".")]
+    pub folder: String,
+    /// On another machine (see `h0x-core machine ls`).
+    #[arg(long, value_name = "MACHINE")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct SessionListResult {
+    /// Newest first.
+    pub sessions: Vec<SessionInfo>,
+}
+
+/// One agent session.
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct SessionParams {
+    /// Its agent: `claude`, `codex`, `opencode`, or another the runtime
+    /// resumes (`copilot`, `qwen`, `grok`, ...).
+    pub agent: String,
+    /// The agent's id for it, in that agent's shape (Claude Code and Codex: a UUID; OpenCode: `ses_...`).
+    pub id: String,
+    /// On another machine (see `h0x-core machine ls`).
+    #[arg(long, value_name = "MACHINE")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct SessionResumeResult {
+    /// The command that resumes it, run in the folder it ran in: argv, never a shell string.
+    pub argv: Vec<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct SessionTrashResult {
+    /// What went to the trash: its files (and folders) in the agent's store.
+    pub trashed: Vec<String>,
+}
+
+/// An agent session, as its agent stored it.
+#[derive(Serialize, JsonSchema, Debug)]
+pub struct SessionInfo {
+    /// The agent: `claude`, `codex` or `opencode` (more may come).
+    pub agent: String,
+    /// The agent's id for it, as given to its resume option.
+    pub id: String,
+    /// Its name, when it has one.
+    pub title: Option<String>,
+    /// When it was last used, unix ms.
+    pub last_used: u64,
+    /// Its file in the agent's store.
+    pub path: String,
+}

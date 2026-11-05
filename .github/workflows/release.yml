@@ -23,6 +23,9 @@ concurrency:
 
 env:
   RUST_TOOLCHAIN: 1.95.0
+  # SQLite (rusqlite's bundled C source) builds against musl's own headers on Linux.
+  CC_x86_64_unknown_linux_musl: musl-gcc
+  CC_aarch64_unknown_linux_musl: musl-gcc
 
 jobs:
   # A tag must name the crate's version; manual builds have no tag to check.
@@ -69,6 +72,8 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
+      - if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.16.0

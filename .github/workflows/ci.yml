@@ -33,6 +33,8 @@ env:
   # A test that checks h0x-core keeps a fixed timing (50 ms to finish a key
   # sequence) skips that check here: a loaded runner can't keep it.
   H0X_CORE_TEST_SLOW_RUNNER: "1"
+  # SQLite (rusqlite's bundled C source) builds against musl's own headers on Linux.
+  CC_x86_64_unknown_linux_musl: musl-gcc
 
 jobs:
   # Fast formatting/advisory checks and Windows clippy from Linux
@@ -63,6 +65,8 @@ jobs:
       - run: cargo clippy --locked --target x86_64-pc-windows-msvc --all-targets -- -D warnings
         env:
           ZIG: ${{ github.workspace }}/scripts/zig-stub.sh
+          # Type-checking only: SQLite's C source is not compiled for Windows here.
+          LIBSQLITE3_SYS_USE_PKG_CONFIG: "1"
 
   test:
     strategy:
@@ -88,6 +92,8 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy
           targets: ${{ matrix.target }}
+      - if: matrix.os == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.16.0
