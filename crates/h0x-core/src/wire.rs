@@ -286,13 +286,10 @@ impl Outbox {
             let reason = self.streams.remove(&channel).and_then(|s| s.ending).unwrap_or_default();
             return Some(encode(channel, CLOSE, &reason));
         }
-        let ready: Vec<u32> = self
-            .streams
-            .iter()
-            .filter(|(_, s)| !s.paused && s.credit > 0 && !s.pending.is_empty())
-            .map(|(ch, _)| *ch)
-            .collect();
-        let channel = *ready.iter().find(|ch| **ch > self.turn).or(ready.first())?;
+        let mut ready =
+            self.streams.iter().filter(|(_, s)| !s.paused && s.credit > 0 && !s.pending.is_empty()).map(|(ch, _)| *ch);
+        let first = ready.next()?;
+        let channel = if first > self.turn { first } else { ready.find(|ch| *ch > self.turn).unwrap_or(first) };
         self.turn = channel;
         let s = self.streams.get_mut(&channel).expect("ready stream");
         if s.resizes.front().is_some_and(|(at, _)| *at == 0) {
@@ -305,8 +302,16 @@ impl Outbox {
             *at -= n;
         }
         s.credit -= n;
-        let chunk: Vec<u8> = s.pending.drain(..n).collect();
-        Some(encode(channel, DATA, &chunk))
+        let mut frame = Vec::with_capacity(HEADER + n);
+        frame.extend_from_slice(&channel.to_le_bytes());
+        frame.push(DATA);
+        frame.extend_from_slice(&(n as u32).to_le_bytes());
+        let (front, back) = s.pending.as_slices();
+        let front = &front[..n.min(front.len())];
+        frame.extend_from_slice(front);
+        frame.extend_from_slice(&back[..n - front.len()]);
+        s.pending.drain(..n);
+        Some(frame)
     }
 }
 
