@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-05
+
+### Changed
+
+- Includes the herdr-core 0.1.18 changes: a terminal's environment survives planned core restarts, terminals start with the display's current facts, and wait/template fixes.
+- `terminal.run` accepts the caller's colors and cell size, so a program's display queries are answered from its first moment.
+- The core raises its open file limit at startup, so many terminals at once no longer run out of file handles.
+- The macOS signing and notarization changes from herdr-core 0.1.18 were not taken: HyperOx ships unsigned GitHub Releases.
+
+### Fixed
+
+- A template's first message is retried if the program is not ready yet; if it still cannot be sent, the terminal keeps it so it can be inspected.
+- Waiting on a terminal's children waits for the tasks sent to them to finish, keeps finished tasks across a planned core restart, and ignores replayed startup reports.
+
 ## [0.1.3] - 2026-11-05
 
 ### Changed
