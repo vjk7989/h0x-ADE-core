@@ -96,9 +96,12 @@ fn a_paired_account_drives_real_terminals() {
 
 const TOKEN: &str = "123456:ABCdef_ghi-JKLmnoPQRstuVWXyz0123";
 
+/// Requests a stub saw: (path, body).
+type Seen = std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>;
+
 /// A loopback Bot API: one `/agents` from user 42, then nothing; records
 /// every request's method and body.
-fn stub() -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>) {
+fn stub() -> (String, Seen) {
     use std::io::{BufRead, BufReader, Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
