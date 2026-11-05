@@ -53,6 +53,9 @@ These commands need a confirmation:
 - text, keys, approve or deny sent to a program that doesn't report its status over OSC 7501, such as a plain shell, where typed text runs as a command.
 
 Text and answers sent to an agent that reports its status run at once.
+Interrupt never needs a confirmation, even into a plain shell: it only presses the stop key (esc for a program that reports its status, else ctrl+c), and a stop that has to wait two minutes is no stop.
+
+A waiting confirmation is void once the account is unpaired or paired again, and after any lock, whether it was locked from a chat or with `h0x-core bridge lock` here. Unlocking doesn't bring it back; ask again.
 
 Approve and deny press keys for you. For a program that reports its status and is `blocked`, approve presses enter and deny presses esc.
 In agents' permission dialogs, enter takes the highlighted first choice ("yes") and esc cancels.
@@ -70,13 +73,14 @@ h0x-core bridge unlock
 While locked, the bridge refuses every remote command, including confirmations already given, and refuses pairing.
 A paired account can lock the bridge from a chat, for example when a phone is lost.
 Only `h0x-core bridge unlock` on this machine lifts the lock; no remote command can.
+Locking voids every confirmation that was waiting.
 
 ## Limits
 
 Each account may send 30 commands a minute; beyond that, the reply says how long to wait.
 Notices (it needs you, it's done, it hit an error, it finished) come at most once per terminal every 10 seconds.
 If an agent goes back to work while a notice is held back, the notice is dropped.
-Both limits are set in config.toml:
+Both limits are set in config.toml; `notice_quiet` is capped at an hour:
 
 ```toml
 [bridge]
@@ -90,18 +94,19 @@ Text that leaves this machine is redacted first: terminal output, terminal lists
 Common secret shapes become `[redacted]`:
 
 - API keys and tokens: `sk-…`, `ghp_…` and other GitHub tokens, Slack `xox…-` tokens, AWS `AKIA…` keys;
-- `Bearer` tokens;
+- `Bearer` tokens, whatever whitespace follows the word;
 - private key blocks, from -----BEGIN … KEY----- through their END line;
 - long values after names ending in token, secret, password or key (`API_KEY=…`, `"auth_token": "…"`).
 
 Redaction matches known shapes and nothing else, so it is a safety net, not a guarantee.
-A secret in an unusual shape still goes out. Don't read terminals that print secrets you can't afford to send to the chat service.
+A secret in an unusual shape still goes out, and so does one split across lines (a wrapped key, a value on the line after its name): each line is matched on its own terms. Don't read terminals that print secrets you can't afford to send to the chat service.
 
 ## Audit log
 
 Every command that reaches the bridge is appended to `audit.jsonl`, and so is every pairing attempt.
 Each entry has the time, the account, the command, the terminal and the result.
-Typed text and commands are stored redacted and cut to 24 characters, with their length. Pairing codes are never stored.
+Typed text, commands, folders and terminal names are stored redacted and cut to 24 characters; text keeps its length.
+Pairing codes and confirmation tokens are never stored: a confirmation is logged as `confirm` with the action it ran.
 If the log can't be written, the command doesn't run.
 
 ```sh
@@ -115,6 +120,14 @@ The bridge folder is `bridge/` beside config.toml: `~/.config/h0x-core/bridge/`,
 It holds `state.json` (paired accounts, the live code, the lock) and `audit.jsonl`.
 On Unix, the folder is 0700 and both files are 0600. On Windows, they use the folder's permissions, like the rest of core's state.
 Pairing codes sit in `state.json` for their 10 minutes. Treat that folder like an SSH key.
+
+If `state.json` is damaged (not a JSON object of the right shape), the bridge refuses every command and pairing until you run
+
+```sh
+h0x-core bridge reset
+```
+
+on this machine. It moves the file aside as `state.json.bad-<time>` and starts empty: no paired accounts, unlocked. Pair again afterwards. No remote command can reset.
 
 ## Threat model
 

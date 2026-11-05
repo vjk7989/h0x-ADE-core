@@ -54,7 +54,7 @@ More
   update [--version X|--from <file>]   latest release, at least X, or a build
   machine add|ls|login|update|rename|rm   other machines, over ssh or a command
                               (--via 'fly ssh console -a x --pty=false -C')
-  bridge pair|ls|unpair|lock|unlock|log
+  bridge pair|ls|unpair|lock|unlock|reset|log
                               remote control from paired chat accounts: full
                               control of this machine (docs/bridge.md)
   connect                     the API over stdin/stdout (ssh box h0x-core connect)
@@ -108,6 +108,7 @@ Commands:
   ls      List paired accounts and whether remote control is locked
   lock    Refuse every remote command until `bridge unlock` on this machine
   unlock  Allow remote commands again (only here, never remotely)
+  reset   Move state.json aside (kept as state.json.bad-<time>) and start empty: no paired accounts, unlocked. For a corrupt state; only here
   log     The last audit log entries: every remote command and pairing attempt
   help    Print this message or the help of the given subcommand(s)
 
@@ -164,6 +165,18 @@ Options:
       --json                   JSON output even in a terminal
       --transport <TRANSPORT>  Where the account to pair writes from [default: telegram] [possible values: telegram]
   -h, --help                   Print help
+```
+
+## h0x-core bridge reset
+
+```text
+Move state.json aside (kept as state.json.bad-<time>) and start empty: no paired accounts, unlocked. For a corrupt state; only here
+
+Usage: h0x-core bridge reset [OPTIONS]
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
 ```
 
 ## h0x-core bridge unlock

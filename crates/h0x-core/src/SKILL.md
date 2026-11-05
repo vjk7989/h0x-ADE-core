@@ -238,7 +238,7 @@ paths start at your current folder. Prefer explicit paths for remote work.
   terminals; per-terminal API `env` overrides still apply. A stop followed by a
   fresh start uses the new launcher's environment.
 - `h0x-core bridge` is remote control for people: chat accounts paired with
-  `bridge pair` get full control of this machine. Never pair, unpair or
+  `bridge pair` get full control of this machine. Never pair, unpair, reset or
   `h0x-core bridge unlock` on your own; `h0x-core bridge ls` and
   `h0x-core bridge log` are safe to read. A person may answer your blocked
   prompt from their phone.

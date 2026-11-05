@@ -56,6 +56,10 @@ struct State {
     blocked_until_ms: u64,
     #[serde(default)]
     locked: bool,
+    /// Times locked: a confirmation given before a lock is void after it,
+    /// whichever process locked (ADR-061 addendum).
+    #[serde(default)]
+    locks: u64,
 }
 
 /// The one live pairing code.
@@ -90,8 +94,38 @@ impl Bridge {
         Bridge { dir, config, recent: HashMap::new(), tokens: HashMap::new() }
     }
 
+    /// The state, or empty when there is none. A file that isn't a JSON
+    /// object of the right shape is an error, left untouched for `reset`.
     fn load(&self) -> Result<State, RpcError> {
-        crate::paths::read_state(&self.dir.join("state.json")).map_err(failed)
+        let path = self.dir.join("state.json");
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(State::default()),
+            Err(e) => return Err(failed(format!("{}: {e}", path.display()))),
+        };
+        let parsed = match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) if value.is_object() => serde_json::from_value(value).map_err(|e| e.to_string()),
+            Ok(_) => Err("not a JSON object".into()),
+            Err(e) => Err(e.to_string()),
+        };
+        parsed.map_err(|e| {
+            RpcError::new(
+                "bridge",
+                format!("the bridge state is corrupt ({e}); run `h0x-core bridge reset` on that machine"),
+                "reset moves it aside and starts with no paired accounts",
+            )
+        })
+    }
+
+    /// Moves state.json aside as `state.json.bad-<now>` and starts empty: no
+    /// paired accounts, no code, unlocked. Local only. Where it went, if anywhere.
+    pub fn reset(&self, now: u64) -> Result<Option<PathBuf>, RpcError> {
+        let (path, aside) = (self.dir.join("state.json"), self.dir.join(format!("state.json.bad-{now}")));
+        match std::fs::rename(&path, &aside) {
+            Ok(()) => Ok(Some(aside)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(failed(format!("{}: {e}", path.display()))),
+        }
     }
 
     /// Replaces state.json with a new 0600 file.
@@ -137,14 +171,15 @@ impl Bridge {
     ) -> Result<Identity, RpcError> {
         let mut st = self.load()?;
         let result = verify(&mut st, transport, user_id, label, code, now);
-        self.save(&st)?;
         let outcome = match &result {
             Ok(_) => "paired".to_string(),
             Err(e) => format!("refused: {}", e.message),
         };
+        // Logged before it counts: an attempt the log can't keep pairs no one.
         self.audit(
             json!({"time_ms": now, "identity": format!("{transport}:{user_id}"), "command": "pair", "result": outcome}),
         )?;
+        self.save(&st)?;
         result
     }
 
@@ -176,6 +211,7 @@ impl Bridge {
         st.locked = locked;
         if locked {
             st.pending = None;
+            st.locks += 1;
         }
         self.save(&st)
     }
@@ -413,6 +449,28 @@ mod tests {
         std::fs::create_dir(b.dir.join("audit.jsonl")).unwrap();
         assert!(b.pair_verify("telegram", "42", "", &code, T).is_err());
         assert!(b.identities().unwrap().is_empty(), "an attempt the log can't keep must not pair");
+        std::fs::remove_dir_all(&b.dir).unwrap();
+    }
+
+    #[test]
+    fn reset_moves_a_corrupt_state_aside_and_starts_empty() {
+        let b = scratch();
+        assert_eq!(b.reset(T).unwrap(), None, "nothing to move");
+        std::fs::create_dir_all(&b.dir).unwrap();
+        for (n, bad) in ["[]", "null", "42", "\"x\"", "{", r#"{"locked": "yes"}"#].into_iter().enumerate() {
+            std::fs::write(b.dir.join("state.json"), bad).unwrap();
+            let err = b.identities().unwrap_err();
+            assert!(err.message.contains("run `h0x-core bridge reset`"), "{bad}: {}", err.message);
+            let at = T + n as u64;
+            let aside = b.reset(at).unwrap().unwrap();
+            assert_eq!(aside, b.dir.join(format!("state.json.bad-{at}")));
+            assert_eq!(std::fs::read_to_string(&aside).unwrap(), bad, "kept as it was");
+            assert!(b.identities().unwrap().is_empty() && !b.locked().unwrap(), "{bad}");
+        }
+        let (code, _) = b.pair("telegram", T).unwrap();
+        b.pair_verify("telegram", "42", "", &code, T).unwrap();
+        b.reset(T + 100).unwrap();
+        assert!(b.identities().unwrap().is_empty(), "a good state can be reset too");
         std::fs::remove_dir_all(&b.dir).unwrap();
     }
 

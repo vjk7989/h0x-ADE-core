@@ -47,7 +47,8 @@ impl BridgeConfig {
     }
 
     pub fn notice_quiet_ms(&self) -> u64 {
-        (self.notice_quiet.filter(|s| s.is_finite() && *s >= 0.0).unwrap_or(10.0) * 1000.0) as u64
+        // At most an hour: a longer quiet period would hide that it needs you.
+        (self.notice_quiet.filter(|s| s.is_finite() && *s >= 0.0).unwrap_or(10.0).min(3600.0) * 1000.0) as u64
     }
 }
 
@@ -128,6 +129,12 @@ mod tests {
         for bad in ["alt+x", "ctrl+", "ctrl+ab", "ctrl+1", "x"] {
             assert_eq!(key(bad).unwrap_err().kind, "config", "{bad}");
         }
+    }
+
+    #[test]
+    fn notice_quiet_is_capped_at_an_hour() {
+        let quiet = |secs: f64| BridgeConfig { notice_quiet: Some(secs), ..Default::default() }.notice_quiet_ms();
+        assert_eq!((quiet(3600.0), quiet(3601.0), quiet(1e12)), (3_600_000, 3_600_000, 3_600_000));
     }
 
     #[test]

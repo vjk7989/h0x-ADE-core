@@ -1,35 +1,35 @@
 //! Secrets out of text that leaves this machine: common token shapes become
-//! `[redacted]`. A pattern list, not a guarantee (see docs/bridge.md).
+//! `[redacted]`. A pattern list, not a guarantee (see docs/bridge.md); a
+//! secret split across lines is not recognized.
+//!
+//! One pass, left to right: after a cut the scan resumes at its end, and a
+//! pattern that fails looks only a bounded distance ahead, so the time is
+//! linear in the text, whatever it repeats.
 
 const MARK: &str = "[redacted]";
+/// How far a key name, the gap after `Bearer`, or a key block's header line may reach.
+const NAME: usize = 64;
+const GAP: usize = 8;
+const HEADER: usize = 80;
 
 /// `text` with API keys, tokens, private keys and `password=...` values replaced.
 pub fn redact(text: &str) -> String {
     let b = text.as_bytes();
-    let mut cuts = Vec::new();
-    for i in 0..b.len() {
-        if i == 0 || !is_word(b[i - 1]) {
-            cuts.extend(prefixed(b, i).map(|end| (i, end)));
-            cuts.extend(bearer(b, i));
-        }
-        if matches!(b[i], b'=' | b':') {
-            cuts.extend(assigned(b, i));
-        }
-        if b[i..].starts_with(b"-----BEGIN ") {
-            cuts.extend(pem(b, i));
-        }
-    }
-    cuts.sort_unstable();
     let mut out = String::with_capacity(text.len());
-    let mut at = 0;
-    for (start, end) in cuts {
-        if start < at {
-            at = at.max(end);
-            continue;
+    let (mut i, mut at) = (0, 0);
+    while i < b.len() {
+        let word_start = i == 0 || !is_word(b[i - 1]);
+        let cut = (if word_start { prefixed(b, i).map(|end| (i, end)).or_else(|| bearer(text, i)) } else { None })
+            .or_else(|| if matches!(b[i], b'=' | b':') { assigned(b, i) } else { None })
+            .or_else(|| pem(b, i));
+        match cut {
+            Some((start, end)) => {
+                out.push_str(&text[at..start]);
+                out.push_str(MARK);
+                (at, i) = (end, end);
+            }
+            None => i += 1,
         }
-        out.push_str(&text[at..start]);
-        out.push_str(MARK);
-        at = end;
     }
     out.push_str(&text[at..]);
     out
@@ -64,45 +64,56 @@ fn prefixed(b: &[u8], i: usize) -> Option<usize> {
     } else {
         return None;
     };
+    // A run shorter than `min` fails within `min` bytes; a longer one is cut and skipped.
     let run = rest[skip..].iter().take_while(|c| ok(**c)).count();
     (run >= min).then_some(i + skip + run)
 }
 
-/// `Bearer <token>` at `i`: the token (the word stays readable).
-fn bearer(b: &[u8], i: usize) -> Option<(usize, usize)> {
+/// `Bearer <token>` at `i`: the token (the word stays readable). Any
+/// whitespace may separate them, a no-break space too.
+fn bearer(text: &str, i: usize) -> Option<(usize, usize)> {
+    let b = text.as_bytes();
     if !b.get(i..i + 6)?.eq_ignore_ascii_case(b"bearer") {
         return None;
     }
-    let spaces = b[i + 6..].iter().take_while(|c| **c == b' ').count();
-    let start = i + 6 + spaces;
+    // `i + 6` follows six ASCII bytes: a character boundary.
+    let gap: usize = text[i + 6..].chars().take(GAP).take_while(|c| c.is_whitespace()).map(char::len_utf8).sum();
+    let start = i + 6 + gap;
     let run = &b[start..][..b[start..].iter().take_while(|c| is_secret(**c)).count()];
     // Prose ("Bearer authentication") has no digits; tokens do, or are long.
     let token = run.len() >= 8 && (run.iter().any(u8::is_ascii_digit) || run.len() >= 20);
-    (spaces > 0 && token).then_some((start, start + run.len()))
+    (gap > 0 && token).then_some((start, start + run.len()))
 }
 
 /// The value after `api_key=`, `"token": "..."`, `PASSWORD=` and the like, at
 /// the `=` or `:` at `i`.
 fn assigned(b: &[u8], i: usize) -> Option<(usize, usize)> {
     let end = if i > 0 && matches!(b[i - 1], b'"' | b'\'') { i - 1 } else { i };
-    let start = b[..end].iter().rposition(|c| !(is_word(*c) || *c == b'-')).map_or(0, |p| p + 1);
+    let from = end.saturating_sub(NAME);
+    let start = b[from..end].iter().rposition(|c| !(is_word(*c) || *c == b'-')).map_or(from, |p| from + p + 1);
     let name = b[start..end].to_ascii_lowercase();
     if !["token", "secret", "password", "key"].iter().any(|k| name.ends_with(k.as_bytes())) {
         return None;
     }
-    let at = i + 1 + b[i + 1..].iter().take_while(|c| matches!(c, b' ' | b'"' | b'\'')).count();
+    let at = i + 1 + b[i + 1..].iter().take(GAP).take_while(|c| matches!(c, b' ' | b'"' | b'\'')).count();
     let run = b[at..].iter().take_while(|c| is_secret(**c)).count();
     (run >= 8).then_some((at, at + run))
 }
 
-/// A `-----BEGIN ... KEY-----` block at `i`, through its END line (or the end of the text).
+/// A `-----BEGIN ... KEY-----` block at `i`, through its END line (or the
+/// end of the text: everything after it is cut, so it is searched once).
 fn pem(b: &[u8], i: usize) -> Option<(usize, usize)> {
-    let line_end = b[i..].iter().position(|c| *c == b'\n').map_or(b.len(), |p| i + p);
+    if !b[i..].starts_with(b"-----BEGIN ") {
+        return None;
+    }
+    let header = &b[i..b.len().min(i + HEADER)];
+    let line_end = i + header.iter().position(|c| *c == b'\n').unwrap_or(header.len());
     find(&b[i..line_end], b"KEY-----")?;
-    let end = find(&b[line_end..], b"-----END ").map_or(b.len(), |p| {
-        let after = line_end + p + 9;
-        find(&b[after..], b"-----").map_or(b.len(), |q| after + q + 5)
-    });
+    let Some(p) = find(&b[line_end..], b"-----END ") else { return Some((i, b.len())) };
+    let after = line_end + p + 9;
+    let tail = &b[after..b.len().min(after + HEADER)];
+    let end = find(tail, b"-----").map(|q| after + q + 5);
+    let end = end.unwrap_or_else(|| after + tail.iter().position(|c| *c == b'\n').unwrap_or(tail.len()));
     Some((i, end))
 }
 
@@ -242,5 +253,36 @@ mod tests {
     fn overlapping_matches_leave_one_mark_and_unicode_survives() {
         assert_eq!(redact("token=sk-abcdefghijklmnopqrst ✓"), "token=[redacted] ✓");
         assert_eq!(redact("é Bearer sk-abcdefghijklmnop1234"), "é Bearer [redacted]");
+    }
+
+    #[test]
+    fn repeated_patterns_take_linear_time() {
+        let cases: [(&str, &str); 5] = [
+            ("sk-", "[redacted]"),
+            ("key=", "key=[redacted]"),
+            ("xoxb-", "[redacted]"),
+            ("-----BEGIN RSA PRIVATE KEY-----\n", "[redacted]"),
+            ("Bearer ", ""),
+        ];
+        for size in [64 << 10, 1 << 20] {
+            for (unit, want) in cases {
+                let text = unit.repeat(size / unit.len());
+                let started = std::time::Instant::now();
+                let out = redact(&text);
+                let took = started.elapsed();
+                assert!(took < std::time::Duration::from_secs(1), "{unit:?} x {size}: {took:?}");
+                let want = if want.is_empty() { text.as_str() } else { want };
+                assert_eq!(out, want, "{unit:?} x {size}");
+            }
+        }
+    }
+
+    #[test]
+    fn any_whitespace_may_follow_bearer() {
+        for gap in [" ", "\t", "\u{a0}", "\u{2003}", "  \u{a0} "] {
+            let text = format!("Authorization: Bearer{gap}abcdef0123456789");
+            assert_eq!(redact(&text), format!("Authorization: Bearer{gap}[redacted]"), "{gap:?}");
+        }
+        assert_eq!(redact("Bearer\u{a0}abc"), "Bearer\u{a0}abc", "short tokens stay");
     }
 }

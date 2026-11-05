@@ -23,10 +23,12 @@ pub(crate) fn status(t: &Value) -> (String, &'static str) {
     (word.into(), dot)
 }
 
-/// Who runs in a terminal: the app it reports, else its program's name.
+/// Who runs in a terminal: the app it reports, else its program's name
+/// (without its folder, `/` or Windows `\`).
 pub(crate) fn agent(t: &Value) -> String {
     let program = t["argv"][0].as_str().unwrap_or_default();
-    t["status"]["app"].as_str().unwrap_or_else(|| program.rsplit('/').next().unwrap_or_default()).into()
+    let name = program.rsplit(['/', '\\']).next().unwrap_or_default();
+    t["status"]["app"].as_str().unwrap_or_else(|| name.strip_suffix(".exe").unwrap_or(name)).into()
 }
 
 /// The current folder, falling back to where the terminal started.
@@ -304,4 +306,24 @@ pub(super) fn exec_out(r: &Value) -> ! {
     };
     let _ = err.flush();
     std::process::exit(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    #[test]
+    fn the_agent_is_the_program_name_without_its_folder() {
+        let agent = |program: &str| super::agent(&json!({"argv": [program]}));
+        for (program, name) in [
+            ("/usr/local/bin/claude", "claude"),
+            (r"C:\Users\me\.local\bin\claude.exe", "claude"),
+            (r"C:/tools\codex.exe", "codex"),
+            ("opencode", "opencode"),
+            ("", ""),
+        ] {
+            assert_eq!(agent(program), name, "{program}");
+        }
+        assert_eq!(super::agent(&json!({"argv": ["x"], "status": {"app": "claude-code"}})), "claude-code");
+    }
 }

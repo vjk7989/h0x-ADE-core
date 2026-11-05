@@ -1,6 +1,6 @@
 //! What a paired account can ask for, and how each request runs against the core.
 
-use super::{Bridge, code, failed, redact};
+use super::{Bridge, Identity, code, failed, redact};
 use crate::cli::output::{agent, cwd, status};
 use crate::rpc::RpcError;
 use serde_json::{Value, json};
@@ -115,7 +115,7 @@ impl Command {
         }
     }
 
-    /// What the audit log keeps: never a whole text.
+    /// What the audit log keeps: never a whole text, never a token.
     fn audit(&self) -> Value {
         let word = match self {
             Command::List => "list",
@@ -132,7 +132,7 @@ impl Command {
         };
         let mut entry = json!({"command": word});
         if let Some(terminal) = self.terminal() {
-            entry["terminal"] = terminal.into();
+            entry["terminal"] = brief(terminal).into();
         }
         match self {
             Command::Send { text, .. } | Command::Run { command: text, .. } => {
@@ -142,10 +142,9 @@ impl Command {
             _ => {}
         }
         match self {
-            Command::Run { folder, .. } => entry["folder"] = folder.as_str().into(),
+            Command::Run { folder, .. } => entry["folder"] = brief(folder).into(),
             Command::Keys { keys, .. } => entry["keys"] = keys.iter().map(|k| k.name()).collect(),
             Command::Read { lines, .. } => entry["lines"] = (*lines).into(),
-            Command::Confirm { token } => entry["token"] = token.as_str().into(),
             _ => {}
         }
         entry
@@ -193,8 +192,12 @@ pub(super) struct Planned {
     what: String,
 }
 
+/// A destructive command waiting for its confirmation. It is void once the
+/// account is unpaired or paired again (a new identity), or after any lock
+/// (ADR-061 addendum).
 pub(super) struct Waiting {
-    sender: String,
+    identity: Identity,
+    locks: u64,
     planned: Planned,
     expires_ms: u64,
 }
@@ -227,22 +230,24 @@ impl Bridge {
             Ok(file) => file,
             Err(e) => return Reply::Failed(format!("the audit log can't be written: {e}")),
         };
-        let reply = match self.load() {
-            Err(e) => Reply::Failed(e.message),
-            Ok(st) if !st.identities.iter().any(|i| i.transport == from.transport && i.user_id == from.user_id) => {
-                Reply::NotPaired
-            }
-            Ok(st) if st.locked => Reply::Locked,
-            Ok(_) => self.run(call, &key, &command, now),
+        let (reply, what) = match self.load() {
+            Err(e) => (Reply::Failed(e.message), None),
+            Ok(st) => match st.identities.iter().find(|i| i.transport == from.transport && i.user_id == from.user_id) {
+                None => (Reply::NotPaired, None),
+                Some(_) if st.locked => (Reply::Locked, None),
+                Some(me) => {
+                    let me = me.clone();
+                    self.run(call, &me, st.locks, &command, now)
+                }
+            },
         };
         let mut entry = command.audit();
         (entry["time_ms"], entry["identity"], entry["result"]) = (now.into(), key.into(), reply.word().into());
-        match &reply {
-            Reply::Failed(message) => entry["error"] = message.as_str().into(),
-            Reply::NeedsConfirm { token, what } => {
-                (entry["token"], entry["what"]) = (token.as_str().into(), what.as_str().into())
-            }
-            _ => {}
+        if let Some(what) = what {
+            entry["what"] = what.into();
+        }
+        if let Reply::Failed(message) = &reply {
+            entry["error"] = message.as_str().into();
         }
         match log.write_all(format!("{entry}\n").as_bytes()) {
             Ok(()) => reply,
@@ -263,52 +268,62 @@ impl Bridge {
         Ok(())
     }
 
+    /// The reply, and for the log what a confirmation asks for or runs.
     fn run(
         &mut self,
         call: &impl Fn(&str, Value) -> Result<Value, RpcError>,
-        key: &str,
+        me: &Identity,
+        locks: u64,
         command: &Command,
         now: u64,
-    ) -> Reply {
+    ) -> (Reply, Option<String>) {
         let done = |result: Result<String, RpcError>| match result {
             Ok(text) => Reply::Done(redact(&text)),
             Err(e) => Reply::Failed(redact(&e.message)),
         };
         match command {
             Command::Lock => {
-                done(self.set_locked(true).map(|()| {
+                self.tokens.clear();
+                let locked = self.set_locked(true).map(|()| {
                     "locked: remote commands are refused until `h0x-core bridge unlock` on that machine".into()
-                }))
+                });
+                (done(locked), None)
             }
-            Command::List => done(list(call)),
-            Command::Read { terminal, lines } => done(read(call, terminal, *lines)),
-            Command::Confirm { token } => match self.take(key, token, now) {
-                Some(planned) => done(perform(call, planned)),
-                None => Reply::Failed("no such confirmation: used, expired (2 minutes) or not yours".into()),
+            Command::List => (done(list(call)), None),
+            Command::Read { terminal, lines } => (done(read(call, terminal, *lines)), None),
+            Command::Confirm { token } => match self.take(me, locks, token, now) {
+                Some(planned) => {
+                    let what = redact(&planned.what);
+                    (done(perform(call, planned)), Some(what))
+                }
+                None => {
+                    (Reply::Failed("no such confirmation: used, expired (2 minutes), voided or not yours".into()), None)
+                }
             },
             command => match plan(call, command) {
-                Err(e) => Reply::Failed(redact(&e.message)),
-                Ok((planned, false)) => done(perform(call, planned)),
+                Err(e) => (Reply::Failed(redact(&e.message)), None),
+                Ok((planned, false)) => (done(perform(call, planned)), None),
                 Ok((planned, true)) => {
                     let token = code();
                     let what = redact(&planned.what);
                     self.tokens.retain(|_, w| now < w.expires_ms);
-                    let waiting = Waiting { sender: key.into(), planned, expires_ms: now + CONFIRM_MS };
+                    let waiting = Waiting { identity: me.clone(), locks, planned, expires_ms: now + CONFIRM_MS };
                     self.tokens.insert(token.clone(), waiting);
-                    Reply::NeedsConfirm { token, what }
+                    (Reply::NeedsConfirm { token, what: what.clone() }, Some(what))
                 }
             },
         }
     }
 
-    /// The command `token` holds, once, for the account it was given to.
-    fn take(&mut self, key: &str, token: &str, now: u64) -> Option<Planned> {
+    /// The command `token` holds, once, for the identity it was given to,
+    /// if no lock came in between.
+    fn take(&mut self, me: &Identity, locks: u64, token: &str, now: u64) -> Option<Planned> {
         let token = token.trim().to_ascii_uppercase();
-        if self.tokens.get(&token)?.sender != key {
+        if self.tokens.get(&token)?.identity != *me {
             return None;
         }
         let waiting = self.tokens.remove(&token)?;
-        (now < waiting.expires_ms).then_some(waiting.planned)
+        (now < waiting.expires_ms && waiting.locks == locks).then_some(waiting.planned)
     }
 }
 
@@ -759,7 +774,57 @@ mod tests {
         assert_eq!(f.send(Command::Confirm { token: kill.clone() }, T), Reply::Locked, "waiting commands too");
         assert!(f.acted().is_empty());
         f.bridge.set_locked(false).unwrap();
-        assert!(matches!(f.send(Command::Confirm { token: kill }, T), Reply::Done(_)));
+        // Spec change (ADR-061 addendum): a lock voids every waiting confirmation.
+        assert!(matches!(f.send(Command::Confirm { token: kill }, T), Reply::Failed(_)), "void after unlock");
+        assert!(f.acted().is_empty());
+        assert!(matches!(f.send(Command::List, T), Reply::Done(_)), "unlocked");
+    }
+
+    #[test]
+    fn a_local_lock_or_a_new_pairing_voids_waiting_confirmations() {
+        let mut f = fixture(BridgeConfig::default());
+        // Locked and unlocked by another process (the CLI): only the state file says so.
+        let kill = token(&f.send(Command::Kill { terminal: "t1".into() }, T));
+        let cli = Bridge::at(f.bridge.dir.clone(), BridgeConfig::default());
+        cli.set_locked(true).unwrap();
+        cli.set_locked(false).unwrap();
+        assert!(matches!(f.send(Command::Confirm { token: kill }, T), Reply::Failed(_)));
+        // Unpaired and paired again: a new identity, the old tokens are not its.
+        let kill = token(&f.send(Command::Kill { terminal: "t1".into() }, T));
+        f.bridge.unpair(None).unwrap();
+        let (code, _) = f.bridge.pair("telegram", T).unwrap();
+        f.bridge.pair_verify("telegram", "42", "me", &code, T).unwrap();
+        assert!(matches!(f.send(Command::Confirm { token: kill }, T), Reply::Failed(_)));
+        assert!(f.acted().is_empty(), "nothing was killed");
+    }
+
+    #[test]
+    fn tokens_never_reach_the_log_but_the_confirmed_action_does() {
+        let mut f = fixture(BridgeConfig::default());
+        let kill = token(&f.send(Command::Kill { terminal: "t2".into() }, T));
+        assert!(matches!(f.send(Command::Confirm { token: kill.clone() }, T), Reply::Done(_)));
+        f.send(Command::Confirm { token: kill.clone() }, T);
+        let text = std::fs::read_to_string(f.bridge.dir.join("audit.jsonl")).unwrap();
+        assert!(!text.contains(&kill), "{text}");
+        let log = f.bridge.log(3).unwrap();
+        assert_eq!((&log[0]["command"], &log[0]["what"]), (&json!("kill"), &json!("kill t2 (claude-code in /work)")));
+        assert_eq!(
+            (&log[1]["command"], &log[1]["what"]),
+            (&json!("confirm"), &json!("kill t2 (claude-code in /work)"))
+        );
+        assert_eq!((&log[2]["result"], log[2].get("what")), (&json!("failed"), None), "a spent token runs nothing");
+    }
+
+    #[test]
+    fn folders_and_terminal_names_are_logged_like_text() {
+        let mut f = fixture(BridgeConfig::default());
+        let folder = "/srv/projects/a-very-long-folder/token=abcdef0123456789";
+        f.send(Command::Run { folder: folder.into(), command: "claude".into() }, T);
+        f.send(Command::Read { terminal: "sk-abcdefghijklmnopqrstuvwx".into(), lines: 1 }, T);
+        let log = f.bridge.log(2).unwrap();
+        assert_eq!(log[0]["folder"], "/srv/projects/a-very-lon…", "redacted, then cut");
+        assert!(!log.iter().any(|e| e.to_string().contains("abcdef0123456789")));
+        assert_eq!(log[1]["terminal"], "[redacted]");
     }
 
     #[test]

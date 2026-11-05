@@ -49,6 +49,13 @@ fn pairing_locking_and_the_log_through_the_cli() {
     assert_eq!(s.err(&["bridge", "unpair"]).0, 2, "an id or --all");
     assert_eq!(s.err(&["bridge", "pair", "--transport", "sms"]).0, 2);
     assert_eq!(s.json(&["bridge", "unpair", "--all"]), json!({"removed": 1}));
+    std::fs::write(dir.join("state.json"), "[]").unwrap();
+    let message = s.err(&["bridge", "ls"]).1["error"]["message"].as_str().unwrap().to_string();
+    assert!(message.contains("h0x-core bridge reset"), "{message}");
+    let moved = s.json(&["bridge", "reset"]);
+    assert!(moved["moved_to"].as_str().unwrap().contains("state.json.bad-"), "{moved}");
+    assert_eq!(s.json(&["bridge", "ls"]), json!({"identities": [], "locked": false}));
+    assert_eq!(s.json(&["bridge", "reset"]), json!({"moved_to": null}));
     assert!(!s.connect_ok(), "bridge commands never start a core");
 }
 

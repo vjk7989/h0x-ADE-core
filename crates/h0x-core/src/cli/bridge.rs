@@ -25,6 +25,9 @@ pub(super) enum BridgeCmd {
     Lock,
     /// Allow remote commands again (only here, never remotely).
     Unlock,
+    /// Move state.json aside (kept as state.json.bad-<time>) and start empty:
+    /// no paired accounts, unlocked. For a corrupt state; only here.
+    Reset,
     /// The last audit log entries: every remote command and pairing attempt.
     Log {
         /// How many entries.
@@ -86,6 +89,14 @@ pub(super) fn bridge(paths: &Paths, action: BridgeCmd) -> Result<Out, RpcError> 
         BridgeCmd::Unlock => {
             bridge.set_locked(false)?;
             locked(false)
+        }
+        BridgeCmd::Reset => {
+            let aside = bridge.reset(now)?;
+            let human = match &aside {
+                Some(path) => format!("moved the old state to {}; no paired accounts now", path.display()),
+                None => "nothing to reset".into(),
+            };
+            Out { json: json!({"moved_to": aside}), human }
         }
         BridgeCmd::Log { n } => {
             let entries = bridge.log(n)?;
