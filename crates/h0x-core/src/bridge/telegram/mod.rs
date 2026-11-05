@@ -447,7 +447,7 @@ impl Frontend {
 }
 
 /// Seconds to wait after `failures` network errors in a row: 1, 2, 4... up to 60.
-fn backoff(failures: u32) -> Duration {
+pub(super) fn backoff(failures: u32) -> Duration {
     Duration::from_secs(2u64.saturating_pow(failures.saturating_sub(1)).min(60))
 }
 

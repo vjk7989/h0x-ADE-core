@@ -228,3 +228,34 @@ fn piped_tokens_with_line_ends_or_the_wrong_shape() {
     // Piped, so JSON (cli.rs:187).
     assert!(shown.contains(r#""telegram_token":"set""#) && !shown.contains("ABCdef"), "{shown}");
 }
+
+#[test]
+fn the_web_panel_prints_a_pairing_link_and_serves_only_its_own_host() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let s = Session::new();
+    let pair = s.json(&["bridge", "pair", "--transport", "web"]);
+    assert_eq!(pair["transport"], "web");
+    assert!(pair["expires_ms"].as_u64().unwrap() <= now_ms() + 5 * 60_000, "a web code lives 5 minutes");
+
+    let mut web = s.cmd().args(["bridge", "web", "--port", "0"]).stdout(std::process::Stdio::piped()).spawn().unwrap();
+    let mut out = BufReader::new(web.stdout.take().unwrap());
+    let mut lines = [String::new(), String::new()];
+    for line in &mut lines {
+        out.read_line(line).unwrap();
+    }
+    let base = lines[0].trim().strip_prefix("web panel: ").unwrap().trim_end_matches('/').to_string();
+    let addr = base.strip_prefix("http://127.0.0.1:").map(|port| format!("127.0.0.1:{port}")).unwrap();
+    assert!(lines[1].contains(&format!("{base}/#pair=")), "{}", lines[1]);
+    let get = |host: &str| {
+        let mut stream = std::net::TcpStream::connect(&addr).unwrap();
+        stream.write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes()).unwrap();
+        let mut answer = String::new();
+        let _ = stream.read_to_string(&mut answer);
+        answer
+    };
+    let page = get(&addr);
+    assert!(page.starts_with("HTTP/1.1 200 ") && page.contains("frame-ancestors 'none'"), "{page}");
+    assert!(get("attacker.example").starts_with("HTTP/1.1 403 "), "DNS rebinding");
+    web.kill().unwrap();
+    web.wait().unwrap();
+}
