@@ -164,6 +164,11 @@ fn chunks(text: &str, pre: bool) -> Vec<String> {
             let rest = cur.split_off(at);
             out.push(std::mem::replace(&mut cur, rest));
             len = cur.chars().map(char::len_utf16).sum();
+            // What follows that line end may still leave no room: cut right here.
+            if len + units > budget {
+                out.push(std::mem::take(&mut cur));
+                len = 0;
+            }
         }
         cur.push_str(&piece);
         len += units;
@@ -253,11 +258,18 @@ fn notice(n: &Notice, chat: i64) -> Out {
     Out::Send { chat, html, buttons, about: Some(t.clone()) }
 }
 
-/// Notice messages, by (chat, message id), and the terminals they are about.
+/// What sent messages stand for, both kept for the last 1000: notice
+/// messages by (chat, message id) and the terminals they are about, and
+/// button ids and the action each stands for (`a:<terminal>`, `c:<token>`...).
+/// Telegram takes at most 64 bytes of button data, and an address can be
+/// longer, so buttons carry only `k:<id>`.
 #[derive(Default)]
 struct Replies {
     terminals: HashMap<(i64, i64), String>,
     order: VecDeque<(i64, i64)>,
+    buttons: HashMap<u64, String>,
+    pressed: VecDeque<u64>,
+    last: u64,
 }
 
 impl Replies {
@@ -270,11 +282,53 @@ impl Replies {
         self.order.push_back(at);
         self.terminals.insert(at, terminal);
     }
+
+    /// The short data for a button standing for `action`.
+    fn button(&mut self, action: String) -> String {
+        if self.pressed.len() >= REMEMBERED
+            && let Some(old) = self.pressed.pop_front()
+        {
+            self.buttons.remove(&old);
+        }
+        self.last += 1;
+        self.pressed.push_back(self.last);
+        self.buttons.insert(self.last, action);
+        format!("k:{}", self.last)
+    }
+
+    /// The action behind button data: `k:<id>` looked up, anything else as it is.
+    fn action(&self, data: &str) -> Option<String> {
+        match data.strip_prefix("k:") {
+            Some(id) => id.parse().ok().and_then(|id| self.buttons.get(&id)).cloned(),
+            None => Some(data.into()),
+        }
+    }
+}
+
+/// The accounts a notice goes to: every paired Telegram account (its chat
+/// is its user id), none while the bridge is locked.
+fn notice_chats(locked: bool, identities: &[super::Identity]) -> Vec<i64> {
+    if locked {
+        return Vec::new();
+    }
+    identities.iter().filter(|i| i.transport == "telegram").filter_map(|i| i.user_id.parse().ok()).collect()
+}
+
+/// A command for another bot in the chat (`/agents@OtherBot`): not ours.
+/// `own` is this bot's username, from getMe.
+fn for_another_bot(text: &str, own: &str) -> bool {
+    let word = text.trim_start().split(char::is_whitespace).next().unwrap_or_default();
+    match word.strip_prefix('/').and_then(|w| w.split_once('@')) {
+        Some((_, name)) => !name.eq_ignore_ascii_case(own),
+        None => false,
+    }
 }
 
 struct Frontend {
     bridge: Bridge,
     replies: Arc<Mutex<Replies>>,
+    /// This bot's username (getMe): commands addressed to other bots are ignored.
+    own: String,
 }
 
 type Core<'a> = &'a dyn Fn(&str, Value) -> Result<Value, RpcError>;
@@ -302,7 +356,8 @@ impl Frontend {
         else {
             return Vec::new();
         };
-        if m["chat"]["type"] != "private" {
+        // Private chats with people only, and commands for this bot (or none in particular).
+        if m["chat"]["type"] != "private" || m["from"]["is_bot"] == true || for_another_bot(typed, &self.own) {
             return Vec::new();
         }
         let user = user.to_string();
@@ -344,20 +399,23 @@ impl Frontend {
 
     fn callback(&mut self, core: Core, q: &Value, now: u64) -> Vec<Out> {
         let message = &q["message"];
-        let (Some(chat), Some(id), Some(user), Some(data)) = (
+        let (Some(chat), Some(id), Some(user), Some(data), Some(callback)) = (
             message["chat"]["id"].as_i64(),
             message["message_id"].as_i64(),
             q["from"]["id"].as_i64(),
             q["data"].as_str(),
+            q["id"].as_str(),
         ) else {
             return Vec::new();
         };
         let user = user.to_string();
-        if message["chat"]["type"] != "private" || !self.paired(&user) {
+        if message["chat"]["type"] != "private" || q["from"]["is_bot"] == true || !self.paired(&user) {
             return Vec::new();
         }
-        let mut out = vec![Out::Answer { callback: q["id"].as_str().unwrap_or_default().into() }];
-        let (kind, arg) = data.split_once(':').unwrap_or((data, ""));
+        let mut out = vec![Out::Answer { callback: callback.into() }];
+        // A button we no longer remember does nothing.
+        let Some(data) = self.replies.lock().unwrap().action(data) else { return out };
+        let (kind, arg) = data.split_once(":").unwrap_or((data.as_str(), ""));
         let terminal = arg.to_string();
         let command = match kind {
             "a" => Command::Approve { terminal },
@@ -399,12 +457,15 @@ fn deliver(api: &Api, replies: &Mutex<Replies>, out: Out) -> Result<(), String> 
         Out::Send { chat, html, buttons, about } => {
             let mut body = json!({"chat_id": chat, "text": html, "parse_mode": "HTML"});
             if !buttons.is_empty() {
-                let rows: Vec<Vec<Value>> = buttons
-                    .into_iter()
-                    .map(|row| {
-                        row.into_iter().map(|(text, data)| json!({"text": text, "callback_data": data})).collect()
-                    })
-                    .collect();
+                let mut memory = replies.lock().unwrap();
+                let mut rows = Vec::new();
+                for row in buttons {
+                    let row: Vec<Value> = row
+                        .into_iter()
+                        .map(|(text, action)| json!({"text": text, "callback_data": memory.button(action)}))
+                        .collect();
+                    rows.push(row);
+                }
                 body["reply_markup"] = json!({"inline_keyboard": rows});
             }
             let sent = api.call("sendMessage", &body, 30)?;
@@ -450,11 +511,9 @@ fn notices(api: Api, replies: Arc<Mutex<Replies>>) {
             let bridge = Bridge::open(&paths)?;
             super::watch(&paths, bridge.config.notice_quiet_ms(), |n| {
                 failures = 0;
-                if bridge.locked().unwrap_or(true) {
-                    return;
-                }
-                let ids = bridge.identities().unwrap_or_default();
-                for chat in ids.iter().filter(|i| i.transport == "telegram").filter_map(|i| i.user_id.parse().ok()) {
+                // An unreadable state counts as locked: nothing goes out.
+                let locked = bridge.locked().unwrap_or(true);
+                for chat in notice_chats(locked, &bridge.identities().unwrap_or_default()) {
                     if let Err(e) = deliver(&api, &replies, notice(&n, chat)) {
                         eprintln!("bridge: {e}");
                     }
@@ -476,6 +535,20 @@ pub fn run(paths: &Paths) -> Result<(), RpcError> {
         .telegram_token()?
         .ok_or_else(|| RpcError::new("bridge", "no bot token", "store one first: h0x-core bridge telegram token"))?;
     let api = Api::new(token)?;
+    // Who we are, so commands for other bots in a chat are left alone.
+    let mut failures = 0;
+    let own = loop {
+        match api.call("getMe", &json!({}), 30) {
+            Ok(me) if me["username"].is_string() => break me["username"].as_str().unwrap_or_default().to_string(),
+            Ok(_) => return Err(RpcError::new("bridge", "getMe: no username", "check the bot token")),
+            Err(e) => {
+                failures += 1;
+                let wait = backoff(failures);
+                eprintln!("bridge: {e}; trying again in {} s", wait.as_secs());
+                std::thread::sleep(wait);
+            }
+        }
+    };
     let replies = Arc::new(Mutex::new(Replies::default()));
     let (for_notices, shared) = (api.clone(), replies.clone());
     std::thread::spawn(move || notices(for_notices, shared));
@@ -483,8 +556,8 @@ pub fn run(paths: &Paths) -> Result<(), RpcError> {
         let stream = crate::client::connect_or_start(paths)?;
         crate::client::call(&stream, method, params).map_err(|e| crate::client::explain_closed(paths, e))
     };
-    let mut front = Frontend { bridge, replies };
-    let (mut offset, mut failures) = (0, 0);
+    let mut front = Frontend { bridge, replies, own };
+    let (mut offset, mut failures) = (0, 0u32);
     eprintln!("bridge: running; stop it with ctrl+c (or kill its terminal)");
     loop {
         match front.step(&api, &core, &mut offset) {

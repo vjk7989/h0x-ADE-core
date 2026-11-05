@@ -30,7 +30,7 @@ fn fixture() -> Fixture {
     let bridge = crate::bridge::scratch();
     let (code, _) = bridge.pair("telegram", T).unwrap();
     bridge.pair_verify("telegram", &ME.to_string(), "vijay", &code, T).unwrap();
-    Fixture { front: Frontend { bridge, replies: Arc::default() }, calls: RefCell::default() }
+    Fixture { front: Frontend { bridge, replies: Arc::default(), own: "h0x_bot".into() }, calls: RefCell::default() }
 }
 
 /// The fake core: t1 a plain shell, t2 an agent blocked on a question, t3 an agent at work.
@@ -408,8 +408,12 @@ fn a_notice_is_sent_with_its_keyboard_and_remembered() {
     assert!(path.ends_with("/sendMessage"));
     assert_eq!(
         body["reply_markup"],
-        json!({"inline_keyboard": [[{"text": "Show", "callback_data": "s:t2"}, {"text": "Interrupt", "callback_data": "i:t2"}]]})
+        json!({"inline_keyboard": [[{"text": "Show", "callback_data": "k:1"}, {"text": "Interrupt", "callback_data": "k:2"}]]}),
+        "buttons carry short ids (spec change: Telegram takes 64 bytes of button data)"
     );
+    let memory = replies.lock().unwrap();
+    assert_eq!((memory.action("k:1"), memory.action("k:2")), (Some("s:t2".into()), Some("i:t2".into())));
+    drop(memory);
     assert_eq!(replies.lock().unwrap().terminals.get(&(ME, 314)).map(String::as_str), Some("t2"));
     deliver(&api, &replies, Out::Answer { callback: "q9".into() }).unwrap();
     deliver(&api, &replies, Out::Edit { chat: ME, message: 314, html: "x".into() }).unwrap();
@@ -657,4 +661,94 @@ fn a_token_with_line_ends_or_the_wrong_shape_is_handled() {
     std::fs::write(b.dir.join("telegram.token"), " \r\n").unwrap();
     assert_eq!(b.telegram_token().unwrap(), None, "a blank file is no token");
     std::fs::remove_dir_all(&b.dir).unwrap();
+}
+
+#[test]
+fn a_long_remote_address_fits_its_buttons_and_taps_find_it_again() {
+    let address = format!("{}a/t7", "gpu-box-".repeat(7));
+    assert_eq!(address.len(), 60);
+    let server = stub(|_, _| json!({"ok": true, "result": {"message_id": 500}}));
+    let mut f = fixture();
+    let n = Notice {
+        terminal: address.clone(),
+        agent: "claude".into(),
+        folder: "/srv".into(),
+        kind: Kind::NeedsYou,
+        excerpt: String::new(),
+    };
+    deliver(&Api::at(&server.url, TOKEN), &f.front.replies, notice(&n, ME)).unwrap();
+    let body = server.seen.lock().unwrap()[0].1.clone();
+    let data: Vec<String> = body["reply_markup"]["inline_keyboard"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|row| row.as_array().unwrap().iter().map(|b| b["callback_data"].as_str().unwrap().to_string()))
+        .collect();
+    assert_eq!(data.len(), 4);
+    assert!(data.iter().all(|d| d.starts_with("k:") && d.len() <= 64), "{data:?}");
+    f.handle(tapped(ME, &data[3]));
+    assert_eq!(f.acted(), [("terminal.interrupt".to_string(), json!({"terminal": address}))], "the Interrupt button");
+    // An id never handed out, or long forgotten: acknowledged, nothing else.
+    for gone in ["k:999", "k:", "k:x", "k:-1"] {
+        assert_eq!(f.handle(tapped(ME, gone)), [Out::Answer { callback: "q1".into() }], "{gone}");
+    }
+    assert!(f.acted().is_empty());
+}
+
+#[test]
+fn button_ids_are_bounded_like_the_notice_map() {
+    let mut r = Replies::default();
+    let first = r.button("a:t1".into());
+    for n in 0..REMEMBERED {
+        r.button(format!("s:t{n}"));
+    }
+    assert_eq!((r.buttons.len(), r.pressed.len()), (REMEMBERED, REMEMBERED));
+    assert_eq!(r.action(&first), None, "the oldest went");
+    assert_eq!(r.action(&format!("k:{}", REMEMBERED + 1)), Some(format!("s:t{}", REMEMBERED - 1)));
+    assert_eq!(r.action("x:"), Some("x:".into()), "plain data stays as it is");
+}
+
+#[test]
+fn commands_for_other_bots_and_messages_from_bots_are_ignored() {
+    let mut f = fixture();
+    for text in ["/agents@OtherBot", "/kill@other_bot t1", "/pair@OtherBot ABCDEFGH"] {
+        assert!(f.handle(said(ME, text)).is_empty(), "{text}");
+    }
+    assert!(!f.handle(said(ME, "/agents@H0X_BOT")).is_empty(), "our own name, any case");
+    assert!(!f.handle(said(ME, "/agents")).is_empty());
+    assert!(!f.handle(said(ME, "mail me @OtherBot")).is_empty(), "plain text is not a command");
+    assert!(for_another_bot("  /x@a b", "b") && !for_another_bot("/x", "b") && !for_another_bot("x@a", "b"));
+    f.acted();
+
+    let mut bot = said(ME, "/agents");
+    bot["message"]["from"]["is_bot"] = true.into();
+    assert!(f.handle(bot).is_empty(), "a bot with a paired id");
+    let mut bot_tap = tapped(ME, "a:t2");
+    bot_tap["callback_query"]["from"]["is_bot"] = true.into();
+    assert!(f.handle(bot_tap).is_empty());
+    let mut no_id = tapped(ME, "a:t2");
+    no_id["callback_query"].as_object_mut().unwrap().remove("id");
+    assert!(f.handle(no_id).is_empty(), "nothing to answer, nothing done");
+    assert!(f.acted().is_empty(), "none of them reached the core");
+}
+
+#[test]
+fn notices_go_to_every_paired_telegram_account_unless_locked() {
+    let id = |n: u32, transport: &str, user: &str| crate::bridge::Identity {
+        id: n,
+        transport: transport.into(),
+        user_id: user.into(),
+        label: String::new(),
+        paired_at_ms: T,
+    };
+    let ids = [
+        id(1, "telegram", "42"),
+        id(2, "relay", "43"),
+        id(3, "telegram", "-7"),
+        id(4, "telegram", "@bob"),
+        id(5, "telegram", "9"),
+    ];
+    assert_eq!(notice_chats(false, &ids), [42, -7, 9]);
+    assert!(notice_chats(true, &ids).is_empty(), "locked: nothing goes out");
+    assert!(notice_chats(false, &[]).is_empty());
 }

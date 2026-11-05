@@ -108,7 +108,8 @@ fn stub() -> (String, Seen) {
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let log = seen.clone();
     std::thread::spawn(move || {
-        for (n, stream) in listener.incoming().enumerate() {
+        let mut polls = 0;
+        for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut first = String::new();
@@ -127,13 +128,17 @@ fn stub() -> (String, Seen) {
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
             let method = path.rsplit('/').next().unwrap_or_default().to_string();
+            polls += usize::from(method == "getUpdates");
             let reply = match method.as_str() {
-                "getUpdates" if n == 0 => json!({"ok": true, "result": [{"update_id": 1, "message": {"message_id": 1,
-                    "from": {"id": 42}, "chat": {"id": 42, "type": "private"}, "text": "/agents"}}]}),
+                "getUpdates" if polls == 1 => {
+                    json!({"ok": true, "result": [{"update_id": 1, "message": {"message_id": 1,
+                    "from": {"id": 42}, "chat": {"id": 42, "type": "private"}, "text": "/agents"}}]})
+                }
                 "getUpdates" => {
                     std::thread::sleep(std::time::Duration::from_millis(200));
                     json!({"ok": true, "result": []})
                 }
+                "getMe" => json!({"ok": true, "result": {"is_bot": true, "username": "h0x_bot"}}),
                 _ => json!({"ok": true, "result": {"message_id": 7}}),
             }
             .to_string();

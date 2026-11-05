@@ -32,6 +32,7 @@ It is built into core and doesn't depend on any one transport. Telegram is the o
 
 The bot only talks to paired accounts in private chats.
 Group chats are ignored. Messages from accounts that aren't paired get no answer, except `/pair`.
+Messages from other bots and commands addressed to another bot (`/agents@OtherBot`) are ignored too; the bot learns its own name from Telegram when it starts.
 
 It only makes outbound connections: it long-polls `api.telegram.org` over https through the system `curl` and never listens on a port.
 The token travels inside the request that curl reads on its stdin, never on a command line that other processes could list.
