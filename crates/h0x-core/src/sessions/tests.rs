@@ -539,10 +539,16 @@ fn kind(r: Result<Vec<PathBuf>, crate::rpc::RpcError>) -> String {
     r.expect_err("an error").kind
 }
 
-/// Moving to the trash is tried only where it is a temp dir: the freedesktop
-/// Trash under the scratch HOME, or (Windows) the Recycle Bin. Finder is never
-/// driven by tests.
-const TRASHES: bool = !cfg!(target_os = "macos");
+/// Whether a test may really move files to the trash: the freedesktop Trash
+/// under the scratch HOME; the Recycle Bin, which is the person's own, only on
+/// CI (`CI` set); Finder never.
+fn trashes() -> bool {
+    let may = !cfg!(target_os = "macos") && (!cfg!(windows) || std::env::var_os("CI").is_some());
+    if !may {
+        eprintln!("note: the move to the trash is skipped here (Windows: only with CI set; macOS: never)");
+    }
+    may
+}
 
 #[test]
 fn trash_moves_a_claude_session_and_its_folder_out_of_the_store() {
@@ -550,7 +556,7 @@ fn trash_moves_a_claude_session_and_its_folder_out_of_the_store() {
     let session = h.claude("-home-u-app", UUID, &[said("/home/u/app")], 1);
     let side = h.put(&format!(".claude/projects/-home-u-app/{UUID}/subagents/agent-1.jsonl"), b"{}\n", 1);
     let other = h.claude("-home-u-app", "1b5f3c3e-1d2a-4c4b-9e7f-2a1b3c4d5e6f", &[said("/home/u/app")], 1);
-    if !TRASHES {
+    if !trashes() {
         return;
     }
     let trashed = trash("claude", UUID, &h.roots()).unwrap();
@@ -567,7 +573,7 @@ fn trash_moves_a_codex_rollout_and_an_opencode_json_session() {
     let rollout = h.codex(UUID, "/home/u/app", 1);
     let session = h.opencode("ses_old", "/home/u/app", 1);
     let messages = h.put(".local/share/opencode/storage/message/ses_old/msg_1.json", b"{}", 1);
-    if !TRASHES {
+    if !trashes() {
         return;
     }
     assert_eq!(trash("codex", UUID, &h.roots()).unwrap(), std::slice::from_ref(&rollout));
@@ -697,6 +703,9 @@ fn trash_on_windows_goes_to_the_recycle_bin_from_a_temp_dir() {
         "CODEX_HOME" => Some(codex.clone()),
         _ => None,
     });
+    if !trashes() {
+        return;
+    }
     let trashed = trash("codex", UUID, &roots).unwrap();
     assert_eq!(trashed.len(), 1);
     assert!(!session.exists(), "moved");
@@ -788,7 +797,8 @@ fn trash_reads_an_opencode_database_without_the_session_as_holding_none() {
     assert_eq!(std::fs::read(&db).unwrap(), b"not sqlite", "read-only");
     let folder = Home::new();
     folder.put(".local/share/opencode/opencode.db/x", b"", 1);
-    assert_eq!(kind(trash("opencode", "ses_1", &folder.roots())), "not_found");
+    // A folder in the database's place is not a plain file: refused (ADR-056 S2 addendum).
+    assert_eq!(kind(trash("opencode", "ses_1", &folder.roots())), "unsupported");
 }
 
 #[test]
@@ -887,4 +897,61 @@ fn trash_without_a_usable_home_trash_refuses_and_keeps_the_session() {
     h.put(".local/share/Trash", b"not a folder", 1);
     assert_eq!(kind(trash("claude", UUID, &h.roots())), "unavailable");
     assert!(session.exists(), "never deleted");
+}
+
+#[test]
+fn a_claude_session_folder_without_its_jsonl_is_not_a_session() {
+    let h = Home::new();
+    let side = h.put(&format!(".claude/projects/-home-u-app/{UUID}/subagents/agent-1.jsonl"), b"{}\n", 1);
+    assert!(h.list("/home/u/app").is_empty(), "session.list does not show it");
+    assert_eq!(kind(trash("claude", UUID, &h.roots())), "not_found");
+    assert!(side.exists(), "left where it is");
+}
+
+#[test]
+fn letta_default_ids_are_held_to_the_limit_whole() {
+    let fits = format!("default:{}", "a".repeat(512 - "default:".len()));
+    assert_eq!(argv("letta", &fits)[4].len(), 504);
+    let over = format!("default:{}", "a".repeat(512 - "default:".len() + 1));
+    assert_eq!(over.len(), 513);
+    assert!(resume_argv("letta", &over).is_err());
+    assert!(resume_argv("letta", &format!("default:{}", "a".repeat(512))).is_err(), "520 bytes");
+}
+
+#[test]
+fn trash_refuses_opencode_when_its_database_is_not_a_plain_file() {
+    let h = Home::new();
+    let json = h.opencode("ses_1", "/home/u/app", 1);
+    let outside = Home::new();
+    let elsewhere = opencode_db(&outside, OPENCODE_TABLE, &[]);
+    let db = h.0.join(".local/share/opencode/opencode.db");
+    if link(&elsewhere, &db) {
+        let e = trash("opencode", "ses_1", &h.roots()).unwrap_err();
+        assert_eq!(e.kind, "unsupported", "a linked database: {e:?}");
+        std::fs::remove_file(&db).or_else(|_| std::fs::remove_dir(&db)).unwrap();
+    }
+    std::fs::create_dir(&db).unwrap();
+    assert_eq!(kind(trash("opencode", "ses_1", &h.roots())), "unsupported", "a folder");
+    assert!(json.exists() && elsewhere.exists(), "nothing moved");
+}
+
+#[cfg(windows)]
+#[test]
+fn trash_on_windows_refuses_a_share_before_reading_it() {
+    // A share that can never answer: refused from its name, not after a wait.
+    let started = std::time::Instant::now();
+    for agent in ["claude", "codex"] {
+        let roots = Roots::new(|name| {
+            matches!(name, "CLAUDE_CONFIG_DIR" | "CODEX_HOME").then(|| r"\\h0x-none.invalid\share\store".to_string())
+        });
+        assert_eq!(kind(trash(agent, UUID, &roots)), "unsupported", "{agent}");
+    }
+    let roots = Roots::new(|name| (name == "XDG_DATA_HOME").then(|| r"\\?\UNC\h0x-none.invalid\share".to_string()));
+    assert_eq!(kind(trash("opencode", "ses_1", &roots)), "unsupported");
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    // A drive letter that is not there holds nothing.
+    let roots = Roots::new(|name| (name == "CLAUDE_CONFIG_DIR").then(|| r"Z:\h0x-none\.claude".to_string()));
+    if !Path::new(r"Z:\").exists() {
+        assert_eq!(kind(trash("claude", UUID, &roots)), "not_found");
+    }
 }

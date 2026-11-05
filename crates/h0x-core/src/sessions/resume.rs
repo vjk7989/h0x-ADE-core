@@ -65,7 +65,8 @@ pub fn argv(agent: &str, id: &str) -> Result<Vec<String>, String> {
     };
     // Letta's own default conversation names the agent after `default:`.
     let checked = if agent == "letta" { id.strip_prefix("default:").unwrap_or(id) } else { id };
-    if !shaped(checked, shape) {
+    // The limit holds for the whole id, `default:` included.
+    if id.len() > MAX_ID || !shaped(checked, shape) {
         return Err(format!("{id:?} is not a {agent} session id"));
     }
     let mut argv = vec![command.to_string()];

@@ -11,12 +11,20 @@ use crate::rpc::RpcError;
 /// Moves `agent`'s session `id` to the trash; the paths it moved.
 pub fn trash(agent: &str, id: &str, roots: &Roots) -> Result<Vec<PathBuf>, RpcError> {
     super::resume::argv(agent, id).map_err(RpcError::invalid_params)?;
-    let found = match (agent, &roots.claude, &roots.codex, &roots.opencode) {
-        ("claude", Some(root), _, _) => claude(&root.join("projects"), id),
-        ("codex", _, Some(root), _) => codex(root, id),
-        ("opencode", _, _, Some(root)) => opencode(root, id)?,
-        ("claude" | "codex" | "opencode", ..) => Vec::new(),
+    let root = match agent {
+        "claude" => &roots.claude,
+        "codex" => &roots.codex,
+        "opencode" => &roots.opencode,
         _ => return Err(unsupported(format!("h0x-core does not read {agent}'s sessions"))),
+    };
+    let found = match root {
+        // Where the store's trash is decided before the store is read.
+        Some(root) if trashable(root)? => match agent {
+            "claude" => claude(&root.join("projects"), id),
+            "codex" => codex(root, id),
+            _ => opencode(root, id)?,
+        },
+        _ => Vec::new(),
     };
     if found.is_empty() {
         return Err(RpcError::new(
@@ -35,13 +43,19 @@ fn real(path: &Path, dir: bool) -> bool {
 }
 
 /// `<project>/<id>.jsonl` and, when Claude kept one, the `<project>/<id>/`
-/// folder of its subagents and tool results.
+/// folder of its subagents and tool results, which only goes along with it.
 fn claude(projects: &Path, id: &str) -> Vec<PathBuf> {
-    dirs(projects)
-        .flat_map(|dir| [(dir.join(format!("{id}.jsonl")), false), (dir.join(id), true)])
-        .filter(|(path, dir)| real(path, *dir))
-        .map(|(path, _)| path)
-        .collect()
+    let mut found = Vec::new();
+    for dir in dirs(projects) {
+        let (session, side) = (dir.join(format!("{id}.jsonl")), dir.join(id));
+        if real(&session, false) {
+            found.push(session);
+            if real(&side, true) {
+                found.push(side);
+            }
+        }
+    }
+    found
 }
 
 fn codex(home: &Path, id: &str) -> Vec<PathBuf> {
@@ -60,7 +74,12 @@ fn codex(home: &Path, id: &str) -> Vec<PathBuf> {
 /// database is rows, not files: it cannot go to the trash, and OpenCode's own
 /// `session delete` deletes for good.
 fn opencode(data: &Path, id: &str) -> Result<Vec<PathBuf>, RpcError> {
-    if opencode::in_db(&data.join("opencode.db"), id) {
+    let db = data.join("opencode.db");
+    // A link or a folder in its place: what OpenCode holds there is unknown.
+    if std::fs::symlink_metadata(&db).is_ok_and(|m| !m.is_file()) {
+        return Err(unsupported(format!("{} is not a plain database file", db.display())));
+    }
+    if opencode::in_db(&db, id) {
         return Err(unsupported(format!(
             "OpenCode keeps session {id} in its database (opencode.db): it cannot be moved to the trash"
         )));
@@ -85,33 +104,53 @@ fn refused(message: String) -> RpcError {
     RpcError::new("unavailable", message, "nothing was deleted")
 }
 
-/// The Recycle Bin, through the shell, as Explorer's Delete does: undoable.
 #[cfg(windows)]
-fn to_trash(paths: &[PathBuf], _: &Roots) -> Result<(), RpcError> {
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain([0]).collect()
+}
+
+/// Whether a store can be read for the trash: only on a local disk, which has
+/// a Recycle Bin. Asked of the drive letter alone, so a share, which has none,
+/// is refused without being reached. A drive that is not there holds nothing.
+#[cfg(windows)]
+fn trashable(root: &Path) -> Result<bool, RpcError> {
     use std::path::{Component, Prefix};
     use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+    // `DRIVE_NO_ROOT_DIR` and `DRIVE_FIXED` (Win32_System_WindowsProgramming).
+    const NO_DRIVE: u32 = 1;
+    const FIXED: u32 = 3;
+
+    let drive = match root.components().next() {
+        Some(Component::Prefix(p)) => match p.kind() {
+            Prefix::Disk(d) | Prefix::VerbatimDisk(d) => Some(d as char),
+            _ => None,
+        },
+        _ => None,
+    };
+    // SAFETY: a NUL-terminated wide string that outlives the call.
+    match drive.map(|d| unsafe { GetDriveTypeW(wide(&format!("{d}:\\")).as_ptr()) }) {
+        Some(FIXED) => Ok(true),
+        Some(NO_DRIVE) => Ok(false),
+        _ => Err(unsupported(format!("{} is not on a local disk with a Recycle Bin", root.display()))),
+    }
+}
+
+#[cfg(not(windows))]
+fn trashable(_: &Path) -> Result<bool, RpcError> {
+    Ok(true)
+}
+
+/// The Recycle Bin, through the shell, as Explorer's Delete does: undoable.
+/// The paths are in a store [`trashable`] found on a local disk.
+#[cfg(windows)]
+fn to_trash(paths: &[PathBuf], _: &Roots) -> Result<(), RpcError> {
     use windows_sys::Win32::UI::Shell::{
         FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING, SHFILEOPSTRUCTW,
         SHFileOperationW,
     };
-    /// `DRIVE_FIXED` (Win32_System_WindowsProgramming): only local disks have a Recycle Bin.
-    const DRIVE_FIXED: u32 = 3;
 
     let mut from: Vec<u16> = Vec::new();
     for path in paths {
-        let drive = match path.components().next() {
-            Some(Component::Prefix(p)) => match p.kind() {
-                Prefix::Disk(d) | Prefix::VerbatimDisk(d) => Some(d as char),
-                _ => None,
-            },
-            _ => None,
-        };
-        let wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
-        // SAFETY: a NUL-terminated wide string that outlives the call.
-        let fixed = drive.is_some_and(|d| unsafe { GetDriveTypeW(wide(&format!("{d}:\\")).as_ptr()) } == DRIVE_FIXED);
-        if !fixed {
-            return Err(unsupported(format!("{} is not on a local disk with a Recycle Bin", path.display())));
-        }
         // The shell takes plain `C:\...` paths, each NUL-terminated.
         let plain = path.display().to_string().replace('/', "\\");
         from.extend(wide(plain.strip_prefix(r"\\?\").unwrap_or(&plain)));
