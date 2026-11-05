@@ -533,6 +533,125 @@ mod tests {
     }
 
     #[test]
+    fn the_window_slides_and_rate_limited_commands_leave_no_trace() {
+        let mut f = fixture(BridgeConfig::default());
+        for at in [T, T + 30_000] {
+            for n in 0..15 {
+                assert!(matches!(f.send(Command::List, at), Reply::Done(_)), "{at} {n}");
+            }
+        }
+        assert_eq!(f.send(Command::List, T + 59_999), Reply::RateLimited { retry_secs: 1 });
+        for n in 0..15 {
+            assert!(matches!(f.send(Command::List, T + 60_000), Reply::Done(_)), "{n}");
+        }
+        assert_eq!(f.send(Command::List, T + 60_000), Reply::RateLimited { retry_secs: 30 });
+        // Unpaired senders are counted too: a flood of them is cut off.
+        let stranger = Sender { transport: "telegram".into(), user_id: "666".into() };
+        for _ in 0..30 {
+            assert_eq!(f.send_as(&stranger, Command::Kill { terminal: "t1".into() }, T), Reply::NotPaired);
+        }
+        assert_eq!(f.send_as(&stranger, Command::List, T), Reply::RateLimited { retry_secs: 60 });
+        let log = f.bridge.log(1_000).unwrap();
+        assert_eq!(log.len(), 1 + 45 + 30, "the pairing, my commands, the stranger's");
+        assert!(log.iter().all(|e| e["result"] != "rate_limited"));
+    }
+
+    #[test]
+    fn a_confirmation_holds_until_its_last_millisecond_and_only_while_paired() {
+        let mut f = fixture(BridgeConfig::default());
+        let kill = token(&f.send(Command::Kill { terminal: "t1".into() }, T));
+        assert_eq!(kill.len(), 8);
+        let blank = f.send(Command::Confirm { token: String::new() }, T);
+        assert!(matches!(blank, Reply::Failed(_)), "{blank:?}");
+        assert!(matches!(f.send(Command::Confirm { token: format!(" {kill} ") }, T + 119_999), Reply::Done(_)));
+        assert_eq!(f.acted(), [("terminal.kill".to_string(), json!({"terminal": "t1"}))]);
+
+        let kill = token(&f.send(Command::Kill { terminal: "t1".into() }, T));
+        f.bridge.unpair(None).unwrap();
+        assert_eq!(f.send(Command::Confirm { token: kill }, T + 1), Reply::NotPaired);
+        assert!(f.acted().is_empty(), "unpairing voids what was waiting");
+    }
+
+    #[test]
+    fn a_stranger_cannot_lock_and_a_lock_outlives_this_bridge() {
+        let mut f = fixture(BridgeConfig::default());
+        let stranger = Sender { transport: "telegram".into(), user_id: "666".into() };
+        assert_eq!(f.send_as(&stranger, Command::Lock, T), Reply::NotPaired);
+        assert!(!f.bridge.locked().unwrap());
+        assert!(matches!(f.send(Command::Lock, T), Reply::Done(_)));
+        assert_eq!(f.send(Command::Lock, T), Reply::Locked, "already locked");
+        let mut again = Bridge::at(f.bridge.dir.clone(), BridgeConfig::default());
+        let core = |_: &str, _: Value| -> Result<Value, RpcError> { panic!("a locked bridge called the core") };
+        assert_eq!(again.execute(&core, &me(), Command::List, T), Reply::Locked, "a restart does not unlock");
+    }
+
+    #[test]
+    fn a_corrupt_state_file_runs_nothing() {
+        let mut f = fixture(BridgeConfig::default());
+        for bad in ["", r#"{"identities": [{"id": 1, "transport": "telegram""#, "not json"] {
+            std::fs::write(f.bridge.dir.join("state.json"), bad).unwrap();
+            assert!(matches!(f.send(Command::List, T), Reply::Failed(_)), "{bad:?}");
+            assert!(matches!(f.send(Command::Send { terminal: "t3".into(), text: "hi".into() }, T), Reply::Failed(_)));
+        }
+        assert!(f.calls.borrow().is_empty(), "the core never heard of it");
+        assert_eq!(f.bridge.log(1).unwrap()[0]["result"], "failed", "still audited");
+    }
+
+    #[test]
+    fn an_unwritable_audit_log_runs_nothing() {
+        let mut f = fixture(BridgeConfig::default());
+        let kill = token(&f.send(Command::Kill { terminal: "t1".into() }, T));
+        f.calls.borrow_mut().clear();
+        let audit = f.bridge.dir.join("audit.jsonl");
+        std::fs::remove_file(&audit).unwrap();
+        std::fs::create_dir(&audit).unwrap();
+        let send = Command::Send { terminal: "t3".into(), text: "hi".into() };
+        for command in [Command::List, send, Command::Confirm { token: kill.clone() }, Command::Lock] {
+            let reply = f.send(command, T);
+            assert!(matches!(&reply, Reply::Failed(m) if m.contains("audit log")), "{reply:?}");
+        }
+        assert!(f.calls.borrow().is_empty(), "nothing reached the core");
+        assert!(!f.bridge.locked().unwrap(), "nor the lock");
+        std::fs::remove_dir(&audit).unwrap();
+        assert!(matches!(f.send(Command::Confirm { token: kill }, T), Reply::Done(_)), "the token was not spent");
+    }
+
+    #[test]
+    fn run_folders_follow_this_machines_path_rules() {
+        let mut f = fixture(BridgeConfig::default());
+        let run = |folder: &str| Command::Run { folder: folder.into(), command: "claude".into() };
+        let (full, relative): (&[&str], &[&str]) = if cfg!(windows) {
+            (&[r"C:\x", "C:/x", r"\\server\share", r"\\server\share\app", r"\\?\C:\x"], &[r"\x", "/x", r".\x", "~"])
+        } else {
+            (&["/", "/x/../y"], &[r"C:\x", r"\\server\share", r"\x", "./x", "~/x"])
+        };
+        for folder in full {
+            let reply = f.send(run(folder), T);
+            let Reply::NeedsConfirm { what, .. } = &reply else { panic!("{folder:?}: {reply:?}") };
+            assert_eq!(*what, format!("run `claude` in {folder}"));
+        }
+        for folder in relative {
+            assert!(matches!(f.send(run(folder), T), Reply::Failed(_)), "{folder:?}");
+        }
+        assert_eq!(
+            f.send(run("C:x"), T),
+            Reply::Failed(r#""C:x" is not a full path on this machine"#.into()),
+            "drive-relative is never full"
+        );
+        assert!(f.acted().is_empty());
+    }
+
+    #[test]
+    fn the_log_cuts_text_after_redacting_it() {
+        assert_eq!(brief(""), "");
+        assert_eq!(brief(&"a".repeat(24)), "a".repeat(24));
+        assert_eq!(brief(&"a".repeat(25)), format!("{}…", "a".repeat(24)));
+        assert_eq!(brief(&"é".repeat(30)), format!("{}…", "é".repeat(24)));
+        let secret = format!("{} sk-abcdefghijklmnopqrstu", "a".repeat(20));
+        assert_eq!(brief(&secret), format!("{} [re…", "a".repeat(20)), "no prefix of the key");
+    }
+
+    #[test]
     fn destructive_commands_wait_for_a_single_use_confirmation() {
         let mut f = fixture(BridgeConfig::default());
         let asked = f.send(Command::Kill { terminal: "t2".into() }, T);

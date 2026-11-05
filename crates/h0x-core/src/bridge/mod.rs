@@ -335,6 +335,88 @@ mod tests {
     }
 
     #[test]
+    fn a_code_holds_until_its_last_millisecond_and_near_misses_keep_it() {
+        let b = scratch();
+        let (code, expires) = b.pair("telegram", T).unwrap();
+        let near = [String::new(), code[..7].to_string(), format!("{code}A"), format!("{code} 2")];
+        for wrong in &near {
+            assert!(b.pair_verify("telegram", "42", "", wrong, T + 1).is_err(), "{wrong:?}");
+        }
+        let err = b.pair_verify("telegram", "", "", &code, T + 1).unwrap_err();
+        assert_eq!(err.message, "no user id", "not a wrong code: no fifth strike");
+        let me = b.pair_verify("telegram", "42", "", &code.to_lowercase(), expires - 1).unwrap();
+        assert_eq!(me.paired_at_ms, T + 599_999);
+        // A good code clears the strikes: four more wrong ones don't block.
+        let (code, _) = b.pair("telegram", T).unwrap();
+        for n in 1..=4 {
+            assert!(b.pair_verify("telegram", "43", "", "AAAAAAAA", T + n).is_err());
+        }
+        assert!(b.pair_verify("telegram", "43", "", &code, T + 5).is_ok());
+        let log = b.log(100).unwrap();
+        assert_eq!(log.len(), 11, "every attempt, the no-user one too");
+        assert!(log.iter().all(|e| !e.to_string().contains(&near[1])), "typed codes never reach the log");
+        std::fs::remove_dir_all(&b.dir).unwrap();
+    }
+
+    #[test]
+    fn the_block_lifts_at_exactly_ten_minutes() {
+        let b = scratch();
+        let (code, _) = b.pair("telegram", T).unwrap();
+        for _ in 0..4 {
+            assert!(b.pair_verify("telegram", "666", "", "AAAAAAAA", T).is_err());
+        }
+        assert!(b.pair("telegram", T).is_ok(), "four wrong codes: not blocked yet");
+        assert!(b.pair_verify("telegram", "666", "", "AAAAAAAA", T).is_err());
+        let err = b.pair("telegram", T + 599_999).unwrap_err();
+        assert!(err.message.contains("disabled for 1 more minute"), "{}", err.message);
+        assert!(b.pair_verify("telegram", "42", "", &code, T + 599_999).is_err());
+        let (code, _) = b.pair("telegram", T + 600_000).unwrap();
+        assert!(b.pair_verify("telegram", "42", "", &code, T + 600_000).is_ok());
+        std::fs::remove_dir_all(&b.dir).unwrap();
+    }
+
+    #[test]
+    fn unpair_all_while_locked_keeps_the_lock() {
+        let b = scratch();
+        for user in ["1", "2"] {
+            let (code, _) = b.pair("telegram", T).unwrap();
+            b.pair_verify("telegram", user, "", &code, T).unwrap();
+        }
+        b.set_locked(true).unwrap();
+        assert_eq!(b.unpair(None).unwrap(), 2);
+        assert!(b.locked().unwrap(), "unpairing does not unlock");
+        assert!(b.pair("telegram", T).is_err());
+        b.set_locked(false).unwrap();
+        assert!(b.identities().unwrap().is_empty());
+        std::fs::remove_dir_all(&b.dir).unwrap();
+    }
+
+    #[test]
+    fn a_corrupt_or_truncated_state_file_pairs_no_one() {
+        let b = scratch();
+        std::fs::create_dir_all(&b.dir).unwrap();
+        for bad in ["", "{", r#"{"identities": ["#, "null", "\0\0\0\0", r#"{"identities": [{"id": 1}]}"#] {
+            std::fs::write(b.dir.join("state.json"), bad).unwrap();
+            assert!(b.identities().is_err(), "{bad:?}");
+            assert!(b.locked().is_err(), "{bad:?}");
+            assert!(b.pair("telegram", T).is_err(), "{bad:?}");
+            assert!(b.pair_verify("telegram", "42", "", "ABCDEFGH", T).is_err(), "{bad:?}");
+            assert_eq!(std::fs::read_to_string(b.dir.join("state.json")).unwrap(), bad, "left as it was");
+        }
+        std::fs::remove_dir_all(&b.dir).unwrap();
+    }
+
+    #[test]
+    fn pairing_with_an_unwritable_audit_log_pairs_no_one() {
+        let b = scratch();
+        let (code, _) = b.pair("telegram", T).unwrap();
+        std::fs::create_dir(b.dir.join("audit.jsonl")).unwrap();
+        assert!(b.pair_verify("telegram", "42", "", &code, T).is_err());
+        assert!(b.identities().unwrap().is_empty(), "an attempt the log can't keep must not pair");
+        std::fs::remove_dir_all(&b.dir).unwrap();
+    }
+
+    #[test]
     fn unpair_one_or_all() {
         let b = scratch();
         for user in ["1", "2", "3"] {

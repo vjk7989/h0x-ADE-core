@@ -129,4 +129,20 @@ mod tests {
             assert_eq!(key(bad).unwrap_err().kind, "config", "{bad}");
         }
     }
+
+    #[test]
+    fn bridge_limits_fall_back_on_odd_values() {
+        let bridge = |text: &str| toml::from_str::<Config>(text).map(|c| c.bridge);
+        let quiet = |value: &str| bridge(&format!("[bridge]\nnotice_quiet = {value}")).unwrap().notice_quiet_ms();
+        assert_eq!(bridge("").unwrap().notice_quiet_ms(), 10_000);
+        assert_eq!(bridge("").unwrap().rate_limit(), 30);
+        for (value, ms) in
+            [("0.0", 0), ("0.0004", 0), ("-1.0", 10_000), ("nan", 10_000), ("inf", 10_000), ("-inf", 10_000)]
+        {
+            assert_eq!(quiet(value), ms, "{value}");
+        }
+        for bad in ["-1", "4294967296", "\"30\""] {
+            assert!(bridge(&format!("[bridge]\nrate_limit = {bad}")).is_err(), "{bad}");
+        }
+    }
 }

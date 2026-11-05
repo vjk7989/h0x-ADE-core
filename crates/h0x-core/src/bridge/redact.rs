@@ -161,6 +161,84 @@ mod tests {
     }
 
     #[test]
+    fn each_pattern_starts_at_its_minimum_length() {
+        let cases = [
+            ("sk-abcdefghijklmnop", "[redacted]"),
+            ("sk-abcdefghijklmno", "sk-abcdefghijklmno"),
+            ("ghp_abcdefghijklmnop", "[redacted]"),
+            ("ghp_abcdefghijklmno", "ghp_abcdefghijklmno"),
+            ("AKIAIOSFODNN7EXAMPL", "AKIAIOSFODNN7EXAMPL"),
+            ("xoxb-1234567890", "[redacted]"),
+            ("xoxb-123456789", "xoxb-123456789"),
+            ("token=abcdefgh", "token=[redacted]"),
+            ("token=abcdefg", "token=abcdefg"),
+            ("Bearer abcdefg1", "Bearer [redacted]"),
+            ("Bearer abcdef1", "Bearer abcdef1"),
+            ("Bearer abcdefghijklmnopqrs", "Bearer abcdefghijklmnopqrs"),
+            ("Bearer abcdefghijklmnopqrst", "Bearer [redacted]"),
+            ("xsk-abcdefghijklmnop", "xsk-abcdefghijklmnop"),
+        ];
+        for (text, want) in cases {
+            assert_eq!(redact(text), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_git_sha_alone_is_left_but_not_after_a_key_name() {
+        let sha = "3f2a9c1e5b7d4f6a8c0e2b4d6f8a0c2e4b6d8f0a";
+        for text in [format!("commit {sha}"), format!("sha={sha}"), "HEAD is now at 3f2a9c1 fix".into()] {
+            assert_eq!(redact(&text), text);
+        }
+        assert_eq!(redact(&format!("key={sha}")), "key=[redacted]");
+        assert_eq!(redact(&format!("deploy_key: {sha} ok")), "deploy_key: [redacted] ok");
+    }
+
+    #[test]
+    fn line_breaks_and_unicode_around_secrets_stay() {
+        let cases = [
+            ("API_KEY=abcd1234efgh5678\r\nnext", "API_KEY=[redacted]\r\nnext"),
+            ("one\ntoken=abcdef0123456789\nthree", "one\ntoken=[redacted]\nthree"),
+            ("→sk-abcdefghijklmnop←", "→[redacted]←"),
+            ("token=abcdef0123456789é", "token=[redacted]é"),
+            ("密码 password: hunter22hunter 完成", "密码 password: [redacted] 完成"),
+            ("ghp_ABCDEFGHIJKLMNOPQRSTUVWX🎉", "[redacted]🎉"),
+            (
+                "a\r\n-----BEGIN RSA PRIVATE KEY-----\r\nMIIE\r\n-----END RSA PRIVATE KEY-----\r\nb",
+                "a\r\n[redacted]\r\nb",
+            ),
+            (
+                "-----BEGIN EC PRIVATE KEY-----\nAAA\n-----END EC PRIVATE KEY-----\nmid\n-----BEGIN PRIVATE KEY-----\nBBB\n-----END PRIVATE KEY-----",
+                "[redacted]\nmid\n[redacted]",
+            ),
+        ];
+        for (text, want) in cases {
+            assert_eq!(redact(text), want, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_megabyte_of_output_stays_fast() {
+        let line = "the quick brown fox: jumps = over 42 lazy dogs at https://example.com:8080/x\n";
+        let mut text = String::new();
+        for n in 0.. {
+            if text.len() >= 1 << 20 {
+                break;
+            }
+            text.push_str(if n % 1000 == 0 { "export API_TOKEN=abcdef0123456789\n" } else { line });
+        }
+        let started = std::time::Instant::now();
+        let out = redact(&text);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        assert!(!out.contains("abcdef0123456789") && out.contains("API_TOKEN=[redacted]"));
+        assert_eq!(out.len(), text.len() - text.matches("abcdef0123456789").count() * 6);
+        for one in ["a".repeat(1 << 20), "=".repeat(1 << 20), ":".repeat(1 << 20)] {
+            let started = std::time::Instant::now();
+            assert_eq!(redact(&one), one);
+            assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        }
+    }
+
+    #[test]
     fn overlapping_matches_leave_one_mark_and_unicode_survives() {
         assert_eq!(redact("token=sk-abcdefghijklmnopqrst ✓"), "token=[redacted] ✓");
         assert_eq!(redact("é Bearer sk-abcdefghijklmnop1234"), "é Bearer [redacted]");

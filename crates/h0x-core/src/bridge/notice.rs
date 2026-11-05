@@ -253,6 +253,60 @@ mod tests {
     }
 
     #[test]
+    fn a_burst_of_flapping_statuses_sends_one_now_and_the_last_later() {
+        let mut n = Notices::new(10_000, &snapshot());
+        let mut out = Vec::new();
+        for at in 0..100u64 {
+            let state = if at % 2 == 0 { "blocked" } else { "error" };
+            out.extend(kinds(n.line(&event("status", "t1", status(state, "")), at)));
+        }
+        assert_eq!(out, [("t1".into(), Kind::NeedsYou)]);
+        assert!(n.line(&heartbeat(), 9_999).is_empty());
+        assert_eq!(kinds(n.line(&heartbeat(), 10_000)), [("t1".into(), Kind::Error)], "only the latest");
+        assert!(n.line(&heartbeat(), 60_000).is_empty());
+    }
+
+    #[test]
+    fn finished_without_any_earlier_status() {
+        let mut n = Notices::new(0, &snapshot());
+        let ended = |data: Value, terminal: &str, n: &mut Notices| {
+            let mut out = n.line(&event("finished", terminal, data), 0);
+            assert_eq!(out.len(), 1, "{terminal}");
+            out.remove(0)
+        };
+        let unknown = ended(json!({"reason": "exited", "exit_code": 0}), "t9", &mut n);
+        assert_eq!(
+            unknown,
+            Notice {
+                terminal: "t9".into(),
+                agent: String::new(),
+                folder: String::new(),
+                kind: Kind::Finished,
+                excerpt: "exit 0".into()
+            }
+        );
+        assert_eq!(ended(json!({"reason": "exited", "signal": 9}), "t8", &mut n).excerpt, "signal 9");
+        assert_eq!(ended(json!({}), "t7", &mut n).excerpt, "ended");
+        let remote = ended(json!({"reason": "killed"}), "m/t2", &mut n);
+        assert_eq!(
+            (remote.agent.as_str(), remote.folder.as_str(), remote.excerpt.as_str()),
+            ("codex", "/srv/api", "killed")
+        );
+        let windows = ended(json!({"reason": "exited", "exit_code": 1}), "t1", &mut n);
+        assert_eq!((windows.folder.as_str(), windows.excerpt.as_str()), (r"C:\work\app", "exit 1"));
+    }
+
+    #[test]
+    fn excerpts_are_redacted_before_they_are_cut() {
+        let mut n = Notices::new(0, &snapshot());
+        let msg = format!("{} sk-abcdefghijklmnopqrstuv", "x".repeat(190));
+        let cut = n.line(&event("status", "t1", status("blocked", &msg)), 0).remove(0).excerpt;
+        assert_eq!(cut, format!("{} [redacted", "x".repeat(190)));
+        let wide = n.line(&event("status", "m/t2", status("error", &"é".repeat(500))), 0).remove(0).excerpt;
+        assert_eq!(wide.chars().count(), 200, "characters, not bytes");
+    }
+
+    #[test]
     fn new_and_unknown_terminals_and_odd_lines() {
         let mut n = Notices::new(0, &Value::Null);
         let record = json!({"address": "t5", "argv": ["/bin/zsh"], "cwd": "/tmp", "state": "live"});
