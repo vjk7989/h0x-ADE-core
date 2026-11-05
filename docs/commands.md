@@ -54,6 +54,9 @@ More
   update [--version X|--from <file>]   latest release, at least X, or a build
   machine add|ls|login|update|rename|rm   other machines, over ssh or a command
                               (--via 'fly ssh console -a x --pty=false -C')
+  bridge pair|ls|unpair|lock|unlock|log
+                              remote control from paired chat accounts: full
+                              control of this machine (docs/bridge.md)
   connect                     the API over stdin/stdout (ssh box h0x-core connect)
   schema                      the API as JSON Schema, for app builders
 
@@ -90,6 +93,105 @@ Options:
       --observe            Watch only: never type or resize
       --history <HISTORY>  Scrollback lines to show first (main screen only) [default: 0]
   -h, --help               Print help
+```
+
+## h0x-core bridge
+
+```text
+Remote control from paired chat accounts: pair, list, lock, audit log
+
+Usage: h0x-core bridge [OPTIONS] <COMMAND>
+
+Commands:
+  pair    Print a one-time pairing code (8 characters, valid 10 minutes, single use)
+  unpair  Remove a paired account (its id in `bridge ls`), or every one
+  ls      List paired accounts and whether remote control is locked
+  lock    Refuse every remote command until `bridge unlock` on this machine
+  unlock  Allow remote commands again (only here, never remotely)
+  log     The last audit log entries: every remote command and pairing attempt
+  help    Print this message or the help of the given subcommand(s)
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h0x-core bridge lock
+
+```text
+Refuse every remote command until `bridge unlock` on this machine
+
+Usage: h0x-core bridge lock [OPTIONS]
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h0x-core bridge log
+
+```text
+The last audit log entries: every remote command and pairing attempt
+
+Usage: h0x-core bridge log [OPTIONS]
+
+Options:
+      --json  JSON output even in a terminal
+  -n <N>      How many entries [default: 20]
+  -h, --help  Print help
+```
+
+## h0x-core bridge ls
+
+```text
+List paired accounts and whether remote control is locked
+
+Usage: h0x-core bridge ls [OPTIONS]
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h0x-core bridge pair
+
+```text
+Print a one-time pairing code (8 characters, valid 10 minutes, single use)
+
+Usage: h0x-core bridge pair [OPTIONS]
+
+Options:
+      --json                   JSON output even in a terminal
+      --transport <TRANSPORT>  Where the account to pair writes from [default: telegram] [possible values: telegram]
+  -h, --help                   Print help
+```
+
+## h0x-core bridge unlock
+
+```text
+Allow remote commands again (only here, never remotely)
+
+Usage: h0x-core bridge unlock [OPTIONS]
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h0x-core bridge unpair
+
+```text
+Remove a paired account (its id in `bridge ls`), or every one
+
+Usage: h0x-core bridge unpair [OPTIONS] [ID]
+
+Arguments:
+  [ID]  
+
+Options:
+      --all   
+      --json  JSON output even in a terminal
+  -h, --help  Print help
 ```
 
 ## h0x-core connect

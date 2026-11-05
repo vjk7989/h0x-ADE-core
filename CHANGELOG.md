@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### New
+
+- Remote control (bridge) groundwork: `bridge pair|unpair|ls|lock|unlock|log` pair chat accounts with one-time codes. Paired accounts can list, read, send, press keys, approve or deny, interrupt, run and kill. Destructive commands need a single-use confirmation, and every command is rate limited, redacted and audited. No transport is included yet; see docs/bridge.md.
+
 ## [0.1.5] - 2026-11-05
 
 ### New

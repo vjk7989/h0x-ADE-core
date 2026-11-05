@@ -27,6 +27,28 @@ pub struct Config {
     /// timeout on top), and to send anything at all before its line is
     /// given up and dialed again (default 30).
     pub machine_timeout: Option<f64>,
+    /// Remote control limits (`h0x-core bridge`).
+    #[serde(default)]
+    pub bridge: BridgeConfig,
+}
+
+/// `[bridge]`: limits on what paired chat accounts may do.
+#[derive(Deserialize, Default)]
+pub struct BridgeConfig {
+    /// Commands one paired account may send per minute (default 30).
+    pub rate_limit: Option<u32>,
+    /// Seconds between two notices about one terminal (default 10).
+    pub notice_quiet: Option<f64>,
+}
+
+impl BridgeConfig {
+    pub fn rate_limit(&self) -> u32 {
+        self.rate_limit.unwrap_or(30)
+    }
+
+    pub fn notice_quiet_ms(&self) -> u64 {
+        (self.notice_quiet.filter(|s| s.is_finite() && *s >= 0.0).unwrap_or(10.0) * 1000.0) as u64
+    }
 }
 
 impl Config {

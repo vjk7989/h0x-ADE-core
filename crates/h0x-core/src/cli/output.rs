@@ -3,7 +3,7 @@
 use super::*;
 
 /// The program's own status word, else live or how it ended, and its dot.
-pub(super) fn status(t: &Value) -> (String, &'static str) {
+pub(crate) fn status(t: &Value) -> (String, &'static str) {
     const HOLLOW: &str = "\x1b[2m\u{25cb}\x1b[22m";
     if t["state"] != "live" {
         let word = match (t["exit_code"].as_i64(), t["signal"].as_i64()) {
@@ -24,13 +24,13 @@ pub(super) fn status(t: &Value) -> (String, &'static str) {
 }
 
 /// Who runs in a terminal: the app it reports, else its program's name.
-pub(super) fn agent(t: &Value) -> String {
+pub(crate) fn agent(t: &Value) -> String {
     let program = t["argv"][0].as_str().unwrap_or_default();
     t["status"]["app"].as_str().unwrap_or_else(|| program.rsplit('/').next().unwrap_or_default()).into()
 }
 
 /// The current folder, falling back to where the terminal started.
-fn cwd(t: &Value) -> Option<&str> {
+pub(crate) fn cwd(t: &Value) -> Option<&str> {
     t["foreground"]["cwd"].as_str().or_else(|| t["cwd"].as_str())
 }
 
