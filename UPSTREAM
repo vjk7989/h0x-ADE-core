@@ -1,0 +1,26 @@
+repo: herdrdev/herdr-core (https://github.com/herdrdev/herdr-core)
+base: b63ecbd (v0.1.17 import)
+synced-to: c6b316f
+date: 2026-11-05
+
+Ported or adapted (commit subjects start with "upstream: <hash>"):
+a847a46 6fd38a0 5d85ab5 ed25eee 01aa338 5850df6 7a39671 70ad106 0a18a03
+282c803 4d27be1 55ec6e8 cd6ba77 c6b316f 1473638
+
+Skipped:
+dbd58d4 unsent-draft hold on agent messages; reverted upstream by 4d133ea
+55aab55 same draft-hold feature; reverted by 4d133ea
+92227cb same draft-hold feature; reverted by 4d133ea
+e6d7f4f same draft-hold feature (test); reverted by 4d133ea
+bb08e28 macOS signed core identity and notarized bundle; we ship unsigned GitHub Releases (ADR-034)
+043b2f1 macOS notarization check; needs bb08e28
+fe2cf7a macOS bundle network prompt name; needs bb08e28
+620df80 macOS bundle copy for remote installs; needs bb08e28
+d7ae6ef macOS bundle path alias on update; needs bb08e28
+2c8701a macOS bundle install notice; needs bb08e28
+bd8d20f macOS notarization ticket wait; needs bb08e28
+e237b6e same draft-hold feature; reverted by 4d133ea
+ec8adcd same draft-hold feature; reverted by 4d133ea
+0725334 same draft-hold feature; reverted by 4d133ea
+4d133ea the revert of the draft-hold feature; net zero with the commits above
+3965a46 upstream release 0.1.18 (version, changelog, lockfile); we version ourselves
