@@ -79,7 +79,7 @@ impl Api {
         // The real API is https only; a loopback stub (tests) may be http.
         let proto = if self.base == HOST { "=https" } else { "=http,https" };
         let mut curl = Command::new("curl");
-        curl.args(["-s", "--proto", proto, "--proto-redir", proto, "--connect-timeout", "10", "--max-time"])
+        curl.args(["-sS", "--proto", proto, "--proto-redir", proto, "--connect-timeout", "10", "--max-time"])
             .arg(seconds.to_string())
             .args(["-K", "-"]);
         let url = format!("{}/bot{}/{method}", self.base, self.token);
@@ -93,25 +93,65 @@ impl Api {
 
     /// One Bot API call: its `result`, or why not (never the token or the payload).
     pub fn call(&self, method: &str, body: &Value, seconds: u64) -> Result<Value, String> {
+        self.answer(method, body, seconds).map_err(|e| scrub(&format!("{method}: {e}")))
+    }
+
+    fn answer(&self, method: &str, body: &Value, seconds: u64) -> Result<Value, String> {
         let (mut curl, config) = self.request(method, body, seconds);
         let mut child = curl
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("{method}: can't run curl: {e}"))?;
+            .map_err(|e| format!("can't run curl: {e}"))?;
         let fed = child.stdin.take().expect("piped").write_all(config.as_bytes());
-        let out = child.wait_with_output().map_err(|e| format!("{method}: curl: {e}"))?;
+        let out = child.wait_with_output().map_err(|e| format!("curl: {e}"))?;
         if fed.is_err() || !out.status.success() {
-            return Err(format!("{method}: no answer (curl exit {})", out.status.code().unwrap_or(-1)));
+            return Err(failure(out.status.code(), &String::from_utf8_lossy(&out.stderr)));
         }
-        let reply: Value =
-            serde_json::from_slice(&out.stdout).map_err(|_| format!("{method}: not a Bot API answer"))?;
+        let reply: Value = serde_json::from_slice(&out.stdout).map_err(|_| "not a Bot API answer".to_string())?;
         match reply["ok"].as_bool() {
             Some(true) => Ok(reply["result"].clone()),
-            _ => Err(format!("{method}: {}", reply["description"].as_str().unwrap_or("refused"))),
+            _ => Err(reply["description"].as_str().unwrap_or("refused").into()),
         }
     }
+}
+
+/// Why curl failed: its exit code and its own message (which may name the URL;
+/// [`Api::call`] scrubs the token out of every error).
+fn failure(code: Option<i32>, stderr: &str) -> String {
+    let said = stderr.trim();
+    let code = code.unwrap_or(-1);
+    if said.is_empty() {
+        format!("no answer (curl exit {code})")
+    } else {
+        format!("no answer (curl exit {code}: {said})")
+    }
+}
+
+/// `text` with every `/bot<id>:<secret>` (a Bot API URL's token) replaced.
+pub(super) fn scrub(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("/bot") {
+        out.push_str(&rest[..at + 4]);
+        let after = &rest[at + 4..];
+        let id = after.bytes().take_while(u8::is_ascii_digit).count();
+        let secret = match after.as_bytes().get(id) {
+            Some(b':') if id > 0 => {
+                after[id + 1..].bytes().take_while(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c == b'-').count()
+            }
+            _ => 0,
+        };
+        if secret > 0 {
+            out.push_str("[token]");
+            rest = &after[id + 1 + secret..];
+        } else {
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -135,8 +175,42 @@ mod tests {
         }
         let (curl, _) = Api::at(HOST, TOKEN).request("getUpdates", &json!({}), 65);
         let args: Vec<String> = curl.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-        assert_eq!(args[..5], ["-s", "--proto", "=https", "--proto-redir", "=https"], "https only to Telegram");
+        assert_eq!(args[..5], ["-sS", "--proto", "=https", "--proto-redir", "=https"], "https only to Telegram");
         assert!(args.windows(2).any(|w| w == ["--max-time", "65"]));
+    }
+
+    #[test]
+    fn a_curl_failure_naming_the_url_never_carries_the_token() {
+        let stderr = format!(
+            "curl: (28) Operation timed out after 65001 milliseconds with 0 bytes received\n\
+             curl: (6) Could not resolve host for https://api.telegram.org/bot{TOKEN}/getUpdates?x=1\n"
+        );
+        let err = scrub(&format!("getUpdates: {}", failure(Some(28), &stderr)));
+        assert!(!err.contains(TOKEN) && !err.contains("ABCdef") && !err.contains("123456"), "{err}");
+        assert!(
+            err.contains("https://api.telegram.org/bot[token]/getUpdates?x=1") && err.contains("curl exit 28"),
+            "{err}"
+        );
+        assert_eq!(failure(None, "  "), "no answer (curl exit -1)");
+        for (text, want) in [
+            (format!("a /bot{TOKEN}/x and /bot{TOKEN}"), "a /bot[token]/x and /bot[token]".to_string()),
+            (
+                "the /bot is fine, /bot42 too, /bot:x, /bot42:".into(),
+                "the /bot is fine, /bot42 too, /bot:x, /bot42:".into(),
+            ),
+            ("é/bot1:a/".into(), "é/bot[token]/".into()),
+            (String::new(), String::new()),
+        ] {
+            assert_eq!(scrub(&text), want, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_that_echoes_the_url_is_scrubbed_too() {
+        // A real call: nothing listens, and curl's message reaches the error scrubbed.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+        let err = Api::at(&format!("http://{closed}"), TOKEN).call("getMe", &json!({}), 5).unwrap_err();
+        assert!(err.starts_with("getMe: no answer (curl exit ") && !err.contains(TOKEN), "{err}");
     }
 
     #[test]

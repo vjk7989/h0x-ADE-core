@@ -169,7 +169,11 @@ fn the_telegram_bot_answers_a_paired_account() {
     assert!(String::from_utf8_lossy(&refused.stderr).contains("not on this machine"), "only a loopback stub");
 
     let mut bot = s.cmd().args(["bridge", "run"]).env("H0X_CORE_TELEGRAM_URL", &url).spawn().unwrap();
-    wait_until("the bot answers /agents", || seen.lock().unwrap().iter().any(|(p, _)| p.ends_with("/sendMessage")));
+    wait_until("the bot answers /agents and polls again", || {
+        let seen = seen.lock().unwrap();
+        seen.iter().any(|(p, _)| p.ends_with("/sendMessage"))
+            && seen.iter().filter(|(p, _)| p.ends_with("/getUpdates")).count() >= 2
+    });
     bot.kill().unwrap();
     bot.wait().unwrap();
     let seen = seen.lock().unwrap().clone();

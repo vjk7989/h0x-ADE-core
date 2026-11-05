@@ -35,6 +35,8 @@ Group chats are ignored. Messages from accounts that aren't paired get no answer
 
 It only makes outbound connections: it long-polls `api.telegram.org` over https through the system `curl` and never listens on a port.
 The token travels inside the request that curl reads on its stdin, never on a command line that other processes could list.
+Errors keep curl's own message but cut the token out of any URL in it, so the token never reaches a log or a chat.
+Accounts are known by their numeric Telegram user id; a username is only a label and can't pair or act.
 When Telegram can't be reached, it tries again after 1, 2, 4, 8 seconds and so on, up to a minute between tries.
 
 ### In the chat
