@@ -1,6 +1,6 @@
 # Shipped notices
 
-`just notices` combines these texts with every registry package in `Cargo.lock`, including target-specific and build dependencies. It reads full LICENSE/COPYING/NOTICE files from Cargo's downloaded sources and fails if none exist. It needs Cargo, jq, and Unix tools. The result is embedded in `hc --licenses` and shipped in release archives.
+`just notices` combines these texts with every registry package in `Cargo.lock`, including target-specific and build dependencies. It reads full LICENSE/COPYING/NOTICE files from Cargo's downloaded sources and fails if none exist. It needs Cargo, jq, and Unix tools. The result is embedded in `h0x-core --licenses` and shipped in release archives.
 
 Non-Cargo inputs are checked in so regeneration doesn't depend on a license server:
 
