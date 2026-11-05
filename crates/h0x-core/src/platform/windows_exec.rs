@@ -15,6 +15,10 @@ use windows_sys::Win32::System::Threading::*;
 /// This machine's own shell: PowerShell 7 if installed, else Windows PowerShell.
 /// PowerShell's `cd` never tells Windows, so h0x-core couldn't see its folder: each
 /// prompt does, after the person's own prompt ran (it reads `$?`).
+/// A pseudo console always has PowerShell in front, so h0x-core can't see a
+/// program hand it back: the prompt also turns off the mouse and focus
+/// reports a program left on (`foreground::INPUT_REPORTS`), or every move of
+/// the mouse would be typed at it.
 pub fn own_shell() -> Vec<String> {
     let on_path = |exe: &str| {
         std::env::var_os("PATH").is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(exe).is_file()))
@@ -22,7 +26,8 @@ pub fn own_shell() -> Vec<String> {
     let exe = if on_path("pwsh.exe") { "pwsh.exe" } else { "powershell.exe" };
     let hook = "$global:__hc_prompt = $function:prompt; function global:prompt { $p = & $global:__hc_prompt; \
                 $l = $ExecutionContext.SessionState.Path.CurrentLocation; \
-                if ($l.Provider.Name -eq 'FileSystem') { try { [Environment]::CurrentDirectory = $l.ProviderPath } catch {} }; $p }";
+                if ($l.Provider.Name -eq 'FileSystem') { try { [Environment]::CurrentDirectory = $l.ProviderPath } catch {} }; \
+                [Console]::Write(-join (9,1000,1002,1003,1004,1005,1006,1015,1016 | ForEach-Object { '' + [char]27 + '[?' + $_ + 'l' })); $p }";
     [exe, "-NoExit", "-Command", hook].map(String::from).to_vec()
 }
 
@@ -127,4 +132,21 @@ unsafe fn resume(pid: u32) -> usize {
         }
     }
     resumed
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_prompt_turns_off_the_reports_a_program_left_on() {
+        let shell = super::own_shell();
+        let out = std::process::Command::new(&shell[0])
+            .args(["-NoProfile", "-NonInteractive", "-Command", &format!("{}; prompt", shell[3])])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let off: String = [9, 1000, 1002, 1003, 1004, 1005, 1006, 1015, 1016].map(|m| format!("\x1b[?{m}l")).concat();
+        assert!(text.starts_with(&off), "{text:?} {}", String::from_utf8_lossy(&out.stderr));
+        assert!(text.contains("PS "), "the person's own prompt follows: {text:?}");
+        assert!(!text.contains("2004"), "bracketed paste is left alone");
+    }
 }

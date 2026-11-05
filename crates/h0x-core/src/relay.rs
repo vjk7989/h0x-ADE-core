@@ -113,6 +113,11 @@ impl Relay {
         (out, Some((n, paint)))
     }
 
+    /// Between sequences: nothing held back, no image arriving.
+    pub fn idle(&self) -> bool {
+        self.held.is_empty() && self.apc.is_none()
+    }
+
     /// Writes a half-received sequence to the screen (before a snapshot).
     pub fn flush(&mut self, screen: &mut Screen) {
         screen.write(&std::mem::take(&mut self.held));
