@@ -29,6 +29,9 @@ No terminal
   file read|write|edit [--on m] <path>
                               a file here or there: print it, write what is piped
                               in, or replace exact text (--old X --new Y)
+  session list [--on m] [folder]
+                              agent sessions that ran there, newest first
+                              (Claude Code, Codex, OpenCode)
 
 More
   templates                   list templates

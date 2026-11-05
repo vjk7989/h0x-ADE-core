@@ -128,6 +128,9 @@ methods! { Ctx<'_>;
     "doc.set" => doc_set, DocSetParams => DocSetResult,
         "Write an opaque JSON document (at most 1 MiB) if its version still matches. Null deletes the value but retains its version. Persists atomically and emits a doc event.",
         errors ["invalid_params", "conflict", "internal", "machine_unknown", "unavailable", "needs_update"];
+    "session.list" => session_list, SessionListParams => SessionListResult,
+        "The agent sessions that ran in a folder, here or on a machine (`on`), newest first: Claude Code, Codex and OpenCode (JSON storage), read from each agent's own store. Files that cannot be read are left out.",
+        errors ["invalid_params", "machine_unknown", "unavailable", "needs_update"];
     "events.subscribe" => events_subscribe, SubscribeParams => SubscribeResult,
         "Snapshot of matching terminals, then every fact change in order (created, lost, restarted, keep, finished, removed, status, turn, title, labels, size, doc) as `event` notifications, `heartbeat` every 15 s, and `missed` + fresh snapshot for a subscriber that fell behind.",
         errors ["not_found", "machine_unknown"];
@@ -510,6 +513,15 @@ async fn file_write(core: Ctx<'_>, p: FileWriteParams) -> Result<FileResult, Rpc
 async fn file_edit(core: Ctx<'_>, p: FileEditParams) -> Result<FileResult, RpcError> {
     let afar = from_afar(core);
     blocking(move || crate::files::edit(p, afar)).await
+}
+
+async fn session_list(core: Ctx<'_>, p: SessionListParams) -> Result<SessionListResult, RpcError> {
+    if p.folder.is_empty() {
+        return Err(RpcError::invalid_params("folder is empty"));
+    }
+    let folder = crate::exec::folder(Some(&p.folder), from_afar(core));
+    let roots = crate::sessions::Roots::from_env();
+    blocking(move || Ok(SessionListResult { sessions: crate::sessions::list(&folder, &roots) })).await
 }
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, RpcError> + Send + 'static) -> Result<T, RpcError> {

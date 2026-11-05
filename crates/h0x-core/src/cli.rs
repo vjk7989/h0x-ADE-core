@@ -15,10 +15,12 @@ use std::io::{IsTerminal, Read};
 mod file;
 mod machine;
 mod output;
+mod session;
 mod update;
 use file::*;
 use machine::*;
 use output::*;
+use session::*;
 use update::*;
 
 #[derive(Parser)]
@@ -77,6 +79,11 @@ enum Cmd {
     Machine {
         #[command(subcommand)]
         action: MachineCmd,
+    },
+    /// Agent sessions (Claude Code, Codex, OpenCode) that ran in a folder.
+    Session {
+        #[command(subcommand)]
+        action: SessionCmd,
     },
     /// Follow fact changes as they happen (one JSON line each when piped).
     Events(SubscribeParams),
@@ -619,6 +626,7 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
         }
         Cmd::Update { from: Some(from), force, .. } => update(&paths, &from, force)?,
         Cmd::Machine { action } => machine(&paths, action, call)?,
+        Cmd::Session { action } => session(action, call)?,
         Cmd::File { action } => match file(action, asked, call)? {
             Some(out) => out,
             None => return Ok(None),
@@ -863,6 +871,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("file read", "file.read"),
     ("file write", "file.write"),
     ("file edit", "file.edit"),
+    ("session list", "session.list"),
     ("events", "events.subscribe"),
     ("templates", "templates.list"),
     ("schema", "rpc.discover"),

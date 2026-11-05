@@ -39,6 +39,9 @@ No terminal
   file read|write|edit [--on m] <path>
                               a file here or there: print it, write what is piped
                               in, or replace exact text (--old X --new Y)
+  session list [--on m] [folder]
+                              agent sessions that ran there, newest first
+                              (Claude Code, Codex, OpenCode)
 
 More
   templates                   list templates
@@ -594,6 +597,38 @@ Usage: h0x-core server stop [OPTIONS]
 Options:
       --json  JSON output even in a terminal
   -h, --help  Print help
+```
+
+## h0x-core session
+
+```text
+Agent sessions (Claude Code, Codex, OpenCode) that ran in a folder
+
+Usage: h0x-core session [OPTIONS] <COMMAND>
+
+Commands:
+  list  Agent sessions that ran in a folder (default: here), newest first
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h0x-core session list
+
+```text
+Agent sessions that ran in a folder (default: here), newest first
+
+Usage: h0x-core session list [OPTIONS] [FOLDER]
+
+Arguments:
+  [FOLDER]  The folder they ran in: absolute, or from where h0x-core runs (through the API, the core's folder; with --on, that machine's home) [default: .]
+
+Options:
+      --json          JSON output even in a terminal
+      --on <MACHINE>  On another machine (see `h0x-core machine ls`)
+  -h, --help          Print help
 ```
 
 ## h0x-core templates

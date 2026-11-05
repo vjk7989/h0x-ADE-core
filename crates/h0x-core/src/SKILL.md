@@ -184,6 +184,7 @@ h0x-core exec --on vps --cwd /srv/app git diff    # short command, exact output,
 h0x-core file read --on vps /srv/app/src/x.rs --offset 200 --limit 100
 h0x-core file edit --on vps /srv/app/src/x.rs --old 'exact text' --new 'replacement'
 h0x-core file write --on vps /srv/app/src/y.rs < content.txt
+h0x-core session list --on vps /srv/app   # past Claude Code, Codex, OpenCode sessions there
 ```
 
 `exec -i` feeds piped input to the command. File writes replace the whole

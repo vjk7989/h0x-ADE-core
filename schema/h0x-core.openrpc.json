@@ -945,6 +945,58 @@
         ],
         "type": "object"
       },
+      "SessionInfo": {
+        "description": "An agent session, as its agent stored it.",
+        "properties": {
+          "agent": {
+            "description": "The agent: `claude`, `codex` or `opencode` (more may come).",
+            "type": "string"
+          },
+          "id": {
+            "description": "The agent's id for it, as given to its resume option.",
+            "type": "string"
+          },
+          "last_used": {
+            "description": "When it was last used, unix ms.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "path": {
+            "description": "Its file in the agent's store.",
+            "type": "string"
+          },
+          "title": {
+            "description": "Its name, when it has one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "agent",
+          "id",
+          "last_used",
+          "path"
+        ],
+        "type": "object"
+      },
+      "SessionListResult": {
+        "properties": {
+          "sessions": {
+            "description": "Newest first.",
+            "items": {
+              "$ref": "#/components/schemas/SessionInfo"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "sessions"
+        ],
+        "type": "object"
+      },
       "Status": {
         "description": "One 7501 record. Words are the program's own; nothing is translated.",
         "properties": {
@@ -3492,6 +3544,70 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/DocSetResult"
+        }
+      }
+    },
+    {
+      "description": "The agent sessions that ran in a folder, here or on a machine (`on`), newest first: Claude Code, Codex and OpenCode (JSON storage), read from each agent's own store. Files that cannot be read are left out.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "needs_update"
+          },
+          "message": "needs_update"
+        }
+      ],
+      "name": "session.list",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The folder they ran in: absolute, or from where h0x-core runs (through\nthe API, the core's folder; with --on, that machine's home).",
+          "name": "folder",
+          "required": true,
+          "schema": {
+            "description": "The folder they ran in: absolute, or from where h0x-core runs (through\nthe API, the core's folder; with --on, that machine's home).",
+            "type": "string"
+          }
+        },
+        {
+          "description": "On another machine (see `h0x-core machine ls`).",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "On another machine (see `h0x-core machine ls`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionListResult"
         }
       }
     },
