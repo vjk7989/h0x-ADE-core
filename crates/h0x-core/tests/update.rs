@@ -92,6 +92,7 @@ fn an_install_in_a_read_only_folder_explains_how_to_update_it() {
 #[test]
 fn update_from_a_file_swaps_hc_and_keeps_everything_running() {
     let mut s = Session::new();
+    s.env.push(("H0X_CORE_SESSION_VALUE".into(), "original".into()));
     let dir = s.root.join("bin");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::copy(BIN, dir.join("h0x-core")).unwrap();
@@ -100,7 +101,16 @@ fn update_from_a_file_swaps_hc_and_keeps_everything_running() {
     let t = run(&s, &["sh", "-c", "echo before; while read l; do echo got-$l; done"]);
     let pid = s.json(&["server", "status"])["pid"].clone();
 
-    let r = s.json(&["update", "--from", BIN]);
+    let out = s
+        .cmd()
+        .env("NO_COLOR", "1")
+        .env("H0X_CORE_SESSION_VALUE", "updater")
+        .env("H0X_CORE_UPDATER_ONLY", "leaked")
+        .args(["update", "--from", BIN])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let r: Value = serde_json::from_slice(&out.stdout).unwrap();
     let real = std::fs::canonicalize(dir.join("h0x-core")).unwrap(); // macOS: /var is /private/var
     assert_eq!(r["path"], real.display().to_string(), "the file h0x-core runs from, not the link: {r}");
     assert!(
@@ -112,6 +122,24 @@ fn update_from_a_file_swaps_hc_and_keeps_everything_running() {
     assert!(dir.join("h0x-core-link").is_symlink(), "the link stays a link");
     s.json(&["send", &t, "after"]);
     wait_until("the terminal still answers", || text(&s, &t).contains("got-after"));
+    let probe =
+        "printf 'ENV:%s|%s|%s\\n' \"${NO_COLOR-unset}\" \"$H0X_CORE_SESSION_VALUE\" \"${H0X_CORE_UPDATER_ONLY-unset}\"";
+    let out = s.core(&["run", "sh", "-c", probe]);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("ENV:unset|original|unset"), "{out:?}");
+    let stream = h0x_core::platform::connect(&s.socket()).unwrap();
+    let terminal = h0x_core::client::call(
+        &stream,
+        "terminal.run",
+        json!({
+            "argv": ["sh", "-c", probe],
+            "env": {"NO_COLOR": "1", "H0X_CORE_SESSION_VALUE": "override"},
+        }),
+    )
+    .unwrap();
+    wait_until("per-terminal environment override", || {
+        text(&s, terminal["address"].as_str().unwrap()).contains("ENV:1|override|unset")
+    });
 
     let older = s.root.join("older");
     std::fs::write(&older, "#!/bin/sh\necho 'h0x-core 0.0.1'\n").unwrap();
