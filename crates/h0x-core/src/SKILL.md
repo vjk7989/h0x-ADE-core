@@ -237,6 +237,11 @@ paths start at your current folder. Prefer explicit paths for remote work.
 - Planned restarts and updates preserve the core's launch environment for new
   terminals; per-terminal API `env` overrides still apply. A stop followed by a
   fresh start uses the new launcher's environment.
+- `h0x-core bridge` is remote control for people: chat accounts paired with
+  `bridge pair` get full control of this machine. Never pair, unpair, reset or
+  `h0x-core bridge unlock` on your own; `h0x-core bridge ls` and
+  `h0x-core bridge log` are safe to read. A person may answer your blocked
+  prompt from their phone.
 - Never `h0x-core server stop` or restart the user's core unless asked. It affects
   every terminal. Tests need their own `H0X_CORE_SESSION` and scratch XDG paths.
 - Errors are `{error: {kind, message, hint}}` on stderr. Exit codes include
