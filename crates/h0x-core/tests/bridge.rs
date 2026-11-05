@@ -26,7 +26,7 @@ fn core(s: &Session) -> impl Fn(&str, Value) -> Result<Value, h0x_core::rpc::Rpc
 #[test]
 fn pairing_locking_and_the_log_through_the_cli() {
     let s = Session::new();
-    assert_eq!(s.json(&["bridge", "ls"]), json!({"identities": [], "locked": false}));
+    assert_eq!(s.json(&["bridge", "ls"]), json!({"identities": [], "locked": false, "telegram_token": "unset"}));
     let pair = s.json(&["bridge", "pair"]);
     assert_eq!(pair["transport"], "telegram");
     bridge(&s).pair_verify("telegram", "42", "vijay", pair["code"].as_str().unwrap(), now_ms()).unwrap();
@@ -54,7 +54,7 @@ fn pairing_locking_and_the_log_through_the_cli() {
     assert!(message.contains("h0x-core bridge reset"), "{message}");
     let moved = s.json(&["bridge", "reset"]);
     assert!(moved["moved_to"].as_str().unwrap().contains("state.json.bad-"), "{moved}");
-    assert_eq!(s.json(&["bridge", "ls"]), json!({"identities": [], "locked": false}));
+    assert_eq!(s.json(&["bridge", "ls"]), json!({"identities": [], "locked": false, "telegram_token": "unset"}));
     assert_eq!(s.json(&["bridge", "reset"]), json!({"moved_to": null}));
     assert!(!s.connect_ok(), "bridge commands never start a core");
 }
@@ -92,4 +92,93 @@ fn a_paired_account_drives_real_terminals() {
     assert_eq!(get(&s, &shell)["state"], "live", "not before the confirmation");
     assert!(matches!(ask(Command::Confirm { token }), Reply::Done(_)));
     wait_until("killed", || get(&s, &shell)["state"] == "finished");
+}
+
+const TOKEN: &str = "123456:ABCdef_ghi-JKLmnoPQRstuVWXyz0123";
+
+/// A loopback Bot API: one `/agents` from user 42, then nothing; records
+/// every request's method and body.
+fn stub() -> (String, std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    std::thread::spawn(move || {
+        for (n, stream) in listener.incoming().enumerate() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            let path = first.split_whitespace().nth(1).unwrap_or_default().to_string();
+            let mut length = 0;
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).unwrap() == 0 || header == "\r\n" {
+                    break;
+                }
+                if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let method = path.rsplit('/').next().unwrap_or_default().to_string();
+            let reply = match method.as_str() {
+                "getUpdates" if n == 0 => json!({"ok": true, "result": [{"update_id": 1, "message": {"message_id": 1,
+                    "from": {"id": 42}, "chat": {"id": 42, "type": "private"}, "text": "/agents"}}]}),
+                "getUpdates" => {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    json!({"ok": true, "result": []})
+                }
+                _ => json!({"ok": true, "result": {"message_id": 7}}),
+            }
+            .to_string();
+            log.lock().unwrap().push((path, serde_json::from_slice(&body).unwrap()));
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", reply.len());
+            let _ = stream.write_all(format!("{head}{reply}").as_bytes());
+        }
+    });
+    (url, seen)
+}
+
+#[test]
+fn the_telegram_bot_answers_a_paired_account() {
+    let s = Session::new();
+    let (code, err) = s.err(&["bridge", "run"]);
+    assert_eq!((code, err["error"]["message"].as_str()), (1, Some("no bot token")));
+    assert_eq!(s.err(&["bridge", "telegram", "token"]).1["error"]["kind"], "invalid_params", "nothing piped in");
+    let stored = s.hc_input(&["--json", "bridge", "telegram", "token"], format!("{TOKEN}\n").as_bytes());
+    assert!(stored.status.success(), "{}", String::from_utf8_lossy(&stored.stderr));
+    let ls = s.core(&["bridge", "ls"]);
+    let shown = String::from_utf8_lossy(&ls.stdout).to_string();
+    assert!(shown.contains(r#""telegram_token":"set""#) && !shown.contains("ABCdef"), "{shown}");
+    let file = s.root.join("config/h0x-core/bridge/telegram.token");
+    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+
+    let (code, _) = bridge(&s).pair("telegram", now_ms()).unwrap();
+    bridge(&s).pair_verify("telegram", "42", "", &code, now_ms()).unwrap();
+    run(&s, &["sleep", "100"]);
+    let (url, seen) = stub();
+    let mut far = s.cmd();
+    far.args(["bridge", "run"]).env("H0X_CORE_TELEGRAM_URL", "http://10.1.2.3:80");
+    let refused = far.output().unwrap();
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("not on this machine"), "only a loopback stub");
+
+    let mut bot = s.cmd().args(["bridge", "run"]).env("H0X_CORE_TELEGRAM_URL", &url).spawn().unwrap();
+    wait_until("the bot answers /agents", || seen.lock().unwrap().iter().any(|(p, _)| p.ends_with("/sendMessage")));
+    bot.kill().unwrap();
+    bot.wait().unwrap();
+    let seen = seen.lock().unwrap().clone();
+    assert!(seen.iter().all(|(path, _)| path.starts_with(&format!("/bot{TOKEN}/"))), "the token rode in the URL");
+    let (_, answer) = seen.iter().find(|(p, _)| p.ends_with("/sendMessage")).unwrap();
+    assert_eq!(answer["chat_id"], 42);
+    assert!(answer["text"].as_str().unwrap().contains("sleep"), "{answer}");
+    let polls: Vec<&Value> =
+        seen.iter().filter(|(p, _)| p.ends_with("/getUpdates")).map(|(_, b)| &b["offset"]).collect();
+    assert_eq!(polls[..2], [&json!(0), &json!(2)], "the update was acknowledged");
+
+    let cleared = s.json(&["bridge", "telegram", "token", "--clear"]);
+    assert_eq!(cleared, json!({"telegram_token": "unset"}));
+    assert!(!file.exists());
 }

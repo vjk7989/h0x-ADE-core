@@ -2,9 +2,58 @@
 
 The bridge lets chat accounts you pair drive this machine's terminals while you are away from it.
 They can see what your agents are doing, answer their questions, send text and keys, start agents and commands, and stop them.
-It is built into core and doesn't depend on any one transport. Telegram is the first transport and arrives separately; until then, nothing reaches the bridge from outside.
+It is built into core and doesn't depend on any one transport. Telegram is the only one today: a bot you create, run by `h0x-core bridge run`.
 
 [Back to the README](../README.md) · [Security](security.md) · [Commands](commands.md)
+
+## Telegram setup
+
+1. In Telegram, talk to @BotFather: send `/newbot`, pick a name, and copy the token it gives you.
+2. Store the token on this machine; it is read from stdin and not shown as you type:
+
+   ```sh
+   h0x-core bridge telegram token
+   ```
+
+   It is kept in the bridge folder, mode 0600, and never logged or printed: `h0x-core bridge ls` only says whether it is set. `h0x-core bridge telegram token --clear` removes it.
+3. Print a pairing code:
+
+   ```sh
+   h0x-core bridge pair
+   ```
+
+4. Start the bot so it can hear you. It keeps running until stopped; under core it survives your terminal closing:
+
+   ```sh
+   h0x-core run --bg --keep -- h0x-core bridge run
+   ```
+
+5. In a private chat with your bot, send `/pair CODE` within 10 minutes. The bot answers that you are paired.
+
+The bot only talks to paired accounts in private chats.
+Group chats are ignored. Messages from accounts that aren't paired get no answer, except `/pair`.
+
+It only makes outbound connections: it long-polls `api.telegram.org` over https through the system `curl` and never listens on a port.
+The token travels inside the request that curl reads on its stdin, never on a command line that other processes could list.
+When Telegram can't be reached, it tries again after 1, 2, 4, 8 seconds and so on, up to a minute between tries.
+
+### In the chat
+
+- `/agents`: terminals, with their agent, folder and status
+- `/read <t> [lines]`: its last lines (default 20)
+- `/send <t> <text>`: type text and press enter
+- `/keys <t> <keys…>`: press enter, esc, ctrl+c, up, down, left, right, y, n
+- `/approve <t>`, `/deny <t>`: answer what it is waiting on
+- `/interrupt <t>`: press its stop key
+- `/run <folder> <command>`: start an agent or command (put a folder with spaces in "double quotes")
+- `/kill <t>`: end its program
+- `/lock`: refuse every remote command until `h0x-core bridge unlock` here
+- `/help`: this list
+
+Notices come with buttons: Approve, Deny, Show and Interrupt when an agent needs you; Show for the rest.
+To type into a terminal, reply to its notice.
+A command that needs a confirmation shows Confirm and Cancel buttons. Cancel leaves the confirmation unused, and it expires in 2 minutes.
+Notices stop while the bridge is locked.
 
 ## Full control means full control
 

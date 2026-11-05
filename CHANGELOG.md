@@ -4,7 +4,8 @@
 
 ### New
 
-- Remote control (bridge) groundwork: `bridge pair|unpair|ls|lock|unlock|log` pair chat accounts with one-time codes. Paired accounts can list, read, send, press keys, approve or deny, interrupt, run and kill. Destructive commands need a single-use confirmation, and every command is rate limited, redacted and audited. No transport is included yet; see docs/bridge.md.
+- Remote control (bridge) groundwork: `bridge pair|unpair|ls|lock|unlock|log` pair chat accounts with one-time codes. Paired accounts can list, read, send, press keys, approve or deny, interrupt, run and kill. Destructive commands need a single-use confirmation, and every command is rate limited, redacted and audited. See docs/bridge.md.
+- Telegram bot for the bridge: `bridge telegram token` stores the bot token (0600, never shown), and `bridge run` long-polls Telegram through the system curl, outbound and https only. It sends notices with Approve, Deny, Show and Interrupt buttons, answers `/agents`, `/read`, `/send`, `/keys`, `/approve`, `/deny`, `/interrupt`, `/run`, `/kill` and `/lock` from paired accounts in private chats, and asks for a confirmation tap before destructive commands.
 
 ## [0.1.5] - 2026-11-05
 

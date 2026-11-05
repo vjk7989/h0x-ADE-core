@@ -44,7 +44,7 @@ More
   update [--version X|--from <file>]   latest release, at least X, or a build
   machine add|ls|login|update|rename|rm   other machines, over ssh or a command
                               (--via 'fly ssh console -a x --pty=false -C')
-  bridge pair|ls|unpair|lock|unlock|reset|log
+  bridge pair|ls|unpair|lock|unlock|reset|log|telegram token|run
                               remote control from paired chat accounts: full
                               control of this machine (docs/bridge.md)
   connect                     the API over stdin/stdout (ssh box h0x-core connect)

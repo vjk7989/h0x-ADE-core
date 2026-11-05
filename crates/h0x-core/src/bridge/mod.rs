@@ -10,6 +10,7 @@
 mod command;
 mod notice;
 mod redact;
+pub mod telegram;
 
 pub use command::{Command, Key, Reply, Sender};
 pub use notice::{Kind, Notice, Notices, watch};
@@ -130,14 +131,19 @@ impl Bridge {
 
     /// Replaces state.json with a new 0600 file.
     fn save(&self, st: &State) -> Result<(), RpcError> {
+        self.write_private("state.json", &serde_json::to_vec_pretty(st).map_err(failed)?)
+    }
+
+    /// Replaces `name` in the bridge folder with a new 0600 file holding `bytes`.
+    fn write_private(&self, name: &str, bytes: &[u8]) -> Result<(), RpcError> {
         let write = || -> std::io::Result<()> {
             crate::platform::private_dir(&self.dir)?;
-            let tmp = self.dir.join("state.json.tmp");
+            let tmp = self.dir.join(format!("{name}.tmp"));
             let _ = std::fs::remove_file(&tmp);
             let mut file = crate::platform::private_file(&tmp)?;
-            file.write_all(&serde_json::to_vec_pretty(st).map_err(std::io::Error::other)?)?;
+            file.write_all(bytes)?;
             file.sync_all()?;
-            std::fs::rename(tmp, self.dir.join("state.json"))
+            std::fs::rename(tmp, self.dir.join(name))
         };
         write().map_err(failed)
     }

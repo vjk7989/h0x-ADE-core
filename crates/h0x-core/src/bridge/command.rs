@@ -53,6 +53,19 @@ impl Key {
             Key::N => "n",
         }
     }
+
+    /// A key a person typed (`enter`, `Esc`, `ctrl+c`, `up`, `y`...), else None.
+    pub fn parse(word: &str) -> Option<Key> {
+        let all = [Key::Enter, Key::Esc, Key::CtrlC, Key::Up, Key::Down, Key::Left, Key::Right, Key::Y, Key::N];
+        let word = word.to_ascii_lowercase();
+        let word = match word.as_str() {
+            "return" => "enter",
+            "escape" => "esc",
+            "ctrl-c" | "^c" => "ctrl+c",
+            other => other,
+        };
+        all.into_iter().find(|k| k.name() == word)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
