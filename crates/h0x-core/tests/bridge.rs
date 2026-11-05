@@ -201,7 +201,9 @@ fn piped_tokens_with_line_ends_or_the_wrong_shape() {
     let file = s.root.join("config/h0x-core/bridge/telegram.token");
     let cleared = s.core(&["bridge", "telegram", "token", "--clear"]);
     assert!(cleared.status.success());
-    assert_eq!(String::from_utf8_lossy(&cleared.stdout).trim(), "no telegram token was set");
+    // stdout is piped, so the CLI prints JSON (cli.rs:187: `json = asked || piped`).
+    let cleared: Value = serde_json::from_slice(&cleared.stdout).unwrap();
+    assert_eq!(cleared, json!({"telegram_token": "unset"}), "nothing was set: still unset");
 
     let near = "123456:ABCdef ghi-JKLmnoPQRstuVWXyz0123";
     for bad in [String::new(), "\n".into(), format!("{near}\n"), format!("\n{TOKEN}\n"), "123456:short\r\n".into()] {
@@ -223,5 +225,6 @@ fn piped_tokens_with_line_ends_or_the_wrong_shape() {
     assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
     let ls = s.core(&["bridge", "ls"]);
     let shown = String::from_utf8_lossy(&ls.stdout);
-    assert!(shown.contains("telegram token: set") && !shown.contains("ABCdef"), "{shown}");
+    // Piped, so JSON (cli.rs:187).
+    assert!(shown.contains(r#""telegram_token":"set""#) && !shown.contains("ABCdef"), "{shown}");
 }
