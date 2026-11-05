@@ -99,7 +99,7 @@ fn curl_signed(url: &str, to: &Path) -> Result<(), RpcError> {
     let sig = minisig(to);
     // A signature that does not download is refused below as missing.
     let _ = curl(&format!("{url}.minisig"), &sig);
-    verify(to, &sig, PUBLIC_KEY)
+    verify(to, &sig, PUBLIC_KEY, url.rsplit('/').next().unwrap_or(url))
 }
 
 fn minisig(file: &Path) -> PathBuf {
@@ -108,16 +108,24 @@ fn minisig(file: &Path) -> PathBuf {
     sig.into()
 }
 
-/// Checks `file` against its minisign signature `sig` by `key`; on any
-/// failure both are deleted and the download is refused.
-fn verify(file: &Path, sig: &Path, key: &str) -> Result<(), RpcError> {
+/// Checks `file` against its minisign signature `sig` by `key`, made for the
+/// release asset `name` (its trusted comment's `file:`, so one signed file
+/// cannot stand in for another); on any failure both are deleted and the
+/// download is refused.
+fn verify(file: &Path, sig: &Path, key: &str, name: &str) -> Result<(), RpcError> {
     let checked = (|| {
         let key = minisign_verify::PublicKey::from_base64(key).map_err(|e| e.to_string())?;
         let text = std::fs::read_to_string(sig).map_err(|_| "it has no signature".to_string())?;
         let signature =
             minisign_verify::Signature::decode(&text).map_err(|e| format!("its signature is unreadable: {e}"))?;
         let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
-        key.verify(&bytes, &signature, false).map_err(|e| format!("its signature does not match: {e}"))
+        key.verify(&bytes, &signature, false).map_err(|e| format!("its signature does not match: {e}"))?;
+        let file_field = format!("file:{name}");
+        if signature.trusted_comment().split('\t').any(|f| f == file_field) {
+            Ok(())
+        } else {
+            Err(format!("its signature is for another file, not {name}"))
+        }
     })();
     let _ = std::fs::remove_file(sig);
     checked.map_err(|why| {
@@ -140,7 +148,22 @@ pub fn manifest(version: Option<&str>, scratch: &Path) -> Result<Manifest, RpcEr
     let file = scratch.join("manifest.json");
     curl_signed(&url, &file)?;
     let bytes = std::fs::read(&file).map_err(|e| unavailable(e.to_string()))?;
-    serde_json::from_slice(&bytes).map_err(|e| unavailable(format!("{url} is not a release list: {e}")))
+    parse(&bytes, version, &url)
+}
+
+/// Reads the list from `url`; one asked for by `version` must be that
+/// version's, so an older signed list served in its place is refused.
+fn parse(bytes: &[u8], version: Option<&str>, url: &str) -> Result<Manifest, RpcError> {
+    let m: Manifest =
+        serde_json::from_slice(bytes).map_err(|e| unavailable(format!("{url} is not a release list: {e}")))?;
+    match version {
+        Some(v) if m.version != v => Err(RpcError::new(
+            "refused",
+            format!("{url} lists h0x-core {}, not the requested {v}", m.version),
+            "the release list may be an old one served in its place; try again later",
+        )),
+        _ => Ok(m),
+    }
 }
 
 /// Windows' own tar opens zips; Git Bash's GNU tar, often first on PATH there, can't.
@@ -275,13 +298,21 @@ mod tests {
 
     /// A throwaway test key pair (not the release key), its signature of
     /// `PAYLOAD`, and the same payload signed by a second throwaway key; made
-    /// with rsign2 (`generate -W`, `sign -W`).
-    const TEST_KEY: &str = "RWRwAuiTWRHKFc9nVniDNoa4b+UqLBXWC7QunJ05dZw+XkvYJ6aaoXoK";
+    /// with rsign2 (`generate -W`, `sign -W -t`), trusted comments the way
+    /// `minisign -S` writes them.
+    const TEST_KEY: &str = "RWTHiUHUIZ1i3u/akRYT+UiUTYEqrBvGkGLpy2lzDfps3RwUxtdUXTKO";
     const PAYLOAD: &str = "h0x-core test release\n";
+    const NAME: &str = "h0x-core-linux-x86_64.tar.gz";
     const SIG: &str = "untrusted comment: signature from rsign secret key
-RURwAuiTWRHKFeiB7A2s5PXfB39odODFiAf+77MxJqllRsihUgeswBruN+SLEaLI6zFdPAqRO+o0muW+5/ISjwzOHIVMxfYZUws=
-trusted comment: test
-FbefAmnfeDeGxboZTkIU3PcVBdecdQ85mQjQTOCf3nUiq0yiND8kte8+Ymv7UmzvNNb7BgVZLCS+McLnbN9oDg==
+RUTHiUHUIZ1i3vJF5wZcNdLt0b9OxVXS7NuLtQBMRSg+xug2295Im+ymvBxnc8iO/w/ahI6e16y78CsjUO5fAsv9N7jGtfnYgAM=
+trusted comment: timestamp:1\tfile:h0x-core-linux-x86_64.tar.gz\thashed
+FbX3ytewV+m9TXZSgfXaMzSiKNyvXzEHmgYQU7Vu/bq7CxChZ7MyisG+BWwI4P+k9WAbNFZV0mRq0lkczqgUCA==
+";
+    /// The same payload and key, signed as `other.json`.
+    const OTHER_FILE_SIG: &str = "untrusted comment: signature from rsign secret key
+RUTHiUHUIZ1i3kQAqYZ6AxJDfx/3aFhJkiyVhPBbsHBSUoWqL2NMpd1Zn1BgJM99GjjuGmByGOcYaHlhWf+W7ACBcXl3KniR+gI=
+trusted comment: timestamp:1\tfile:other.json\thashed
+UD5fqWKQDxUt4uJF6V83QziiAFOerEgVvRfWXbqhGztaExyVpc5nMxVKs5J5x5w3BxhiFtnNBPiuZDa+AzjgDg==
 ";
     const OTHER_KEY_SIG: &str = "untrusted comment: signature from rsign secret key
 RURaRIrUmDKGf+VfuMRCB6G+7YmOZuDtq2kGvfhr9JFuy2kWFMZ6J+L3UogLdr/J7fvVdNbKYfGvxVj6sSbZQmp4hSeTA28H6g8=
@@ -302,7 +333,7 @@ ZJhj3MtbsDPyt278bwB0BcVRB5ZoKqA6VCCZ5s51lq49BobYTBUuzlJqofyqGhaBwWB6iLyCd1cVXXQh
     }
 
     fn refused(file: &std::path::Path, sig: &std::path::Path, key: &str, why: &str) {
-        let err = super::verify(file, sig, key).unwrap_err();
+        let err = super::verify(file, sig, key, NAME).unwrap_err();
         assert_eq!(err.kind, "refused");
         assert!(
             err.message
@@ -318,7 +349,7 @@ ZJhj3MtbsDPyt278bwB0BcVRB5ZoKqA6VCCZ5s51lq49BobYTBUuzlJqofyqGhaBwWB6iLyCd1cVXXQh
     #[test]
     fn a_file_signed_by_the_key_is_kept() {
         let (_scratch, file, sig) = signed(PAYLOAD, Some(SIG));
-        super::verify(&file, &sig, TEST_KEY).unwrap();
+        super::verify(&file, &sig, TEST_KEY, NAME).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), PAYLOAD);
         assert!(!sig.exists(), "the signature is not left behind");
     }
@@ -346,6 +377,32 @@ ZJhj3MtbsDPyt278bwB0BcVRB5ZoKqA6VCCZ5s51lq49BobYTBUuzlJqofyqGhaBwWB6iLyCd1cVXXQh
         // The test signature does not pass for the embedded release key either.
         let (_scratch, file, sig) = signed(PAYLOAD, Some(SIG));
         refused(&file, &sig, super::PUBLIC_KEY, "its signature does not match");
+    }
+
+    #[test]
+    fn a_signature_made_for_another_file_is_refused() {
+        let (_scratch, file, sig) = signed(PAYLOAD, Some(OTHER_FILE_SIG));
+        refused(&file, &sig, TEST_KEY, "its signature is for another file, not h0x-core-linux-x86_64.tar.gz");
+        // `file:` must name the asset whole, not just begin with its name.
+        let (_scratch, file, sig) = signed(PAYLOAD, Some(SIG));
+        let err = super::verify(&file, &sig, TEST_KEY, "h0x-core-linux-x86_64.tar").unwrap_err();
+        assert_eq!(err.kind, "refused");
+        assert!(err.message.contains("its signature is for another file"), "{}", err.message);
+        assert!(!file.exists() && !sig.exists(), "a refused download and its signature are deleted");
+    }
+
+    #[test]
+    fn a_list_for_another_version_than_the_one_asked_for_is_refused() {
+        let list = br#"{"version":"0.1.0","generation":1,"targets":{}}"#;
+        let url = "https://github.com/vjk7989/h0x-ADE-core/releases/download/v0.1.1/manifest.json";
+        let err = super::parse(list, Some("0.1.1"), url).err().unwrap();
+        assert_eq!(err.kind, "refused");
+        assert_eq!(err.message, format!("{url} lists h0x-core 0.1.0, not the requested 0.1.1"));
+        assert_eq!(super::parse(list, Some("0.1.0"), url).unwrap().version, "0.1.0");
+        // The latest list may be any version.
+        assert_eq!(super::parse(list, None, url).unwrap().version, "0.1.0");
+        let err = super::parse(b"", Some("0.1.0"), url).err().unwrap();
+        assert_eq!(err.kind, "unavailable");
     }
 
     #[test]
