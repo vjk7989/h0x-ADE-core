@@ -449,3 +449,256 @@ fn an_unreadable_opencode_database_lists_nothing_but_json_storage_still_does() {
     drop(writer);
     assert_eq!(locked.list("/home/u/app")[0], s("opencode", "ses_1", Some("First")), "readable again");
 }
+
+const UUID: &str = "0b5f3c3e-1d2a-4c4b-9e7f-2a1b3c4d5e6f";
+
+fn argv(agent: &str, id: &str) -> Vec<String> {
+    resume_argv(agent, id).unwrap_or_else(|e| panic!("{agent} {id}: {e}"))
+}
+
+#[test]
+fn resume_commands_per_agent_as_argv() {
+    let cursor = if cfg!(windows) { "cursor-agent.cmd" } else { "cursor-agent" };
+    let cases: [(&str, &str, &[&str]); 19] = [
+        ("claude", UUID, &["claude", "--resume", UUID]),
+        ("codex", UUID, &["codex", "resume", UUID]),
+        ("copilot", UUID, &["copilot", "--resume=0b5f3c3e-1d2a-4c4b-9e7f-2a1b3c4d5e6f"]),
+        ("devin", "d-1", &["devin", "--resume", "d-1"]),
+        ("droid", UUID, &["droid", "--resume", UUID]),
+        ("kimi", "k_1", &["kimi", "--session", "k_1"]),
+        ("mastracode", "t1", &["mastracode", "--thread", "t1"]),
+        ("pi", "p1", &["pi", "--session", "p1"]),
+        ("omp", "abc", &["omp", "--resume=abc"]),
+        ("hermes", "20260101_120000_ab12", &["hermes", "--resume", "20260101_120000_ab12"]),
+        ("opencode", "ses_4f1a2bXyZ", &["opencode", "--session", "ses_4f1a2bXyZ"]),
+        ("qodercli", "q1", &["qodercli", "--resume", "q1"]),
+        ("qwen", UUID, &["qwen", "--resume", UUID]),
+        ("kilo", "ses_1", &["kilo", "--session", "ses_1"]),
+        ("cursor", "c1", &[cursor, "--resume", "c1"]),
+        ("agy", "a.1", &["agy", "--conversation", "a.1"]),
+        ("grok", "g1", &["grok", "--resume", "g1"]),
+        ("letta", "conv-1", &["letta", "--conversation", "conv-1"]),
+        ("letta", "default:agent-9", &["letta", "--conversation", "default", "--agent", "agent-9"]),
+    ];
+    for (agent, id, want) in cases {
+        assert_eq!(argv(agent, id), want, "{agent}");
+    }
+    // Any case of hex digits.
+    assert_eq!(argv("claude", &UUID.to_uppercase())[2], UUID.to_uppercase());
+}
+
+#[test]
+fn resume_refuses_ids_not_of_their_agents_shape() {
+    let long = "a".repeat(513);
+    let max = "a".repeat(512);
+    for agent in ["claude", "codex", "opencode", "devin", "letta", "cursor"] {
+        for id in [
+            "",
+            long.as_str(),
+            "--flag",
+            "-r",
+            "a b",
+            " a",
+            "a/b",
+            r"a\b",
+            "..",
+            "../x",
+            r"C:\x",
+            "/tmp/s.jsonl",
+            "a\nb",
+            "a\u{0}b",
+            "it's",
+            "a;b",
+            "$(x)",
+            "é",
+        ] {
+            let e = resume_argv(agent, id).expect_err(&format!("{agent} {id:?}"));
+            assert!(e.contains("session id") || e.contains("resume"), "{e}");
+        }
+    }
+    assert_eq!(argv("devin", &max)[2], max, "the longest id");
+    for (agent, id) in [
+        ("claude", "s-here"),
+        ("claude", "0b5f3c3e1d2a4c4b9e7f2a1b3c4d5e6f"),
+        ("claude", "0b5f3c3e-1d2a-4c4b-9e7f-2a1b3c4d5e6g"),
+        ("claude", "0b5f3c3e-1d2a-4c4b-9e7f-2a1b3c4d5e6f0"),
+        ("codex", "rollout-x"),
+        ("opencode", UUID),
+        ("opencode", "ses_"),
+        ("opencode", "ses_a-b"),
+        ("letta", "default:"),
+        ("letta", "default:--x"),
+    ] {
+        assert!(resume_argv(agent, id).is_err(), "{agent} {id}");
+    }
+    let e = resume_argv("vim", "x").unwrap_err();
+    assert!(e.contains("no resume command"), "{e}");
+}
+
+fn kind(r: Result<Vec<PathBuf>, crate::rpc::RpcError>) -> String {
+    r.expect_err("an error").kind
+}
+
+/// Moving to the trash is tried only where it is a temp dir: the freedesktop
+/// Trash under the scratch HOME, or (Windows) the Recycle Bin. Finder is never
+/// driven by tests.
+const TRASHES: bool = !cfg!(target_os = "macos");
+
+#[test]
+fn trash_moves_a_claude_session_and_its_folder_out_of_the_store() {
+    let h = Home::new();
+    let session = h.claude("-home-u-app", UUID, &[said("/home/u/app")], 1);
+    let side = h.put(&format!(".claude/projects/-home-u-app/{UUID}/subagents/agent-1.jsonl"), b"{}\n", 1);
+    let other = h.claude("-home-u-app", "1b5f3c3e-1d2a-4c4b-9e7f-2a1b3c4d5e6f", &[said("/home/u/app")], 1);
+    if !TRASHES {
+        return;
+    }
+    let trashed = trash("claude", UUID, &h.roots()).unwrap();
+    assert_eq!(trashed, [session.clone(), side.parent().unwrap().parent().unwrap().to_path_buf()]);
+    assert!(!session.exists() && !side.exists());
+    assert!(other.exists(), "only that session");
+    assert_eq!(h.list("/home/u/app").len(), 1);
+    assert_eq!(kind(trash("claude", UUID, &h.roots())), "not_found", "already gone");
+}
+
+#[test]
+fn trash_moves_a_codex_rollout_and_an_opencode_json_session() {
+    let h = Home::new();
+    let rollout = h.codex(UUID, "/home/u/app", 1);
+    let session = h.opencode("ses_old", "/home/u/app", 1);
+    let messages = h.put(".local/share/opencode/storage/message/ses_old/msg_1.json", b"{}", 1);
+    if !TRASHES {
+        return;
+    }
+    assert_eq!(trash("codex", UUID, &h.roots()).unwrap(), std::slice::from_ref(&rollout));
+    assert!(!rollout.exists());
+    assert_eq!(
+        trash("opencode", "ses_old", &h.roots()).unwrap(),
+        [session.clone(), messages.parent().unwrap().to_path_buf()]
+    );
+    assert!(!session.exists() && !messages.exists());
+    assert!(h.list("/home/u/app").is_empty());
+}
+
+#[test]
+fn trash_refuses_what_is_not_a_session_in_the_store() {
+    let h = Home::new();
+    let roots = h.roots();
+    // Not of the agent's shape: never a path.
+    for id in ["", "../x", r"..\x", "/etc/passwd", "--all", "a b", "s-here"] {
+        assert_eq!(kind(trash("claude", id, &roots)), "invalid_params", "{id:?}");
+    }
+    assert_eq!(kind(trash("vim", "x", &roots)), "invalid_params");
+    // Resumable, but h0x-core does not read its store.
+    assert_eq!(kind(trash("copilot", UUID, &roots)), "unsupported");
+    // Missing, or only beside the store.
+    assert_eq!(kind(trash("claude", UUID, &roots)), "not_found");
+    let beside = h.put(&format!(".claude/{UUID}.jsonl"), b"{}\n", 1);
+    let wrong_name = h.put(&format!(".codex/sessions/2026/11/05/{UUID}.jsonl"), b"{}\n", 1);
+    let too_deep = h.put(&format!(".codex/sessions/2026/11/05/x/rollout-1-{UUID}.jsonl"), b"{}\n", 1);
+    assert_eq!(kind(trash("claude", UUID, &roots)), "not_found");
+    assert_eq!(kind(trash("codex", UUID, &roots)), "not_found");
+    assert_eq!(kind(trash("opencode", "ses_none", &roots)), "not_found");
+    assert!(beside.exists() && wrong_name.exists() && too_deep.exists());
+    // No store at all.
+    let none = Roots::new(|_| None);
+    assert_eq!(kind(trash("claude", UUID, &none)), "not_found");
+}
+
+#[test]
+fn trash_never_follows_links_out_of_the_store() {
+    let h = Home::new();
+    let outside = Home::new();
+    let target = outside.put("s.jsonl", jsonl(&[said("/home/u/app")]).as_bytes(), 1);
+    let store = h.0.join(".claude/projects");
+    if !link(&target, &store.join(format!("-home-u-app/{UUID}.jsonl"))) {
+        return; // this OS account cannot make links
+    }
+    let project = outside.put(&format!("proj/{UUID}.jsonl"), jsonl(&[said("/home/u/x")]).as_bytes(), 1);
+    assert!(link(project.parent().unwrap(), &store.join("-home-u-x")));
+    assert_eq!(kind(trash("claude", UUID, &h.roots())), "not_found");
+    let rollout = outside.codex(UUID, "/home/u/app", 1);
+    assert!(link(rollout.parent().unwrap(), &h.0.join(".codex/sessions/2026/11/05")));
+    assert_eq!(kind(trash("codex", UUID, &h.roots())), "not_found");
+    assert!(target.exists() && project.exists() && rollout.exists(), "nothing behind a link is touched");
+}
+
+#[test]
+fn trash_refuses_opencode_sessions_in_its_database() {
+    let h = Home::new();
+    h.opencode("ses_1", "/home/u/app", 1);
+    let db = opencode_db(&h, OPENCODE_TABLE, &[("ses_1", None, "/home/u/app", "First", 1, None)]);
+    let e = trash("opencode", "ses_1", &h.roots()).unwrap_err();
+    assert_eq!(e.kind, "unsupported", "{e:?}");
+    assert!(e.message.contains("database"), "{}", e.message);
+    assert!(db.exists() && h.0.join(".local/share/opencode/storage/session/p1/ses_1.json").exists());
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn trash_follows_the_freedesktop_layout() {
+    let h = Home::new();
+    let trash_dir = h.0.join("data/Trash");
+    let data = h.0.join("data").display().to_string();
+    let home = h.0.display().to_string();
+    let roots = Roots::new(|name| match name {
+        "HOME" => Some(home.clone()),
+        "XDG_DATA_HOME" => Some(data.clone()),
+        _ => None,
+    });
+    assert_eq!(roots.trash.as_deref(), Some(trash_dir.as_path()));
+    let dir = "-home-u-my-app";
+    let first = h.claude(dir, UUID, &[said("/home/u/my app")], 1);
+    // A name already in the Trash: the next one is `.2`.
+    h.put(&format!("data/Trash/info/{UUID}.jsonl.trashinfo"), b"[Trash Info]\n", 1);
+    assert_eq!(trash("claude", UUID, &roots).unwrap(), std::slice::from_ref(&first));
+    let moved = trash_dir.join(format!("files/{UUID}.jsonl.2"));
+    assert!(moved.is_file() && !first.exists());
+    let info = std::fs::read_to_string(trash_dir.join(format!("info/{UUID}.jsonl.2.trashinfo"))).unwrap();
+    let lines: Vec<&str> = info.lines().collect();
+    assert_eq!(lines[0], "[Trash Info]");
+    let path = first.display().to_string().replace(' ', "%20");
+    assert_eq!(lines[1], format!("Path={path}"));
+    let date = lines[2].strip_prefix("DeletionDate=").unwrap();
+    assert_eq!(date.len(), 19, "{date}");
+    assert_eq!((&date[4..5], &date[10..11], &date[13..14]), ("-", "T", ":"));
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(trash_dir.join("files")).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o700);
+    // Percent-encoded: a space and a non-ASCII character in the path.
+    let encoded = Home::new();
+    let session = encoded.put(&format!("a b/ü/.claude/projects/-p/{UUID}.jsonl"), b"{}\n", 1);
+    let root = encoded.0.join("a b/ü/.claude").display().to_string();
+    let trash_home = encoded.0.display().to_string();
+    let roots = Roots::new(|name| match name {
+        "HOME" => Some(trash_home.clone()),
+        "CLAUDE_CONFIG_DIR" => Some(root.clone()),
+        _ => None,
+    });
+    trash("claude", UUID, &roots).unwrap();
+    let info =
+        std::fs::read_to_string(encoded.0.join(format!(".local/share/Trash/info/{UUID}.jsonl.trashinfo"))).unwrap();
+    let want = format!("Path={}/a%20b/%C3%BC/.claude/projects/-p/{UUID}.jsonl", encoded.0.display());
+    assert!(info.contains(&want), "{info}");
+    assert!(!session.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn trash_on_windows_goes_to_the_recycle_bin_from_a_temp_dir() {
+    let h = Home::new();
+    let session = h.codex(UUID, r"C:\Users\u\app", 1);
+    assert_eq!(h.list(r"c:\users\u\app").len(), 1);
+    // The store named with `/`, as `CODEX_HOME` may be.
+    let home = h.0.display().to_string().replace('\\', "/");
+    let codex = format!("{home}/.codex");
+    let roots = Roots::new(|name| match name {
+        "HOME" => Some(home.clone()),
+        "CODEX_HOME" => Some(codex.clone()),
+        _ => None,
+    });
+    let trashed = trash("codex", UUID, &roots).unwrap();
+    assert_eq!(trashed.len(), 1);
+    assert!(!session.exists(), "moved");
+    assert!(h.list(r"c:\users\u\app").is_empty());
+}
