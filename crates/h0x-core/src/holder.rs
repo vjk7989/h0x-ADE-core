@@ -167,10 +167,10 @@ impl Holder {
     }
 
     /// Queues a frame for the current core.
-    fn to_core(&self, st: &mut State, frame: &[u8]) {
+    fn to_core(&self, st: &mut State, frame: Vec<u8>) {
         if let Some(core) = &st.core {
             core.backlog.update(|b| *b = b.map(|n| n + frame.len()));
-            let _ = core.frames.send(frame.to_vec());
+            let _ = core.frames.send(frame);
         }
     }
 
@@ -240,7 +240,7 @@ impl Holder {
             let (holder, written, generation) = (self.clone(), backlog.clone(), st.generation);
             std::thread::spawn(move || holder.write_to_core(generation, writer, queued, written));
             st.core = Some(Core { generation, frames, backlog, stream: kept });
-            self.to_core(&mut st, &out);
+            self.to_core(&mut st, out);
             generation
         };
 
@@ -281,7 +281,7 @@ impl Holder {
                 proto::FOREGROUND => {
                     let mut st = self.lock();
                     let pgid = st.terms.get(&id).filter(|t| t.exit.is_none()).map_or(-1, |t| t.pty.foreground());
-                    self.to_core(&mut st, &proto::json_frame(proto::FOREGROUND_IS, id, &proto::Foreground { pgid }));
+                    self.to_core(&mut st, proto::json_frame(proto::FOREGROUND_IS, id, &proto::Foreground { pgid }));
                 }
                 proto::RELEASE => {
                     if let Some(t) = self.lock().terms.remove(&id)
@@ -315,7 +315,7 @@ impl Holder {
                         scopes.into_iter().for_each(|scope| self.sweep(scope));
                         self.wait_for_sweeps();
                         let mut st = self.lock();
-                        self.to_core(&mut st, &proto::frame(proto::BYE, 0, &[]));
+                        self.to_core(&mut st, proto::frame(proto::BYE, 0, &[]));
                         let backlog = st.core.as_ref().map(|c| c.backlog.clone());
                         drop(st);
                         if let Some(backlog) = backlog {
@@ -323,7 +323,7 @@ impl Holder {
                         }
                         self.exit();
                     }
-                    self.to_core(&mut st, &proto::frame(proto::BYE, 0, &[]));
+                    self.to_core(&mut st, proto::frame(proto::BYE, 0, &[]));
                     self.core_gone(&mut st, "handover");
                     return Ok(());
                 }
@@ -337,7 +337,7 @@ impl Holder {
         let mut st = self.lock();
         if let Some(t) = st.terms.get(&id) {
             let frame = proto::json_frame(proto::SPAWNED, id, &proto::Spawned { pid: t.pid });
-            return self.to_core(&mut st, &frame);
+            return self.to_core(&mut st, frame);
         }
         let started = platform::spawn_pty(&spec.argv, &spec.env, &spec.cwd, spec.cols, spec.rows)
             .and_then(|(pty, child)| Ok((pty.reader()?, pty.writer()?, pty, child)));
@@ -379,7 +379,7 @@ impl Holder {
                 proto::json_frame(proto::SPAWNED, id, &proto::Spawned { pid })
             }
         };
-        self.to_core(&mut st, &frame);
+        self.to_core(&mut st, frame);
     }
 
     /// Always reads, core or not, so programs never stall on a full PTY.
@@ -397,7 +397,7 @@ impl Holder {
             t.tail.extend(&buf[..n]);
             let excess = t.tail.len().saturating_sub(TAIL_BYTES);
             t.tail.drain(..excess);
-            self.to_core(&mut st, &proto::frame(proto::OUTPUT, id, &buf[..n]));
+            self.to_core(&mut st, proto::frame(proto::OUTPUT, id, &buf[..n]));
             // A core that falls behind slows its programs, as a PTY nobody reads would.
             let Some(backlog) = st.core.as_ref().map(|c| c.backlog.clone()).filter(|b| b.over(BACKLOG_BYTES)) else {
                 continue;
@@ -452,7 +452,7 @@ impl Holder {
         }
         if let Some(t) = st.terms.get_mut(&id) {
             t.exit = Some(exit);
-            self.to_core(&mut st, &proto::json_frame(proto::EXITED, id, &exit));
+            self.to_core(&mut st, proto::json_frame(proto::EXITED, id, &exit));
         }
     }
 
@@ -555,7 +555,7 @@ mod tests {
             report("to_core", chunk, || {
                 let mut st = holder.lock();
                 for _ in 0..count {
-                    holder.to_core(&mut st, &proto::frame(proto::OUTPUT, 1, &data));
+                    holder.to_core(&mut st, proto::frame(proto::OUTPUT, 1, &data));
                     for frame in queued.try_iter() {
                         black_box(frame);
                     }
