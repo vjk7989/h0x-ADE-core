@@ -90,7 +90,11 @@ fn state_word(t: &Terminal) -> Option<String> {
 
 /// A paste the way a terminal sends one: bracketed when the program asked.
 pub fn paste(bracketed: bool, text: &str) -> Vec<u8> {
-    let text = text.replace("\x1b[201~", "");
+    // Until none is left: one pass would let `ESC[20ESC[201~1~` re-form the marker.
+    let mut text = text.to_owned();
+    while text.contains("\x1b[201~") {
+        text = text.replace("\x1b[201~", "");
+    }
     if bracketed { format!("\x1b[200~{text}\x1b[201~").into_bytes() } else { text.into_bytes() }
 }
 
@@ -351,5 +355,14 @@ mod tests {
         assert_eq!(paste(true, "hi"), b"\x1b[200~hi\x1b[201~");
         assert_eq!(paste(false, "hi"), b"hi");
         assert_eq!(paste(true, "a\x1b[201~b"), b"\x1b[200~ab\x1b[201~");
+    }
+
+    #[test]
+    fn a_split_end_marker_cannot_re_form_and_end_the_paste_early() {
+        assert_eq!(paste(true, "a\x1b[20\x1b[201~1~b"), b"\x1b[200~ab\x1b[201~");
+        assert_eq!(paste(true, "a\x1b[20\x1b[20\x1b[201~1~1~b"), b"\x1b[200~ab\x1b[201~");
+        assert_eq!(paste(false, "a\x1b[20\x1b[201~1~b"), b"ab");
+        assert_eq!(paste(true, ""), b"\x1b[200~\x1b[201~");
+        assert_eq!(paste(true, "a\x1bb"), b"\x1b[200~a\x1bb\x1b[201~");
     }
 }
