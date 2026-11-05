@@ -42,6 +42,9 @@ No terminal
   session list [--on m] [folder]
                               agent sessions that ran there, newest first
                               (Claude Code, Codex, OpenCode)
+  session resume|trash [--on m] <agent> <id>
+                              the command that resumes one, or move its files
+                              to the trash (Recycle Bin, Trash)
 
 More
   templates                   list templates
@@ -602,13 +605,15 @@ Options:
 ## h0x-core session
 
 ```text
-Agent sessions (Claude Code, Codex, OpenCode) that ran in a folder
+Agent sessions (Claude Code, Codex, OpenCode): list, resume, trash
 
 Usage: h0x-core session [OPTIONS] <COMMAND>
 
 Commands:
-  list  Agent sessions that ran in a folder (default: here), newest first
-  help  Print this message or the help of the given subcommand(s)
+  list    Agent sessions that ran in a folder (default: here), newest first
+  resume  The command that resumes a session (run it in the folder it ran in)
+  trash   Move a session's files to the trash (Recycle Bin, Trash), never deleting them
+  help    Print this message or the help of the given subcommand(s)
 
 Options:
       --json  JSON output even in a terminal
@@ -624,6 +629,40 @@ Usage: h0x-core session list [OPTIONS] [FOLDER]
 
 Arguments:
   [FOLDER]  The folder they ran in: absolute, or from where h0x-core runs (through the API, the core's folder; with --on, that machine's home) [default: .]
+
+Options:
+      --json          JSON output even in a terminal
+      --on <MACHINE>  On another machine (see `h0x-core machine ls`)
+  -h, --help          Print help
+```
+
+## h0x-core session resume
+
+```text
+The command that resumes a session (run it in the folder it ran in)
+
+Usage: h0x-core session resume [OPTIONS] <AGENT> <ID>
+
+Arguments:
+  <AGENT>  Its agent: `claude`, `codex`, `opencode`, or another the runtime resumes (`copilot`, `qwen`, `grok`, ...)
+  <ID>     The agent's id for it, in that agent's shape (Claude Code and Codex: a UUID; OpenCode: `ses_...`)
+
+Options:
+      --json          JSON output even in a terminal
+      --on <MACHINE>  On another machine (see `h0x-core machine ls`)
+  -h, --help          Print help
+```
+
+## h0x-core session trash
+
+```text
+Move a session's files to the trash (Recycle Bin, Trash), never deleting them
+
+Usage: h0x-core session trash [OPTIONS] <AGENT> <ID>
+
+Arguments:
+  <AGENT>  Its agent: `claude`, `codex`, `opencode`, or another the runtime resumes (`copilot`, `qwen`, `grok`, ...)
+  <ID>     The agent's id for it, in that agent's shape (Claude Code and Codex: a UUID; OpenCode: `ses_...`)
 
 Options:
       --json          JSON output even in a terminal

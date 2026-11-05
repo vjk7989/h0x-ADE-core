@@ -32,6 +32,9 @@ No terminal
   session list [--on m] [folder]
                               agent sessions that ran there, newest first
                               (Claude Code, Codex, OpenCode)
+  session resume|trash [--on m] <agent> <id>
+                              the command that resumes one, or move its files
+                              to the trash (Recycle Bin, Trash)
 
 More
   templates                   list templates

@@ -997,6 +997,36 @@
         ],
         "type": "object"
       },
+      "SessionResumeResult": {
+        "properties": {
+          "argv": {
+            "description": "The command that resumes it, run in the folder it ran in: argv, never a shell string.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "argv"
+        ],
+        "type": "object"
+      },
+      "SessionTrashResult": {
+        "properties": {
+          "trashed": {
+            "description": "What went to the trash: its files (and folders) in the agent's store.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "trashed"
+        ],
+        "type": "object"
+      },
       "Status": {
         "description": "One 7501 record. Words are the program's own; nothing is translated.",
         "properties": {
@@ -3608,6 +3638,166 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/SessionListResult"
+        }
+      }
+    },
+    {
+      "description": "The command (argv, never a shell string) that resumes an agent's session, here or on a machine (`on`): Claude Code, Codex, OpenCode and the other agents the runtime restores. The id must have its agent's shape.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "needs_update"
+          },
+          "message": "needs_update"
+        }
+      ],
+      "name": "session.resume_argv",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Its agent: `claude`, `codex`, `opencode`, or another the runtime\nresumes (`copilot`, `qwen`, `grok`, ...).",
+          "name": "agent",
+          "required": true,
+          "schema": {
+            "description": "Its agent: `claude`, `codex`, `opencode`, or another the runtime\nresumes (`copilot`, `qwen`, `grok`, ...).",
+            "type": "string"
+          }
+        },
+        {
+          "description": "The agent's id for it, in that agent's shape (Claude Code and Codex: a UUID; OpenCode: `ses_...`).",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "description": "The agent's id for it, in that agent's shape (Claude Code and Codex: a UUID; OpenCode: `ses_...`).",
+            "type": "string"
+          }
+        },
+        {
+          "description": "On another machine (see `h0x-core machine ls`).",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "On another machine (see `h0x-core machine ls`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionResumeResult"
+        }
+      }
+    },
+    {
+      "description": "Move a Claude Code, Codex or OpenCode (JSON storage) session's files from the agent's own store to the OS trash (Recycle Bin, Trash), here or on a machine (`on`); never a permanent delete. Links are never followed. `unsupported` where there is no trash, or for an OpenCode session kept in its database.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unsupported"
+          },
+          "message": "unsupported"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "needs_update"
+          },
+          "message": "needs_update"
+        }
+      ],
+      "name": "session.trash",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Its agent: `claude`, `codex`, `opencode`, or another the runtime\nresumes (`copilot`, `qwen`, `grok`, ...).",
+          "name": "agent",
+          "required": true,
+          "schema": {
+            "description": "Its agent: `claude`, `codex`, `opencode`, or another the runtime\nresumes (`copilot`, `qwen`, `grok`, ...).",
+            "type": "string"
+          }
+        },
+        {
+          "description": "The agent's id for it, in that agent's shape (Claude Code and Codex: a UUID; OpenCode: `ses_...`).",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "description": "The agent's id for it, in that agent's shape (Claude Code and Codex: a UUID; OpenCode: `ses_...`).",
+            "type": "string"
+          }
+        },
+        {
+          "description": "On another machine (see `h0x-core machine ls`).",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "On another machine (see `h0x-core machine ls`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SessionTrashResult"
         }
       }
     },

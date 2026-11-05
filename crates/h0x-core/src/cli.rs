@@ -80,7 +80,7 @@ enum Cmd {
         #[command(subcommand)]
         action: MachineCmd,
     },
-    /// Agent sessions (Claude Code, Codex, OpenCode) that ran in a folder.
+    /// Agent sessions (Claude Code, Codex, OpenCode): list, resume, trash.
     Session {
         #[command(subcommand)]
         action: SessionCmd,
@@ -872,6 +872,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("file write", "file.write"),
     ("file edit", "file.edit"),
     ("session list", "session.list"),
+    ("session resume", "session.resume_argv"),
+    ("session trash", "session.trash"),
     ("events", "events.subscribe"),
     ("templates", "templates.list"),
     ("schema", "rpc.discover"),

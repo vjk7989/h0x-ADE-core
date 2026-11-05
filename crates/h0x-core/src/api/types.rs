@@ -817,6 +817,32 @@ pub struct SessionListResult {
     pub sessions: Vec<SessionInfo>,
 }
 
+/// One agent session.
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct SessionParams {
+    /// Its agent: `claude`, `codex`, `opencode`, or another the runtime
+    /// resumes (`copilot`, `qwen`, `grok`, ...).
+    pub agent: String,
+    /// The agent's id for it, in that agent's shape (Claude Code and Codex: a UUID; OpenCode: `ses_...`).
+    pub id: String,
+    /// On another machine (see `h0x-core machine ls`).
+    #[arg(long, value_name = "MACHINE")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct SessionResumeResult {
+    /// The command that resumes it, run in the folder it ran in: argv, never a shell string.
+    pub argv: Vec<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct SessionTrashResult {
+    /// What went to the trash: its files (and folders) in the agent's store.
+    pub trashed: Vec<String>,
+}
+
 /// An agent session, as its agent stored it.
 #[derive(Serialize, JsonSchema, Debug)]
 pub struct SessionInfo {
