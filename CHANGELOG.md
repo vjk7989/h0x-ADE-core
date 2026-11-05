@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-11-05
+
+### New
+
+- Agent sessions: `session list`, `session resume` and `session trash` (API `session.list`, `session.resume_argv`, `session.trash`) find, resume and remove past Claude Code, Codex and OpenCode sessions.
+- Trashing a session moves its files to the Recycle Bin or Trash; it never deletes them permanently.
+
+### Fixed
+
+- Stray mouse and focus reports no longer reach the shell after a full-screen program exits.
+
 ## [0.1.4] - 2026-11-05
 
 ### Changed
