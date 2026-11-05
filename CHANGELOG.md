@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-11-05
+
+### Fixed
+
+- Fixed (security): a remote machine you ran a command on could gain the right to type into any of your local terminals; now only the terminal that called it.
+- Remote machines can no longer force input into a terminal waiting on you, and their input is always labelled with the machine.
+- Remote machines can no longer show their terminals as yours.
+- Pasted text can no longer end bracketed paste early.
+- Release files must be signed for that exact file, and a release list for another version is refused.
+
 ## [0.1.1] - 2026-11-05
 
 ### New
