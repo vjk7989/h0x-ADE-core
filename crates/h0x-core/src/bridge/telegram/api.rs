@@ -231,4 +231,44 @@ mod tests {
             assert!(!loopback(url), "{url}");
         }
     }
+
+    #[test]
+    fn look_alike_hosts_never_pass_as_loopback() {
+        for url in [
+            "https://localhost.evil.com",
+            "http://127.0.0.1.nip.io",
+            "http://127.0.0.1.nip.io:8080/x",
+            "http://127.0.0.1:80@evil.com",
+            "http://localhost:8080.evil.com",
+            "http://evil.com/127.0.0.1",
+            "http://evil.com?host=localhost",
+            "http://evil.com#@127.0.0.1",
+            "http://127.0.0.2",
+            "http://0.0.0.0:80",
+            "http://[::ffff:127.0.0.1]",
+            "http://127.0.0.1:",
+            "HTTP://127.0.0.1",
+            r"\\127.0.0.1\share",
+            "file:///127.0.0.1",
+        ] {
+            assert!(!loopback(url), "{url}");
+        }
+        for url in ["http://127.0.0.1", "http://localhost/", "http://127.0.0.1:65535?x#y", "http://[::1]"] {
+            assert!(loopback(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn scrub_stops_at_the_secret_and_keeps_what_follows() {
+        for (text, want) in [
+            (format!("x/bot{TOKEN}"), "x/bot[token]".to_string()),
+            (format!("/bot{TOKEN}?offset=3 /bot{TOKEN}#f"), "/bot[token]?offset=3 /bot[token]#f".into()),
+            (format!("//bot/bot{TOKEN}\n"), "//bot/bot[token]\n".into()),
+            (format!("/bot/bot{TOKEN}"), "/bot/bot[token]".into()),
+            ("/bot😀:x /bot1:😀".into(), "/bot😀:x /bot1:😀".into()),
+            ("/bot".into(), "/bot".into()),
+        ] {
+            assert_eq!(scrub(&text), want, "{text:?}");
+        }
+    }
 }

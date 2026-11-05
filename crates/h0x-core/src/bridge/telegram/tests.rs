@@ -431,3 +431,230 @@ fn refusals_and_dead_ends_are_errors_without_the_token() {
     let err = Api::at(&format!("http://{closed}"), TOKEN).call("getMe", &json!({}), 5).unwrap_err();
     assert!(err.starts_with("getMe: no answer") && !err.contains(TOKEN) && !err.contains("123456"), "{err}");
 }
+
+#[test]
+fn exactly_4096_units_is_one_message_and_one_more_is_two() {
+    for (pre, budget) in [(false, LIMIT), (true, LIMIT - "<pre></pre>".len())] {
+        assert_eq!(chunks(&"a".repeat(budget), pre).len(), 1, "pre {pre}");
+        let parts = chunks(&"a".repeat(budget + 1), pre);
+        assert_eq!(parts.len(), 2, "pre {pre}");
+        assert_eq!(parts[0].encode_utf16().count(), LIMIT, "pre {pre}: the first one is full");
+        // An emoji (2 units) or an entity (5 units) that would cross the line moves whole.
+        for tail in ["😀", "&"] {
+            let parts = chunks(&format!("{}{tail}", "a".repeat(budget - 1)), pre);
+            assert_eq!(parts.len(), 2, "pre {pre}, {tail}");
+            assert!(parts.iter().all(|p| p.encode_utf16().count() <= LIMIT), "pre {pre}, {tail}");
+            assert!(parts[1].contains(&escape(tail)), "pre {pre}, {tail}: {}", parts[1]);
+        }
+    }
+    let script = chunks("<script>alert(1)</script> <b>x</b> &amp;", false);
+    assert_eq!(script, ["&lt;script&gt;alert(1)&lt;/script&gt; &lt;b&gt;x&lt;/b&gt; &amp;amp;"]);
+}
+
+#[test]
+fn a_cut_back_to_a_line_end_still_leaves_room_for_a_wide_character() {
+    // The only line end is the first character: the cut keeps everything after
+    // it, and the emoji or entity that did not fit must still fit afterwards.
+    for (pre, budget) in [(false, LIMIT), (true, LIMIT - "<pre></pre>".len())] {
+        for tail in ["😀", "&", "<"] {
+            let text = format!("\n{}{tail}", "a".repeat(budget - 1));
+            let parts = chunks(&text, pre);
+            for part in &parts {
+                assert!(
+                    part.encode_utf16().count() <= LIMIT,
+                    "pre {pre}, {tail}: {} units",
+                    part.encode_utf16().count()
+                );
+            }
+            let joined: String =
+                parts.iter().map(|p| p.trim_start_matches("<pre>").trim_end_matches("</pre>")).collect();
+            assert_eq!(joined, escape(&text), "pre {pre}, {tail}: nothing lost");
+        }
+    }
+}
+
+#[test]
+fn edge_arguments_parse_or_ask_for_usage() {
+    let t = |s: &str| s.to_string();
+    let cases = [
+        ("/read t3 0", Ask::Do(Command::Read { terminal: t("t3"), lines: 0 })),
+        ("/read t3 99999", Ask::Do(Command::Read { terminal: t("t3"), lines: 99999 })),
+        ("/send@h0x_bot t3  hi", Ask::Do(Command::Send { terminal: t("t3"), text: t("hi") })),
+        ("/PAIR@h0x_bot ABCD", Ask::Pair(t("ABCD"))),
+        ("/keys\tt1\tENTER", Ask::Do(Command::Keys { terminal: t("t1"), keys: vec![Key::Enter] })),
+        (
+            r#"/run "\\server\share\My App" claude --resume"#,
+            Ask::Do(Command::Run { folder: t(r"\\server\share\My App"), command: t("claude --resume") }),
+        ),
+        (
+            r#"/run "/home/me/my app"  npm test"#,
+            Ask::Do(Command::Run { folder: t("/home/me/my app"), command: t("npm test") }),
+        ),
+    ];
+    for (text, want) in cases {
+        assert_eq!(parse(text), Some(want), "{text:?}");
+    }
+    for bad in [
+        "/read t3 -1",
+        "/read t3 5 6",
+        "/read t3 18446744073709551616",
+        "/keys",
+        "/keys t1 enter,esc",
+        "/send   ",
+        "/interrupt",
+        "/deny t2 now",
+        r#"/run "C:\My App""#,
+        r#"/run "C:\My App"   "#,
+        r#"/run "" claude"#,
+        "/run claude",
+        "/@h0x_bot",
+    ] {
+        assert!(matches!(parse(bad), Some(Ask::Usage(_))), "{bad:?}");
+    }
+}
+
+#[test]
+fn read_line_counts_are_clamped_before_the_core_hears_them() {
+    let mut f = fixture();
+    for (asked, sent) in [("0", 1), ("1", 1), ("200", 200), ("201", 200), ("99999", 200)] {
+        f.handle(said(ME, &format!("/read t3 {asked}")));
+        let reads: Vec<Value> =
+            f.acted().into_iter().filter(|(m, _)| m == "terminal.read").map(|(_, p)| p["lines"].clone()).collect();
+        assert_eq!(reads, [json!(sent)], "/read t3 {asked}");
+    }
+    assert_eq!(texts(&f.handle(said(ME, "/read t3 -1"))), ["Usage: /read &lt;t&gt; [lines]"]);
+    assert!(f.acted().is_empty());
+}
+
+#[test]
+fn updates_without_a_numeric_sender_or_text_are_ignored() {
+    let mut f = fixture();
+    let private = json!({"id": ME, "type": "private"});
+    for update in [
+        json!({"update_id": 4}),
+        json!({"update_id": 4, "edited_message": {"message_id": 5, "from": {"id": ME}, "chat": private, "text": "/kill t1"}}),
+        json!({"update_id": 4, "channel_post": {"message_id": 5, "chat": {"id": -100, "type": "channel"}, "text": "/agents"}}),
+        json!({"update_id": 4, "message": {"message_id": 5, "chat": private, "text": "/agents"}}),
+        json!({"update_id": 4, "message": {"message_id": 5, "from": {"id": "42"}, "chat": private, "text": "/agents"}}),
+        json!({"update_id": 4, "message": {"message_id": 5, "from": {"id": 7, "username": "vijay"}, "chat": private, "text": "/agents"}}),
+        json!({"update_id": 4, "message": {"message_id": 5, "from": {"id": ME}, "chat": private, "caption": "/agents"}}),
+        json!({"update_id": 4, "message": {"message_id": 5, "from": {"id": ME}, "chat": private, "text": null}}),
+        json!({"update_id": 4, "callback_query": {"id": "q1", "from": {"id": ME}, "data": "a:t2"}}),
+        json!({"update_id": 4, "callback_query": {"id": "q1", "from": {"id": ME},
+            "message": {"message_id": 77, "chat": private}}}),
+    ] {
+        assert!(f.handle(update.clone()).is_empty(), "{update}");
+    }
+    assert!(f.acted().is_empty(), "the core never heard of them");
+}
+
+#[test]
+fn unknown_or_oversized_button_data_is_only_acknowledged() {
+    let mut f = fixture();
+    for data in ["", ":", "zz:t2", "A:t2", "approve t2", "q"] {
+        assert_eq!(f.handle(tapped(ME, data)), [Out::Answer { callback: "q1".into() }], "{data:?}");
+    }
+    // A made-up confirmation, far past Telegram's 64 bytes: answered, refused, nothing run.
+    let out = f.handle(tapped(ME, &format!("c:{}", "Z".repeat(200))));
+    assert_eq!(out[0], Out::Answer { callback: "q1".into() });
+    assert!(matches!(&out[1], Out::Edit { html, .. } if html.starts_with("Failed: no such confirmation")), "{out:?}");
+    assert!(f.acted().is_empty(), "nothing acted");
+}
+
+#[test]
+fn a_confirmation_tapped_by_another_paired_account_does_nothing() {
+    let mut f = fixture();
+    let (code, _) = f.front.bridge.pair("telegram", T).unwrap();
+    f.front.bridge.pair_verify("telegram", "7", "other", &code, T).unwrap();
+    let out = f.handle(said(ME, "/kill t1"));
+    let [Out::Send { buttons, .. }] = out.as_slice() else { panic!("{out:?}") };
+    let data = buttons[0][0].1.clone();
+    assert!(data.len() <= 64, "Telegram takes callback data up to 64 bytes: {data}");
+    f.acted();
+
+    let out = f.handle(tapped(7, &data));
+    assert_eq!(out[0], Out::Answer { callback: "q1".into() });
+    assert!(
+        matches!(&out[1], Out::Edit { chat: 7, html, .. } if html.starts_with("Failed: no such confirmation")),
+        "{out:?}"
+    );
+    assert!(f.acted().is_empty(), "nothing killed");
+    let out = f.handle(tapped(ME, &data));
+    assert_eq!(out[1], Out::Edit { chat: ME, message: 77, html: "done: kill t1 (sh in /work)".into() });
+    assert_eq!(f.acted(), [("terminal.kill".to_string(), json!({"terminal": "t1"}))], "still the asker's");
+}
+
+#[test]
+fn the_offset_never_moves_backwards_and_odd_results_are_harmless() {
+    let counted = AtomicUsize::new(0);
+    let server = stub(move |method, _| match (method, counted.fetch_add(1, Ordering::SeqCst)) {
+        ("getUpdates", 0) => json!({"ok": true, "result": [{"update_id": 10}, {"update_id": 3}, {"update_id": "11"}]}),
+        ("getUpdates", 1) => json!({"ok": true, "result": {"update_id": 50}}),
+        ("getUpdates", _) => json!({"ok": true}),
+        _ => json!({"ok": true, "result": {"message_id": 1}}),
+    });
+    let api = Api::at(&server.url, TOKEN);
+    let mut f = fixture();
+    let core = |method: &str, params: Value| fake_core(method, &params);
+    let mut offset = 0;
+    f.front.step(&api, &core, &mut offset).unwrap();
+    assert_eq!(offset, 11, "the highest id plus one; a lower id after it does not pull it back");
+    f.front.step(&api, &core, &mut offset).unwrap();
+    assert_eq!(offset, 11, "a result that is not a list moves nothing");
+    f.front.step(&api, &core, &mut offset).unwrap();
+    assert_eq!(offset, 11, "no result at all moves nothing");
+    let seen = server.seen.lock().unwrap();
+    let offsets: Vec<&Value> = seen.iter().map(|(_, b)| &b["offset"]).collect();
+    assert_eq!(offsets, [&json!(0), &json!(11), &json!(11)]);
+    assert_eq!(seen[0].1["allowed_updates"], json!(["message", "callback_query"]));
+}
+
+#[test]
+fn a_conflict_or_bad_token_is_reported_without_the_token() {
+    for (code, description) in [
+        (409, format!("Conflict: terminated by other getUpdates request at /bot{TOKEN}/getUpdates")),
+        (401, format!("Unauthorized: /bot{TOKEN}")),
+    ] {
+        let server = stub(move |_, _| json!({"ok": false, "error_code": code, "description": description.clone()}));
+        let mut f = fixture();
+        let core = |method: &str, params: Value| fake_core(method, &params);
+        let mut offset = 9;
+        let err = f.front.step(&Api::at(&server.url, TOKEN), &core, &mut offset).unwrap_err();
+        assert!(err.starts_with("getUpdates: ") && err.contains("/bot[token]"), "{code}: {err}");
+        assert!(!err.contains(TOKEN) && !err.contains("ABCdef") && !err.contains("123456"), "{code}: {err}");
+        assert_eq!(offset, 9, "{code}: nothing acknowledged");
+    }
+    let server = stub(|_, _| json!("not an object"));
+    let err = Api::at(&server.url, TOKEN).call("getMe", &json!({}), 5).unwrap_err();
+    assert_eq!(err, "getMe: refused");
+}
+
+#[test]
+fn a_token_with_line_ends_or_the_wrong_shape_is_handled() {
+    let b = crate::bridge::scratch();
+    let secret19 = format!("123456:{}", "a".repeat(19));
+    let secret20 = format!("123456:{}", "a".repeat(20));
+    for bad in [
+        secret19.as_str(),
+        "123456:",
+        ":ABCdef_ghi-JKLmnoPQRstuVWXyz0123",
+        "123456:ABCdef_ghi-JKLmno:PQRstuVWXyz0123",
+        "123456:ABCdef_ghi-JKLmnoPQRstuVWXyz0123\n123456:ABCdef_ghi-JKLmnoPQRstuVWXyz0123",
+        "١٢٣:ABCdef_ghi-JKLmnoPQRstuVWXyz0123",
+        "123456:ABCdef_ghi-JKLmnoPQRstuVWXyzé",
+        "bot123456:ABCdef_ghi-JKLmnoPQRstuVWXyz0123",
+        " \r\n ",
+    ] {
+        let err = b.set_telegram_token(bad).unwrap_err();
+        assert_eq!(err.kind, "invalid_params", "{bad:?}");
+        assert!(!err.message.contains("ABCdef") && !err.hint.contains("ABCdef"), "the error never echoes it");
+        assert_eq!(b.telegram_token().unwrap(), None, "{bad:?}: nothing stored");
+    }
+    b.set_telegram_token(&secret20).unwrap();
+    assert_eq!(b.telegram_token().unwrap(), Some(secret20));
+    b.set_telegram_token(&format!("\t{TOKEN} \r\n")).unwrap();
+    assert_eq!(b.telegram_token().unwrap().as_deref(), Some(TOKEN), "CRLF and blanks trimmed; the new one replaces");
+    std::fs::write(b.dir.join("telegram.token"), " \r\n").unwrap();
+    assert_eq!(b.telegram_token().unwrap(), None, "a blank file is no token");
+    std::fs::remove_dir_all(&b.dir).unwrap();
+}

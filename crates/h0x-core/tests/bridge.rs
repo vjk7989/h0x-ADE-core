@@ -189,3 +189,34 @@ fn the_telegram_bot_answers_a_paired_account() {
     assert_eq!(cleared, json!({"telegram_token": "unset"}));
     assert!(!file.exists());
 }
+
+#[test]
+fn piped_tokens_with_line_ends_or_the_wrong_shape() {
+    let s = Session::new();
+    let file = s.root.join("config/h0x-core/bridge/telegram.token");
+    let cleared = s.core(&["bridge", "telegram", "token", "--clear"]);
+    assert!(cleared.status.success());
+    assert_eq!(String::from_utf8_lossy(&cleared.stdout).trim(), "no telegram token was set");
+
+    let near = "123456:ABCdef ghi-JKLmnoPQRstuVWXyz0123";
+    for bad in [String::new(), "\n".into(), format!("{near}\n"), format!("\n{TOKEN}\n"), "123456:short\r\n".into()] {
+        let out = s.hc_input(&["bridge", "telegram", "token"], bad.as_bytes());
+        assert!(!out.status.success(), "{bad:?}");
+        let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(said.contains("invalid_params") && !said.contains("ABCdef"), "{bad:?}: {said}");
+        assert!(!file.exists(), "{bad:?}: nothing stored");
+    }
+
+    let stored =
+        s.hc_input(&["--json", "bridge", "telegram", "token"], format!("  {TOKEN}\r\nsecond line\n").as_bytes());
+    assert!(stored.status.success(), "{}", String::from_utf8_lossy(&stored.stderr));
+    assert!(
+        !String::from_utf8_lossy(&stored.stdout).contains("ABCdef")
+            && !String::from_utf8_lossy(&stored.stderr).contains("ABCdef")
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), TOKEN, "the first line, trimmed of CRLF and blanks");
+    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    let ls = s.core(&["bridge", "ls"]);
+    let shown = String::from_utf8_lossy(&ls.stdout);
+    assert!(shown.contains("telegram token: set") && !shown.contains("ABCdef"), "{shown}");
+}
