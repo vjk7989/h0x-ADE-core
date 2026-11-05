@@ -56,7 +56,7 @@ pub fn list(folder: &str, roots: &Roots) -> Vec<SessionInfo> {
         all.extend(codex::list(root, &want));
     }
     if let Some(root) = &roots.opencode {
-        all.extend(opencode::list(&root.join("storage"), &want));
+        all.extend(opencode::list(root, &want));
     }
     all.sort_by(|a, b| b.last_used.cmp(&a.last_used).then_with(|| (&a.agent, &a.id).cmp(&(&b.agent, &b.id))));
     all

@@ -129,7 +129,7 @@ methods! { Ctx<'_>;
         "Write an opaque JSON document (at most 1 MiB) if its version still matches. Null deletes the value but retains its version. Persists atomically and emits a doc event.",
         errors ["invalid_params", "conflict", "internal", "machine_unknown", "unavailable", "needs_update"];
     "session.list" => session_list, SessionListParams => SessionListResult,
-        "The agent sessions that ran in a folder, here or on a machine (`on`), newest first: Claude Code, Codex and OpenCode (JSON storage), read from each agent's own store. Files that cannot be read are left out.",
+        "The agent sessions that ran in a folder, here or on a machine (`on`), newest first: Claude Code, Codex and OpenCode, read from each agent's own store (OpenCode's database read-only). Files that cannot be read are left out.",
         errors ["invalid_params", "machine_unknown", "unavailable", "needs_update"];
     "events.subscribe" => events_subscribe, SubscribeParams => SubscribeResult,
         "Snapshot of matching terminals, then every fact change in order (created, lost, restarted, keep, finished, removed, status, turn, title, labels, size, doc) as `event` notifications, `heartbeat` every 15 s, and `missed` + fresh snapshot for a subscriber that fell behind.",

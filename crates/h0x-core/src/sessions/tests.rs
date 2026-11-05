@@ -346,3 +346,106 @@ fn link(target: &Path, at: &Path) -> bool {
     };
     made.is_ok()
 }
+
+/// OpenCode 1.x's `session` table, as `PRAGMA table_info(session)` shows it (the columns read).
+const OPENCODE_TABLE: &str = "CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, \
+    directory TEXT NOT NULL, title TEXT NOT NULL, time_created INTEGER, time_updated INTEGER NOT NULL, time_archived INTEGER)";
+
+type Row<'a> = (&'a str, Option<&'a str>, &'a str, &'a str, i64, Option<i64>);
+
+/// OpenCode's database under HOME, made with `table` and holding `rows`.
+fn opencode_db(h: &Home, table: &str, rows: &[Row]) -> PathBuf {
+    let path = h.0.join(".local/share/opencode/opencode.db");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute_batch(table).unwrap();
+    for (id, parent, directory, title, updated, archived) in rows {
+        db.execute(
+            "INSERT INTO session (id, parent_id, directory, title, time_updated, time_archived) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![id, parent, directory, title, updated, archived],
+        )
+        .unwrap();
+    }
+    path
+}
+
+#[test]
+fn opencode_database_root_sessions_of_the_folder_read_only() {
+    let h = Home::new();
+    let db = opencode_db(
+        &h,
+        OPENCODE_TABLE,
+        &[
+            ("ses_1", None, "/home/u/app", "First", 1_000, None),
+            ("ses_2", None, "/home/u/app/", "Second", 3_000, Some(0)),
+            ("ses_other", None, "/home/u/other", "Other", 5_000, None),
+            ("ses_child", Some("ses_1"), "/home/u/app", "Subagent", 6_000, None),
+            ("ses_archived", None, "/home/u/app", "Archived", 7_000, Some(6_500)),
+            ("ses_untitled", None, "/home/u/app", "", 2_000, None),
+            ("ses_win", None, r"C:\Users\Me\My Proj", "Windows", 4_000, None),
+        ],
+    );
+    // Older JSON storage still counts; the database wins for a session in both.
+    h.opencode("ses_json", "/home/u/app", 2_500);
+    h.opencode("ses_1", "/home/u/app", 9_000);
+    let before = std::fs::read(&db).unwrap();
+
+    assert_eq!(
+        h.list("/home/u/app"),
+        [
+            s("opencode", "ses_2", Some("Second")),
+            s("opencode", "ses_json", Some("ses_json title")),
+            s("opencode", "ses_untitled", None),
+            s("opencode", "ses_1", Some("First")),
+        ]
+    );
+    let first = list("/home/u/app", &h.roots()).remove(0);
+    assert_eq!((first.last_used, PathBuf::from(first.path)), (3_000, db.clone()));
+    assert_eq!(h.list(r"\\?\c:\users\me\my proj\"), [s("opencode", "ses_win", Some("Windows"))]);
+    assert!(h.list("/home/u/none").is_empty());
+    assert_eq!(std::fs::read(&db).unwrap(), before, "never written");
+    assert!(!h.0.join(".local/share/opencode/opencode.db-journal").exists());
+}
+
+#[test]
+fn opencode_databases_in_wal_mode_are_read_with_or_without_opencode_running() {
+    let h = Home::new();
+    let db = opencode_db(&h, OPENCODE_TABLE, &[("ses_1", None, "/home/u/app", "First", 1, None)]);
+    let opencode = rusqlite::Connection::open(&db).unwrap();
+    opencode.execute_batch("PRAGMA journal_mode=WAL; UPDATE session SET title = 'Running';").unwrap();
+    assert_eq!(h.list("/home/u/app"), [s("opencode", "ses_1", Some("Running"))], "OpenCode running");
+    drop(opencode);
+    assert_eq!(h.list("/home/u/app"), [s("opencode", "ses_1", Some("Running"))], "OpenCode closed");
+}
+
+#[test]
+fn an_unreadable_opencode_database_lists_nothing_but_json_storage_still_does() {
+    let only_json = [s("opencode", "ses_json", Some("ses_json title"))];
+
+    let corrupt = Home::new();
+    corrupt.opencode("ses_json", "/home/u/app", 1);
+    corrupt.put(".local/share/opencode/opencode.db", b"not a database, not at all, not even close", 1);
+    assert_eq!(corrupt.list("/home/u/app"), only_json, "corrupt");
+
+    let older = Home::new();
+    older.opencode("ses_json", "/home/u/app", 1);
+    opencode_db(&older, "CREATE TABLE session (id TEXT, directory TEXT, title TEXT)", &[]);
+    assert_eq!(older.list("/home/u/app"), only_json, "a column missing");
+
+    let empty = Home::new();
+    empty.opencode("ses_json", "/home/u/app", 1);
+    empty.put(".local/share/opencode/opencode.db", b"", 1);
+    assert_eq!(empty.list("/home/u/app"), only_json, "empty");
+
+    // A writer holding the database: we give up after the busy timeout, without an error.
+    let locked = Home::new();
+    locked.opencode("ses_json", "/home/u/app", 1);
+    let db = opencode_db(&locked, OPENCODE_TABLE, &[("ses_1", None, "/home/u/app", "First", 1, None)]);
+    let writer = rusqlite::Connection::open(&db).unwrap();
+    writer.execute_batch("BEGIN EXCLUSIVE; UPDATE session SET title = 'Busy';").unwrap();
+    let started = std::time::Instant::now();
+    assert_eq!(locked.list("/home/u/app"), only_json, "locked");
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    drop(writer);
+    assert_eq!(locked.list("/home/u/app")[0], s("opencode", "ses_1", Some("First")), "readable again");
+}

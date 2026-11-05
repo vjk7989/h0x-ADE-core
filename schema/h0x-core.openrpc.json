@@ -3548,7 +3548,7 @@
       }
     },
     {
-      "description": "The agent sessions that ran in a folder, here or on a machine (`on`), newest first: Claude Code, Codex and OpenCode (JSON storage), read from each agent's own store. Files that cannot be read are left out.",
+      "description": "The agent sessions that ran in a folder, here or on a machine (`on`), newest first: Claude Code, Codex and OpenCode, read from each agent's own store (OpenCode's database read-only). Files that cannot be read are left out.",
       "errors": [
         {
           "code": -32602,
