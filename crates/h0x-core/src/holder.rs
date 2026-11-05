@@ -482,3 +482,114 @@ impl Holder {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wire::{HEADER, Outbox};
+    use std::hint::black_box;
+
+    const TOTAL: usize = 64 << 20;
+    const RUNS: usize = 5;
+
+    /// Prints the median of `RUNS` timings of `work` (TOTAL bytes in `chunk`-sized frames).
+    fn report(name: &str, chunk: usize, mut work: impl FnMut()) {
+        let mut runs: Vec<Duration> = (0..RUNS)
+            .map(|_| {
+                let at = Instant::now();
+                work();
+                at.elapsed()
+            })
+            .collect();
+        runs.sort();
+        let median = runs[RUNS / 2];
+        let mb_s = TOTAL as f64 / 1e6 / median.as_secs_f64();
+        let ns_frame = median.as_nanos() as f64 / (TOTAL / chunk) as f64;
+        println!("perf {name:<9} {chunk:>5} B  {mb_s:>9.1} MB/s  {ns_frame:>8.1} ns/frame");
+    }
+
+    /// The byte path's hot spots: holder `to_core`, the viewer `Outbox`, and the
+    /// core's frame reads from a holder link (unbuffered and buffered).
+    #[test]
+    #[ignore = "timing: cargo test --release -p h0x-core perf_byte_path -- --ignored --nocapture"]
+    fn perf_byte_path_throughput() {
+        #[cfg(windows)]
+        let socket = std::path::PathBuf::from(format!(r"\\.\pipe\h0x-core-perf-{}", std::process::id()));
+        #[cfg(unix)]
+        let socket = std::env::temp_dir().join(format!("h0x-core-perf-{}.sock", std::process::id()));
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&socket);
+        let listener = platform::listen(&socket).unwrap();
+        let client = platform::connect(&socket).unwrap();
+        let mut server = listener.incoming().next().unwrap().unwrap();
+
+        let (frames, queued) = std::sync::mpsc::channel();
+        let backlog = Arc::new(Backlog { bytes: Mutex::new(Some(0)), changed: Condvar::new() });
+        let core = Core { generation: 1, frames, backlog, stream: client.try_clone().unwrap() };
+        let holder = Holder {
+            state: Mutex::new(State {
+                terms: HashMap::new(),
+                core: Some(core),
+                generation: 1,
+                previous: "",
+                core_left: Instant::now(),
+                restarts: Vec::new(),
+            }),
+            changed: Condvar::new(),
+            instance: "perf".into(),
+            grace: Duration::ZERO,
+            paths: Paths {
+                socket: socket.clone(),
+                holder_socket: socket.clone(),
+                state: socket.clone(),
+                config: socket.clone(),
+            },
+            socket,
+            draining: std::sync::atomic::AtomicBool::new(false),
+            sweeps: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        for chunk in [4096, 256] {
+            let data = vec![b'x'; chunk];
+            let count = TOTAL / chunk;
+            report("to_core", chunk, || {
+                let mut st = holder.lock();
+                for _ in 0..count {
+                    holder.to_core(&mut st, &proto::frame(proto::OUTPUT, 1, &data));
+                    for frame in queued.try_iter() {
+                        black_box(frame);
+                    }
+                }
+            });
+            report("outbox", chunk, || {
+                let mut out = Outbox::default();
+                out.open(1);
+                for _ in 0..count {
+                    out.data(1, &data);
+                    while let Some(frame) = out.next_frame() {
+                        out.credit(1, frame.len() - HEADER);
+                        black_box(frame);
+                    }
+                }
+            });
+            let wire: Arc<Vec<u8>> = Arc::new((0..count).flat_map(|_| proto::frame(proto::OUTPUT, 1, &data)).collect());
+            for (name, buffered) in [("read", false), ("read+buf", true)] {
+                report(name, chunk, || {
+                    let (wire, mut tx) = (wire.clone(), client.try_clone().unwrap());
+                    let writer = std::thread::spawn(move || tx.write_all(&wire).unwrap());
+                    if buffered {
+                        let mut reader = io::BufReader::with_capacity(64 << 10, &mut server);
+                        for _ in 0..count {
+                            black_box(proto::read(&mut reader).unwrap().unwrap());
+                        }
+                    } else {
+                        for _ in 0..count {
+                            black_box(proto::read(&mut server).unwrap().unwrap());
+                        }
+                    }
+                    writer.join().unwrap();
+                });
+            }
+        }
+    }
+}
