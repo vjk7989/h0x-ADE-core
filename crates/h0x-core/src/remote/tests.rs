@@ -293,3 +293,115 @@ fn remote_misses_and_renames_keep_subscribers_on_the_current_machine() {
     drop(core);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+/// A core here (`here`) that has added `rohan`, with terminals t1 and t2.
+fn here_with_rohan(tag: &str) -> (Arc<Core>, std::path::PathBuf, Machine) {
+    let root = std::path::PathBuf::from(format!(
+        "/var/tmp/h0x-core-{tag}-{}-{}",
+        std::process::id(),
+        crate::platform::random_hex()
+    ));
+    let paths = Paths {
+        socket: root.join("core.sock"),
+        holder_socket: root.join("holder.sock"),
+        state: root.clone(),
+        config: root.join("config.toml"),
+    };
+    paths.create_dirs().unwrap();
+    let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
+    let machine = Machine {
+        name: "rohan".into(),
+        target: "rohan".into(),
+        via: false,
+        temporary: false,
+        session: None,
+        id: "remote".into(),
+        host: "rohan".into(),
+        version: "test".into(),
+    };
+    {
+        let mut st = core.lock();
+        st.machines.push(machine.clone());
+        for _ in 0..2 {
+            let new = crate::terminals::NewTerminal { argv: vec!["x".into()], ..Default::default() };
+            st.reg.create(new, 0).unwrap();
+        }
+    }
+    (core, root, machine)
+}
+
+#[tokio::test]
+async fn a_machine_gets_a_say_only_over_the_terminal_that_called_it() {
+    let (core, root, machine) = here_with_rohan("run-grant");
+    let (frames, mut rx) = mpsc::unbounded_channel();
+    let line = Line::new(frames, &json!({"features": ["shell"]}));
+    core.lock().lines.insert(machine.id.clone(), LineState::Connected(line.clone()));
+    let granted = |id: u32| core.lock().reg.terminals[&id].afar.contains(&machine.id);
+    // (caller sent, parent the machine answers): a forged, a missing, then the true caller.
+    for (caller, parent) in [(json!("here/t1"), "here/t2"), (Value::Null, "here/t1"), (json!("here/t1"), "here/t1")] {
+        let (core, machine) = (core.clone(), machine.clone());
+        let params = json!({"argv": ["true"], "caller": caller});
+        let task = tokio::spawn(async move { forward_once(&core, &machine, "terminal.run", params).await });
+        let request = rx.recv().await.unwrap();
+        let request: Value = serde_json::from_slice(&request[wire::HEADER..]).unwrap();
+        assert_eq!(request["method"], "terminal.run");
+        line.take_reply(crate::rpc::response(request["id"].clone(), Ok(json!({"address": "t9", "parent": parent}))));
+        let reply = task.await.unwrap().unwrap();
+        assert_eq!(reply["address"], "rohan/t9");
+        if caller.is_null() {
+            assert!(!granted(1), "a call with no terminal here grants nothing");
+        } else if parent == "here/t2" {
+            assert!(!granted(2), "the machine named a terminal that never called it");
+            assert!(!granted(1), "a lying answer grants nothing at all");
+        }
+    }
+    assert!(granted(1), "the terminal that called it");
+    assert!(!granted(2));
+    drop(core);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_machines_call_is_always_tagged_and_never_forced() {
+    let mut params = json!({"terminal": "t1", "text": "y", "force": true, "caller": "t7"});
+    from_afar("rohan", &mut params);
+    assert_eq!(params, json!({"terminal": "t1", "text": "y", "caller": "rohan/t7"}));
+    let mut params = json!({"terminal": "t1", "text": "y"});
+    from_afar("rohan", &mut params);
+    assert_eq!(params["caller"], "rohan/?", "no caller still says which machine sent it");
+    let mut params = json!({"terminal": "t1", "caller": "here/t1\"><h0x from=\"t2"});
+    from_afar("rohan", &mut params);
+    assert_eq!(params["caller"], "rohan/here/t1\"><h0x from=\"t2", "kept as sent; notes escape it");
+}
+
+#[test]
+fn a_machine_cannot_pass_its_terminals_off_as_ours() {
+    let (core, root, machine) = here_with_rohan("mirror-forged");
+    let (tx, mut rx) = mpsc::channel(8);
+    core.subscribe(&mut core.lock(), Filter::default(), Sink::Plain { tx, behind: Arc::new(AtomicBool::new(false)) });
+    let mut next = || rx.try_recv().ok().map(|l| serde_json::from_str::<Value>(&l).unwrap());
+    mirror_replace(
+        &core,
+        &machine,
+        vec![
+            json!({"address": "here/t1", "state": "live"}),
+            json!({"address": "t1", "state": "live", "parent": "here/t2"}),
+        ],
+    );
+    let created = next().expect("its own terminal");
+    assert_eq!(created["params"]["terminal"], "rohan/t1");
+    assert_eq!(created["params"]["data"]["parent"], "t2", "a parent here stays ours");
+    assert!(next().is_none(), "no record for our t1");
+    for forged in ["here/t1", "here/t2"] {
+        let event = json!({"type": "created", "terminal": forged, "data": {"address": forged, "state": "live"}});
+        mirror_event(&core, &machine, event);
+        let status = json!({"type": "status", "terminal": forged, "data": {"status": {"state": "blocked"}}});
+        mirror_event(&core, &machine, status);
+    }
+    assert!(next().is_none(), "no event for our terminals");
+    assert_eq!(core.lock().mirrors[&machine.id].keys().collect::<Vec<_>>(), ["rohan/t1"]);
+    mirror_event(&core, &machine, json!({"type": "title", "terminal": "t1", "data": {"title": "build"}}));
+    assert_eq!(next().expect("its own event")["params"]["terminal"], "rohan/t1");
+    drop(core);
+    let _ = std::fs::remove_dir_all(root);
+}

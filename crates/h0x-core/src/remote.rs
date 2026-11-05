@@ -410,6 +410,7 @@ fn mirror_replace(core: &Core, m: &Machine, terminals: Vec<Value>) {
         .into_iter()
         .map(|t| localize_in(core, &st, &name, &[], t))
         .map(|t| (t["address"].as_str().unwrap_or_default().to_string(), t))
+        .filter(|(address, _)| theirs(address))
         .collect();
     let old = st.mirrors.remove(&m.id).unwrap_or_default();
     for (address, record) in old.iter().filter(|(a, _)| !fresh.contains_key(*a)) {
@@ -440,6 +441,12 @@ pub fn rename_mirror(core: &Core, st: &mut State, id: &str, old: &str, new: &str
     for (address, record) in renamed {
         core.deliver(st, "created", &address, record.clone(), &record, None);
     }
+}
+
+/// A mirrored terminal must be one there: a machine naming ours (`<our id>/t5`,
+/// localized to `t5`) would pass its records and events off as local.
+fn theirs(address: &str) -> bool {
+    address.contains('/')
 }
 
 /// Event lines from a machine: applied to its mirror, passed on as seen from here.
@@ -475,6 +482,9 @@ fn mirror_event(core: &Core, m: &Machine, p: Value) {
         if p.get("machine").is_none() {
             core.doc_event(&mut st, data, Some(&name));
         }
+        return;
+    }
+    if !theirs(address) {
         return;
     }
     let mirror = st.mirrors.entry(m.id.clone()).or_default();
@@ -523,6 +533,16 @@ fn apply(record: &mut Value, kind: &str, data: &Value) {
 /// What a machine may ask of terminals here that are parents of its own.
 const CALLS_BACK: &[&str] = &["terminal.send", "terminal.get", "terminal.read", "terminal.wait"];
 
+/// A machine's call as it reaches a terminal here: always tagged with who sent
+/// it (`rohan/t7`, `rohan/?`), and never typed past an approval dialog.
+fn from_afar(machine: &str, params: &mut Value) {
+    let caller = format!("{machine}/{}", params["caller"].as_str().unwrap_or("?"));
+    params["caller"] = caller.into();
+    if let Some(p) = params.as_object_mut() {
+        p.remove("force");
+    }
+}
+
 /// A call or a note from a machine we dialed. It reaches only terminals here
 /// that started work there: adding a machine gives it no say over the rest.
 async fn from_machine(core: Arc<Core>, m: Machine, line: Arc<Line>, message: Value) {
@@ -549,9 +569,7 @@ async fn from_machine(core: Arc<Core>, m: Machine, line: Arc<Line>, message: Val
         )),
         Some(id) => {
             params["terminal"] = crate::terminals::address(id).into();
-            if let Some(caller) = params["caller"].as_str() {
-                params["caller"] = format!("{}/{caller}", m.name).into();
-            }
+            from_afar(&m.name, &mut params);
             let call = crate::api::Call { core: &core, conn: None, plain: None };
             crate::api::dispatch(&call, method, params).await
         }
@@ -953,6 +971,12 @@ async fn forward_once(core: &Core, m: &Machine, method: &str, mut params: Value)
             format!("h0x-core machine update {}", m.name),
         ));
     }
+    // The terminal here that asked (`route` sent it by our id): the only one
+    // its child there may call back, whatever parent the machine answers with.
+    let caller = params["caller"]
+        .as_str()
+        .and_then(|c| c.strip_prefix(&format!("{}/", core.info.id)))
+        .and_then(crate::terminals::parse_id);
     let reply = line.call(&m.name, method, params, deadline).await.map_err(|e| match e.kind.as_str() {
         "unknown_method" => RpcError::new(
             "needs_update",
@@ -966,6 +990,7 @@ async fn forward_once(core: &Core, m: &Machine, method: &str, mut params: Value)
     // It started work there: its child may now call back and send it notes.
     if method == "terminal.run"
         && let Some(parent) = reply["parent"].as_str().and_then(crate::terminals::parse_id)
+        && caller == Some(parent)
     {
         let mut st = core.lock();
         if let Some(t) = st.reg.terminals.get_mut(&parent) {

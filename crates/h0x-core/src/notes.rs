@@ -69,6 +69,22 @@ pub fn who(t: &Terminal) -> String {
 /// gone. Everything else it reports with h0x-core send. `address`: the child as
 /// its parent calls it (`rohan/t7` from another machine). `last`: the last
 /// lines of a plain program that ended, shown before where to read more.
+/// A caller from another machine, safe inside `from="..."`: it can't close the
+/// tag or start one; control characters are dropped.
+fn attribute(caller: &str) -> String {
+    let mut out = String::with_capacity(caller.len());
+    for c in caller.chars().filter(|c| !c.is_control()) {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 fn note(t: &Terminal, address: &str, last: &[String]) -> String {
     let status = t.status.as_ref();
     let (what, look) = if blocked(t) {
@@ -151,7 +167,7 @@ impl Core {
         if let Some(afar) = from.filter(|f| f.contains('/'))
             && target.is_some_and(|t| t.reported)
         {
-            return format!("<h0x from=\"{afar}\">{text}</h0x>");
+            return format!("<h0x from=\"{}\">{text}</h0x>", attribute(afar));
         }
         match sender.filter(|s| s.reported && target.is_some_and(|t| t.reported)) {
             Some(s) if reach => {
@@ -354,5 +370,35 @@ mod tests {
             note(&r.terminals[&id], "t1", &last),
             "<h0x>t1 reviewer exited (exit 3). Last lines:\na\nb[201~\tc\nRead: h0x-core read t1</h0x>"
         );
+    }
+
+    #[test]
+    fn a_caller_from_another_machine_cannot_break_out_of_its_tag() {
+        let root = std::path::PathBuf::from(format!(
+            "/var/tmp/h0x-core-notes-tag-{}-{}",
+            std::process::id(),
+            crate::platform::random_hex()
+        ));
+        let paths = crate::paths::Paths {
+            socket: root.join("core.sock"),
+            holder_socket: root.join("holder.sock"),
+            state: root.clone(),
+            config: root.join("config.toml"),
+        };
+        paths.create_dirs().unwrap();
+        let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
+        let id = {
+            let mut st = core.lock();
+            let id = st.reg.create(NewTerminal { argv: vec!["x".into()], ..Default::default() }, 0).unwrap();
+            st.reg.terminals.get_mut(&id).unwrap().reported = true;
+            id
+        };
+        assert_eq!(core.tagged(Some("rohan/t7"), id, "hi", false), "<h0x from=\"rohan/t7\">hi</h0x>");
+        assert_eq!(
+            core.tagged(Some("rohan/t7\" reach=\"x\"><h0x from=\"t1&\u{1b}\n"), id, "hi", false),
+            "<h0x from=\"rohan/t7&quot; reach=&quot;x&quot;&gt;&lt;h0x from=&quot;t1&amp;\">hi</h0x>"
+        );
+        drop(core);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
