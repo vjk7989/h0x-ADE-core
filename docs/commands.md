@@ -54,7 +54,7 @@ More
   update [--version X|--from <file>]   latest release, at least X, or a build
   machine add|ls|login|update|rename|rm   other machines, over ssh or a command
                               (--via 'fly ssh console -a x --pty=false -C')
-  bridge pair|ls|unpair|lock|unlock|reset|log
+  bridge pair|ls|unpair|lock|unlock|reset|log|telegram token|run
                               remote control from paired chat accounts: full
                               control of this machine (docs/bridge.md)
   connect                     the API over stdin/stdout (ssh box h0x-core connect)
@@ -103,14 +103,16 @@ Remote control from paired chat accounts: pair, list, lock, audit log
 Usage: h0x-core bridge [OPTIONS] <COMMAND>
 
 Commands:
-  pair    Print a one-time pairing code (8 characters, valid 10 minutes, single use)
-  unpair  Remove a paired account (its id in `bridge ls`), or every one
-  ls      List paired accounts and whether remote control is locked
-  lock    Refuse every remote command until `bridge unlock` on this machine
-  unlock  Allow remote commands again (only here, never remotely)
-  reset   Move state.json aside (kept as state.json.bad-<time>) and start empty: no paired accounts, unlocked. For a corrupt state; only here
-  log     The last audit log entries: every remote command and pairing attempt
-  help    Print this message or the help of the given subcommand(s)
+  pair      Print a one-time pairing code (8 characters, valid 10 minutes, single use)
+  unpair    Remove a paired account (its id in `bridge ls`), or every one
+  ls        List paired accounts and whether remote control is locked
+  lock      Refuse every remote command until `bridge unlock` on this machine
+  unlock    Allow remote commands again (only here, never remotely)
+  reset     Move state.json aside (kept as state.json.bad-<time>) and start empty: no paired accounts, unlocked. For a corrupt state; only here
+  log       The last audit log entries: every remote command and pairing attempt
+  telegram  The Telegram bot's settings
+  run       Run the Telegram bot until stopped: answers paired accounts, sends notices. Under core: h0x-core run --bg --keep -- h0x-core bridge run
+  help      Print this message or the help of the given subcommand(s)
 
 Options:
       --json  JSON output even in a terminal
@@ -177,6 +179,47 @@ Usage: h0x-core bridge reset [OPTIONS]
 Options:
       --json  JSON output even in a terminal
   -h, --help  Print help
+```
+
+## h0x-core bridge run
+
+```text
+Run the Telegram bot until stopped: answers paired accounts, sends notices. Under core: h0x-core run --bg --keep -- h0x-core bridge run
+
+Usage: h0x-core bridge run [OPTIONS]
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h0x-core bridge telegram
+
+```text
+The Telegram bot's settings
+
+Usage: h0x-core bridge telegram [OPTIONS] <COMMAND>
+
+Commands:
+  token  Store the bot token from @BotFather, read from stdin (not shown as you type)
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h0x-core bridge telegram token
+
+```text
+Store the bot token from @BotFather, read from stdin (not shown as you type)
+
+Usage: h0x-core bridge telegram token [OPTIONS]
+
+Options:
+      --clear  Remove the stored token instead
+      --json   JSON output even in a terminal
+  -h, --help   Print help
 ```
 
 ## h0x-core bridge unlock

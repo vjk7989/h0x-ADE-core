@@ -1,5 +1,6 @@
-//! `h0x-core bridge pair|unpair|ls|lock|unlock|log`: who may control this
-//! machine remotely. Local files only: no core needed.
+//! `h0x-core bridge pair|unpair|ls|lock|unlock|reset|log|telegram|run`: who
+//! may control this machine remotely, and the Telegram bot. Local files only,
+//! except `run`.
 
 use super::*;
 use crate::bridge::Bridge;
@@ -34,6 +35,50 @@ pub(super) enum BridgeCmd {
         #[arg(short = 'n', default_value_t = 20)]
         n: usize,
     },
+    /// The Telegram bot's settings.
+    Telegram {
+        #[command(subcommand)]
+        action: TelegramCmd,
+    },
+    /// Run the Telegram bot until stopped: answers paired accounts, sends notices.
+    /// Under core: h0x-core run --bg --keep -- h0x-core bridge run
+    Run,
+}
+
+#[derive(Subcommand)]
+pub(super) enum TelegramCmd {
+    /// Store the bot token from @BotFather, read from stdin (not shown as you type).
+    Token {
+        /// Remove the stored token instead.
+        #[arg(long)]
+        clear: bool,
+    },
+}
+
+/// The bot token: typed without echo in a terminal, else the first line piped in.
+fn read_token() -> Result<String, RpcError> {
+    if !std::io::stdin().is_terminal() {
+        let mut text = String::new();
+        std::io::stdin().read_to_string(&mut text).map_err(|e| RpcError::internal(e.to_string()))?;
+        return Ok(text.lines().next().unwrap_or_default().to_string());
+    }
+    eprint!("bot token from @BotFather (not shown), then enter: ");
+    let mut token = Vec::new();
+    {
+        let _raw = crate::platform::console::RawMode::enter();
+        let mut input = crate::platform::console::stdin();
+        let mut byte = [0u8];
+        while input.read(&mut byte).map_err(|e| RpcError::internal(e.to_string()))? == 1 {
+            match byte[0] {
+                b'\r' | b'\n' => break,
+                3 | 4 => return Err(cancelled()),
+                8 | 127 => drop(token.pop()),
+                b => token.push(b),
+            }
+        }
+    }
+    eprintln!();
+    String::from_utf8(token).map_err(|_| RpcError::invalid_params("that is not a bot token"))
 }
 
 /// `5m ago`, from two ms timestamps.
@@ -80,7 +125,23 @@ pub(super) fn bridge(paths: &Paths, action: BridgeCmd) -> Result<Out, RpcError> 
                 rows.push("no paired accounts (h0x-core bridge pair)".into());
             }
             rows.push(format!("remote control {}", if locked { "locked" } else { "unlocked" }));
-            Out { json: json!({"identities": identities, "locked": locked}), human: rows.join("\n") }
+            let token = if bridge.telegram_token()?.is_some() { "set" } else { "unset" };
+            rows.push(format!("telegram token: {token}"));
+            let json = json!({"identities": identities, "locked": locked, "telegram_token": token});
+            Out { json, human: rows.join("\n") }
+        }
+        BridgeCmd::Telegram { action: TelegramCmd::Token { clear: true } } => {
+            let human =
+                if bridge.clear_telegram_token()? { "telegram token removed" } else { "no telegram token was set" };
+            Out { json: json!({"telegram_token": "unset"}), human: human.into() }
+        }
+        BridgeCmd::Telegram { action: TelegramCmd::Token { clear: false } } => {
+            bridge.set_telegram_token(&read_token()?)?;
+            Out { json: json!({"telegram_token": "set"}), human: "telegram token stored".into() }
+        }
+        BridgeCmd::Run => {
+            crate::bridge::telegram::run(paths)?;
+            Out { json: Value::Null, human: String::new() }
         }
         BridgeCmd::Lock => {
             bridge.set_locked(true)?;
