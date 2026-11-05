@@ -595,7 +595,9 @@ impl Core {
 
     /// Handles the holder's frames until it says goodbye (true) or the link ends (false).
     fn holder_frames(&self, stream: &mut UnixStream, instance: &str) -> io::Result<bool> {
-        while let Some((kind, id, payload)) = proto::read(stream)? {
+        // Nothing reads this link after us, so buffering cannot strand bytes.
+        let mut stream = io::BufReader::with_capacity(64 << 10, stream);
+        while let Some((kind, id, payload)) = proto::read(&mut stream)? {
             let mut st = self.lock();
             match kind {
                 proto::OUTPUT => self.output(&mut st, id, &payload),
