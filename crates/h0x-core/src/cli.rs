@@ -80,7 +80,7 @@ enum Cmd {
         #[command(subcommand)]
         action: MachineCmd,
     },
-    /// Agent sessions (Claude Code, Codex, OpenCode) that ran in a folder.
+    /// Agent sessions (Claude Code, Codex, OpenCode): list, resume, trash.
     Session {
         #[command(subcommand)]
         action: SessionCmd,
@@ -872,6 +872,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("file write", "file.write"),
     ("file edit", "file.edit"),
     ("session list", "session.list"),
+    ("session resume", "session.resume_argv"),
+    ("session trash", "session.trash"),
     ("events", "events.subscribe"),
     ("templates", "templates.list"),
     ("schema", "rpc.discover"),
@@ -1049,5 +1051,30 @@ mod tests {
         assert!(Cli::try_parse_from(["h0x-core", "label", "t1", "=v"]).is_err());
         let Cmd::Label(p) = parsed(&["label", "t1", "gone="]) else { panic!() };
         assert_eq!(to(&p)["labels"], json!({"gone": ""}), "an empty value removes it");
+    }
+
+    #[test]
+    fn resume_and_trash_sessions_need_an_agent_and_an_id() {
+        let missing = Cli::try_parse_from(["h0x-core", "session", "resume", "claude"]).err().unwrap();
+        assert!(missing.to_string().contains("<ID>"), "{missing}");
+        for args in [
+            &["session", "trash"][..],
+            &["session", "trash", "claude", "a", "b"],
+            &["session", "resume", "--on"],
+            &["session", "resume", "claude", "-x"],
+        ] {
+            assert!(Cli::try_parse_from([&["h0x-core"], args].concat()).is_err(), "{args:?}");
+        }
+        // After `--` an id is only a value: the API judges its shape.
+        let Cmd::Session { action: SessionCmd::Trash(p) } =
+            parsed(&["session", "trash", "--on", "m", "claude", "--", "-x"])
+        else {
+            panic!()
+        };
+        assert_eq!(to(&p), json!({"agent": "claude", "id": "-x", "on": "m"}));
+        let Cmd::Session { action: SessionCmd::Resume(p) } = parsed(&["session", "resume", "opencode", "ses_1"]) else {
+            panic!()
+        };
+        assert_eq!(to(&p), json!({"agent": "opencode", "id": "ses_1"}), "no `on` here");
     }
 }

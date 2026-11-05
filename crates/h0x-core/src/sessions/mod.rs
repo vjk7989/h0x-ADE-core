@@ -3,7 +3,8 @@
 //! MB. The stores are other programs' formats, so a file that does not parse
 //! is left out, never an error. Only real folders and files inside a store
 //! are read: links could lead out of it, and the asked folder is compared,
-//! never joined into a path.
+//! never joined into a path. `session.resume_argv` and `session.trash`
+//! act on one session by its agent and id.
 
 use crate::api::SessionInfo;
 use std::fs::{DirEntry, File, Metadata};
@@ -13,8 +14,13 @@ use std::path::{Path, PathBuf};
 mod claude;
 mod codex;
 mod opencode;
+mod resume;
 #[cfg(test)]
 mod tests;
+mod trash;
+
+pub use resume::argv as resume_argv;
+pub use trash::trash;
 
 /// Where each agent keeps its sessions, found as the agent finds it.
 pub struct Roots {
@@ -24,6 +30,9 @@ pub struct Roots {
     pub codex: Option<PathBuf>,
     /// `$XDG_DATA_HOME/opencode`, else `~/.local/share/opencode` (on every OS).
     pub opencode: Option<PathBuf>,
+    /// `$XDG_DATA_HOME/Trash`, else `~/.local/share/Trash`: the freedesktop
+    /// home trash `session.trash` uses on Linux and the BSDs.
+    pub trash: Option<PathBuf>,
 }
 
 impl Roots {
@@ -37,10 +46,12 @@ impl Roots {
         let or_home = |var: &str, under: &[&str]| {
             env(var).or_else(|| home.as_ref().map(|h| under.iter().fold(h.clone(), |p, part| p.join(part))))
         };
+        let data = or_home("XDG_DATA_HOME", &[".local", "share"]);
         Roots {
             claude: or_home("CLAUDE_CONFIG_DIR", &[".claude"]),
             codex: or_home("CODEX_HOME", &[".codex"]),
-            opencode: or_home("XDG_DATA_HOME", &[".local", "share"]).map(|d| d.join("opencode")),
+            opencode: data.as_ref().map(|d| d.join("opencode")),
+            trash: data.map(|d| d.join("Trash")),
         }
     }
 }

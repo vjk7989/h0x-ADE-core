@@ -40,11 +40,22 @@ fn from_db(db: &Path, want: &str) -> Vec<SessionInfo> {
     })
 }
 
-fn query(db: &Path, want: &str) -> rusqlite::Result<Vec<SessionInfo>> {
+/// Whether the database holds session `id` (one that cannot be read holds none).
+pub(super) fn in_db(db: &Path, id: &str) -> bool {
+    std::fs::symlink_metadata(db).is_ok_and(|m| m.is_file())
+        && connect(db).and_then(|conn| conn.query_row("SELECT 1 FROM session WHERE id = ?1", [id], |_| Ok(()))).is_ok()
+}
+
+fn connect(db: &Path) -> rusqlite::Result<Connection> {
     // Read-only, never created: OpenCode's database is its own.
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(uri(db), flags)?;
     conn.busy_timeout(BUSY)?;
+    Ok(conn)
+}
+
+fn query(db: &Path, want: &str) -> rusqlite::Result<Vec<SessionInfo>> {
+    let conn = connect(db)?;
     // Paths are stored as OpenCode got them: compare folders here, by our rules.
     let mut folders = conn.prepare(&format!("SELECT DISTINCT directory FROM session WHERE {ROOT}"))?;
     let folders: Vec<String> = folders
