@@ -54,7 +54,7 @@ More
   update [--version X|--from <file>]   latest release, at least X, or a build
   machine add|ls|login|update|rename|rm   other machines, over ssh or a command
                               (--via 'fly ssh console -a x --pty=false -C')
-  bridge pair|ls|unpair|lock|unlock|reset|log|telegram token|run
+  bridge pair|ls|unpair|lock|unlock|reset|log|telegram token|run|web
                               remote control from paired chat accounts: full
                               control of this machine (docs/bridge.md)
   connect                     the API over stdin/stdout (ssh box h0x-core connect)
@@ -112,6 +112,7 @@ Commands:
   log       The last audit log entries: every remote command and pairing attempt
   telegram  The Telegram bot's settings
   run       Run the Telegram bot until stopped: answers paired accounts, sends notices. Under core: h0x-core run --bg --keep -- h0x-core bridge run
+  web       Serve the web panel until stopped: a page and a WebSocket API for paired devices. On 127.0.0.1; --lan: this machine's private network address (plain http)
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -165,7 +166,7 @@ Usage: h0x-core bridge pair [OPTIONS]
 
 Options:
       --json                   JSON output even in a terminal
-      --transport <TRANSPORT>  Where the account to pair writes from [default: telegram] [possible values: telegram]
+      --transport <TRANSPORT>  Where the account to pair writes from [default: telegram] [possible values: telegram, web]
   -h, --help                   Print help
 ```
 
@@ -248,6 +249,20 @@ Options:
       --all   
       --json  JSON output even in a terminal
   -h, --help  Print help
+```
+
+## h0x-core bridge web
+
+```text
+Serve the web panel until stopped: a page and a WebSocket API for paired devices. On 127.0.0.1; --lan: this machine's private network address (plain http)
+
+Usage: h0x-core bridge web [OPTIONS]
+
+Options:
+      --json         JSON output even in a terminal
+      --lan          Listen on this machine's private LAN address instead of 127.0.0.1
+      --port <PORT>  The port (0: any free one) [default: 8377]
+  -h, --help         Print help
 ```
 
 ## h0x-core connect

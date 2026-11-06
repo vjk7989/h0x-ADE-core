@@ -58,6 +58,76 @@ To type into a terminal, reply to its notice.
 A command that needs a confirmation shows Confirm and Cancel buttons. Cancel leaves the confirmation unused, and it expires in 2 minutes.
 Notices stop while the bridge is locked.
 
+## Web panel
+
+`h0x-core bridge web` serves a small web page and a WebSocket API. A phone or an app uses it to see the running agents and control them, the same way the Telegram bot does.
+
+```sh
+h0x-core bridge web          # on 127.0.0.1:8377, this machine only
+h0x-core bridge web --lan    # on this machine's private network address, for a phone on the same Wi-Fi
+h0x-core run --bg --keep -- h0x-core bridge web --lan   # under core, so it keeps running
+```
+
+When it starts, it prints the panel's address and a one-time pairing link, as text and as a QR code to scan.
+The link is valid for 5 minutes and works once. `h0x-core bridge pair --transport web` prints a new code you can type on the panel instead.
+Opening the link pairs the device: it becomes a paired account in `h0x-core bridge ls`, with transport `web` and the device's label, and it receives a session token.
+The token stays on the device. This machine keeps only its SHA-256 and compares it in constant time.
+Each later connection must give that token as its first message.
+`h0x-core bridge unpair <id>` revokes a device at once, and so does a reset.
+Everything else is as for Telegram: confirmations, the lock (no notices go out while locked), rate limits, redaction and the audit log.
+
+`--lan` only binds a private address: 10.x, 172.16–31.x, 192.168.x, or 100.64.0.0/10 (Tailscale and other private overlays).
+It refuses public, loopback and link-local addresses.
+It is plain http: anyone on that network can watch the traffic, the pairing link included. Use it only on a network you trust.
+
+What the server accepts:
+
+- Only its own address in `Host`, so a hostile web page can't reach it through DNS rebinding.
+  A browser's `Origin`, when sent, must be the panel itself. Apps that send no `Origin` still have to authenticate.
+- No CORS headers, no request bodies (`GET` only), request heads up to 8 KB that arrive within 10 seconds, and WebSocket messages up to 64 KB.
+  Messages must be masked and unfragmented text; anything else closes the connection.
+- A connection must pair or authenticate within 30 seconds and say something at least every 60.
+  The server sends a heartbeat every 20 seconds.
+- Every answer carries `Content-Security-Policy: default-src 'self'; frame-ancestors 'none'`, `Referrer-Policy: no-referrer` and `X-Content-Type-Options: nosniff`.
+
+### WebSocket messages
+
+Every message is JSON `{"name": ..., "data": ...}`.
+
+From the device:
+
+- `pair` `{token, label}`: the one-time token from the link.
+- `auth` `{session}`: every later connection.
+- `command` `{cmd, id, ...}`, where `cmd` is one of:
+  - `list`
+  - `read` `{terminal, lines}`
+  - `send` `{terminal, text}`
+  - `keys` `{terminal, keys}`
+  - `approve`, `deny`, `interrupt`, `kill` `{terminal}`
+  - `run` `{folder, command}`
+  - `lock`
+  - `confirm` `{token}`
+- `snapshot`: the list again.
+- `ping`: answered with `pong`.
+
+From the server:
+
+- `paired` `{session, device, id}`
+- `hello`
+- `snapshot` `{lines}`: the terminals, as `/agents` lists them.
+- `reply` `{id, kind, ...}`, where `kind` is one of:
+  - `done` `{text}`
+  - `needs_confirm` `{token, what}`
+  - `locked`
+  - `rate_limited` `{retry_secs}`
+  - `failed` `{message}`
+  - `not_paired`
+- `notice` `{terminal, agent, folder, kind, excerpt}`
+- `heartbeat`
+- `error` `{message}`, after which the connection usually closes.
+
+Reconnecting is the device's job: authenticate again with the session token.
+
 ## Full control means full control
 
 A paired account has the same power as you at this machine's keyboard, through core:
@@ -192,6 +262,8 @@ The bridge defends against:
 - **A lost or stolen phone.** Lock from any paired account, or unpair it here. Unlocking takes this machine.
 - **Secrets leaking into chat history.** Known secret shapes are redacted before anything is sent.
 - **Not knowing what happened.** The audit log records every remote command.
+- **Web pages reaching the web panel.** Strict `Host` and `Origin` checks stop DNS rebinding and other sites' pages, and the panel's own CSP keeps it from loading anything from elsewhere.
+- **A leaked device database.** Session tokens are stored only as SHA-256 hashes.
 
 It does not defend against:
 
@@ -199,5 +271,7 @@ It does not defend against:
 - **The chat service itself.** It sees everything sent through it.
 - **Other programs running as your account.** They can already reach core and its files.
 - **Secrets the redaction patterns don't recognize.**
+- **Someone watching a `--lan` network.** The panel is plain http there; they can see the traffic and a pairing link.
 
-The bridge only makes outbound connections and never listens on a network port.
+The Telegram bot only makes outbound connections.
+The web panel listens on 127.0.0.1, or on a private LAN address with `--lan`, never on a public one.

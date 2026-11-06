@@ -43,6 +43,16 @@ pub(super) enum BridgeCmd {
     /// Run the Telegram bot until stopped: answers paired accounts, sends notices.
     /// Under core: h0x-core run --bg --keep -- h0x-core bridge run
     Run,
+    /// Serve the web panel until stopped: a page and a WebSocket API for paired devices.
+    /// On 127.0.0.1; --lan: this machine's private network address (plain http).
+    Web {
+        /// Listen on this machine's private LAN address instead of 127.0.0.1.
+        #[arg(long)]
+        lan: bool,
+        /// The port (0: any free one).
+        #[arg(long, default_value_t = crate::bridge::web::PORT)]
+        port: u16,
+    },
 }
 
 #[derive(Subcommand)]
@@ -102,9 +112,13 @@ pub(super) fn bridge(paths: &Paths, action: BridgeCmd) -> Result<Out, RpcError> 
     Ok(match action {
         BridgeCmd::Pair { transport } => {
             let (code, expires_ms) = bridge.pair(&transport, now)?;
-            let human = format!(
-                "pairing code for {transport}: {code}\nvalid 10 minutes, once; it gives that account full control of this machine"
+            let minutes = (expires_ms - now) / 60_000;
+            let mut human = format!(
+                "pairing code for {transport}: {code}\nvalid {minutes} minutes, once; it gives that account full control of this machine"
             );
+            if transport == "web" {
+                human.push_str("\nenter it on the web panel, or use the link and QR code `h0x-core bridge web` prints");
+            }
             Out { json: json!({"code": code, "transport": transport, "expires_ms": expires_ms}), human }
         }
         BridgeCmd::Unpair { id, all: _ } => {
@@ -138,6 +152,10 @@ pub(super) fn bridge(paths: &Paths, action: BridgeCmd) -> Result<Out, RpcError> 
         BridgeCmd::Telegram { action: TelegramCmd::Token { clear: false } } => {
             bridge.set_telegram_token(&read_token()?)?;
             Out { json: json!({"telegram_token": "set"}), human: "telegram token stored".into() }
+        }
+        BridgeCmd::Web { lan, port } => {
+            crate::bridge::web::run(paths, lan, port)?;
+            Out { json: Value::Null, human: String::new() }
         }
         BridgeCmd::Run => {
             crate::bridge::telegram::run(paths)?;
