@@ -33,6 +33,7 @@ const HEARTBEAT: Duration = Duration::from_secs(20);
 
 const PAGE: &str = include_str!("page.html");
 const SCRIPT: &str = include_str!("app.js");
+const STYLE: &str = include_str!("style.css");
 
 /// The address `--lan` binds: the private IPv4 address this machine reaches
 /// the network from (home, office, or a private overlay like Tailscale's
@@ -317,6 +318,7 @@ async fn connection(mut stream: tokio::net::TcpStream, web: Arc<Web>) {
     let out = match req.path.split(['?', '#']).next().unwrap_or_default() {
         "/" => page(PAGE, "text/html; charset=utf-8"),
         "/app.js" => page(SCRIPT, "text/javascript; charset=utf-8"),
+        "/style.css" => page(STYLE, "text/css; charset=utf-8"),
         "/ws" => match http::upgrade(&req) {
             Ok(head) => {
                 if stream.write_all(&head).await.is_ok() {
@@ -473,5 +475,7 @@ pub fn run(paths: &Paths, lan: bool, port: u16) -> Result<(), RpcError> {
     })
 }
 
+#[cfg(test)]
+mod assets;
 #[cfg(test)]
 mod tests;
