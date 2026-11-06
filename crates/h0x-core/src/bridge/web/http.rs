@@ -330,4 +330,95 @@ mod tests {
         assert_eq!(encode(1, &[0; 200])[..4], [0x81, 126, 0, 200]);
         assert_eq!(encode(1, &vec![0; 70_000])[..2], [0x81, 127]);
     }
+
+    #[test]
+    fn a_host_is_ours_only_when_it_is_exactly_our_address() {
+        assert_eq!(req("GET / HTTP/1.1\nX: 1"), Err(400), "no Host at all");
+        assert_eq!(req("GET / HTTP/1.1\nHost: 127.0.0.1:8377\nHOST: 127.0.0.1:8377"), Err(400), "Host twice");
+        assert_eq!(req("GET / HTTP/1.1\nHost : 127.0.0.1:8377"), Err(400), "a space before the colon");
+        let ok = |head: &str| allowed(&req(head).unwrap(), &hosts());
+        assert_eq!(ok("GET / HTTP/1.1\nhOsT:\t127.0.0.1:8377\nContent-Length: 0"), Ok(()));
+        for host in
+            ["", "[::1]:8377", "localhost.:8377", "127.0.0.1.:8377", "127.0.0.1:8377.", "127.1:8377", "0x7f.0.0.1:8377"]
+        {
+            assert_eq!(ok(&format!("GET / HTTP/1.1\nHost: {host}")), Err(403), "{host:?}");
+        }
+        let lan = vec!["192.168.1.20:9".to_string()];
+        assert_eq!(allowed(&req("GET / HTTP/1.1\nHost: localhost:9").unwrap(), &lan), Err(403), "LAN: no localhost");
+        for origin in ["", "null", "http://127.0.0.1:8377/", "http://127.0.0.1:8378", "http://localhost.:8377"] {
+            let head = format!("GET / HTTP/1.1\nHost: 127.0.0.1:8377\nOrigin: {origin}");
+            assert_eq!(ok(&head), Err(403), "{origin:?}");
+        }
+        for method in ["HEAD", "OPTIONS", "get"] {
+            assert_eq!(ok(&format!("{method} / HTTP/1.1\nHost: 127.0.0.1:8377")), Err(405), "{method}");
+        }
+    }
+
+    #[test]
+    fn an_upgrade_needs_version_13_and_a_16_byte_key() {
+        let ws = "GET /ws HTTP/1.1\nHost: 127.0.0.1:8377\nUpgrade: websocket\nConnection: Upgrade\n\
+                  Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\nSec-WebSocket-Version: 13";
+        let up = |head: &str| upgrade(&req(head).unwrap());
+        assert!(up(ws).is_ok());
+        assert!(up(&ws.replace("Upgrade: websocket", "Upgrade: WebSocket")).is_ok(), "any case");
+        for (head, status) in [
+            (ws.replace("\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==", ""), 400),
+            (ws.replace("\nSec-WebSocket-Version: 13", ""), 400),
+            (ws.replace("Version: 13", "Version: 13, 8"), 400),
+            (ws.replace("dGhlIHNhbXBsZSBub25jZQ==", ""), 400),
+            (ws.replace("dGhlIHNhbXBsZSBub25jZQ==", "AAAAAAAAAAAAAAAAAAAAAAA="), 400),
+            (ws.replace("dGhlIHNhbXBsZSBub25jZQ==", "AAAAAAAAAAAAAAAAAAAA"), 400),
+            (ws.replace("dGhlIHNhbXBsZSBub25jZQ==", "dGhlIHNhbXBsZSBub25jZQ!!"), 400),
+            (ws.replace("Upgrade: websocket", "Upgrade: h2c"), 426),
+            (ws.replace("Connection: Upgrade", "Connection: keep-alive"), 426),
+            (ws.replace("\nConnection: Upgrade", ""), 426),
+        ] {
+            assert_eq!(up(&head), Err(status), "{head:?}");
+        }
+    }
+
+    #[test]
+    fn frames_at_the_protocol_edges_are_read_or_refused() {
+        assert_eq!(decode(&[], MAX_FRAME), Ok(None));
+        assert_eq!(decode(&[0x81], MAX_FRAME), Ok(None));
+        let exact = client_frame(1, &vec![b'x'; MAX_FRAME]);
+        assert_eq!(decode(&exact, MAX_FRAME).unwrap().unwrap().1, exact.len(), "exactly 64 KiB is fine");
+        assert_eq!(decode(&client_frame(1, b""), MAX_FRAME), Ok(Some((Frame::Text(String::new()), 6))));
+        // A 64-bit length with the top bit set: refused from the header alone.
+        let huge = [0x81, 0xff, 0x80, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(decode(&huge, MAX_FRAME), Err("frame too big"));
+        assert_eq!(
+            decode(&[0x81, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff], MAX_FRAME),
+            Err("frame too big")
+        );
+        assert_eq!(decode(&client_frame(9, &[1; 125]), MAX_FRAME).unwrap().unwrap().0, Frame::Ping(vec![1; 125]));
+        assert_eq!(decode(&client_frame(8, &[0; 126]), MAX_FRAME), Err("frame too big"), "control frames <= 125");
+        let bye = [&1000u16.to_be_bytes()[..], b"bye"].concat();
+        assert_eq!(
+            decode(&client_frame(8, &bye), MAX_FRAME).unwrap().unwrap().0,
+            Frame::Close,
+            "a close with a reason"
+        );
+        assert_eq!(decode(&client_frame(10, b"x"), MAX_FRAME).unwrap().unwrap().0, Frame::Pong);
+        assert_eq!(decode(&client_frame(0, b"hi"), MAX_FRAME), Err("unknown opcode"), "a continuation, no start");
+        for opcode in [3, 7, 11, 15] {
+            assert_eq!(decode(&client_frame(opcode, b"hi"), MAX_FRAME), Err("unknown opcode"), "{opcode}");
+        }
+        let mut ping = client_frame(9, b"p");
+        ping[0] &= 0x7f;
+        assert_eq!(decode(&ping, MAX_FRAME), Err("fragmented messages are not accepted"), "a fragmented ping");
+        for rsv in [0x40, 0x20, 0x10] {
+            let mut odd = client_frame(1, b"hi");
+            odd[0] |= rsv;
+            assert_eq!(decode(&odd, MAX_FRAME), Err("reserved bits set"), "{rsv:#x}");
+        }
+        // Overlong UTF-8 and a lone surrogate are not UTF-8.
+        for bad in [&[0xc0, 0xaf][..], &[0xed, 0xa0, 0x80][..], &[b'a', 0xe2, 0x82][..]] {
+            assert_eq!(decode(&client_frame(1, bad), MAX_FRAME), Err("text is not UTF-8"), "{bad:?}");
+        }
+        // Two frames back to back: one at a time.
+        let both = [client_frame(1, b"a"), client_frame(1, b"b")].concat();
+        assert_eq!(decode(&both, MAX_FRAME), Ok(Some((Frame::Text("a".into()), 7))));
+        assert_eq!(decode(&both[7..], MAX_FRAME), Ok(Some((Frame::Text("b".into()), 7))));
+    }
 }

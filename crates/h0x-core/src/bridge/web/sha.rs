@@ -123,6 +123,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn both_digests_are_right_at_the_padding_boundaries() {
+        // 55 bytes fit one block with the length; 56 and 64 need a second.
+        for (n, one, two56) in [
+            (
+                55,
+                "c1c8bbdc22796e28c0e15163d20899b65621d65a",
+                "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318",
+            ),
+            (
+                56,
+                "c2db330f6083854c99d4b5bfb6e8f29f201be699",
+                "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a",
+            ),
+            (
+                63,
+                "03f09f5b158a7a8cdad920bddc29b81c18a551f5",
+                "7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34",
+            ),
+            (
+                64,
+                "0098ba824b5c16427bd7a1122a5a442a25ec644d",
+                "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+            ),
+        ] {
+            let data = vec![b'a'; n];
+            assert_eq!((hex(&sha1(&data)), hex(&sha256(&data))), (one.to_string(), two56.to_string()), "{n} bytes");
+        }
+        assert_eq!(hex(&[]), "");
+        assert_eq!(hex(&[0x00, 0x0f, 0xff]), "000fff", "two lowercase digits per byte");
+    }
+
     /// Windows: BCrypt's SHA-256 over many lengths, padding edges included.
     #[cfg(windows)]
     #[test]
