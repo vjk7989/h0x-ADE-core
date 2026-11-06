@@ -72,3 +72,18 @@ fn assets_stay_small() {
     let total = PAGE.len() + SCRIPT.len() + STYLE.len();
     assert!(total < 40 * 1024, "{total} bytes");
 }
+
+/// app.test.mjs runs app.js against a fake page with node's own test runner;
+/// without node on PATH it is left to CI.
+#[test]
+fn app_logic_passes_its_node_tests() {
+    let file = concat!(env!("CARGO_MANIFEST_DIR"), "/src/bridge/web/app.test.mjs");
+    let out = match std::process::Command::new("node").arg("--test").arg(file).output() {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return eprintln!("node not found: app.test.mjs not run"),
+        Err(e) => panic!("node: {e}"),
+    };
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("fail 0"), "{text}");
+}
