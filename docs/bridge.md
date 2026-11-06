@@ -80,9 +80,53 @@ Everything else is as for Telegram: confirmations, the lock (no notices go out w
 It refuses public, loopback and link-local addresses.
 It is plain http: anyone on that network can watch the traffic, the pairing link included. Use it only on a network you trust.
 
+### Ways to reach it
+
+| Way | Command | Who can reach it |
+| --- | --- | --- |
+| Local | `h0x-core bridge web` | This machine only |
+| LAN (plain http) | `h0x-core bridge web --lan` | Devices on your private network |
+| Tunnel | a tunnel provider (its own section, when that option is available) | Anyone with the link, through a tunnel provider |
+| Your VPS | `h0x-core bridge web --via vps --public-host h0x.example.com` | Anyone who can reach your VPS's HTTPS name |
+| SSH only | `ssh -L 8377:127.0.0.1:8377 you@your-pc`, then open `http://127.0.0.1:8377/` | Only you, with no public exposure at all |
+
+The SSH-only way is for power users: your PC runs `h0x-core bridge web`, and the device you read it from forwards the port with `ssh -L`.
+Nothing is exposed to the internet, and the pairing link works through the forwarded port.
+
+### Through your VPS
+
+Add your server once as a machine, then run the panel with `--via`:
+
+```sh
+h0x-core machine add you@vps.example.com --name vps
+h0x-core bridge web --via vps --public-host h0x.example.com   # --remote-port 8377 by default
+```
+
+The bridge keeps an `ssh -N -R` running that opens the port on the server's **loopback only** (`127.0.0.1`, never `0.0.0.0`).
+It uses the machine's ssh target, adds `ExitOnForwardFailure=yes`, `ServerAliveInterval=15` and `BatchMode=yes`, and never forwards your ssh agent.
+Use an SSH key without a passphrase prompt (or an agent): it cannot ask questions. Connect to the server once by hand first, so its host key is known.
+If ssh ends, it is started again with growing pauses (1 s up to 60 s). It is stopped when the bridge stops, and while the bridge is locked.
+`--via` needs a plain ssh machine (not one added with `--via` a custom command), a `--public-host` that is a DNS name (no IP address, port or wildcard), and a `--remote-port` from 1024 to 65535.
+It cannot be combined with `--lan`.
+
+On the server, put your own HTTPS reverse proxy in front of that port. With Caddy, which gets the certificate for you:
+
+```text
+h0x.example.com {
+    reverse_proxy 127.0.0.1:8377
+}
+```
+
+The pairing link and QR code then use `https://h0x.example.com/#pair=...`, and that name is added to the accepted `Host` and `Origin` values.
+Keep the proxy's `Host` header as it received it (Caddy and nginx's `proxy_set_header Host $host` do), and let it pass WebSocket upgrades.
+
+Security: the proxy on your VPS ends TLS, so it can see the traffic, pairing link included; run it only on a server you control.
+Pairing and session authentication still apply to every device, and so do the lock, the allow-list, rate limits and the audit log.
+Anyone who can reach the name can load the page, so treat a pairing link like a password: it works once, for 5 minutes.
+
 What the server accepts:
 
-- Only its own address in `Host`, so a hostile web page can't reach it through DNS rebinding.
+- Only its own address (and, with `--via`, your public name) in `Host`, so a hostile web page can't reach it through DNS rebinding.
   A browser's `Origin`, when sent, must be the panel itself. Apps that send no `Origin` still have to authenticate.
 - No CORS headers, no request bodies (`GET` only), request heads up to 8 KB that arrive within 10 seconds, and WebSocket messages up to 64 KB.
   Messages must be masked and unfragmented text; anything else closes the connection.

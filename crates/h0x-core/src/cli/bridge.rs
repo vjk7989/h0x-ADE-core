@@ -52,6 +52,16 @@ pub(super) enum BridgeCmd {
         /// The port (0: any free one).
         #[arg(long, default_value_t = crate::bridge::web::PORT)]
         port: u16,
+        /// Reach it through your VPS: the name of an ssh machine (`machine add`).
+        /// Opens a reverse port on the server's loopback; your HTTPS proxy there serves it.
+        #[arg(long = "via", value_name = "MACHINE", requires = "public_host", conflicts_with = "lan")]
+        via: Option<String>,
+        /// The DNS name your HTTPS proxy serves, for the pairing link.
+        #[arg(long, requires = "via")]
+        public_host: Option<String>,
+        /// The port on the server's loopback.
+        #[arg(long, default_value_t = crate::bridge::web::PORT, requires = "via")]
+        remote_port: u16,
     },
 }
 
@@ -153,8 +163,14 @@ pub(super) fn bridge(paths: &Paths, action: BridgeCmd) -> Result<Out, RpcError> 
             bridge.set_telegram_token(&read_token()?)?;
             Out { json: json!({"telegram_token": "set"}), human: "telegram token stored".into() }
         }
-        BridgeCmd::Web { lan, port } => {
-            crate::bridge::web::run(paths, lan, port)?;
+        BridgeCmd::Web { lan, port, via, public_host, remote_port } => {
+            let via = match (via, public_host) {
+                (Some(machine), Some(host)) => {
+                    Some(crate::bridge::web::vps::plan(paths, &machine, &host, remote_port)?)
+                }
+                _ => None,
+            };
+            crate::bridge::web::run(paths, lan, port, via)?;
             Out { json: Value::Null, human: String::new() }
         }
         BridgeCmd::Run => {
