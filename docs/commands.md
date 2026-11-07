@@ -54,7 +54,7 @@ More
   update [--version X|--from <file>]   latest release, at least X, or a build
   machine add|ls|login|update|rename|rm   other machines, over ssh or a command
                               (--via 'fly ssh console -a x --pty=false -C')
-  bridge pair|ls|unpair|lock|unlock|reset|log|telegram token|run|web
+  bridge pair|ls|unpair|lock|unlock|reset|log|telegram token|run|web|tunnel
                               remote control from paired chat accounts: full
                               control of this machine (docs/bridge.md)
   connect                     the API over stdin/stdout (ssh box h0x-core connect)
@@ -113,6 +113,7 @@ Commands:
   telegram  The Telegram bot's settings
   run       Run the Telegram bot until stopped: answers paired accounts, sends notices. Under core: h0x-core run --bg --keep -- h0x-core bridge run
   web       Serve the web panel until stopped: a page and a WebSocket API for paired devices. On 127.0.0.1; --lan: this machine's private network address (plain http)
+  tunnel    Turn "access from anywhere" (a Cloudflare tunnel) on or off for the running web panel
   help      Print this message or the help of the given subcommand(s)
 
 Options:
@@ -223,6 +224,49 @@ Options:
   -h, --help   Print help
 ```
 
+## h0x-core bridge tunnel
+
+```text
+Turn "access from anywhere" (a Cloudflare tunnel) on or off for the running web panel
+
+Usage: h0x-core bridge tunnel [OPTIONS] <COMMAND>
+
+Commands:
+  on    Start a tunnel to the running panel and print a pairing link through it
+  off   Stop the tunnel
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h0x-core bridge tunnel off
+
+```text
+Stop the tunnel
+
+Usage: h0x-core bridge tunnel off [OPTIONS]
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h0x-core bridge tunnel on
+
+```text
+Start a tunnel to the running panel and print a pairing link through it
+
+Usage: h0x-core bridge tunnel on [OPTIONS]
+
+Options:
+      --for <MINUTES>  Stop the tunnel after this many minutes (1 to 1440) [default: 60]
+      --json           JSON output even in a terminal
+      --yes            Download the pinned cloudflared without asking, if none is on PATH
+  -h, --help           Print help
+```
+
 ## h0x-core bridge unlock
 
 ```text
@@ -259,10 +303,13 @@ Serve the web panel until stopped: a page and a WebSocket API for paired devices
 Usage: h0x-core bridge web [OPTIONS]
 
 Options:
-      --json         JSON output even in a terminal
-      --lan          Listen on this machine's private LAN address instead of 127.0.0.1
-      --port <PORT>  The port (0: any free one) [default: 8377]
-  -h, --help         Print help
+      --json           JSON output even in a terminal
+      --lan            Listen on this machine's private LAN address instead of 127.0.0.1
+      --port <PORT>    The port (0: any free one) [default: 8377]
+      --tunnel         Also reach it from anywhere through a Cloudflare tunnel (https, not end-to-end)
+      --for <MINUTES>  Stop the tunnel after this many minutes (1 to 1440) [default: 60]
+      --yes            Download the pinned cloudflared without asking, if none is on PATH
+  -h, --help           Print help
 ```
 
 ## h0x-core connect
