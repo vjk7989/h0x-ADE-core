@@ -30,6 +30,12 @@ const IDLE: Duration = Duration::from_secs(60);
 const AUTH: Duration = Duration::from_secs(30);
 /// How often the server says it is alive.
 const HEARTBEAT: Duration = Duration::from_secs(20);
+/// After this many failed `auth`s from one address it is refused for [`AUTH_BLOCK_MS`].
+const AUTH_STRIKES: u32 = 5;
+const AUTH_BLOCK_MS: u64 = 60_000;
+/// After closing, how long to keep reading so unread data cannot turn the
+/// close into a reset (RFC 6455 7.1.1).
+const LINGER: Duration = Duration::from_secs(1);
 
 const PAGE: &str = include_str!("page.html");
 const SCRIPT: &str = include_str!("app.js");
@@ -116,12 +122,15 @@ pub(crate) struct Web {
     core: Box<CoreCall>,
     hosts: Vec<String>,
     notices: tokio::sync::broadcast::Sender<Notice>,
+    /// Failed `auth`s per peer address: (strikes, refused until ms).
+    strikes: Mutex<std::collections::HashMap<IpAddr, (u32, u64)>>,
 }
 
 /// One connection's device, once it paired or authenticated.
 #[derive(Clone, Default)]
 struct Conn {
     device: Option<Sender>,
+    peer: Option<IpAddr>,
 }
 
 /// What to send back for one message, and whether to hang up after.
@@ -238,7 +247,12 @@ impl Web {
     /// A one-time pairing token becomes a device and its session token.
     fn pair(&self, conn: &mut Conn, data: &Value, now: u64) -> Step {
         let token = data["token"].as_str().unwrap_or_default();
-        let label: String = data["label"].as_str().unwrap_or_default().trim().chars().take(40).collect();
+        // Nothing typed is a usage error, not a wrong guess.
+        if token.chars().all(|c| matches!(c, ' ' | '-')) {
+            return refuse("usage: pair needs the code from `h0x-core bridge pair`");
+        }
+        let label = data["label"].as_str().unwrap_or_default().replace(char::is_control, "");
+        let label: String = label.trim().chars().take(40).collect();
         let label = if label.is_empty() { "web device".to_string() } else { label };
         let user = crate::platform::random_hex()[..16].to_string();
         let bridge = self.bridge.lock().unwrap();
@@ -261,14 +275,40 @@ impl Web {
 
     fn auth(&self, conn: &mut Conn, data: &Value, now: u64) -> Step {
         let token = data["session"].as_str().unwrap_or_default();
-        let user = match self.bridge.lock().unwrap().session_user(token) {
+        let peer = conn.peer;
+        if peer.is_some_and(|ip| self.strikes.lock().unwrap().get(&ip).is_some_and(|s| now < s.1)) {
+            return refuse("too many failed attempts; try again later");
+        }
+        // The guard must be gone before a failure takes the lock again.
+        let found = self.bridge.lock().unwrap().session_user(token);
+        let user = match found {
             Ok(Some(user)) => user,
-            Ok(None) => return refuse("unknown or revoked session; pair again"),
+            Ok(None) => return self.auth_failed(peer, "unknown or revoked session; pair again", now),
             Err(e) => return refuse(&e.message),
         };
+        if let Some(ip) = peer {
+            self.strikes.lock().unwrap().remove(&ip);
+        }
         let from = Sender { transport: "web".into(), user_id: user };
         conn.device = Some(from.clone());
         Step { out: vec![message("hello", Value::Null), self.snapshot(&from, now)], close: false }
+    }
+
+    /// A failed `auth`: logged (never the token) and counted against the
+    /// peer's address. The connection closes either way.
+    fn auth_failed(&self, peer: Option<IpAddr>, why: &str, now: u64) -> Step {
+        let who = peer.map_or_else(|| "unknown".to_string(), |ip| ip.to_string());
+        let entry = json!({"time_ms": now, "identity": format!("web:{who}"), "command": "auth", "result": format!("refused: {why}")});
+        let _ = self.bridge.lock().unwrap().audit(entry);
+        if let Some(ip) = peer {
+            let mut strikes = self.strikes.lock().unwrap();
+            let strike = strikes.entry(ip).or_default();
+            strike.0 += 1;
+            if strike.0 >= AUTH_STRIKES {
+                *strike = (0, now + AUTH_BLOCK_MS);
+            }
+        }
+        refuse(why)
     }
 
     /// A notice for this connection: only to a device that is still paired,
@@ -337,9 +377,31 @@ async fn send(wr: &mut tokio::net::tcp::OwnedWriteHalf, msg: &Value) -> bool {
     wr.write_all(&http::encode(1, msg.to_string().as_bytes())).await.is_ok()
 }
 
+/// The close code for a frame the decoder refused.
+fn close_code(why: &str) -> u16 {
+    match why {
+        "frame too big" => 1009,
+        "binary frames are not accepted" => 1003,
+        "text is not UTF-8" => 1007,
+        _ => 1002,
+    }
+}
+
+/// Closes as RFC 6455 7.1.1 says: the close frame, then our write side, then
+/// read (and drop) what the client still sends until it ends or [`LINGER`]
+/// passes. Dropping the socket with unread data would send a reset that can
+/// erase the close frame.
+async fn hang_up(mut rd: tokio::net::tcp::OwnedReadHalf, mut wr: tokio::net::tcp::OwnedWriteHalf, payload: &[u8]) {
+    let _ = wr.write_all(&http::encode(8, payload)).await;
+    let _ = wr.shutdown().await;
+    let mut sink = [0u8; 4096];
+    let _ = tokio::time::timeout(LINGER, async { while matches!(rd.read(&mut sink).await, Ok(n) if n > 0) {} }).await;
+}
+
 async fn websocket(stream: tokio::net::TcpStream, mut buf: Vec<u8>, web: Arc<Web>) {
+    let peer = stream.peer_addr().ok().map(|a| a.ip());
     let (mut rd, mut wr) = stream.into_split();
-    let mut conn = Conn::default();
+    let mut conn = Conn { peer, ..Conn::default() };
     let mut notices = web.notices.subscribe();
     let mut beat = tokio::time::interval(HEARTBEAT);
     let (opened, mut last) = (tokio::time::Instant::now(), tokio::time::Instant::now());
@@ -353,7 +415,7 @@ async fn websocket(stream: tokio::net::TcpStream, mut buf: Vec<u8>, web: Arc<Web
                     frame
                 }
                 Ok(None) => break,
-                Err(_) => return drop(wr.write_all(&http::encode(8, &1009u16.to_be_bytes())).await),
+                Err(why) => return hang_up(rd, wr, &close_code(why).to_be_bytes()).await,
             };
             last = tokio::time::Instant::now();
             match frame {
@@ -375,7 +437,7 @@ async fn websocket(stream: tokio::net::TcpStream, mut buf: Vec<u8>, web: Arc<Web
                         }
                     }
                     if step.close {
-                        return drop(wr.write_all(&http::encode(8, &1008u16.to_be_bytes())).await);
+                        return hang_up(rd, wr, &1008u16.to_be_bytes()).await;
                     }
                 }
                 http::Frame::Ping(data) => {
@@ -384,9 +446,11 @@ async fn websocket(stream: tokio::net::TcpStream, mut buf: Vec<u8>, web: Arc<Web
                     }
                 }
                 http::Frame::Pong => {}
-                http::Frame::Close => return drop(wr.write_all(&http::encode(8, &[])).await),
+                http::Frame::Close => return hang_up(rd, wr, &[]).await,
             }
         }
+        let idle = last + IDLE;
+        let due = if conn.device.is_none() { idle.min(opened + AUTH) } else { idle };
         tokio::select! {
             read = rd.read(&mut chunk) => match read {
                 Ok(0) | Err(_) => return,
@@ -403,10 +467,8 @@ async fn websocket(stream: tokio::net::TcpStream, mut buf: Vec<u8>, web: Arc<Web
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             },
+            _ = tokio::time::sleep_until(due) => return hang_up(rd, wr, &1001u16.to_be_bytes()).await,
             _ = beat.tick() => {
-                if last.elapsed() > IDLE || (conn.device.is_none() && opened.elapsed() > AUTH) {
-                    return drop(wr.write_all(&http::encode(8, &1001u16.to_be_bytes())).await);
-                }
                 if !send(&mut wr, &message("heartbeat", Value::Null)).await {
                     return;
                 }
@@ -464,7 +526,8 @@ pub fn run(paths: &Paths, lan: bool, port: u16) -> Result<(), RpcError> {
         let stream = crate::client::connect_or_start(&paths)?;
         crate::client::call(&stream, method, params).map_err(|e| crate::client::explain_closed(&paths, e))
     };
-    let web = Arc::new(Web { bridge: Mutex::new(bridge), core: Box::new(core), hosts, notices });
+    let web =
+        Arc::new(Web { bridge: Mutex::new(bridge), core: Box::new(core), hosts, notices, strikes: Default::default() });
     let runtime =
         tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| failed(e.to_string()))?;
     runtime.block_on(async {
