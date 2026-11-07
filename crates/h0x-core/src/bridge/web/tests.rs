@@ -36,7 +36,8 @@ fn fixture(hosts: Vec<String>) -> Fixture {
     let bridge = crate::bridge::scratch();
     let dir = bridge.dir.clone();
     let (notices, _) = tokio::sync::broadcast::channel(16);
-    let web = Web { bridge: Mutex::new(bridge), core: Box::new(fake_core), hosts, notices };
+    let web =
+        Web { bridge: Mutex::new(bridge), core: Box::new(fake_core), hosts, notices, strikes: Default::default() };
     Fixture { web: Arc::new(web), dir }
 }
 
@@ -657,5 +658,110 @@ fn an_authenticated_socket_hears_heartbeats_and_closes_when_idle() {
     let beats = said.iter().filter(|name| *name == "heartbeat").count() as u32;
     assert!(beats >= IDLE.as_secs() as u32 / HEARTBEAT.as_secs() as u32, "every 20 s: {said:?}");
     assert_eq!(frames.last(), Some(&(8, 1001u16.to_be_bytes().to_vec())), "going away");
-    assert!(took > IDLE && took <= IDLE + HEARTBEAT, "{took:?}");
+    assert!(took >= IDLE && took <= IDLE + HEARTBEAT, "{took:?}");
+}
+
+#[test]
+fn every_refusal_closes_with_its_own_code() {
+    let (_f, addr) = start();
+    let origin = format!("http://{addr}");
+    let masked = |first: u8| vec![first, 0x80, 0, 0, 0, 0];
+    for (what, frame, code) in [
+        ("unmasked", http::encode(1, b"{}"), 1002u16),
+        ("reserved bits", masked(0xc1), 1002),
+        ("fragmented", masked(0x01), 1002),
+        ("continuation without a start", http::client_frame(0, b"hi"), 1002),
+        ("unknown opcode", http::client_frame(3, b"hi"), 1002),
+        ("binary", http::client_frame(2, b"hi"), 1003),
+        ("invalid UTF-8", http::client_frame(1, &[0xff]), 1007),
+        ("too big", http::client_frame(1, &vec![b'x'; http::MAX_FRAME + 1]), 1009),
+    ] {
+        let mut client = ws(addr, &origin);
+        let _ = client.stream.write_all(&frame);
+        let close = std::iter::from_fn(|| client.frame()).find(|(op, _)| *op != 1);
+        assert_eq!(close, Some((8, code.to_be_bytes().to_vec())), "{what}");
+    }
+    let mut early = ws(addr, &origin);
+    early.send("command", json!({"cmd": "list"}));
+    assert_eq!(early.recv().unwrap()["data"]["message"], "pair or auth first");
+    assert_eq!(early.frame(), Some((8, 1008u16.to_be_bytes().to_vec())), "policy");
+}
+
+#[test]
+fn the_close_frame_survives_unread_data_in_the_servers_buffer() {
+    let (_f, addr) = start();
+    let mut client = ws(addr, &format!("http://{addr}"));
+    // An unmasked header, then more bytes the server never reads on its own.
+    let mut frame = http::encode(1, &vec![b'x'; 2000]);
+    frame.extend_from_slice(&[0; 5000]);
+    client.stream.write_all(&frame).unwrap();
+    let close = std::iter::from_fn(|| client.frame()).find(|(op, _)| *op != 1);
+    assert_eq!(close, Some((8, 1002u16.to_be_bytes().to_vec())));
+    assert!(client.frame().is_none(), "then the server's end of the stream is shut");
+}
+
+#[test]
+fn deadlines_are_exact_not_the_next_heartbeat() {
+    let (f, listener) = unserved();
+    let head = upgrade_head(listener.local_addr().unwrap());
+    let (heard, took) = on_a_paused_clock(&f, listener, &head, b"");
+    assert_eq!(server_frames(&heard).last(), Some(&(8, 1001u16.to_be_bytes().to_vec())));
+    assert!(took >= AUTH && took <= Duration::from_secs(31), "{took:?}");
+
+    let (f, listener) = unserved();
+    let (_, session) = f.paired();
+    let auth = json!({"name": "auth", "data": {"session": session}}).to_string();
+    let sent = [upgrade_head(listener.local_addr().unwrap()), http::client_frame(1, auth.as_bytes())].concat();
+    let (heard, took) = on_a_paused_clock(&f, listener, &sent, b"");
+    assert_eq!(server_frames(&heard).last(), Some(&(8, 1001u16.to_be_bytes().to_vec())));
+    assert!(took >= IDLE && took <= Duration::from_secs(61), "{took:?}");
+}
+
+#[test]
+fn five_failed_auths_from_one_address_block_it_and_are_logged_without_the_token() {
+    let f = fixture(Vec::new());
+    let (_, good) = f.paired();
+    let ip: IpAddr = "192.168.1.7".parse().unwrap();
+    let peer = || Conn { peer: Some(ip), ..Conn::default() };
+    for n in 0..5 {
+        let step = f.say(&mut peer(), "auth", json!({"session": "secret-guess"}), T + n);
+        assert!(step.close, "a failed auth closes");
+    }
+    let blocked = f.say(&mut peer(), "auth", json!({"session": good}), T + 10);
+    assert!(blocked.close && blocked.out[0]["data"]["message"].as_str().unwrap().contains("too many"), "{blocked:?}");
+    let mut other = Conn { peer: Some("192.168.1.8".parse().unwrap()), ..Conn::default() };
+    assert_eq!(names(&f.say(&mut other, "auth", json!({"session": good}), T + 10)), ["hello", "snapshot"]);
+    let after = f.say(&mut peer(), "auth", json!({"session": good}), T + 60_000 + 5);
+    assert_eq!(names(&after), ["hello", "snapshot"], "refused for 60 s only");
+    let log = std::fs::read_to_string(f.dir.join("audit.jsonl")).unwrap();
+    assert_eq!(log.matches("\"command\":\"auth\"").count(), 5, "{log}");
+    assert!(log.contains("web:192.168.1.7") && !log.contains("secret-guess") && !log.contains(&good), "{log}");
+}
+
+#[test]
+fn control_characters_never_reach_a_device_label() {
+    let f = fixture(Vec::new());
+    let label = |given: &str| {
+        let step = f.say(&mut Conn::default(), "pair", json!({"token": f.code(T), "label": given}), T);
+        step.out[0]["data"]["device"].as_str().unwrap().to_string()
+    };
+    assert_eq!(label("\u{1b}]0;x\u{7}ph\u{1b}[31mone\u{9b}\u{7f}\n"), "]0;xph[31mone");
+    assert_eq!(label(&format!("{}{}", "\u{1}".repeat(50), "a".repeat(45))), "a".repeat(40), "stripped before the cut");
+    assert_eq!(label("\u{1b}\u{85}"), "web device");
+}
+
+#[test]
+fn an_empty_pair_code_is_usage_and_not_a_wrong_guess() {
+    let f = fixture(Vec::new());
+    let code = f.code(T);
+    for blank in [json!(""), json!(null), json!(" - "), json!(7)] {
+        let step = f.say(&mut Conn::default(), "pair", json!({"token": blank}), T);
+        assert!(step.close && step.out[0]["data"]["message"].as_str().unwrap().contains("usage"), "{step:?}");
+    }
+    assert!(f.say(&mut Conn::default(), "pair", json!({}), T).close);
+    for n in 0..4 {
+        assert!(f.say(&mut Conn::default(), "pair", json!({"token": "AAAAAAAA"}), T + n).close);
+    }
+    let paired = f.say(&mut Conn::default(), "pair", json!({"token": code}), T + 5);
+    assert_eq!(paired.out[0]["name"], "paired", "four real guesses, not five");
 }
