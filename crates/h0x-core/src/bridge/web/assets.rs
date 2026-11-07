@@ -74,16 +74,26 @@ fn assets_stay_small() {
 }
 
 /// app.test.mjs runs app.js against a fake page with node's own test runner;
-/// without node on PATH it is left to CI.
+/// without node on PATH it is skipped locally, but fails on CI (the `CI` env
+/// var), where a missing node would otherwise hide that the tests never ran.
 #[test]
 fn app_logic_passes_its_node_tests() {
     let file = concat!(env!("CARGO_MANIFEST_DIR"), "/src/bridge/web/app.test.mjs");
     let out = match std::process::Command::new("node").arg("--test").arg(file).output() {
         Ok(out) => out,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return eprintln!("node not found: app.test.mjs not run"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            assert!(std::env::var_os("CI").is_none(), "node not found on CI: app.test.mjs did not run");
+            return eprintln!("node not found: app.test.mjs not run");
+        }
         Err(e) => panic!("node: {e}"),
     };
     let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    // The summary line ("pass 16"), visible with --nocapture.
+    if let Some(line) =
+        text.lines().find(|l| l.trim_start_matches(|c: char| !c.is_ascii_alphanumeric()).starts_with("pass "))
+    {
+        println!("{}", line.trim());
+    }
     assert!(out.status.success(), "{text}");
     assert!(text.contains("fail 0"), "{text}");
 }
