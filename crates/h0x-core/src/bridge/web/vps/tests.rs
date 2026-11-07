@@ -376,7 +376,9 @@ fn origin_rewrite_is_strict_about_scheme_shape_and_list() {
         https_origin_as_http(&mut req, &hosts);
         super::super::http::allowed(&req, &hosts)
     };
-    assert_eq!(check("HTTPS://h0x.example.com"), Err(403), "an uppercase scheme is not rewritten");
+    // The scheme is case-insensitive (ADR-061, REM-3c addendum); the host still has to be ours.
+    assert_eq!(check("HTTPS://h0x.example.com"), Ok(()), "an uppercase scheme is the same origin");
+    assert_eq!(check("HtTpS://evil.example.com"), Err(403));
     assert_eq!(check("https://h0x.example.com/"), Err(403), "a trailing slash");
     assert_eq!(check("https://"), Err(403), "empty host");
     assert_eq!(check("https://localhost"), Err(403), "port-less form of a host listed with a port");
@@ -468,4 +470,25 @@ fn dropping_the_tunnel_kills_a_running_ssh() {
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(starts(&log), 1, "nothing starts after drop");
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn the_lock_is_read_from_the_bridge_it_was_given_and_unreadable_state_is_reported_once() {
+    let a = crate::bridge::scratch();
+    let b = Bridge::at(a.dir.clone(), Default::default());
+    let notes = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let sink = notes.clone();
+    let locked = lock_check(b, move |why| sink.lock().unwrap().push(why.into()));
+    assert!(!locked());
+    a.set_locked(true).unwrap();
+    assert!(locked(), "sees the lock set through the other handle");
+    a.set_locked(false).unwrap();
+    assert!(!locked());
+    assert!(notes.lock().unwrap().is_empty());
+
+    std::fs::write(a.dir.join("state.json"), b"{ not json").unwrap();
+    assert!(locked() && locked(), "unreadable state counts as locked");
+    assert_eq!(notes.lock().unwrap().len(), 1, "one line, not one per check");
+    assert!(notes.lock().unwrap()[0].contains("treating it as locked"));
+    let _ = std::fs::remove_dir_all(&a.dir);
 }

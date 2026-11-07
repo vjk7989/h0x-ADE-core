@@ -516,9 +516,10 @@ pub fn run(paths: &Paths, lan: bool, port: u16, via: Option<vps::Vps>) -> Result
             "through your vps: reverse port 127.0.0.1:{} on the server; point your HTTPS proxy there",
             plan.remote_port
         );
-        let locked = || Paths::from_env().and_then(|p| Bridge::open(&p)).and_then(|b| b.locked()).unwrap_or(true);
-        vps::Tunnel::ssh(plan, port, locked)
+        let locked = vps::lock_check(Bridge::open(paths)?, |why| eprintln!("bridge: vps: {why}"));
+        Ok(vps::Tunnel::ssh(plan, port, locked))
     });
+    let tunnel = tunnel.transpose()?;
     let (notices, _) = tokio::sync::broadcast::channel(64);
     let feed = notices.clone();
     let quiet = bridge.config.notice_quiet_ms();

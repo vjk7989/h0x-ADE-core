@@ -3,6 +3,7 @@
 //! loopback only; the user's own HTTPS reverse proxy there serves it under
 //! `<name>`. Pairing and session auth apply unchanged.
 
+use super::super::Bridge;
 use super::http::Request;
 use crate::machines::{Machine, check_target, unknown};
 use crate::paths::Paths;
@@ -141,12 +142,31 @@ pub fn with_public(mut base: Vec<String>, public_host: Option<&str>) -> Vec<Stri
 /// that one origin (a host of ours without a port) look like its http form.
 pub fn https_origin_as_http(req: &mut Request, hosts: &[String]) {
     for (name, value) in &mut req.headers {
-        let rest = value.strip_prefix("https://").map(String::from);
+        let rest = value.get(8..).filter(|_| value[..8].eq_ignore_ascii_case("https://")).map(String::from);
         if name == "origin"
             && let Some(rest) = rest
             && hosts.iter().any(|h| !h.contains(':') && h.eq_ignore_ascii_case(&rest))
         {
             *value = format!("http://{rest}");
+        }
+    }
+}
+
+/// Whether remote control is locked, read from the bridge's own state. When
+/// the state cannot be read it counts as locked (ssh stays down), and says
+/// why once per run of failures through `report`.
+pub fn lock_check(bridge: Bridge, report: impl Fn(&str) + Send + 'static) -> impl Fn() -> bool + Send + 'static {
+    let reported = AtomicBool::new(false);
+    move || match bridge.locked() {
+        Ok(locked) => {
+            reported.store(false, Ordering::SeqCst);
+            locked
+        }
+        Err(e) => {
+            if !reported.swap(true, Ordering::SeqCst) {
+                report(&format!("cannot read the bridge state, treating it as locked: {}", e.message));
+            }
+            true
         }
     }
 }
