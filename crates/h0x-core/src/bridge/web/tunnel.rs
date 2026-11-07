@@ -30,6 +30,9 @@ pub const MAX_MINUTES: u64 = 24 * 60;
 const URL_WAIT: Duration = Duration::from_secs(45);
 /// A running panel takes a request within this.
 const TAKEN_WAIT: Duration = Duration::from_secs(3);
+/// A request older than this (or this far ahead) is ignored.
+const REQUEST_TTL_MS: u64 = 10_000;
+const LOCKED: &str = "remote control is locked; `h0x-core bridge unlock` here first";
 const REQUEST: &str = "tunnel.request";
 const STATUS: &str = "tunnel.json";
 
@@ -86,8 +89,33 @@ pub fn host_of(url: &str) -> Option<&str> {
     ok.then_some(host)
 }
 
-/// The tunnel host in one line of cloudflared's log, if it has one.
+/// `line` without terminal colour sequences (`ESC [ ... letter`).
+fn plain(line: &str) -> String {
+    let mut out = String::new();
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// The tunnel host in one line of cloudflared's log, if it has one. Only
+/// the banner box counts (`INF |  https://<name>.trycloudflare.com  |`): a
+/// line without its `|` borders, or at ERR, WRN or FTL level, is never
+/// trusted, because those quote URLs from elsewhere.
 pub fn host_in(line: &str) -> Option<&str> {
+    let alert = plain(line).split_whitespace().any(|word| matches!(word, "ERR" | "WRN" | "FTL"));
+    if alert || !line.contains('|') {
+        return None;
+    }
     line.split(|c: char| c.is_whitespace() || c == '|').find_map(host_of)
 }
 
@@ -149,8 +177,10 @@ pub struct Tunnel {
 
 impl Tunnel {
     /// Starts `program` as a quick tunnel to `origin` (`ip:port`) and waits
-    /// for its address.
-    pub async fn start(program: &Path, origin: &str) -> Result<Tunnel, String> {
+    /// for its address. `locked` is asked every second meanwhile and once
+    /// more when the address arrives: a lock kills cloudflared and nothing is
+    /// listed.
+    pub async fn start(program: &Path, origin: &str, locked: &dyn Fn() -> bool) -> Result<Tunnel, String> {
         let mut child = tokio::process::Command::new(program)
             .args(["tunnel", "--url", &format!("http://{origin}"), "--no-autoupdate", "--protocol", "http2"])
             .stdin(Stdio::null())
@@ -161,15 +191,32 @@ impl Tunnel {
             .map_err(|e| format!("cannot start {}: {e}", program.display()))?;
         let mut lines = tokio::io::BufReader::new(child.stderr.take().expect("piped")).lines();
         let found = tokio::time::timeout(URL_WAIT, async {
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(host) = host_in(&line) {
-                    return Some(host.to_string());
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                tokio::select! {
+                    line = lines.next_line() => match line {
+                        Ok(Some(line)) => {
+                            if let Some(host) = host_in(&line) {
+                                return Some(host.to_string());
+                            }
+                        }
+                        _ => return None,
+                    },
+                    _ = tick.tick() => {
+                        if locked() {
+                            return None;
+                        }
+                    }
                 }
             }
-            None
         })
         .await;
+        if locked() {
+            let _ = child.kill().await;
+            return Err(LOCKED.into());
+        }
         let Ok(Some(host)) = found else {
+            let _ = child.kill().await;
             return Err("cloudflared gave no tunnel address; check your connection and try again".into());
         };
         // Keep reading, so cloudflared never blocks on a full pipe.
@@ -214,23 +261,34 @@ pub fn install_dir() -> Result<PathBuf, RpcError> {
 /// downloaded into `install`.
 pub fn find(path: Option<&std::ffi::OsStr>, install: &Path) -> Option<PathBuf> {
     let name = exe_name();
-    let on_path = path.into_iter().flat_map(std::env::split_paths).map(|dir| dir.join(&name));
+    // Absolute entries only: an empty or relative one would run whatever sits
+    // in the current folder.
+    let on_path = path.into_iter().flat_map(std::env::split_paths).filter(|dir| dir.is_absolute());
+    let on_path = on_path.map(|dir| dir.join(&name));
     on_path.chain([install.join(&name)]).find(|p| p.is_file())
+}
+
+/// Deletes a file when dropped (a download, whatever became of it).
+struct Delete<'a>(&'a Path);
+
+impl Drop for Delete<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
+    }
 }
 
 /// Moves a downloaded `asset` (at `file`) into `dir` as cloudflared, only if
 /// its SHA-256 is `sum`. A mismatch deletes the download and installs nothing.
 pub fn install(file: &Path, asset: &str, sum: &str, dir: &Path) -> Result<PathBuf, String> {
+    let _gone = Delete(file);
     let bytes = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
     let got = sha::hex(&sha::sha256(&bytes));
     if got != sum {
-        let _ = std::fs::remove_file(file);
         return Err(format!("refusing {asset}: its SHA-256 is {got}, not the pinned {sum}"));
     }
     let dest = dir.join(exe_name());
     let placed = if asset.ends_with(".tgz") {
         let ok = Command::new("tar").arg("-xzf").arg(file).arg("-C").arg(dir).arg("cloudflared").status();
-        let _ = std::fs::remove_file(file);
         ok.map_err(|e| e.to_string()).and_then(|s| s.success().then_some(()).ok_or(format!("cannot unpack {asset}")))
     } else {
         std::fs::rename(file, &dest).map_err(|e| e.to_string()).and_then(|()| {
@@ -291,13 +349,26 @@ fn announce(status: &Value) -> String {
 }
 
 /// A request from `bridge tunnel on|off`, taken: Some(Some(minutes)) on,
-/// Some(None) off. Anything unreadable is dropped.
-fn take(bridge: &Bridge) -> Option<Option<u64>> {
+/// Some(None) off. A request that is unreadable, older than 10 seconds (or
+/// that far ahead), or asks for minutes outside 1..=1440 is dropped, and
+/// said so when it was readable.
+fn take(bridge: &Bridge, now_ms: u64) -> Option<Option<u64>> {
     let path = bridge.dir.join(REQUEST);
     let bytes = std::fs::read(&path).ok()?;
     let _ = std::fs::remove_file(&path);
     let request: Value = serde_json::from_slice(&bytes).ok()?;
-    Some(request["minutes"].as_u64().map(|m| m.clamp(1, MAX_MINUTES)))
+    if request["at_ms"].as_u64().is_none_or(|at| now_ms.abs_diff(at) > REQUEST_TTL_MS) {
+        eprintln!("tunnel: ignoring a stale or undated request");
+        return None;
+    }
+    match request.get("minutes") {
+        Some(Value::Null) => Some(None),
+        Some(m) if m.as_u64().is_some_and(|m| (1..=MAX_MINUTES).contains(&m)) => Some(m.as_u64()),
+        _ => {
+            eprintln!("tunnel: ignoring a request for {} minutes (1 to {MAX_MINUTES})", request["minutes"]);
+            None
+        }
+    }
 }
 
 /// A started tunnel: the pairing link through it, the answer for `bridge
@@ -315,27 +386,29 @@ fn opened(bridge: &Bridge, host: &str, minutes: u64, until_ms: u64, now: u64) ->
 /// tunnel on|off` requests and stops the tunnel when [`must_stop`] says so.
 /// The tunnel ends with this future.
 pub async fn manage(bridge: Bridge, origin: String, first: Option<u64>) {
+    // Whatever was asked before this panel started is nobody's request now.
     let _ = std::fs::remove_file(bridge.dir.join(STATUS));
+    let _ = std::fs::remove_file(bridge.dir.join(REQUEST));
     let mut up: Option<(Tunnel, u64)> = None;
     let mut pending = first.map(Some);
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
         tick.tick().await;
         let now = crate::runtime::now_ms();
-        match pending.take().or_else(|| take(&bridge)) {
+        match pending.take().or_else(|| take(&bridge, now)) {
             Some(Some(minutes)) => {
                 let locked = bridge.locked().unwrap_or(true);
                 if let Some((tunnel, until_ms)) = up.as_mut().filter(|_| !locked) {
                     *until_ms = until(now, minutes);
                     opened(&bridge, &tunnel.host, minutes, *until_ms, now);
                 } else if locked {
-                    let why = "remote control is locked; `h0x-core bridge unlock` here first";
+                    let why = LOCKED;
                     let _ = bridge.write_private(STATUS, json!({"error": why}).to_string().as_bytes());
                     eprintln!("tunnel: {why}");
                 } else {
                     let program = install_dir().ok().and_then(|dir| find(std::env::var_os("PATH").as_deref(), &dir));
                     let started = match program {
-                        Some(program) => Tunnel::start(&program, &origin).await,
+                        Some(program) => Tunnel::start(&program, &origin, &|| bridge.locked().unwrap_or(true)).await,
                         None => Err("no cloudflared; `h0x-core bridge tunnel on` downloads it".into()),
                     };
                     match started {
@@ -378,7 +451,10 @@ pub async fn manage(bridge: Bridge, origin: String, first: Option<u64>) {
 pub fn ask(bridge: &Bridge, minutes: Option<u64>) -> Result<(Value, String), RpcError> {
     let (request, status) = (bridge.dir.join(REQUEST), bridge.dir.join(STATUS));
     let _ = std::fs::remove_file(&status);
-    bridge.write_private(REQUEST, json!({"minutes": minutes}).to_string().as_bytes())?;
+    bridge.write_private(
+        REQUEST,
+        json!({"minutes": minutes, "at_ms": crate::runtime::now_ms()}).to_string().as_bytes(),
+    )?;
     let started = std::time::Instant::now();
     while request.exists() {
         if started.elapsed() > TAKEN_WAIT {
@@ -601,28 +677,29 @@ mod tests {
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         runtime.block_on(async {
             let up = fake(&at("up"), "INF |  https://fake-tunnel-words.trycloudflare.com  |", true);
-            let mut tunnel = Tunnel::start(&up, "127.0.0.1:9").await.unwrap();
+            let mut tunnel = Tunnel::start(&up, "127.0.0.1:9", &|| false).await.unwrap();
             assert_eq!(tunnel.host, "fake-tunnel-words.trycloudflare.com");
             assert_eq!(host().as_deref(), Some("fake-tunnel-words.trycloudflare.com"), "on the allow-list");
             assert!(!tunnel.exited(), "still running");
             tokio::time::timeout(Duration::from_secs(10), tunnel.stop()).await.expect("killed and reaped");
             assert_eq!(host(), None, "off the allow-list");
 
-            let dropped = Tunnel::start(&up, "127.0.0.1:9").await.unwrap();
+            let dropped = Tunnel::start(&up, "127.0.0.1:9", &|| false).await.unwrap();
             assert!(host().is_some());
             drop(dropped);
             assert_eq!(host(), None, "dropped: off the allow-list too");
 
             let quiet = fake(&at("quiet"), "INF |  http://not-https.trycloudflare.com  |", false);
-            let err = Tunnel::start(&quiet, "127.0.0.1:9").await.err().unwrap();
+            let err = Tunnel::start(&quiet, "127.0.0.1:9", &|| false).await.err().unwrap();
             assert!(err.contains("no tunnel address"), "{err}");
             assert_eq!(host(), None, "nothing listed for a refused address");
 
-            let missing = Tunnel::start(&dir.join("no-such-cloudflared"), "127.0.0.1:9").await.err().unwrap();
+            let missing =
+                Tunnel::start(&dir.join("no-such-cloudflared"), "127.0.0.1:9", &|| false).await.err().unwrap();
             assert!(missing.contains("cannot start"), "{missing}");
 
             let short = fake(&at("short"), "|  https://short-lived.trycloudflare.com  |", false);
-            let mut ended = Tunnel::start(&short, "127.0.0.1:9").await.unwrap();
+            let mut ended = Tunnel::start(&short, "127.0.0.1:9", &|| false).await.unwrap();
             let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
             while !ended.exited() {
                 assert!(tokio::time::Instant::now() < deadline, "cloudflared ended but it was not noticed");
@@ -634,22 +711,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A request file as `ask` writes it, made at `at` ms.
+    fn put_at(bridge: &Bridge, minutes: &str, at: u64) {
+        bridge.write_private(REQUEST, format!(r#"{{"minutes": {minutes}, "at_ms": {at}}}"#).as_bytes()).unwrap();
+    }
+
+    fn put(bridge: &Bridge, minutes: &str) {
+        put_at(bridge, minutes, crate::runtime::now_ms());
+    }
+
     #[test]
     fn requests_are_taken_once_and_bad_ones_dropped() {
         let bridge = crate::bridge::scratch();
-        assert_eq!(take(&bridge), None, "nothing asked");
+        let now = crate::runtime::now_ms();
+        assert_eq!(take(&bridge, now), None, "nothing asked");
+        put_at(&bridge, "30", now);
+        assert_eq!(take(&bridge, now), Some(Some(30)));
+        assert_eq!(take(&bridge, now), None, "taken once");
+        put_at(&bridge, "null", now);
+        assert_eq!(take(&bridge, now), Some(None), "off");
+        put_at(&bridge, "1", now);
+        assert_eq!(take(&bridge, now), Some(Some(1)), "a minute is the least");
+        put_at(&bridge, &MAX_MINUTES.to_string(), now);
+        assert_eq!(take(&bridge, now), Some(Some(MAX_MINUTES)), "a day is the most");
+        for bad in ["0", "1441", "99999999", "-1", "1.5", r#""30""#, "true", "[]"] {
+            put_at(&bridge, bad, now);
+            assert_eq!(take(&bridge, now), None, "{bad}: refused, not clamped");
+            assert!(!bridge.dir.join(REQUEST).exists(), "{bad}: and not left behind");
+        }
+        bridge.write_private(REQUEST, format!(r#"{{"at_ms": {now}}}"#).as_bytes()).unwrap();
+        assert_eq!(take(&bridge, now), None, "no minutes at all is not an off");
         bridge.write_private(REQUEST, br#"{"minutes": 30}"#).unwrap();
-        assert_eq!(take(&bridge), Some(Some(30)));
-        assert_eq!(take(&bridge), None, "taken once");
-        bridge.write_private(REQUEST, br#"{"minutes": null}"#).unwrap();
-        assert_eq!(take(&bridge), Some(None), "off");
-        bridge.write_private(REQUEST, br#"{"minutes": 0}"#).unwrap();
-        assert_eq!(take(&bridge), Some(Some(1)), "at least a minute");
-        bridge.write_private(REQUEST, br#"{"minutes": 99999999}"#).unwrap();
-        assert_eq!(take(&bridge), Some(Some(MAX_MINUTES)), "at most a day");
+        assert_eq!(take(&bridge, now), None, "undated");
         bridge.write_private(REQUEST, b"garbage").unwrap();
-        assert_eq!(take(&bridge), None, "unreadable: dropped");
+        assert_eq!(take(&bridge, now), None, "unreadable: dropped");
         assert!(!bridge.dir.join(REQUEST).exists());
+        let _ = std::fs::remove_dir_all(&bridge.dir);
+    }
+
+    #[test]
+    fn an_old_request_is_ignored_and_a_fresh_one_taken() {
+        let bridge = crate::bridge::scratch();
+        let now = 1_000_000_000;
+        for (at, taken) in [
+            (now, true),
+            (now - REQUEST_TTL_MS, true),
+            (now - REQUEST_TTL_MS - 1, false),
+            (now + REQUEST_TTL_MS, true),
+            (now + REQUEST_TTL_MS + 1, false),
+            (0, false),
+            (u64::MAX, false),
+        ] {
+            put_at(&bridge, "30", at);
+            assert_eq!(take(&bridge, now).is_some(), taken, "made at {at}, now {now}");
+            assert!(!bridge.dir.join(REQUEST).exists(), "gone either way");
+        }
+        let _ = std::fs::remove_dir_all(&bridge.dir);
+    }
+
+    #[test]
+    fn a_request_left_before_the_panel_started_is_never_acted_on() {
+        // Locked, so an acted-on request would leave an error in tunnel.json,
+        // not start the cloudflared that may be on this machine's PATH.
+        let bridge = crate::bridge::scratch();
+        bridge.set_locked(true).unwrap();
+        put(&bridge, "30");
+        let panel = Bridge::at(bridge.dir.clone(), crate::config::BridgeConfig::default());
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
+        runtime.block_on(async {
+            let _ = tokio::time::timeout(Duration::from_secs(3), manage(panel, "127.0.0.1:9".into(), None)).await;
+        });
+        assert!(!bridge.dir.join(REQUEST).exists(), "deleted at start");
+        assert!(!bridge.dir.join(STATUS).exists(), "and not answered: nobody asked this panel");
+        drop(runtime);
         let _ = std::fs::remove_dir_all(&bridge.dir);
     }
 
@@ -820,6 +954,7 @@ mod tests {
         let nowhere = dir.join("no such folder");
         assert!(install(&part, "cloudflared-linux-amd64", &sum, &nowhere).is_err(), "a folder it cannot write to");
         assert!(!nowhere.join(exe_name()).exists());
+        assert!(!part.exists(), "the download is gone on every failure");
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -831,7 +966,7 @@ mod tests {
         let silent = fake(&dir, "INF Requesting new quick Tunnel on trycloudflare.com...", cfg!(unix));
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
         let real = std::time::Instant::now();
-        let err = runtime.block_on(Tunnel::start(&silent, "127.0.0.1:9")).err().unwrap();
+        let err = runtime.block_on(Tunnel::start(&silent, "127.0.0.1:9", &|| false)).err().unwrap();
         assert!(err.contains("no tunnel address"), "{err}");
         assert!(real.elapsed() < Duration::from_secs(20), "the 45 s wait is the clock's, not cloudflared ending");
         drop(runtime);
@@ -843,25 +978,32 @@ mod tests {
         let bridge = crate::bridge::scratch();
         let panel = || Bridge::at(bridge.dir.clone(), crate::config::BridgeConfig::default());
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
-        let run = |first: Option<u64>| {
+        // `asked` is written by a client once the panel is running.
+        let run = |first: Option<u64>, asked: Option<String>| {
             runtime.block_on(async {
-                let _ =
-                    tokio::time::timeout(Duration::from_secs(3), manage(panel(), "127.0.0.1:9".into(), first)).await;
+                let client = async {
+                    if let Some(asked) = asked {
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        bridge.write_private(REQUEST, asked.as_bytes()).unwrap();
+                    }
+                };
+                let panel = tokio::time::timeout(Duration::from_secs(3), manage(panel(), "127.0.0.1:9".into(), first));
+                let _ = tokio::join!(panel, client);
             })
         };
+        let asking = |minutes: &str| format!(r#"{{"minutes": {minutes}, "at_ms": {}}}"#, crate::runtime::now_ms());
         let status =
             || std::fs::read(bridge.dir.join(STATUS)).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
 
         bridge.set_locked(true).unwrap();
         bridge.write_private(STATUS, br#"{"url": "https://stale.trycloudflare.com/"}"#).unwrap();
-        run(Some(5));
+        run(Some(5), None);
         let refused = status().expect("an answer");
         assert!(refused["error"].as_str().is_some_and(|e| e.contains("locked")), "{refused}");
         assert_eq!(refused["url"], Value::Null, "the stale answer is gone");
 
-        bridge.write_private(REQUEST, br#"{"minutes": 30}"#).unwrap();
         bridge.write_private(STATUS, b"{}").unwrap();
-        run(None);
+        run(None, Some(asking("30")));
         assert!(!bridge.dir.join(REQUEST).exists(), "taken");
         assert!(
             status().is_some_and(|s| s["error"].as_str().is_some_and(|e| e.contains("locked"))),
@@ -869,13 +1011,11 @@ mod tests {
         );
 
         bridge.set_locked(false).unwrap();
-        bridge.write_private(REQUEST, br#"{"minutes": null}"#).unwrap();
         bridge.write_private(STATUS, b"{}").unwrap();
-        run(None);
+        run(None, Some(asking("null")));
         assert!(!bridge.dir.join(REQUEST).exists() && !bridge.dir.join(STATUS).exists(), "off with no tunnel: quiet");
 
-        bridge.write_private(REQUEST, b"{\"minutes\": 3").unwrap();
-        run(None);
+        run(None, Some("{\"minutes\": 3".into()));
         assert!(!bridge.dir.join(REQUEST).exists(), "corrupt: dropped");
         assert!(!bridge.dir.join(STATUS).exists(), "and nothing started or answered");
         drop(runtime);
@@ -893,6 +1033,7 @@ mod tests {
                 let _ = tokio::time::timeout(Duration::from_secs(8), manage(panel, "127.0.0.1:9".into(), None)).await;
             });
         });
+        std::thread::sleep(Duration::from_millis(700));
         let err = ask(&bridge, Some(MAX_MINUTES)).unwrap_err();
         assert!(err.message.contains("locked"), "{}", err.message);
         let (json, human) = ask(&bridge, None).unwrap();
@@ -901,5 +1042,70 @@ mod tests {
         assert!(!bridge.dir.join(REQUEST).exists());
         running.join().unwrap();
         let _ = std::fs::remove_dir_all(&bridge.dir);
+    }
+
+    #[test]
+    fn urls_in_error_and_warning_lines_or_outside_the_box_are_never_the_tunnel() {
+        let url = "https://evil-words.trycloudflare.com";
+        for line in [
+            format!("2026-11-06T10:00:02Z ERR Error unmarshaling QuickTunnel response: url=\"{url}\""),
+            format!("2026-11-06T10:00:02Z ERR |  {url}  |"),
+            format!("2026-11-06T10:00:02Z WRN |  {url}  |"),
+            format!("2026-11-06T10:00:02Z FTL |  {url}  |"),
+            format!("\u{1b}[31mERR\u{1b}[0m |  {url}  |"),
+            format!("2026-11-06T10:00:02Z INF Visit {url} now"),
+            format!("2026-11-06T10:00:02Z INF {url}"),
+            url.to_string(),
+        ] {
+            assert_eq!(host_in(&line), None, "{line:?}");
+        }
+        assert_eq!(host_in(&format!("2026-11-06T10:00:03Z INF |  {url}  |")), Some("evil-words.trycloudflare.com"));
+    }
+
+    #[test]
+    fn empty_and_relative_path_entries_are_never_searched() {
+        let rel = PathBuf::from(format!("tunnel-test-rel-{}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&rel).unwrap();
+        std::fs::write(rel.join(exe_name()), "").unwrap();
+        let install = scratch("norel");
+        let sep = if std::env::consts::OS == "windows" { ";" } else { ":" };
+        for path in [
+            format!("{}", rel.display()),
+            format!("{sep}{}{sep}", rel.display()),
+            format!("./{}", rel.display()),
+            String::new(),
+            ".".into(),
+        ] {
+            assert_eq!(find(Some(std::ffi::OsStr::new(&path)), &install), None, "{path:?}");
+        }
+        let _ = std::fs::remove_dir_all(&rel);
+        let _ = std::fs::remove_dir_all(install);
+    }
+
+    #[test]
+    fn a_lock_during_start_up_kills_cloudflared_and_lists_no_host() {
+        let dir = scratch("lockstart");
+        let at = |name: &str| {
+            let sub = dir.join(name);
+            std::fs::create_dir_all(&sub).unwrap();
+            sub
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            // Silent so far, then locked: given up on well before the 45 s.
+            let slow = fake(&at("slow"), "INF Requesting new quick Tunnel on trycloudflare.com...", true);
+            let started = std::time::Instant::now();
+            let err = Tunnel::start(&slow, "127.0.0.1:9", &|| true).await.err().unwrap();
+            assert!(err.contains("locked"), "{err}");
+            assert!(started.elapsed() < Duration::from_secs(20), "not after the 45 s wait");
+            assert_eq!(host(), None);
+
+            // Its address arrives at the same time as the lock: still refused.
+            let quick = fake(&at("quick"), "INF |  https://too-late.trycloudflare.com  |", true);
+            let err = Tunnel::start(&quick, "127.0.0.1:9", &|| true).await.err().unwrap();
+            assert!(err.contains("locked"), "{err}");
+            assert_eq!(host(), None, "nothing listed");
+        });
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
