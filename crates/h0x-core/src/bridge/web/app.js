@@ -17,7 +17,12 @@ const store = {
 };
 
 let session = store.get();
-let pairCode = new URLSearchParams(location.hash.slice(1)).get('pair');
+// One shape for a pairing code, from the link or typed: trimmed, upper-case,
+// cut at anything that can't belong to it. '' means no code.
+function cleanCode(raw) {
+  return String(raw || '').trim().split(/[#&\s]/)[0].toUpperCase();
+}
+let pairCode = cleanCode(new URLSearchParams(location.hash.slice(1)).get('pair'));
 // The one-time code leaves the address bar (and the history) at once.
 if (location.hash) history.replaceState(null, '', location.pathname + location.search);
 
@@ -424,7 +429,7 @@ $('list').addEventListener('touchend', () => {
 // $('pair-form'): a code typed from `h0x-core bridge pair --transport web`.
 $('pair-form').addEventListener('submit', (e) => {
   e.preventDefault();
-  const code = $('pair-code').value.trim();
+  const code = cleanCode($('pair-code').value);
   if (!code) return;
   $('pair-code').value = '';
   pairCode = code;
@@ -438,7 +443,8 @@ const wake = () => { if (!ws && session && !document.hidden) { retries = 0; conn
 document.addEventListener('visibilitychange', wake);
 window.addEventListener('online', wake);
 
-const local = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
+const host = location.hostname.toLowerCase();
+const local = /^127(\.\d{1,3}){3}$/.test(host) || host === 'localhost' || host === 'localhost.' || host === '[::1]';
 $('insecure').hidden = location.protocol !== 'http:' || local;
 alertsButton();
 pill('Connecting', 'wait');

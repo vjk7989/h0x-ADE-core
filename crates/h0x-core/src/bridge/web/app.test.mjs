@@ -172,11 +172,16 @@ test('the pair fragment parses empty, padded, very long and mixed fragments', ()
   for (const [hash, token] of [
     ['#pair=AB&x=1', 'AB'],
     ['#x=1&pair=AB', 'AB'],
-    ['#pair=%20AB%20', ' AB '],
+    ['#pair=%20AB%20', 'AB'],
+    ['#pair=abcd2345', 'ABCD2345'],
+    ['#pair=ab%20cd', 'AB'],
+    ['#pair=ab%23cd', 'AB'],
+    ['#pair=%20%20', null],
     [`#pair=${long}`, long],
   ]) {
     const w = load({ href: `http://192.168.1.20:8377/${hash}` });
     assert.deepEqual(w.history, [['replace', null, '', '/']], hash);
+    if (token === null) { assert.equal(w.sockets.length, 0, hash); continue; }
     w.ws().open();
     assert.deepEqual(w.ws().sent[0].data.token, token, hash);
   }
@@ -223,11 +228,25 @@ test('a typed code is trimmed and an empty one is ignored', () => {
   w.$('pair-code').value = '   ';
   w.$('pair-form').fire('submit');
   assert.equal(w.sockets.length, 0);
-  w.$('pair-code').value = '  ABCD2345 ';
+  w.$('pair-code').value = '  abcd2345 ';
   w.$('pair-form').fire('submit');
   w.ws().open();
   assert.equal(w.ws().sent[0].data.token, 'ABCD2345');
   assert.equal(w.$('pair-code').value, '');
+});
+
+test('a typed code is cut like one from the link', () => {
+  for (const typed of ['abcd2345#x', 'ABCD2345&pair=1', 'abcd2345 extra', '\tabcd2345\n']) {
+    const w = load();
+    w.$('pair-code').value = typed;
+    w.$('pair-form').fire('submit');
+    w.ws().open();
+    assert.equal(w.ws().sent[0].data.token, 'ABCD2345', JSON.stringify(typed));
+  }
+  const none = load();
+  none.$('pair-code').value = '#x';
+  none.$('pair-form').fire('submit');
+  assert.equal(none.sockets.length, 0, 'nothing left of the code');
 });
 
 test('a localStorage that throws still pairs and reconnects within the tab', () => {
@@ -425,6 +444,12 @@ test('the plain-http banner shows off localhost only, the tunnel banner on reque
     ['http://localhost:8377/', true],
     ['http://127.0.0.1:8377/', true],
     ['http://[::1]:8377/', true],
+    ['http://127.1.2.3:8377/', true],
+    ['http://LocalHost:8377/', true],
+    ['http://localhost.:8377/', true],
+    ['http://127.0.0.1.example.com:8377/', false],
+    ['http://localhost.example.com:8377/', false],
+    ['http://128.0.0.1:8377/', false],
     ['http://192.168.1.20:8377/', false],
     ['http://100.64.0.5:8377/', false],
     ['https://192.168.1.20:8377/', true],
