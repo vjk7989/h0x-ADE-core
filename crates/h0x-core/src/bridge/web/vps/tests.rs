@@ -297,3 +297,175 @@ fn an_ssh_that_ends_is_restarted_with_backoff_and_a_missing_one_is_survived() {
     missing.stop();
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn public_host_length_and_label_boundaries() {
+    let label = |c: &str, n: usize| c.repeat(n);
+    let exact = format!("{}.{}.{}.{}", label("a", 63), label("b", 63), label("c", 63), label("d", 61));
+    assert_eq!(exact.len(), 253);
+    assert_eq!(host(&exact).unwrap(), exact, "exactly 253 characters");
+    let over = format!("{}.{}.{}.{}", label("a", 63), label("b", 63), label("c", 63), label("d", 62));
+    assert_eq!(over.len(), 254);
+    assert!(host(&over).is_err(), "254 characters");
+    assert!(host(&format!("{}.com", label("A", 64))).is_err(), "a 64-char label, uppercase too");
+    assert_eq!(host("a.bc").unwrap(), "a.bc", "one-char label");
+    assert_eq!(host("123.example.com").unwrap(), "123.example.com", "a numeric label that is not the last");
+    assert_eq!(host("example.c0m").unwrap(), "example.c0m", "a TLD with a digit is not an IP");
+    assert_eq!(host("XN--BCHER-KVA.Example").unwrap(), "xn--bcher-kva.example", "punycode is lowercased");
+    for bad in [".", "com.", "a.-", "a.b-", "example.123", "[2001:db8::1]", "[::1]:443", "a.b\t", "ex\u{0}.com"] {
+        assert!(host(bad).is_err(), "{bad:?} must be refused");
+    }
+}
+
+#[test]
+fn argv_is_exactly_the_forced_options_one_loopback_forward_and_the_target() {
+    let expected = [
+        "-N",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ForwardAgent=no",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPath=none",
+        "-R",
+        "127.0.0.1:65535:127.0.0.1:1",
+        "--",
+        "ssh://me@vps.example.com:2222",
+    ];
+    assert_eq!(argv("ssh://me@vps.example.com:2222", 65535, 1), expected, "port bounds and a URI target");
+    let spaced = argv("me@my vps", 1024, 8377);
+    assert_eq!(spaced.last().map(String::as_str), Some("me@my vps"), "one argument, not split");
+    assert_eq!(spaced.iter().filter(|a| *a == "-R").count(), 1, "one forward only");
+}
+
+#[test]
+fn plan_edges_uri_target_case_and_unreadable_machines() {
+    let json = format!(
+        "[{},{}]",
+        machine("vps", "ssh://me@vps.example.com:2222", false),
+        machine("spaced", "me@my vps", false)
+    );
+    let (paths, dir) = scratch_paths(&json);
+    let ok = plan(&paths, "vps", "h0x.example.com", 65535).unwrap();
+    assert_eq!(ok.target, "ssh://me@vps.example.com:2222");
+    assert_eq!(ok.remote_port, 65535);
+    assert_eq!(plan(&paths, "VPS", "h0x.example.com", 8377).unwrap_err().kind, "machine_unknown", "names are exact");
+    assert_eq!(plan(&paths, "", "h0x.example.com", 8377).unwrap_err().kind, "machine_unknown", "empty name");
+    assert!(plan(&paths, "spaced", "h0x.example.com", 8377).is_err(), "a target with a space");
+    assert!(plan(&paths, "vps", "h0x.example.com", 1023).is_err());
+    assert!(plan(&paths, "vps", "h0x.example.com", 0).is_err());
+    assert!(plan(&paths, "vps", "", 8377).is_err(), "empty public host");
+    std::fs::remove_dir_all(dir).unwrap();
+
+    let (paths, dir) = scratch_paths("not json");
+    assert_eq!(plan(&paths, "vps", "h0x.example.com", 8377).unwrap_err().kind, "internal", "corrupt machines.json");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn origin_rewrite_is_strict_about_scheme_shape_and_list() {
+    let hosts = with_public(vec!["127.0.0.1:8377".into(), "localhost:8377".into()], Some("h0x.example.com"));
+    let check = |origin: &str| {
+        let mut req = request(origin);
+        https_origin_as_http(&mut req, &hosts);
+        super::super::http::allowed(&req, &hosts)
+    };
+    assert_eq!(check("HTTPS://h0x.example.com"), Err(403), "an uppercase scheme is not rewritten");
+    assert_eq!(check("https://h0x.example.com/"), Err(403), "a trailing slash");
+    assert_eq!(check("https://"), Err(403), "empty host");
+    assert_eq!(check("https://localhost"), Err(403), "port-less form of a host listed with a port");
+    assert_eq!(check("https://localhost:8377"), Err(403), "a listed host with a port stays http-only");
+    assert_eq!(check("https://user@h0x.example.com"), Err(403), "userinfo");
+
+    // Without --via there is no port-less entry, so nothing https is ever accepted.
+    let local = with_public(vec!["127.0.0.1:8377".into()], None);
+    let mut req = request("https://127.0.0.1:8377");
+    req.headers[0].1 = "127.0.0.1:8377".into();
+    https_origin_as_http(&mut req, &local);
+    assert_eq!(req.headers[1].1, "https://127.0.0.1:8377", "left as it was");
+    assert_eq!(super::super::http::allowed(&req, &local), Err(403));
+
+    // Only the origin header is touched.
+    let mut req = request("https://h0x.example.com");
+    req.headers.push(("referer".into(), "https://h0x.example.com".into()));
+    https_origin_as_http(&mut req, &hosts);
+    assert_eq!(req.headers[1].1, "http://h0x.example.com");
+    assert_eq!(req.headers[2].1, "https://h0x.example.com", "other headers stay");
+}
+
+/// An ssh that cannot be started; each try is noted in `log`.
+fn missing(log: PathBuf) -> impl Fn() -> Command + Send + 'static {
+    move || {
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&log).unwrap();
+        std::io::Write::write_all(&mut file, b"x").unwrap();
+        Command::new(r"C:\no\such\dir\ssh.exe")
+    }
+}
+
+#[test]
+fn a_lock_while_backing_off_holds_the_restart_until_unlock() {
+    let dir = std::env::temp_dir().join(format!("h0x-vps-lockoff-{}", crate::platform::random_hex()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("starts");
+    let locked = Arc::new(AtomicBool::new(false));
+    let flag = locked.clone();
+    let tunnel = Tunnel::start(missing(log.clone()), move || flag.load(Ordering::SeqCst), Duration::from_millis(10));
+    wait_for("first try", || starts(&log) == 1);
+    // Now in the 1 s backoff after the failed start.
+    locked.store(true, Ordering::SeqCst);
+    std::thread::sleep(Duration::from_millis(1600));
+    assert_eq!(starts(&log), 1, "the backoff ended while locked: no try");
+    locked.store(false, Ordering::SeqCst);
+    wait_for("a try after unlock", || starts(&log) == 2);
+    tunnel.stop();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn stop_during_a_backoff_returns_without_waiting_it_out() {
+    let dir = std::env::temp_dir().join(format!("h0x-vps-stopoff-{}", crate::platform::random_hex()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("starts");
+    let tunnel = Tunnel::start(missing(log.clone()), || false, Duration::from_millis(10));
+    wait_for("second try", || starts(&log) == 2);
+    // Now in the 2 s backoff.
+    let began = Instant::now();
+    tunnel.stop();
+    assert!(began.elapsed() < Duration::from_secs(1), "stop took {:?}", began.elapsed());
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(starts(&log), 2, "no try after stop");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn locked_from_the_start_never_runs_ssh() {
+    let dir = std::env::temp_dir().join(format!("h0x-vps-locked-{}", crate::platform::random_hex()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("starts");
+    let tunnel = Tunnel::start(fake(log.clone()), || true, Duration::from_millis(10));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(starts(&log), 0);
+    tunnel.stop();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn dropping_the_tunnel_kills_a_running_ssh() {
+    let dir = std::env::temp_dir().join(format!("h0x-vps-drop-{}", crate::platform::random_hex()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("starts");
+    let tunnel = Tunnel::start(fake(log.clone()), || false, Duration::from_millis(20));
+    wait_for("first start", || starts(&log) == 1);
+    let began = Instant::now();
+    drop(tunnel);
+    assert!(began.elapsed() < Duration::from_secs(10), "drop kills the 60 s ssh, not waits for it");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(starts(&log), 1, "nothing starts after drop");
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -226,4 +226,35 @@ mod tests {
         );
         assert_eq!(super::ago(0, 5_000), "0s ago", "a clock that went back");
     }
+
+    #[test]
+    fn web_via_needs_a_public_host_and_excludes_lan() {
+        use super::{BridgeCmd, Cli, Cmd};
+        use clap::Parser;
+        let parse = |args: &[&str]| Cli::try_parse_from([&["h0x-core", "bridge", "web"], args].concat());
+        for args in [
+            &["--via", "vps"][..],
+            &["--public-host", "h0x.example.com"],
+            &["--remote-port", "9000"],
+            &["--public-host", "h0x.example.com", "--remote-port", "9000"],
+            &["--via", "vps", "--public-host", "h0x.example.com", "--lan"],
+            &["--via", "vps", "--public-host", "h0x.example.com", "--remote-port", "65536"],
+            &["--via", "vps", "--public-host", "h0x.example.com", "--remote-port", "-1"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?} must be refused");
+        }
+        let Some(Cmd::Bridge { action: BridgeCmd::Web { lan, via, public_host, remote_port, .. } }) =
+            parse(&["--via", "vps", "--public-host", "h0x.example.com"]).unwrap().cmd
+        else {
+            panic!("bridge web")
+        };
+        assert!(!lan);
+        assert_eq!((via.as_deref(), public_host.as_deref()), (Some("vps"), Some("h0x.example.com")));
+        assert_eq!(remote_port, crate::bridge::web::PORT, "default remote port");
+        let Some(Cmd::Bridge { action: BridgeCmd::Web { via, remote_port, .. } }) = parse(&[]).unwrap().cmd else {
+            panic!("bridge web")
+        };
+        assert_eq!(via, None, "plain bridge web still parses");
+        assert_eq!(remote_port, crate::bridge::web::PORT);
+    }
 }
