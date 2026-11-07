@@ -680,4 +680,226 @@ mod tests {
         assert!(!announce(&locked).contains("#pair="));
         let _ = std::fs::remove_dir_all(&bridge.dir);
     }
+
+    #[test]
+    fn the_first_valid_address_wins_and_quoted_or_coloured_noise_is_handled() {
+        assert_eq!(
+            host_in(
+                "| https://x_y.trycloudflare.com https://good-one.trycloudflare.com https://second.trycloudflare.com |"
+            ),
+            Some("good-one.trycloudflare.com"),
+            "the first valid one, not the first url"
+        );
+        let found: Vec<_> = [
+            "INF Requesting new quick Tunnel on trycloudflare.com...",
+            r#"2026-11-06T10:00:02Z ERR Error unmarshaling QuickTunnel response: error="Post \"https://api.trycloudflare.com/tunnel\": dial tcp: i/o timeout""#,
+            "INF |  https://first-words.trycloudflare.com  |",
+            "INF |  https://later-words.trycloudflare.com  |",
+        ]
+        .into_iter()
+        .filter_map(host_in)
+        .collect();
+        assert_eq!(found.first(), Some(&"first-words.trycloudflare.com"), "the quoted api url in an error is not one");
+        assert_eq!(
+            host_in(
+                "\u{1b}[90m2026-11-06T10:00:03Z\u{1b}[0m \u{1b}[32mINF\u{1b}[0m |  https://coloured-words.trycloudflare.com  |"
+            ),
+            Some("coloured-words.trycloudflare.com"),
+            "colour codes around, not touching"
+        );
+        let tight = host_in("\u{1b}[36mhttps://tight-words.trycloudflare.com\u{1b}[0m");
+        assert!(
+            matches!(tight, None | Some("tight-words.trycloudflare.com")),
+            "never a host with an escape in it: {tight:?}"
+        );
+        assert_eq!(host_in("|  https://crlf-words.trycloudflare.com  |\r"), Some("crlf-words.trycloudflare.com"));
+        assert_eq!(host_in("https://half-a-line.trycloud"), None, "a line cut short is not an address");
+    }
+
+    #[test]
+    fn labels_at_their_edges_and_look_alikes() {
+        assert_eq!(host_of("https://a.trycloudflare.com"), Some("a.trycloudflare.com"), "one character is enough");
+        assert_eq!(host_of("https://0-9.trycloudflare.com"), Some("0-9.trycloudflare.com"));
+        let longest = format!("a{}a", "-".repeat(61));
+        assert_eq!(host_of(&format!("https://{longest}.trycloudflare.com/")).map(str::len), Some(63 + 18));
+        for bad in [
+            "https://x.trycloudflare.com.",
+            "https://x.trycloudflare.com./",
+            "https://x.trycloudflare.com//",
+            "https://x.trycloudflare.com ",
+            "https://x-.trycloudflare.com",
+            "https://abC.trycloudflare.com",
+            "https://x.Trycloudflare.com",
+            "https://\u{430}bc.trycloudflare.com",
+            "https://x\u{ff0e}trycloudflare.com",
+            "https://x.trycloudflare\u{2024}com",
+            "https://x\u{200b}.trycloudflare.com",
+            "https://é.trycloudflare.com",
+            "https:/x.trycloudflare.com",
+            "https://",
+        ] {
+            assert_eq!(host_of(bad), None, "{bad:?}");
+        }
+        assert_eq!(
+            host_of(&format!("https://{}.trycloudflare.com", "\u{e9}".repeat(31))),
+            None,
+            "62 bytes but not ascii"
+        );
+    }
+
+    #[test]
+    fn odd_hosts_and_origins_are_not_let_through_the_tunnel() {
+        let t = Some("abc.trycloudflare.com");
+        let through = |text: &str| through(&req(text), t);
+        for not_it in [
+            "GET / HTTP/1.1\nHost: abc.trycloudflare.com.",
+            "GET / HTTP/1.1\nHost: abc.trycloudflare.com:443",
+            "GET / HTTP/1.1\nHost: xabc.trycloudflare.com",
+        ] {
+            assert_eq!(through(not_it), Ok(false), "not the tunnel's host: the panel's own rules: {not_it:?}");
+        }
+        for bad in [
+            "GET / HTTP/1.1\nHost: abc.trycloudflare.com\nOrigin: https://abc.trycloudflare.com/",
+            "GET / HTTP/1.1\nHost: abc.trycloudflare.com\nOrigin: https://abc.trycloudflare.com:443",
+            "GET / HTTP/1.1\nHost: abc.trycloudflare.com\nOrigin: abc.trycloudflare.com",
+            "GET / HTTP/1.1\nHost: abc.trycloudflare.com\nOrigin: https://",
+        ] {
+            assert_eq!(through(bad), Err(403), "{bad:?}");
+        }
+        assert_eq!(
+            through("GET /ws HTTP/1.1\nHost: abc.trycloudflare.com\nUpgrade: websocket\nConnection: Upgrade"),
+            Ok(true),
+            "a tunnelled socket with no Origin (an app) is still the tunnel's"
+        );
+        assert_eq!(super::through(&req("GET / HTTP/1.1\nHost: abc.trycloudflare.com"), Some("")), Ok(false));
+    }
+
+    #[test]
+    fn empty_and_quoted_path_entries_still_find_cloudflared() {
+        let root = scratch("oddpath");
+        let (spaced, install) = (root.join("cloud flared (x86)"), root.join("core bin"));
+        std::fs::create_dir_all(&spaced).unwrap();
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::write(install.join(exe_name()), "").unwrap();
+        let (sep, quote) = if std::env::consts::OS == "windows" { (";", "\"") } else { (":", "") };
+        let path = std::ffi::OsString::from(format!("{sep}{sep}{quote}{}{quote}{sep}", spaced.display()));
+        assert_eq!(find(Some(&path), &install), Some(install.join(exe_name())), "nothing on PATH yet");
+        assert_eq!(find(Some(std::ffi::OsStr::new("")), &install), Some(install.join(exe_name())), "an empty PATH");
+        assert_eq!(find(Some(std::ffi::OsStr::new(sep)), &install), Some(install.join(exe_name())), "only a separator");
+        std::fs::write(spaced.join(exe_name()), "").unwrap();
+        assert_eq!(find(Some(&path), &install), Some(spaced.join(exe_name())), "{path:?}");
+        if std::env::consts::OS == "windows" {
+            std::fs::remove_file(spaced.join(exe_name())).unwrap();
+            std::fs::write(spaced.join("cloudflared"), "").unwrap();
+            assert_eq!(find(Some(&path), &install), Some(install.join(exe_name())), "no .exe: not it on Windows");
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_partial_or_missing_download_is_refused_and_nothing_is_installed() {
+        let dir = scratch("partial");
+        let whole = b"#!/bin/sh\necho the whole cloudflared\n";
+        let sum = sha::hex(&sha::sha256(whole));
+        let part = dir.join("cloudflared-linux-amd64.part");
+        std::fs::write(&part, &whole[..whole.len() / 2]).unwrap();
+        let refused = install(&part, "cloudflared-linux-amd64", &sum, &dir).unwrap_err();
+        assert!(refused.contains("SHA-256"), "{refused}");
+        assert!(!part.exists() && !dir.join(exe_name()).exists(), "half a download is deleted, not installed");
+
+        let missing = install(&part, "cloudflared-linux-amd64", &sum, &dir).unwrap_err();
+        assert!(missing.contains("cloudflared-linux-amd64.part"), "{missing}");
+
+        let tgz = dir.join("cloudflared-darwin-arm64.tgz.part");
+        std::fs::write(&tgz, b"not a tarball").unwrap();
+        let (_, pinned) = asset("macos", "aarch64").unwrap();
+        assert!(install(&tgz, "cloudflared-darwin-arm64.tgz", pinned, &dir).is_err());
+        assert!(!tgz.exists() && !dir.join(exe_name()).exists(), "refused before it is unpacked");
+
+        std::fs::write(&part, whole).unwrap();
+        let nowhere = dir.join("no such folder");
+        assert!(install(&part, "cloudflared-linux-amd64", &sum, &nowhere).is_err(), "a folder it cannot write to");
+        assert!(!nowhere.join(exe_name()).exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cloudflared_that_never_prints_an_address_gives_up_after_45_seconds() {
+        let dir = scratch("silent");
+        // Windows child pipes are read on tokio's blocking pool, which holds a
+        // paused clock still: there the fake ends at once (the no-URL path).
+        let silent = fake(&dir, "INF Requesting new quick Tunnel on trycloudflare.com...", cfg!(unix));
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
+        let real = std::time::Instant::now();
+        let err = runtime.block_on(Tunnel::start(&silent, "127.0.0.1:9")).err().unwrap();
+        assert!(err.contains("no tunnel address"), "{err}");
+        assert!(real.elapsed() < Duration::from_secs(20), "the 45 s wait is the clock's, not cloudflared ending");
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_panel_refuses_a_tunnel_while_locked_and_clears_stale_and_corrupt_files() {
+        let bridge = crate::bridge::scratch();
+        let panel = || Bridge::at(bridge.dir.clone(), crate::config::BridgeConfig::default());
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
+        let run = |first: Option<u64>| {
+            runtime.block_on(async {
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(3), manage(panel(), "127.0.0.1:9".into(), first)).await;
+            })
+        };
+        let status =
+            || std::fs::read(bridge.dir.join(STATUS)).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+
+        bridge.set_locked(true).unwrap();
+        bridge.write_private(STATUS, br#"{"url": "https://stale.trycloudflare.com/"}"#).unwrap();
+        run(Some(5));
+        let refused = status().expect("an answer");
+        assert!(refused["error"].as_str().is_some_and(|e| e.contains("locked")), "{refused}");
+        assert_eq!(refused["url"], Value::Null, "the stale answer is gone");
+
+        bridge.write_private(REQUEST, br#"{"minutes": 30}"#).unwrap();
+        bridge.write_private(STATUS, b"{}").unwrap();
+        run(None);
+        assert!(!bridge.dir.join(REQUEST).exists(), "taken");
+        assert!(
+            status().is_some_and(|s| s["error"].as_str().is_some_and(|e| e.contains("locked"))),
+            "`on` refused while locked"
+        );
+
+        bridge.set_locked(false).unwrap();
+        bridge.write_private(REQUEST, br#"{"minutes": null}"#).unwrap();
+        bridge.write_private(STATUS, b"{}").unwrap();
+        run(None);
+        assert!(!bridge.dir.join(REQUEST).exists() && !bridge.dir.join(STATUS).exists(), "off with no tunnel: quiet");
+
+        bridge.write_private(REQUEST, b"{\"minutes\": 3").unwrap();
+        run(None);
+        assert!(!bridge.dir.join(REQUEST).exists(), "corrupt: dropped");
+        assert!(!bridge.dir.join(STATUS).exists(), "and nothing started or answered");
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(&bridge.dir);
+    }
+
+    #[test]
+    fn asking_a_locked_panel_for_a_tunnel_fails_and_off_is_answered() {
+        let bridge = crate::bridge::scratch();
+        bridge.set_locked(true).unwrap();
+        let panel = Bridge::at(bridge.dir.clone(), crate::config::BridgeConfig::default());
+        let running = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async {
+                let _ = tokio::time::timeout(Duration::from_secs(8), manage(panel, "127.0.0.1:9".into(), None)).await;
+            });
+        });
+        let err = ask(&bridge, Some(MAX_MINUTES)).unwrap_err();
+        assert!(err.message.contains("locked"), "{}", err.message);
+        let (json, human) = ask(&bridge, None).unwrap();
+        assert_eq!(json, json!({"tunnel": false}));
+        assert_eq!(human, "tunnel off");
+        assert!(!bridge.dir.join(REQUEST).exists());
+        running.join().unwrap();
+        let _ = std::fs::remove_dir_all(&bridge.dir);
+    }
 }

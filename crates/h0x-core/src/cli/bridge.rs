@@ -278,4 +278,31 @@ mod tests {
         );
         assert_eq!(super::ago(0, 5_000), "0s ago", "a clock that went back");
     }
+
+    #[test]
+    fn tunnel_minutes_are_one_to_a_day_and_default_to_an_hour() {
+        use super::{BridgeCmd, TunnelCmd};
+        use clap::Parser;
+        let parse = |args: &[&str]| {
+            let cli = crate::cli::Cli::try_parse_from([&["h0x-core", "bridge"], args].concat()).ok()?;
+            match cli.cmd? {
+                crate::cli::Cmd::Bridge { action: BridgeCmd::Web { tunnel: true, how, .. } }
+                | crate::cli::Cmd::Bridge { action: BridgeCmd::Tunnel { action: TunnelCmd::On { how } } } => {
+                    Some((how.minutes, how.yes))
+                }
+                _ => None,
+            }
+        };
+        for on in [&["web", "--tunnel"][..], &["tunnel", "on"][..]] {
+            let with = |extra: &[&str]| parse(&[on, extra].concat());
+            assert_eq!(with(&[]), Some((60, false)), "{on:?}: an hour by default");
+            assert_eq!(with(&["--for", "1"]), Some((1, false)));
+            assert_eq!(with(&["--for", "1440", "--yes"]), Some((1440, true)));
+            for bad in ["0", "1441", "-1", "", "1.5", "60m", "18446744073709551616"] {
+                assert_eq!(with(&["--for", bad]), None, "{on:?} --for {bad:?}");
+            }
+        }
+        assert!(crate::cli::Cli::try_parse_from(["h0x-core", "bridge", "tunnel", "off", "--for", "5"]).is_err());
+        assert!(crate::cli::Cli::try_parse_from(["h0x-core", "bridge", "tunnel"]).is_err(), "on or off");
+    }
 }
