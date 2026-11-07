@@ -10,6 +10,7 @@
 
 mod http;
 mod sha;
+pub mod tunnel;
 
 use super::{Bridge, Command, Key, Kind, Notice, Reply, Sender};
 use crate::paths::Paths;
@@ -117,10 +118,12 @@ pub(crate) struct Web {
     notices: tokio::sync::broadcast::Sender<Notice>,
 }
 
-/// One connection's device, once it paired or authenticated.
+/// One connection's device, once it paired or authenticated, and whether it
+/// came through the Cloudflare tunnel.
 #[derive(Clone, Default)]
 struct Conn {
     device: Option<Sender>,
+    tunnel: bool,
 }
 
 /// What to send back for one message, and whether to hang up after.
@@ -194,9 +197,11 @@ impl Web {
     }
 
     /// The terminal list, right after a device comes in.
-    fn snapshot(&self, from: &Sender, now: u64) -> Value {
+    fn snapshot(&self, conn: &Conn, from: &Sender, now: u64) -> Value {
         match self.execute(from, Command::List, now) {
-            Reply::Done(text) => message("snapshot", json!({"lines": text.lines().collect::<Vec<_>>()})),
+            Reply::Done(text) => {
+                message("snapshot", json!({"lines": text.lines().collect::<Vec<_>>(), "tunnel": conn.tunnel}))
+            }
             other => message("reply", reply_json(&Value::Null, other)),
         }
     }
@@ -226,7 +231,7 @@ impl Web {
                 let close = reply == Reply::NotPaired;
                 Step { out: vec![message("reply", reply_json(id, reply))], close }
             }
-            "snapshot" => Step { out: vec![self.snapshot(&from, now)], close: false },
+            "snapshot" => Step { out: vec![self.snapshot(conn, &from, now)], close: false },
             _ => Step {
                 out: vec![message("error", json!({"message": format!("unknown message {name:?}")}))],
                 close: false,
@@ -255,7 +260,7 @@ impl Web {
         let from = Sender { transport: "web".into(), user_id: user };
         conn.device = Some(from.clone());
         let paired = message("paired", json!({"session": session, "device": me.label, "id": me.id}));
-        Step { out: vec![paired, self.snapshot(&from, now)], close: false }
+        Step { out: vec![paired, self.snapshot(conn, &from, now)], close: false }
     }
 
     fn auth(&self, conn: &mut Conn, data: &Value, now: u64) -> Step {
@@ -267,7 +272,8 @@ impl Web {
         };
         let from = Sender { transport: "web".into(), user_id: user };
         conn.device = Some(from.clone());
-        Step { out: vec![message("hello", Value::Null), self.snapshot(&from, now)], close: false }
+        let hello = message("hello", json!({"tunnel": conn.tunnel}));
+        Step { out: vec![hello, self.snapshot(conn, &from, now)], close: false }
     }
 
     /// A notice for this connection: only to a device that is still paired,
@@ -308,9 +314,13 @@ async fn connection(mut stream: tokio::net::TcpStream, web: Arc<Web>) {
         Ok(Err(status)) => return drop(stream.write_all(&http::error(status)).await),
         Err(_) => return drop(stream.write_all(&http::error(408)).await),
     };
-    let answer = http::parse(&buf[..end]).and_then(|req| http::allowed(&req, &web.hosts).map(|()| req));
-    let req = match answer {
-        Ok(req) => req,
+    let tunnel = tunnel::host();
+    let answer = http::parse(&buf[..end]).and_then(|req| match tunnel::through(&req, tunnel.as_deref())? {
+        true => Ok((req, true)),
+        false => http::allowed(&req, &web.hosts).map(|()| (req, false)),
+    });
+    let (req, via_tunnel) = match answer {
+        Ok(answer) => answer,
         Err(status) => return drop(stream.write_all(&http::error(status)).await),
     };
     let page = |body: &str, kind: &str| http::response(200, kind, body.as_bytes());
@@ -320,7 +330,7 @@ async fn connection(mut stream: tokio::net::TcpStream, web: Arc<Web>) {
         "/ws" => match http::upgrade(&req) {
             Ok(head) => {
                 if stream.write_all(&head).await.is_ok() {
-                    websocket(stream, buf.split_off(end + 4), web).await;
+                    websocket(stream, buf.split_off(end + 4), web, via_tunnel).await;
                 }
                 return;
             }
@@ -335,9 +345,9 @@ async fn send(wr: &mut tokio::net::tcp::OwnedWriteHalf, msg: &Value) -> bool {
     wr.write_all(&http::encode(1, msg.to_string().as_bytes())).await.is_ok()
 }
 
-async fn websocket(stream: tokio::net::TcpStream, mut buf: Vec<u8>, web: Arc<Web>) {
+async fn websocket(stream: tokio::net::TcpStream, mut buf: Vec<u8>, web: Arc<Web>, tunnel: bool) {
     let (mut rd, mut wr) = stream.into_split();
-    let mut conn = Conn::default();
+    let mut conn = Conn { tunnel, ..Conn::default() };
     let mut notices = web.notices.subscribe();
     let mut beat = tokio::time::interval(HEARTBEAT);
     let (opened, mut last) = (tokio::time::Instant::now(), tokio::time::Instant::now());
@@ -421,8 +431,10 @@ async fn serve(listener: tokio::net::TcpListener, web: Arc<Web>) {
     }
 }
 
-/// `h0x-core bridge web`: serves until the process is stopped.
-pub fn run(paths: &Paths, lan: bool, port: u16) -> Result<(), RpcError> {
+/// `h0x-core bridge web`: serves until the process is stopped (or Ctrl+C,
+/// which also ends a tunnel). `tunnel`: open a Cloudflare tunnel at once,
+/// for that many minutes.
+pub fn run(paths: &Paths, lan: bool, port: u16, tunnel: Option<u64>) -> Result<(), RpcError> {
     let failed = |e: String| RpcError::new("bridge", e, "see docs/bridge.md, Web panel");
     let ip = if lan { lan_address(outbound_ip()).map_err(failed)? } else { Ipv4Addr::LOCALHOST };
     let bridge = Bridge::open(paths)?;
@@ -433,6 +445,8 @@ pub fn run(paths: &Paths, lan: bool, port: u16) -> Result<(), RpcError> {
     println!("web panel: {base}/");
     if bridge.locked()? {
         println!("remote control is locked: no pairing until `h0x-core bridge unlock`");
+    } else if tunnel.is_some() {
+        println!("starting a Cloudflare tunnel; its pairing link follows");
     } else {
         let (code, _) = bridge.pair("web", crate::runtime::now_ms())?;
         let link = format!("{base}/#pair={code}");
@@ -462,13 +476,18 @@ pub fn run(paths: &Paths, lan: bool, port: u16) -> Result<(), RpcError> {
         let stream = crate::client::connect_or_start(&paths)?;
         crate::client::call(&stream, method, params).map_err(|e| crate::client::explain_closed(&paths, e))
     };
+    let manager = tunnel::manage(Bridge::open(paths)?, hosts[0].clone(), tunnel);
     let web = Arc::new(Web { bridge: Mutex::new(bridge), core: Box::new(core), hosts, notices });
     let runtime =
         tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| failed(e.to_string()))?;
     runtime.block_on(async {
         listener.set_nonblocking(true).map_err(|e| failed(e.to_string()))?;
         let listener = tokio::net::TcpListener::from_std(listener).map_err(|e| failed(e.to_string()))?;
-        serve(listener, web).await;
+        tokio::select! {
+            () = serve(listener, web) => {}
+            () = manager => {}
+            _ = tokio::signal::ctrl_c() => {}
+        }
         Ok(())
     })
 }

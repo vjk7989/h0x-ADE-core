@@ -1,9 +1,10 @@
-//! `h0x-core bridge pair|unpair|ls|lock|unlock|reset|log|telegram|run`: who
-//! may control this machine remotely, and the Telegram bot. Local files only,
-//! except `run`.
+//! `h0x-core bridge pair|unpair|ls|lock|unlock|reset|log|telegram|run|web|tunnel`:
+//! who may control this machine remotely, the Telegram bot and the web panel.
+//! Local files only, except `run`, `web` and a cloudflared download.
 
 use super::*;
 use crate::bridge::Bridge;
+use crate::bridge::web::tunnel;
 
 #[derive(Subcommand)]
 pub(super) enum BridgeCmd {
@@ -52,7 +53,39 @@ pub(super) enum BridgeCmd {
         /// The port (0: any free one).
         #[arg(long, default_value_t = crate::bridge::web::PORT)]
         port: u16,
+        /// Also reach it from anywhere through a Cloudflare tunnel (https, not end-to-end).
+        #[arg(long)]
+        tunnel: bool,
+        #[command(flatten)]
+        how: TunnelArgs,
     },
+    /// Turn "access from anywhere" (a Cloudflare tunnel) on or off for the running web panel.
+    Tunnel {
+        #[command(subcommand)]
+        action: TunnelCmd,
+    },
+}
+
+#[derive(clap::Args)]
+pub(super) struct TunnelArgs {
+    /// Stop the tunnel after this many minutes (1 to 1440).
+    #[arg(long = "for", value_name = "MINUTES", default_value_t = tunnel::MINUTES,
+          value_parser = clap::value_parser!(u64).range(1..=tunnel::MAX_MINUTES))]
+    minutes: u64,
+    /// Download the pinned cloudflared without asking, if none is on PATH.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Subcommand)]
+pub(super) enum TunnelCmd {
+    /// Start a tunnel to the running panel and print a pairing link through it.
+    On {
+        #[command(flatten)]
+        how: TunnelArgs,
+    },
+    /// Stop the tunnel.
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -63,6 +96,29 @@ pub(super) enum TelegramCmd {
         #[arg(long)]
         clear: bool,
     },
+}
+
+/// cloudflared: one on PATH, else the one downloaded before, else the pinned
+/// release, downloaded once the user says yes (`--yes`, or y at a prompt).
+fn cloudflared(yes: bool) -> Result<(), RpcError> {
+    let dir = tunnel::install_dir()?;
+    if tunnel::find(std::env::var_os("PATH").as_deref(), &dir).is_some() {
+        return Ok(());
+    }
+    let refused = |why: &str| RpcError::new("bridge", why, "install cloudflared on PATH, or pass --yes to download it");
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            return Err(refused("cloudflared is not installed"));
+        }
+        eprint!("{}", tunnel::download_question(&dir));
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer).map_err(|e| RpcError::internal(e.to_string()))?;
+        if !answer.trim().eq_ignore_ascii_case("y") && !answer.trim().eq_ignore_ascii_case("yes") {
+            return Err(refused("cloudflared was not downloaded"));
+        }
+    }
+    eprintln!("downloading cloudflared into {}", dir.display());
+    tunnel::download(&dir).map(drop)
 }
 
 /// The bot token: typed without echo in a terminal, else the first line piped in.
@@ -153,9 +209,21 @@ pub(super) fn bridge(paths: &Paths, action: BridgeCmd) -> Result<Out, RpcError> 
             bridge.set_telegram_token(&read_token()?)?;
             Out { json: json!({"telegram_token": "set"}), human: "telegram token stored".into() }
         }
-        BridgeCmd::Web { lan, port } => {
-            crate::bridge::web::run(paths, lan, port)?;
+        BridgeCmd::Web { lan, port, tunnel, how } => {
+            if tunnel {
+                cloudflared(how.yes)?;
+            }
+            crate::bridge::web::run(paths, lan, port, tunnel.then_some(how.minutes))?;
             Out { json: Value::Null, human: String::new() }
+        }
+        BridgeCmd::Tunnel { action: TunnelCmd::On { how } } => {
+            cloudflared(how.yes)?;
+            let (json, human) = tunnel::ask(&bridge, Some(how.minutes))?;
+            Out { json, human }
+        }
+        BridgeCmd::Tunnel { action: TunnelCmd::Off } => {
+            let (json, human) = tunnel::ask(&bridge, None)?;
+            Out { json, human }
         }
         BridgeCmd::Run => {
             crate::bridge::telegram::run(paths)?;
