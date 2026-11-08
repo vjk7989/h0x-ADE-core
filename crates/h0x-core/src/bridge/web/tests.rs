@@ -43,6 +43,7 @@ fn fixture(hosts: Vec<String>) -> Fixture {
         key: e2e::ServerKey::generate(),
         notices,
         strikes: Default::default(),
+        pair_strikes: Default::default(),
     };
     Fixture { web: Arc::new(web), dir }
 }
@@ -58,9 +59,14 @@ impl Fixture {
 
     /// A paired connection and its session token.
     fn paired(&self) -> (Conn, String) {
+        self.paired_at(T)
+    }
+
+    /// The same, paired at `now`: sessions are checked against the real clock on a live socket.
+    fn paired_at(&self, now: u64) -> (Conn, String) {
         let mut conn = phone();
-        let code = self.code(T);
-        let step = self.say(&mut conn, "pair", json!({"token": code, "label": "phone"}), T);
+        let code = self.code(now);
+        let step = self.say(&mut conn, "pair", json!({"token": code, "label": "phone"}), now);
         let session = step.out[0]["data"]["session"].as_str().unwrap().to_string();
         (conn, session)
     }
@@ -146,14 +152,15 @@ fn a_one_time_token_pairs_one_device_once() {
 }
 
 #[test]
-fn guessing_tokens_disables_pairing() {
+fn guessing_tokens_disables_pairing_from_that_source() {
     let f = fixture(Vec::new());
     let code = f.code(T);
+    let guesser = || Conn { peer: Some("192.168.1.7".parse().unwrap()), ..phone() };
     for n in 0..5 {
-        assert!(f.say(&mut phone(), "pair", json!({"token": "AAAAAAAA"}), T + n).close);
+        assert!(f.say(&mut guesser(), "pair", json!({"token": "AAAAAAAA"}), T + n).close);
     }
-    let blocked = f.say(&mut phone(), "pair", json!({"token": code}), T + 10);
-    assert!(blocked.out[0]["data"]["message"].as_str().unwrap().contains("disabled"), "{blocked:?}");
+    let blocked = f.say(&mut guesser(), "pair", json!({"token": code}), T + 10);
+    assert!(blocked.out[0]["data"]["message"].as_str().unwrap().contains("too many"), "{blocked:?}");
 }
 
 #[test]
@@ -822,7 +829,7 @@ fn a_socket_that_never_authenticates_is_closed_after_the_auth_deadline() {
 #[test]
 fn an_authenticated_socket_hears_heartbeats_and_closes_when_idle() {
     let (f, listener) = unserved();
-    let (_, session) = f.paired();
+    let (_, session) = f.paired_at(crate::runtime::now_ms());
     let auth = json!({"name": "auth", "data": {"session": session}});
     let (frames, took) = on_a_paused_clock_secure(&f, listener, &PHONE, &auth);
     let said: Vec<String> = frames
@@ -887,7 +894,7 @@ fn deadlines_are_exact_not_the_next_heartbeat() {
     assert!(took >= AUTH && took <= Duration::from_secs(31), "{took:?}");
 
     let (f, listener) = unserved();
-    let (_, session) = f.paired();
+    let (_, session) = f.paired_at(crate::runtime::now_ms());
     let auth = json!({"name": "auth", "data": {"session": session}});
     let (frames, took) = on_a_paused_clock_secure(&f, listener, &PHONE, &auth);
     assert_eq!(frames.last(), Some(&(8, 1001u16.to_be_bytes().to_vec())));
@@ -960,19 +967,26 @@ fn qr_json_is_a_square_of_ones_and_zeros_and_refuses_empty_or_huge_text() {
 }
 
 #[test]
-fn the_ready_line_has_exactly_four_keys_with_nulls_for_what_is_absent() {
-    let plain = ready_line("http://127.0.0.1:7777/", Some("http://127.0.0.1:7777/#pair=ABCD2345"), None, None);
+fn the_ready_line_has_exactly_five_keys_with_nulls_for_what_is_absent() {
+    let plain = ready_line("http://127.0.0.1:7777/", Some("http://127.0.0.1:7777/#pair=ABCD2345"), None, None, None);
     assert_eq!(
         plain,
-        json!({"url": "http://127.0.0.1:7777/", "pair": "http://127.0.0.1:7777/#pair=ABCD2345", "tunnel": null, "via": null})
+        json!({"url": "http://127.0.0.1:7777/", "pair": "http://127.0.0.1:7777/#pair=ABCD2345", "tunnel": null, "via": null, "warning": null})
     );
-    let all = ready_line("http://10.0.0.5:7777/", None, Some("https://a.trycloudflare.com/"), Some("h0x.example.com"));
+    let all = ready_line(
+        "http://10.0.0.5:7777/",
+        None,
+        Some("https://a.trycloudflare.com/"),
+        Some("h0x.example.com"),
+        Some("careful"),
+    );
     assert_eq!(all["pair"], Value::Null);
     assert_eq!(
         (all["tunnel"].as_str(), all["via"].as_str()),
         (Some("https://a.trycloudflare.com/"), Some("h0x.example.com"))
     );
-    assert_eq!(all.as_object().unwrap().len(), 4);
+    assert_eq!(all["warning"], "careful");
+    assert_eq!(all.as_object().unwrap().len(), 5);
     assert!(!all.to_string().contains('\n'), "one line");
 }
 
@@ -1016,14 +1030,14 @@ fn qr_draws_terminal_blocks_two_module_rows_per_line_inside_a_quiet_zone() {
 fn the_ready_line_keeps_null_pair_and_tunnel_when_locked_or_the_tunnel_failed() {
     let url = "http://127.0.0.1:7777/";
     for (line, via) in [
-        (ready_line(url, None, None, None), Value::Null),
-        (ready_line(url, None, None, Some("h0x.example.com")), json!("h0x.example.com")),
+        (ready_line(url, None, None, None, None), Value::Null),
+        (ready_line(url, None, None, Some("h0x.example.com"), None), json!("h0x.example.com")),
     ] {
         let text = line.to_string();
         let parsed: Value = serde_json::from_str(&text).unwrap();
         let keys = parsed.as_object().unwrap();
-        assert_eq!(keys.len(), 4, "{text}");
-        for key in ["url", "pair", "tunnel", "via"] {
+        assert_eq!(keys.len(), 5, "{text}");
+        for key in ["url", "pair", "tunnel", "via", "warning"] {
             assert!(keys.contains_key(key), "{key} is present even when null: {text}");
         }
         assert_eq!((&parsed["url"], &parsed["pair"], &parsed["tunnel"]), (&json!(url), &Value::Null, &Value::Null));
@@ -1365,4 +1379,139 @@ fn a_bridge_folder_with_spaces_keeps_its_own_stable_fingerprint() {
         let _ = Bridge::at(dir, Default::default()).secret_del("web.key");
     }
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A connection from `ip`.
+fn from(ip: &str) -> Conn {
+    Conn { peer: Some(ip.parse().unwrap()), ..phone() }
+}
+
+#[test]
+fn every_way_to_reach_the_panel_but_localhost_warns_about_the_page() {
+    assert_eq!(integrity_warning(false, false, false), None, "localhost only: nothing to say");
+    for (lan, cloudflare, vps, path) in [
+        (true, false, false, "your Wi-Fi"),
+        (false, true, false, "Cloudflare"),
+        (false, false, true, "your VPS"),
+        (true, true, false, "your Wi-Fi, Cloudflare"),
+        (true, true, true, "your Wi-Fi, Cloudflare, your VPS"),
+    ] {
+        let said = integrity_warning(lan, cloudflare, vps).unwrap();
+        assert_eq!(
+            said,
+            format!(
+                "messages are end-to-end encrypted, but the page itself is delivered by {path}, so an attacker who controls that path could change it"
+            )
+        );
+    }
+}
+
+const DAY: u64 = 24 * 60 * 60_000;
+
+#[test]
+fn a_session_lasts_exactly_thirty_days_from_pairing() {
+    assert_eq!(SESSION_MS, 30 * DAY);
+    let f = fixture(Vec::new());
+    let (_, session) = f.paired();
+    let auth = |now: u64| f.say(&mut from("192.168.1.9"), "auth", json!({"session": session}), now);
+    assert_eq!(names(&auth(T + 30 * DAY - 1)), ["hello", "snapshot"], "one millisecond before it turns 30 days old");
+    let late = auth(T + 30 * DAY);
+    assert!(late.close, "30 days old: expired");
+    assert_eq!(late.out[0]["data"]["message"], "unknown or revoked session; pair again");
+    assert!(auth(T + 400 * DAY).close, "and it stays expired");
+    let again = f.say(&mut phone(), "pair", json!({"token": f.code(T + 31 * DAY)}), T + 31 * DAY);
+    assert_eq!(names(&again), ["paired", "snapshot"], "the device pairs again and gets a fresh 30 days");
+}
+
+#[test]
+fn a_session_saved_before_expiry_existed_counts_from_when_it_is_first_seen() {
+    let f = fixture(Vec::new());
+    let (_, session) = f.paired();
+    let path = f.dir.join("state.json");
+    let mut state: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(state.as_object_mut().unwrap().remove("session_times").is_some(), "the new field is saved");
+    std::fs::write(&path, state.to_string()).unwrap();
+    let auth = |now: u64| f.say(&mut from("192.168.1.9"), "auth", json!({"session": session}), now);
+    let first = T + 5 * DAY;
+    assert_eq!(names(&auth(first)), ["hello", "snapshot"], "an old state.json still loads and works");
+    let state = std::fs::read_to_string(&path).unwrap();
+    assert!(state.contains("session_times") && state.contains(&first.to_string()), "dated now, kept: {state}");
+    assert_eq!(names(&auth(first + 30 * DAY - 1)), ["hello", "snapshot"]);
+    assert!(auth(first + 30 * DAY).close, "30 days after it was first seen");
+}
+
+#[test]
+fn wrong_pairing_codes_are_limited_per_source_and_before_the_code_is_checked() {
+    let f = fixture(Vec::new());
+    let code = f.code(T);
+    for n in 0..5 {
+        assert!(f.say(&mut from("203.0.113.5"), "pair", json!({"token": "AAAAAAAA"}), T + n).close);
+    }
+    let block = T + 4 + PAIR_BLOCK_MS;
+    for now in [T + 10, block - 1] {
+        let refused = f.say(&mut from("203.0.113.5"), "pair", json!({"token": code}), now);
+        assert!(refused.close && refused.out[0]["data"]["message"].as_str().unwrap().contains("too many"), "{now}");
+    }
+    let log = std::fs::read_to_string(f.dir.join("audit.jsonl")).unwrap();
+    assert_eq!(log.matches("\"command\":\"pair\"").count(), 5, "a refused source is not even checked: {log}");
+    let mut second = from("203.0.113.6");
+    let step = f.say(&mut second, "pair", json!({"token": code}), T + 20);
+    assert_eq!(names(&step), ["paired", "snapshot"], "another source still pairs, and the code was not spent");
+    let again = f.say(&mut from("203.0.113.5"), "pair", json!({"token": f.code(block)}), block);
+    assert_eq!(names(&again), ["paired", "snapshot"], "the block ends after ten minutes");
+}
+
+#[test]
+fn a_right_code_clears_the_sources_wrong_ones() {
+    let f = fixture(Vec::new());
+    let code = f.code(T);
+    for n in 0..4 {
+        assert!(f.say(&mut from("203.0.113.5"), "pair", json!({"token": "AAAAAAAA"}), T + n).close);
+    }
+    assert_eq!(names(&f.say(&mut from("203.0.113.5"), "pair", json!({"token": code}), T + 5)), ["paired", "snapshot"]);
+    let code = f.code(T + 6);
+    for n in 0..4 {
+        assert!(f.say(&mut from("203.0.113.5"), "pair", json!({"token": "AAAAAAAA"}), T + 7 + n).close);
+    }
+    let step = f.say(&mut from("203.0.113.5"), "pair", json!({"token": code}), T + 12);
+    assert_eq!(names(&step), ["paired", "snapshot"], "four wrong, one right, four wrong: never five in a row");
+}
+
+#[test]
+fn web_failures_do_not_touch_telegram_pairing_and_the_other_way_round() {
+    let f = fixture(Vec::new());
+    for n in 0..20 {
+        let ip = format!("203.0.113.{n}");
+        assert!(f.say(&mut from(&ip), "pair", json!({"token": "AAAAAAAA"}), T + n).close);
+    }
+    let bridge = f.web.bridge.lock().unwrap();
+    let (code, _) = bridge.pair("telegram", T + 30).unwrap();
+    assert!(bridge.pair_verify("telegram", "42", "me", &code, T + 31).is_ok(), "telegram pairs after 20 web failures");
+    for n in 0..5 {
+        assert!(bridge.pair_verify("telegram", "666", "", "AAAAAAAA", T + 40 + n).is_err());
+    }
+    assert!(bridge.pair("telegram", T + 50).is_err(), "telegram is blocked by its own failures");
+    let (web_code, _) = bridge.pair("web", T + 51).unwrap();
+    drop(bridge);
+    let step = f.say(&mut from("203.0.113.99"), "pair", json!({"token": web_code}), T + 52);
+    assert_eq!(names(&step), ["paired", "snapshot"], "web pairing is not blocked by telegram failures");
+}
+
+#[test]
+fn a_full_server_refuses_the_extra_connection_with_503_and_serves_again_when_one_leaves() {
+    let (_f, addr) = start();
+    let held: Vec<TcpStream> = (0..MAX_CONNECTIONS).map(|_| TcpStream::connect(addr).unwrap()).collect();
+    let mut extra = TcpStream::connect(addr).unwrap();
+    extra.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut answer = Vec::new();
+    let _ = extra.read_to_end(&mut answer);
+    let answer = String::from_utf8_lossy(&answer);
+    assert!(answer.starts_with("HTTP/1.1 503 "), "{answer:?}");
+    drop(held);
+    let head = format!("GET / HTTP/1.1\nHost: {addr}\n\n");
+    let served = (0..50).any(|_| {
+        std::thread::sleep(Duration::from_millis(100));
+        request(addr, &head).starts_with("HTTP/1.1 200 ")
+    });
+    assert!(served, "the slots came back");
 }

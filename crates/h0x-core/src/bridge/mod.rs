@@ -34,6 +34,8 @@ fn code_ms(transport: &str) -> u64 {
 }
 const WRONG_CODES: u32 = 5;
 const BLOCK_MS: u64 = 10 * 60_000;
+/// audit.jsonl moves to audit.jsonl.1 (replacing the older one) once it holds this many bytes.
+const AUDIT_MAX: u64 = 1 << 20;
 /// No 0/O or 1/I: read off a screen and typed on a phone. 32 letters: no modulo bias.
 const ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
@@ -73,6 +75,10 @@ struct State {
     /// a session is only good from that key (ADR-064). Older sessions have none and are refused.
     #[serde(default)]
     devices: BTreeMap<String, String>,
+    /// Web devices: their user id and when the session was made (ms). A session
+    /// without one (from before sessions expired) counts as made when first seen.
+    #[serde(default)]
+    session_times: BTreeMap<String, u64>,
 }
 
 /// The one live pairing code.
@@ -190,7 +196,9 @@ impl Bridge {
         if st.locked {
             return Err(RpcError::new("bridge", "remote control is locked", "run `h0x-core bridge unlock` first"));
         }
-        blocked(&st, now)?;
+        if transport != "web" {
+            blocked(&st, now)?;
+        }
         let code = code();
         let expires_ms = now + code_ms(transport);
         st.pending = Some(Pending { code: code.clone(), transport: transport.into(), expires_ms });
@@ -199,7 +207,9 @@ impl Bridge {
     }
 
     /// Pairs `user_id` on `transport` if `code` is the live one. Five wrong
-    /// codes in a row disable pairing for 10 minutes.
+    /// chat codes in a row disable chat pairing for 10 minutes. Wrong web codes
+    /// count against the connection's source in the panel instead, so a web
+    /// stranger can't block Telegram pairing (nor the other way round).
     pub fn pair_verify(
         &self,
         transport: &str,
@@ -234,6 +244,7 @@ impl Bridge {
         // An unpaired device's session goes with it.
         let ids = &st.identities;
         st.sessions.retain(|user, _| ids.iter().any(|i| i.transport == "web" && &i.user_id == user));
+        st.session_times.retain(|user, _| ids.iter().any(|i| i.transport == "web" && &i.user_id == user));
         st.devices.retain(|user, _| ids.iter().any(|i| i.transport == "web" && &i.user_id == user));
         let removed = before - st.identities.len();
         if let (Some(id), 0) = (id, removed) {
@@ -282,7 +293,22 @@ impl Bridge {
         }
     }
 
+    /// Moves a full audit log aside as audit.jsonl.1, so it cannot grow without end.
+    fn rotate_audit(&self, max: u64) -> std::io::Result<()> {
+        let path = self.dir.join("audit.jsonl");
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() >= max) {
+            let old = self.dir.join("audit.jsonl.1");
+            match std::fs::remove_file(&old) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+            std::fs::rename(&path, &old)?;
+        }
+        Ok(())
+    }
+
     fn audit(&self, entry: Value) -> Result<(), RpcError> {
+        self.rotate_audit(AUDIT_MAX).map_err(failed)?;
         let mut file = self.audit_file().map_err(failed)?;
         file.write_all(format!("{entry}\n").as_bytes()).map_err(failed)
     }
@@ -326,20 +352,30 @@ fn verify(
     if user_id.is_empty() {
         return Err(failed("no user id"));
     }
-    blocked(st, now)?;
+    if transport != "web" {
+        blocked(st, now)?;
+    }
     // Typed on a phone: any case, spaces and dashes are fine.
     let typed: String = code.chars().filter(|c| !matches!(c, ' ' | '-')).collect::<String>().to_ascii_uppercase();
     let live = st.pending.take().filter(|p| now < p.expires_ms);
     let good = live.as_ref().is_some_and(|p| p.transport == transport && same(typed.as_bytes(), p.code.as_bytes()));
     if !good {
         st.pending = live;
-        st.failures += 1;
-        if st.failures >= WRONG_CODES {
-            (st.failures, st.pending, st.blocked_until_ms) = (0, None, now + BLOCK_MS);
+        if transport != "web" {
+            st.failures += 1;
+            if st.failures >= WRONG_CODES {
+                (st.failures, st.blocked_until_ms) = (0, now + BLOCK_MS);
+                // Only chat's own code goes; a live web link is not the chat's to spoil.
+                if st.pending.as_ref().is_some_and(|p| p.transport == transport) {
+                    st.pending = None;
+                }
+            }
         }
         return Err(RpcError::new("bridge", "wrong or expired code", "run `h0x-core bridge pair` for a new one"));
     }
-    st.failures = 0;
+    if transport != "web" {
+        st.failures = 0;
+    }
     st.identities.retain(|i| !(i.transport == transport && i.user_id == user_id));
     st.last_id += 1;
     let label = if label.is_empty() { user_id } else { label };
@@ -576,5 +612,58 @@ mod tests {
         b.pair("telegram", T).unwrap();
         assert!(b.dir.join("state.json").is_file());
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod audit_and_pairing_tests {
+    use super::*;
+
+    const T: u64 = 1_000_000;
+
+    fn fill_audit(b: &Bridge, bytes: u64) {
+        std::fs::create_dir_all(&b.dir).unwrap();
+        std::fs::write(b.dir.join("audit.jsonl"), vec![b'x'; usize::try_from(bytes).unwrap()]).unwrap();
+    }
+
+    #[test]
+    fn the_audit_log_rotates_exactly_at_its_size_limit() {
+        let b = scratch();
+        fill_audit(&b, AUDIT_MAX - 1);
+        b.audit(json!({"n": 1})).unwrap();
+        assert!(!b.dir.join("audit.jsonl.1").exists(), "one byte under the limit: no rotation");
+        let size = std::fs::metadata(b.dir.join("audit.jsonl")).unwrap().len();
+        assert!(size >= AUDIT_MAX, "the entry was appended: {size}");
+
+        b.audit(json!({"n": 2})).unwrap();
+        let old = std::fs::metadata(b.dir.join("audit.jsonl.1")).unwrap().len();
+        assert_eq!(old, size, "the full log moved aside whole");
+        assert_eq!(b.log(10).unwrap(), [json!({"n": 2})], "a new log starts with the new entry");
+
+        fill_audit(&b, AUDIT_MAX);
+        b.audit(json!({"n": 3})).unwrap();
+        let second = std::fs::read(b.dir.join("audit.jsonl.1")).unwrap();
+        assert_eq!(second.len() as u64, AUDIT_MAX, "exactly at the limit rotates, replacing the older .1");
+        assert_eq!(b.log(10).unwrap(), [json!({"n": 3})]);
+        std::fs::remove_dir_all(&b.dir).unwrap();
+    }
+
+    #[test]
+    fn wrong_web_codes_never_count_against_chat_pairing_and_chat_failures_never_block_web() {
+        let b = scratch();
+        b.pair("web", T).unwrap();
+        for n in 0..10 {
+            assert!(b.pair_verify("web", &format!("u{n}"), "", "AAAAAAAA", T + n).is_err());
+        }
+        let (chat, _) = b.pair("telegram", T + 20).unwrap();
+        assert!(b.pair_verify("telegram", "42", "", &chat, T + 21).is_ok(), "no block from web guesses");
+
+        let (web, _) = b.pair("web", T + 30).unwrap();
+        for n in 0..5 {
+            assert!(b.pair_verify("telegram", "666", "", "AAAAAAAA", T + 40 + n).is_err());
+        }
+        assert!(b.pair("telegram", T + 50).is_err(), "chat is blocked");
+        assert!(b.pair_verify("web", "u99", "", &web, T + 51).is_ok(), "web verify is not");
+        std::fs::remove_dir_all(&b.dir).unwrap();
     }
 }

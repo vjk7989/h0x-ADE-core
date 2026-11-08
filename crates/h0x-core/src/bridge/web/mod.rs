@@ -38,6 +38,16 @@ const HEARTBEAT: Duration = Duration::from_secs(20);
 /// After this many failed `auth`s from one address it is refused for [`AUTH_BLOCK_MS`].
 const AUTH_STRIKES: u32 = 5;
 const AUTH_BLOCK_MS: u64 = 60_000;
+/// The same for wrong pairing codes: [`AUTH_STRIKES`] from one source, then [`PAIR_BLOCK_MS`].
+const PAIR_BLOCK_MS: u64 = 10 * 60_000;
+/// Sources remembered at once; past this, only the ones being refused are kept.
+const MAX_SOURCES: usize = 4096;
+/// A web session lives this long from pairing; then the device pairs again.
+const SESSION_MS: u64 = 30 * 24 * 60 * 60_000;
+/// Connections served at once; more are refused with 503.
+const MAX_CONNECTIONS: usize = 64;
+/// How long to wait after a failed `accept`, so a persistent error cannot spin.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// After closing, how long to keep reading so unread data cannot turn the
 /// close into a reset (RFC 6455 7.1.1).
 const LINGER: Duration = Duration::from_secs(1);
@@ -116,8 +126,31 @@ pub fn qr_json(text: &str) -> Result<Value, RpcError> {
 
 /// The one line `bridge web --json` prints once it is reachable. With a tunnel
 /// the pairing link is the one through it.
-pub fn ready_line(url: &str, pair: Option<&str>, tunnel: Option<&str>, via: Option<&str>) -> Value {
-    json!({"url": url, "pair": pair, "tunnel": tunnel, "via": via})
+/// `warning`: what [`integrity_warning`] says (null for a localhost-only panel).
+pub fn ready_line(
+    url: &str,
+    pair: Option<&str>,
+    tunnel: Option<&str>,
+    via: Option<&str>,
+    warning: Option<&str>,
+) -> Value {
+    json!({"url": url, "pair": pair, "tunnel": tunnel, "via": via, "warning": warning})
+}
+
+/// What a device must know about the path that delivers the page (ADR-064): the
+/// messages are encrypted, but whoever controls that path could change the page.
+/// None when the panel is reachable from this machine only.
+pub(crate) fn integrity_warning(lan: bool, cloudflare: bool, vps: bool) -> Option<String> {
+    let paths: Vec<&str> = [(lan, "your Wi-Fi"), (cloudflare, "Cloudflare"), (vps, "your VPS")]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect();
+    (!paths.is_empty()).then(|| {
+        format!(
+            "messages are end-to-end encrypted, but the page itself is delivered by {}, so an attacker who controls that path could change it",
+            paths.join(", ")
+        )
+    })
 }
 
 /// Prints one line to stdout and flushes it, so a reader of the pipe or terminal sees it now.
@@ -130,9 +163,10 @@ fn emit(line: &Value) {
 
 impl Bridge {
     /// Remembers a web device's session token, hashed, and the device key it paired with.
-    fn add_session(&self, user: &str, token: &str, device: &[u8]) -> Result<(), RpcError> {
+    fn add_session(&self, user: &str, token: &str, device: &[u8], now: u64) -> Result<(), RpcError> {
         let mut st = self.load()?;
         st.sessions.insert(user.into(), sha::hex(&sha::sha256(token.as_bytes())));
+        st.session_times.insert(user.into(), now);
         st.devices.insert(user.into(), e2e::b64(device));
         self.save(&st)
     }
@@ -140,9 +174,11 @@ impl Bridge {
     /// The paired web device a session token belongs to, if any, and only
     /// when the connection's device key is the one it paired with (a session
     /// from before device keys has none, so it is refused). Every stored hash
-    /// is compared, each in constant time.
-    fn session_user(&self, token: &str, device: &[u8]) -> Result<Option<String>, RpcError> {
-        let st = self.load()?;
+    /// is compared, each in constant time. A session is good for [`SESSION_MS`]
+    /// from the moment it was made: valid until the instant it turns 30 days old.
+    /// One from before sessions expired is dated now, the first time it is seen.
+    fn session_user(&self, token: &str, device: &[u8], now: u64) -> Result<Option<String>, RpcError> {
+        let mut st = self.load()?;
         let hash = sha::hex(&sha::sha256(token.as_bytes()));
         let mut found = None;
         for (user, stored) in &st.sessions {
@@ -151,7 +187,17 @@ impl Bridge {
             }
         }
         let bound = |user: &String| st.devices.get(user).is_some_and(|d| *d == e2e::b64(device));
-        Ok(found.filter(bound).filter(|user| st.identities.iter().any(|i| i.transport == "web" && &i.user_id == user)))
+        let paired = |user: &String| st.identities.iter().any(|i| i.transport == "web" && &i.user_id == user);
+        let Some(user) = found.filter(bound).filter(paired) else { return Ok(None) };
+        let made = match st.session_times.get(&user) {
+            Some(made) => *made,
+            None => {
+                st.session_times.insert(user.clone(), now);
+                self.save(&st)?;
+                now
+            }
+        };
+        Ok((now.saturating_sub(made) < SESSION_MS).then_some(user))
     }
 }
 
@@ -187,12 +233,46 @@ pub(crate) struct Web {
     hosts: Vec<String>,
     key: e2e::ServerKey,
     notices: tokio::sync::broadcast::Sender<Notice>,
-    /// Failed `auth`s per peer address: (strikes, refused until ms).
-    strikes: Mutex<std::collections::HashMap<IpAddr, (u32, u64)>>,
+    /// Failed `auth`s per source address.
+    strikes: Strikes,
+    /// Wrong pairing codes per source address, counted before the code is checked.
+    pair_strikes: Strikes,
+}
+
+/// Failures per source address: (strikes, refused until ms).
+#[derive(Default)]
+struct Strikes(Mutex<std::collections::HashMap<IpAddr, (u32, u64)>>);
+
+impl Strikes {
+    /// Whether `source` is being refused at `now`. An unknown source is never.
+    fn refused(&self, source: Option<IpAddr>, now: u64) -> bool {
+        source.is_some_and(|ip| self.0.lock().unwrap().get(&ip).is_some_and(|s| now < s.1))
+    }
+
+    /// One more failure; the [`AUTH_STRIKES`]th refuses the source for `block_ms`.
+    fn add(&self, source: Option<IpAddr>, now: u64, block_ms: u64) {
+        let Some(ip) = source else { return };
+        let mut map = self.0.lock().unwrap();
+        if map.len() >= MAX_SOURCES {
+            map.retain(|_, s| now < s.1);
+        }
+        let strike = map.entry(ip).or_default();
+        strike.0 += 1;
+        if strike.0 >= AUTH_STRIKES {
+            *strike = (0, now + block_ms);
+        }
+    }
+
+    fn clear(&self, source: Option<IpAddr>) {
+        if let Some(ip) = source {
+            self.0.lock().unwrap().remove(&ip);
+        }
+    }
 }
 
 /// One connection's device once it paired or authenticated, the device key from its
-/// hello, and whether it came through the Cloudflare tunnel.
+/// hello, whether it came through the Cloudflare tunnel, and its source address
+/// (behind our tunnel the visitor's, from `CF-Connecting-IP`; else the socket's).
 #[derive(Clone, Default)]
 struct Conn {
     device: Option<Sender>,
@@ -322,6 +402,10 @@ impl Web {
             return refuse("usage: pair needs the code from `h0x-core bridge pair`");
         }
         let Some(device_key) = conn.device_key else { return refuse("no device key") };
+        let source = conn.peer;
+        if self.pair_strikes.refused(source, now) {
+            return refuse("too many wrong codes; try again later");
+        }
         let label = data["label"].as_str().unwrap_or_default().replace(char::is_control, "");
         let label: String = label.trim().chars().take(40).collect();
         let label = if label.is_empty() { "web device".to_string() } else { label };
@@ -329,12 +413,17 @@ impl Web {
         let bridge = self.bridge.lock().unwrap();
         let me = match bridge.pair_verify("web", &user, &label, token, now) {
             Ok(me) => me,
-            Err(e) => return refuse(&e.message),
+            Err(e) => {
+                drop(bridge);
+                self.pair_strikes.add(source, now, PAIR_BLOCK_MS);
+                return refuse(&e.message);
+            }
         };
+        self.pair_strikes.clear(source);
         let mut secret = [0u8; 32];
         crate::platform::random_bytes(&mut secret);
         let session = sha::hex(&secret);
-        if let Err(e) = bridge.add_session(&user, &session, &device_key) {
+        if let Err(e) = bridge.add_session(&user, &session, &device_key, now) {
             return refuse(&e.message);
         }
         drop(bridge);
@@ -348,19 +437,17 @@ impl Web {
         let Some(device_key) = conn.device_key else { return refuse("no device key") };
         let token = data["session"].as_str().unwrap_or_default();
         let peer = conn.peer;
-        if peer.is_some_and(|ip| self.strikes.lock().unwrap().get(&ip).is_some_and(|s| now < s.1)) {
+        if self.strikes.refused(peer, now) {
             return refuse("too many failed attempts; try again later");
         }
         // The guard must be gone before a failure takes the lock again.
-        let found = self.bridge.lock().unwrap().session_user(token, &device_key);
+        let found = self.bridge.lock().unwrap().session_user(token, &device_key, now);
         let user = match found {
             Ok(Some(user)) => user,
             Ok(None) => return self.auth_failed(peer, "unknown or revoked session; pair again", now),
             Err(e) => return refuse(&e.message),
         };
-        if let Some(ip) = peer {
-            self.strikes.lock().unwrap().remove(&ip);
-        }
+        self.strikes.clear(peer);
         let from = Sender { transport: "web".into(), user_id: user };
         conn.device = Some(from.clone());
         let hello = message("hello", json!({"tunnel": conn.tunnel}));
@@ -373,14 +460,7 @@ impl Web {
         let who = peer.map_or_else(|| "unknown".to_string(), |ip| ip.to_string());
         let entry = json!({"time_ms": now, "identity": format!("web:{who}"), "command": "auth", "result": format!("refused: {why}")});
         let _ = self.bridge.lock().unwrap().audit(entry);
-        if let Some(ip) = peer {
-            let mut strikes = self.strikes.lock().unwrap();
-            let strike = strikes.entry(ip).or_default();
-            strike.0 += 1;
-            if strike.0 >= AUTH_STRIKES {
-                *strike = (0, now + AUTH_BLOCK_MS);
-            }
-        }
+        self.strikes.add(peer, now, AUTH_BLOCK_MS);
         refuse(why)
     }
 
@@ -416,6 +496,7 @@ async fn read_head(stream: &mut tokio::net::TcpStream, buf: &mut Vec<u8>) -> Res
 }
 
 async fn connection(mut stream: tokio::net::TcpStream, web: Arc<Web>) {
+    let peer = stream.peer_addr().ok().map(|a| a.ip());
     let mut buf = Vec::new();
     let end = match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut stream, &mut buf)).await {
         Ok(Ok(end)) => end,
@@ -443,7 +524,8 @@ async fn connection(mut stream: tokio::net::TcpStream, web: Arc<Web>) {
         "/ws" => match http::upgrade(&req) {
             Ok(head) => {
                 if stream.write_all(&head).await.is_ok() {
-                    websocket(stream, buf.split_off(end + 4), web, via_tunnel).await;
+                    let client = tunnel::client(&req, peer, via_tunnel);
+                    websocket(stream, buf.split_off(end + 4), web, via_tunnel, client).await;
                 }
                 return;
             }
@@ -485,8 +567,7 @@ async fn hang_up(mut rd: tokio::net::tcp::OwnedReadHalf, mut wr: tokio::net::tcp
     let _ = tokio::time::timeout(LINGER, async { while matches!(rd.read(&mut sink).await, Ok(n) if n > 0) {} }).await;
 }
 
-async fn websocket(stream: tokio::net::TcpStream, mut buf: Vec<u8>, web: Arc<Web>, tunnel: bool) {
-    let peer = stream.peer_addr().ok().map(|a| a.ip());
+async fn websocket(stream: tokio::net::TcpStream, mut buf: Vec<u8>, web: Arc<Web>, tunnel: bool, peer: Option<IpAddr>) {
     let (mut rd, mut wr) = stream.into_split();
     let mut conn = Conn { peer, tunnel, ..Conn::default() };
     let mut chan: Option<e2e::Channel> = None;
@@ -587,9 +668,21 @@ async fn websocket(stream: tokio::net::TcpStream, mut buf: Vec<u8>, web: Arc<Web
 }
 
 async fn serve(listener: tokio::net::TcpListener, web: Arc<Web>) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
-        if let Ok((stream, _)) = listener.accept().await {
-            tokio::spawn(connection(stream, web.clone()));
+        match listener.accept().await {
+            Ok((stream, _)) => match slots.clone().try_acquire_owned() {
+                Ok(slot) => {
+                    let web = web.clone();
+                    tokio::spawn(async move {
+                        connection(stream, web).await;
+                        drop(slot);
+                    });
+                }
+                // Full: a short answer, best effort, and the socket is closed.
+                Err(_) => drop(stream.try_write(&http::error(503))),
+            },
+            Err(_) => tokio::time::sleep(ACCEPT_BACKOFF).await,
         }
     }
 }
@@ -637,14 +730,14 @@ pub fn run(
         pair = Some(link);
     }
     let url = format!("{local}/");
-    let ready = (json && tunnel.is_some()).then(|| (url.clone(), public.map(String::from)));
+    let warning = integrity_warning(lan, tunnel.is_some(), via.is_some());
+    let ready = (json && tunnel.is_some()).then(|| (url.clone(), public.map(String::from), warning.clone()));
     if json && tunnel.is_none() {
-        emit(&ready_line(&url, pair.as_deref(), None, public));
+        emit(&ready_line(&url, pair.as_deref(), None, public, warning.as_deref()));
     }
-    if lan {
-        eprintln!(
-            "warning: this is plain http on your network; the traffic is encrypted, but anyone on it could alter the page you load"
-        );
+    // A tunnel prints its own warning when it opens.
+    if !json && let Some(why) = integrity_warning(lan, false, via.is_some()) {
+        println!("warning: {why}");
     }
     let ssh = via.as_ref().map(|plan| {
         if !json {
@@ -684,6 +777,7 @@ pub fn run(
         key,
         notices,
         strikes: Default::default(),
+        pair_strikes: Default::default(),
     });
     let runtime =
         tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| failed(e.to_string()))?;
@@ -722,3 +816,24 @@ async fn stopped() {
 mod assets;
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, windows))]
+mod store_tests {
+    use super::*;
+
+    #[test]
+    fn an_unusable_secret_store_never_replaces_web_key() {
+        let bridge = crate::bridge::scratch();
+        let key = server_key(&bridge).unwrap();
+        let blob = bridge.dir.join("web.key.dpapi");
+        std::fs::write(&blob, b"not a DPAPI blob").unwrap();
+        let err = server_key(&bridge).err().expect("a store that cannot be read is an error, not an absent key");
+        assert!(err.message.contains("web.key"), "{}", err.message);
+        assert!(bridge.secret_get("web.key").is_err(), "distinct from not found");
+        assert_eq!(std::fs::read(&blob).unwrap(), b"not a DPAPI blob", "web.key was left alone");
+        assert!(bridge.secret_del("web.key").unwrap());
+        assert_ne!(server_key(&bridge).unwrap().fp(), key.fp(), "truly absent: a new one");
+        let _ = bridge.secret_del("web.key");
+        let _ = std::fs::remove_dir_all(&bridge.dir);
+    }
+}

@@ -16,6 +16,7 @@ use super::super::Bridge;
 use super::{http, sha};
 use crate::rpc::RpcError;
 use serde_json::{Value, json};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -135,6 +136,18 @@ pub fn through(req: &http::Request, tunnel: Option<&str>) -> Result<bool, u16> {
     let headers = req.headers.iter().filter(|(name, _)| name != "origin").cloned().collect();
     let rest = http::Request { method: req.method.clone(), path: req.path.clone(), headers };
     http::allowed(&rest, &[host.to_string()]).map(|()| true)
+}
+
+/// Who is on the other end of a request: behind our tunnel the visitor's
+/// address from Cloudflare's `CF-Connecting-IP` (cloudflared connects from this
+/// machine, so the header is only believed from a loopback peer on a request
+/// that came through the tunnel), anywhere else the socket's own `peer`.
+pub fn client(req: &http::Request, peer: Option<IpAddr>, via_tunnel: bool) -> Option<IpAddr> {
+    if via_tunnel && peer.is_some_and(|ip| ip.is_loopback()) {
+        let seen = req.header("cf-connecting-ip").and_then(|v| v.parse::<IpAddr>().ok());
+        return seen.or(peer);
+    }
+    peer
 }
 
 /// The host the panel answers through the tunnel, while one is up.
@@ -268,6 +281,35 @@ pub fn find(path: Option<&std::ffi::OsStr>, install: &Path) -> Option<PathBuf> {
     on_path.chain([install.join(&name)]).find(|p| p.is_file())
 }
 
+/// Refuses a cloudflared sitting in `install` unless its bytes still hash to
+/// `pinned` (the asset name and SHA-256 for this machine), checked before every
+/// start: whoever can write that folder could swap it after the download. One
+/// found elsewhere (on PATH) is the user's own and is left alone. A `.tgz`
+/// asset is pinned as the archive, so the unpacked program has no hash to check.
+pub fn trusted(program: &Path, install: &Path, pinned: Option<(&str, &str)>) -> Result<(), String> {
+    if program.parent() != Some(install) {
+        return Ok(());
+    }
+    let Some((asset, sum)) = pinned else {
+        return Err(format!(
+            "refusing {}: there is no pinned cloudflared for this machine to check it against; put cloudflared on PATH",
+            program.display()
+        ));
+    };
+    if asset.ends_with(".tgz") {
+        return Ok(());
+    }
+    let bytes = std::fs::read(program).map_err(|e| format!("{}: {e}", program.display()))?;
+    let got = sha::hex(&sha::sha256(&bytes));
+    if got != sum {
+        return Err(format!(
+            "refusing {}: its SHA-256 is {got}, not the pinned {sum}; delete it and run `h0x-core bridge tunnel on` to download it again",
+            program.display()
+        ));
+    }
+    Ok(())
+}
+
 /// Deletes a file when dropped (a download, whatever became of it).
 struct Delete<'a>(&'a Path);
 
@@ -337,10 +379,10 @@ pub fn download_question(dir: &Path) -> String {
 /// warning, and a pairing link (with its QR code) when there is one.
 fn announce(status: &Value) -> String {
     let mut out = format!(
-        "tunnel: {} for {} minutes (`h0x-core bridge tunnel off` stops it)\n\
-         warning: messages are end-to-end encrypted, so Cloudflare sees only ciphertext, but it delivers the page and could alter it",
+        "tunnel: {} for {} minutes (`h0x-core bridge tunnel off` stops it)\nwarning: {}",
         status["url"].as_str().unwrap_or_default(),
         status["minutes"],
+        super::integrity_warning(false, true, false).unwrap_or_default(),
     );
     if let Some(link) = status["pair"].as_str() {
         out.push_str(&format!("\npair a device within 5 minutes (once): {link}\n{}", super::qr(link)));
@@ -381,14 +423,17 @@ fn say(json: bool, text: &str) {
 }
 
 /// `bridge web --json`'s one line, once the first tunnel start has an answer
-/// (its address, or none when it failed). `ready`: the panel's url and `via`.
-fn ready_once(ready: &mut Option<(String, Option<String>)>, status: Option<&Value>) {
-    if let Some((url, via)) = ready.take() {
+/// (its address, or none when it failed). `ready`: the panel's url, `via` and warning.
+fn ready_once(ready: &mut Option<Ready>, status: Option<&Value>) {
+    if let Some((url, via, warning)) = ready.take() {
         let tunnel = status.and_then(|s| s["url"].as_str());
         let pair = status.and_then(|s| s["pair"].as_str());
-        super::emit(&super::ready_line(&url, pair, tunnel, via.as_deref()));
+        super::emit(&super::ready_line(&url, pair, tunnel, via.as_deref(), warning.as_deref()));
     }
 }
+
+/// What `bridge web --json` prints once reachable: the panel's url, `via`, warning.
+pub type Ready = (String, Option<String>, Option<String>);
 
 /// A started tunnel: the pairing link through it, the answer for `bridge
 /// tunnel on`, and the panel's own printout.
@@ -409,13 +454,7 @@ fn opened(bridge: &Bridge, host: &str, minutes: u64, until_ms: u64, now: u64, js
 /// now when `first` says for how long, then each second takes `bridge
 /// tunnel on|off` requests and stops the tunnel when [`must_stop`] says so.
 /// The tunnel ends with this future.
-pub async fn manage(
-    bridge: Bridge,
-    origin: String,
-    first: Option<u64>,
-    json: bool,
-    mut ready: Option<(String, Option<String>)>,
-) {
+pub async fn manage(bridge: Bridge, origin: String, first: Option<u64>, json: bool, mut ready: Option<Ready>) {
     // Whatever was asked before this panel started is nobody's request now.
     let _ = std::fs::remove_file(bridge.dir.join(STATUS));
     let _ = std::fs::remove_file(bridge.dir.join(REQUEST));
@@ -437,9 +476,16 @@ pub async fn manage(
                     eprintln!("tunnel: {why}");
                     ready_once(&mut ready, None);
                 } else {
-                    let program = install_dir().ok().and_then(|dir| find(std::env::var_os("PATH").as_deref(), &dir));
-                    let started = match program {
-                        Some(program) => Tunnel::start(&program, &origin, &|| bridge.locked().unwrap_or(true)).await,
+                    let found = install_dir()
+                        .ok()
+                        .and_then(|dir| find(std::env::var_os("PATH").as_deref(), &dir).map(|program| (program, dir)));
+                    let started = match found {
+                        Some((program, dir)) => {
+                            match trusted(&program, &dir, asset(std::env::consts::OS, std::env::consts::ARCH)) {
+                                Ok(()) => Tunnel::start(&program, &origin, &|| bridge.locked().unwrap_or(true)).await,
+                                Err(why) => Err(why),
+                            }
+                        }
                         None => Err("no cloudflared; `h0x-core bridge tunnel on` downloads it".into()),
                     };
                     match started {
@@ -1171,6 +1217,64 @@ mod tests {
             assert!(err.contains("locked"), "{err}");
             assert_eq!(host(), None, "nothing listed");
         });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    fn request(headers: &[(&str, &str)]) -> http::Request {
+        let headers = headers.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect();
+        http::Request { method: "GET".into(), path: "/ws".into(), headers }
+    }
+
+    #[test]
+    fn the_visitors_address_is_believed_only_behind_our_tunnel_from_this_machine() {
+        let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+        let cf = request(&[("cf-connecting-ip", "198.51.100.7")]);
+        assert_eq!(client(&cf, ip("127.0.0.1"), true), ip("198.51.100.7"), "through the tunnel");
+        assert_eq!(client(&request(&[("cf-connecting-ip", "2001:db8::7")]), ip("::1"), true), ip("2001:db8::7"));
+        assert_eq!(client(&cf, ip("127.0.0.1"), false), ip("127.0.0.1"), "localhost: ignored");
+        assert_eq!(client(&cf, ip("192.168.1.20"), false), ip("192.168.1.20"), "LAN: ignored");
+        assert_eq!(client(&cf, ip("192.168.1.20"), true), ip("192.168.1.20"), "a LAN peer is not cloudflared");
+        for bad in ["", "not an ip", "198.51.100.7, 10.0.0.1", "198.51.100.7:80"] {
+            let req = request(&[("cf-connecting-ip", bad)]);
+            assert_eq!(client(&req, ip("127.0.0.1"), true), ip("127.0.0.1"), "{bad:?}");
+        }
+        assert_eq!(client(&request(&[]), ip("127.0.0.1"), true), ip("127.0.0.1"), "no header");
+        assert_eq!(client(&cf, None, true), None, "no socket address, no answer");
+    }
+
+    #[test]
+    fn a_tampered_cloudflared_in_the_install_folder_is_refused_before_every_start() {
+        let dir = std::env::temp_dir().join(format!("h0x-core-trusted-{}", crate::platform::random_hex()));
+        let (install, other) = (dir.join("bin"), dir.join("path"));
+        for d in [&install, &other] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let sum = sha::hex(&sha::sha256(b"the real cloudflared"));
+        let pinned = Some(("cloudflared-linux-amd64", sum.as_str()));
+        let (mine, theirs) = (install.join(exe_name()), other.join(exe_name()));
+        std::fs::write(&mine, b"the real cloudflared").unwrap();
+        assert_eq!(trusted(&mine, &install, pinned), Ok(()), "the pinned bytes");
+        std::fs::write(&mine, b"the real cloudflared!").unwrap();
+        let refused = trusted(&mine, &install, pinned).unwrap_err();
+        assert!(refused.contains("refusing") && refused.contains("SHA-256") && refused.contains(&sum), "{refused}");
+        std::fs::write(&mine, b"").unwrap();
+        assert!(trusted(&mine, &install, pinned).is_err(), "emptied");
+        std::fs::remove_file(&mine).unwrap();
+        assert!(trusted(&mine, &install, pinned).is_err(), "vanished between find and start");
+        std::fs::write(&mine, b"anything").unwrap();
+        assert!(trusted(&mine, &install, None).unwrap_err().contains("no pinned"), "nothing to check it against");
+        assert_eq!(
+            trusted(&mine, &install, Some(("cloudflared-darwin-arm64.tgz", sum.as_str()))),
+            Ok(()),
+            "a tgz is pinned whole"
+        );
+        std::fs::write(&theirs, b"the user's own build").unwrap();
+        assert_eq!(trusted(&theirs, &install, pinned), Ok(()), "one on PATH is the user's own");
         let _ = std::fs::remove_dir_all(dir);
     }
 }
