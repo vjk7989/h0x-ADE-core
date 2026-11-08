@@ -930,11 +930,13 @@ Swap this h0x-core for another build and restart (terminals keep running)
 Usage: h0x-core update [OPTIONS]
 
 Options:
-      --from <FILE>      An h0x-core binary to use (default: download the latest release)
-      --json             JSON output even in a terminal
-      --version <X.Y.Z>  At least this release (`0.1.4`): nothing changes when this h0x-core is already that or newer
-      --force            Allow an older version (saved state only moves forward), or a release of another protocol generation
-  -h, --help             Print help
+      --from <FILE>       A release archive (h0x-core-<target>.tar.gz or .zip) to use, with its .minisig beside it (default: download the latest release)
+      --json              JSON output even in a terminal
+      --signature <FILE>  The signature of --from, if not <FILE>.minisig
+      --check             Only check the signature of --from: nothing is swapped, no core starts
+      --version <X.Y.Z>   At least this release (`0.1.4`): nothing changes when this h0x-core is already that or newer
+      --force             Allow an older version (saved state only moves forward), or a release of another protocol generation
+  -h, --help              Print help
 ```
 
 ## h0x-core wait
