@@ -387,6 +387,63 @@ fn strangers_by_host_or_origin_and_oversized_frames_are_turned_away() {
 }
 
 #[test]
+fn the_page_and_its_two_assets_are_served_whole_with_the_security_headers_and_nothing_else_is() {
+    let (_f, addr) = start();
+    let ask = |method: &str, path: &str| request(addr, &format!("{method} {path} HTTP/1.1\nHost: {addr}\n\n"));
+    for (path, kind, content) in [
+        ("/", "text/html", PAGE),
+        ("/app.js", "text/javascript", SCRIPT),
+        ("/style.css", "text/css", STYLE),
+        ("/app.js?v=2", "text/javascript", SCRIPT),
+        ("/style.css?", "text/css", STYLE),
+        ("/app.js#top", "text/javascript", SCRIPT),
+    ] {
+        let answer = ask("GET", path);
+        let (head, body) = answer.split_once("\r\n\r\n").unwrap_or_default();
+        assert!(head.starts_with("HTTP/1.1 200 "), "{path}: {head}");
+        for header in [
+            format!("Content-Type: {kind}; charset=utf-8"),
+            format!("Content-Length: {}", content.len()),
+            "Content-Security-Policy: default-src 'self'".to_string(),
+            "X-Content-Type-Options: nosniff".to_string(),
+            "X-Frame-Options: DENY".to_string(),
+            "Referrer-Policy: no-referrer".to_string(),
+            "Cache-Control: no-store".to_string(),
+        ] {
+            assert!(head.contains(&format!("\r\n{header}")), "{path} lacks {header}: {head}");
+        }
+        assert_eq!(body, content, "{path}");
+    }
+    for path in [
+        "/style.css/",
+        "/app.js/",
+        "/APP.JS",
+        "/Style.css",
+        "/app.js.map",
+        "/style.css.map",
+        "/static/app.js",
+        "/./app.js",
+        "/../app.js",
+        "//app.js",
+        "/app%2Ejs",
+        "/style.css%00",
+        "/page.html",
+        "/assets.rs",
+        "/favicon.ico",
+        "/C:\\app.js",
+        "/..\\app.js",
+    ] {
+        assert!(ask("GET", path).starts_with("HTTP/1.1 404 "), "{path}");
+    }
+    assert!(ask("GET", "app.js").starts_with("HTTP/1.1 400 "), "a path without its slash");
+    for method in ["HEAD", "POST", "OPTIONS"] {
+        for path in ["/app.js", "/style.css", "/app.js?v=2"] {
+            assert!(ask(method, path).starts_with("HTTP/1.1 405 "), "{method} {path}");
+        }
+    }
+}
+
+#[test]
 fn lan_mode_refuses_the_addresses_just_outside_the_private_ranges() {
     let lan = |s: &str| lan_address(Some(s.parse::<IpAddr>().unwrap()));
     for ok in
