@@ -851,6 +851,22 @@ mod tests {
     }
 
     #[test]
+    fn the_tunnel_link_pins_the_same_fingerprint_as_the_lan_link() {
+        let bridge = crate::bridge::scratch();
+        let status = opened(&bridge, "abc.trycloudflare.com", 60, 42, 1_000, false);
+        let link = status["pair"].as_str().unwrap();
+        let key = super::super::server_key(&bridge).unwrap();
+        assert!(link.ends_with(&format!("&fp={}", key.fp())), "{link}");
+        let lan = super::super::pair_link("http://192.168.1.20:8377", "ABCD2345", &key);
+        assert_eq!(
+            lan.rsplit_once("&fp="),
+            link.rsplit_once("&fp=").map(|(_, fp)| ("http://192.168.1.20:8377/#pair=ABCD2345", fp))
+        );
+        let _ = bridge.secret_del("web.key");
+        let _ = std::fs::remove_dir_all(&bridge.dir);
+    }
+
+    #[test]
     fn the_first_valid_address_wins_and_quoted_or_coloured_noise_is_handled() {
         assert_eq!(
             host_in(
