@@ -10,6 +10,7 @@
 
 mod http;
 mod sha;
+pub mod tunnel;
 pub mod vps;
 
 use super::{Bridge, Command, Key, Kind, Notice, Reply, Sender};
@@ -127,10 +128,12 @@ pub(crate) struct Web {
     strikes: Mutex<std::collections::HashMap<IpAddr, (u32, u64)>>,
 }
 
-/// One connection's device, once it paired or authenticated.
+/// One connection's device, once it paired or authenticated, and whether it
+/// came through the Cloudflare tunnel.
 #[derive(Clone, Default)]
 struct Conn {
     device: Option<Sender>,
+    tunnel: bool,
     peer: Option<IpAddr>,
 }
 
@@ -205,9 +208,11 @@ impl Web {
     }
 
     /// The terminal list, right after a device comes in.
-    fn snapshot(&self, from: &Sender, now: u64) -> Value {
+    fn snapshot(&self, conn: &Conn, from: &Sender, now: u64) -> Value {
         match self.execute(from, Command::List, now) {
-            Reply::Done(text) => message("snapshot", json!({"lines": text.lines().collect::<Vec<_>>()})),
+            Reply::Done(text) => {
+                message("snapshot", json!({"lines": text.lines().collect::<Vec<_>>(), "tunnel": conn.tunnel}))
+            }
             other => message("reply", reply_json(&Value::Null, other)),
         }
     }
@@ -237,7 +242,7 @@ impl Web {
                 let close = reply == Reply::NotPaired;
                 Step { out: vec![message("reply", reply_json(id, reply))], close }
             }
-            "snapshot" => Step { out: vec![self.snapshot(&from, now)], close: false },
+            "snapshot" => Step { out: vec![self.snapshot(conn, &from, now)], close: false },
             _ => Step {
                 out: vec![message("error", json!({"message": format!("unknown message {name:?}")}))],
                 close: false,
@@ -271,7 +276,7 @@ impl Web {
         let from = Sender { transport: "web".into(), user_id: user };
         conn.device = Some(from.clone());
         let paired = message("paired", json!({"session": session, "device": me.label, "id": me.id}));
-        Step { out: vec![paired, self.snapshot(&from, now)], close: false }
+        Step { out: vec![paired, self.snapshot(conn, &from, now)], close: false }
     }
 
     fn auth(&self, conn: &mut Conn, data: &Value, now: u64) -> Step {
@@ -292,7 +297,8 @@ impl Web {
         }
         let from = Sender { transport: "web".into(), user_id: user };
         conn.device = Some(from.clone());
-        Step { out: vec![message("hello", Value::Null), self.snapshot(&from, now)], close: false }
+        let hello = message("hello", json!({"tunnel": conn.tunnel}));
+        Step { out: vec![hello, self.snapshot(conn, &from, now)], close: false }
     }
 
     /// A failed `auth`: logged (never the token) and counted against the
@@ -350,12 +356,16 @@ async fn connection(mut stream: tokio::net::TcpStream, web: Arc<Web>) {
         Ok(Err(status)) => return drop(stream.write_all(&http::error(status)).await),
         Err(_) => return drop(stream.write_all(&http::error(408)).await),
     };
-    let answer = http::parse(&buf[..end]).and_then(|mut req| {
-        vps::https_origin_as_http(&mut req, &web.hosts);
-        http::allowed(&req, &web.hosts).map(|()| req)
+    let tunnel = tunnel::host();
+    let answer = http::parse(&buf[..end]).and_then(|mut req| match tunnel::through(&req, tunnel.as_deref())? {
+        true => Ok((req, true)),
+        false => {
+            vps::https_origin_as_http(&mut req, &web.hosts);
+            http::allowed(&req, &web.hosts).map(|()| (req, false))
+        }
     });
-    let req = match answer {
-        Ok(req) => req,
+    let (req, via_tunnel) = match answer {
+        Ok(answer) => answer,
         Err(status) => return drop(stream.write_all(&http::error(status)).await),
     };
     let page = |body: &str, kind: &str| http::response(200, kind, body.as_bytes());
@@ -366,7 +376,7 @@ async fn connection(mut stream: tokio::net::TcpStream, web: Arc<Web>) {
         "/ws" => match http::upgrade(&req) {
             Ok(head) => {
                 if stream.write_all(&head).await.is_ok() {
-                    websocket(stream, buf.split_off(end + 4), web).await;
+                    websocket(stream, buf.split_off(end + 4), web, via_tunnel).await;
                 }
                 return;
             }
@@ -402,10 +412,10 @@ async fn hang_up(mut rd: tokio::net::tcp::OwnedReadHalf, mut wr: tokio::net::tcp
     let _ = tokio::time::timeout(LINGER, async { while matches!(rd.read(&mut sink).await, Ok(n) if n > 0) {} }).await;
 }
 
-async fn websocket(stream: tokio::net::TcpStream, mut buf: Vec<u8>, web: Arc<Web>) {
+async fn websocket(stream: tokio::net::TcpStream, mut buf: Vec<u8>, web: Arc<Web>, tunnel: bool) {
     let peer = stream.peer_addr().ok().map(|a| a.ip());
     let (mut rd, mut wr) = stream.into_split();
-    let mut conn = Conn { peer, ..Conn::default() };
+    let mut conn = Conn { peer, tunnel, ..Conn::default() };
     let mut notices = web.notices.subscribe();
     let mut beat = tokio::time::interval(HEARTBEAT);
     let (opened, mut last) = (tokio::time::Instant::now(), tokio::time::Instant::now());
@@ -489,8 +499,10 @@ async fn serve(listener: tokio::net::TcpListener, web: Arc<Web>) {
     }
 }
 
-/// `h0x-core bridge web`: serves until the process is stopped.
-pub fn run(paths: &Paths, lan: bool, port: u16, via: Option<vps::Vps>) -> Result<(), RpcError> {
+/// `h0x-core bridge web`: serves until the process is stopped (or Ctrl+C,
+/// which also ends a tunnel). `via`: reverse the port through your vps.
+/// `tunnel`: open a Cloudflare tunnel at once, for that many minutes.
+pub fn run(paths: &Paths, lan: bool, port: u16, via: Option<vps::Vps>, tunnel: Option<u64>) -> Result<(), RpcError> {
     let failed = |e: String| RpcError::new("bridge", e, "see docs/bridge.md, Web panel");
     let ip = if lan { lan_address(outbound_ip()).map_err(failed)? } else { Ipv4Addr::LOCALHOST };
     let bridge = Bridge::open(paths)?;
@@ -503,6 +515,8 @@ pub fn run(paths: &Paths, lan: bool, port: u16, via: Option<vps::Vps>) -> Result
     println!("web panel: {local}/");
     if bridge.locked()? {
         println!("remote control is locked: no pairing until `h0x-core bridge unlock`");
+    } else if tunnel.is_some() {
+        println!("starting a Cloudflare tunnel; its pairing link follows");
     } else {
         let (code, _) = bridge.pair("web", crate::runtime::now_ms())?;
         let link = format!("{base}/#pair={code}");
@@ -513,7 +527,7 @@ pub fn run(paths: &Paths, lan: bool, port: u16, via: Option<vps::Vps>) -> Result
             "warning: this is plain http on your network; anyone on it can see the traffic, pairing links included"
         );
     }
-    let tunnel = via.as_ref().map(|plan| {
+    let ssh = via.as_ref().map(|plan| {
         println!(
             "through your vps: reverse port 127.0.0.1:{} on the server; point your HTTPS proxy there",
             plan.remote_port
@@ -521,7 +535,7 @@ pub fn run(paths: &Paths, lan: bool, port: u16, via: Option<vps::Vps>) -> Result
         let locked = vps::lock_check(Bridge::open(paths)?, |why| eprintln!("bridge: vps: {why}"));
         Ok(vps::Tunnel::ssh(plan, port, locked))
     });
-    let tunnel = tunnel.transpose()?;
+    let ssh = ssh.transpose()?;
     let (notices, _) = tokio::sync::broadcast::channel(64);
     let feed = notices.clone();
     let quiet = bridge.config.notice_quiet_ms();
@@ -541,6 +555,7 @@ pub fn run(paths: &Paths, lan: bool, port: u16, via: Option<vps::Vps>) -> Result
         let stream = crate::client::connect_or_start(&paths)?;
         crate::client::call(&stream, method, params).map_err(|e| crate::client::explain_closed(&paths, e))
     };
+    let manager = tunnel::manage(Bridge::open(paths)?, hosts[0].clone(), tunnel);
     let web =
         Arc::new(Web { bridge: Mutex::new(bridge), core: Box::new(core), hosts, notices, strikes: Default::default() });
     let runtime =
@@ -551,12 +566,13 @@ pub fn run(paths: &Paths, lan: bool, port: u16, via: Option<vps::Vps>) -> Result
             let listener = tokio::net::TcpListener::from_std(listener).map_err(|e| failed(e.to_string()))?;
             tokio::select! {
                 () = serve(listener, web) => {}
+                () = manager => {}
                 () = stopped() => {}
             }
             Ok(())
         })
-        // The tunnel is stopped (ssh killed) as it drops here, on every way out.
-        .inspect(|()| drop(tunnel))
+        // The vps tunnel is stopped (ssh killed) as it drops here, on every way out.
+        .inspect(|()| drop(ssh))
 }
 
 /// Ctrl-C, or on Unix a termination signal.

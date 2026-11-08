@@ -86,7 +86,7 @@ It is plain http: anyone on that network can watch the traffic, the pairing link
 | --- | --- | --- |
 | Local | `h0x-core bridge web` | This machine only |
 | LAN (plain http) | `h0x-core bridge web --lan` | Devices on your private network |
-| Tunnel | a tunnel provider (its own section, when that option is available) | Anyone with the link, through a tunnel provider |
+| Tunnel (Cloudflare) | `h0x-core bridge web --tunnel`, or `h0x-core bridge tunnel on` for a running panel; `bridge tunnel off` closes it | Anyone with the link, through Cloudflare (https, not end-to-end); see "Access from anywhere" |
 | Your VPS | `h0x-core bridge web --via vps --public-host h0x.example.com` | Anyone who can reach your VPS's HTTPS name |
 | SSH only | `ssh -L 8377:127.0.0.1:8377 you@your-pc`, then open `http://127.0.0.1:8377/` | Only you, with no public exposure at all |
 
@@ -157,8 +157,9 @@ From the device:
 From the server:
 
 - `paired` `{session, device, id}`
-- `hello`
-- `snapshot` `{lines}`: the terminals, as `/agents` lists them.
+- `hello` `{tunnel}`
+- `snapshot` `{lines, tunnel}`: the terminals, as `/agents` lists them.
+  `tunnel` is true on a connection that came through the Cloudflare tunnel, so the page can say it is not end-to-end.
 - `reply` `{id, kind, ...}`, where `kind` is one of:
   - `done` `{text}`
   - `needs_confirm` `{token, what}`
@@ -171,6 +172,52 @@ From the server:
 - `error` `{message}`, after which the connection usually closes.
 
 Reconnecting is the device's job: authenticate again with the session token.
+
+## Access from anywhere
+
+To reach the panel when the phone is not on your Wi-Fi, switch on a Cloudflare quick tunnel:
+
+```sh
+h0x-core bridge web --tunnel             # serve the panel and open a tunnel at once
+h0x-core bridge web --tunnel --for 30    # the tunnel stops after 30 minutes (default 60, at most 1440)
+h0x-core bridge tunnel on [--for 30]     # open one for a panel that is already running
+h0x-core bridge tunnel off               # close it
+```
+
+The panel starts `cloudflared tunnel --url http://<panel> --no-autoupdate --protocol http2` and reads its address, `https://<random words>.trycloudflare.com`.
+It accepts only an https address with exactly one name before `.trycloudflare.com`.
+It prints that address, a warning, and a new one-time pairing link through the tunnel with its QR code; `bridge tunnel on` prints them too.
+A new link replaces any earlier one; the newest works.
+Only one tunnel runs at a time; `tunnel on` while one is up keeps its address and restarts its timer.
+
+While the tunnel is up, the panel also answers the tunnel's `Host`, and a browser's `Origin` must then be the tunnel's own https page.
+Everything else stays the same: pairing, session tokens, the lock, rate limits, redaction and the audit log.
+
+What passes through Cloudflare: the connection is https from the phone to Cloudflare, and Cloudflare hands it on to cloudflared here.
+Cloudflare can read all of it: the pairing link, session tokens, terminal text and every command.
+It is not end-to-end. The panel tells the device so (`tunnel: true` in `hello` and `snapshot`).
+Anyone who learns the address can reach the page, but not control anything without pairing.
+
+The tunnel stops, and cloudflared is killed:
+
+- when its time is up (`--for`, 60 minutes by default);
+- on `h0x-core bridge tunnel off`;
+- within a second of a lock, from a device or with `h0x-core bridge lock`; `tunnel on` is refused while locked;
+- if cloudflared ends by itself;
+- when the panel stops: Ctrl+C, an error, or its core terminal being killed (on Windows the terminal's job ends cloudflared with it).
+
+If the panel itself is killed some other way, cloudflared may keep running for a while, but the address is no longer accepted: a new panel only answers its own tunnel.
+
+`bridge tunnel on|off` finds the running panel through the bridge folder: it writes `tunnel.request`, which the panel takes within a second, and reads the panel's answer from `tunnel.json`.
+With no panel running, it says so after 3 seconds.
+
+### cloudflared
+
+A `cloudflared` on `PATH` is used first. Otherwise the panel uses one downloaded beside `h0x-core`.
+If there is none, `bridge web --tunnel` and `bridge tunnel on` ask before downloading one (pass `--yes` to skip the question; without a terminal and without `--yes` they refuse).
+The download is a pinned cloudflared release (2026.10.7) from github.com/cloudflare/cloudflared, about 20–55 MB depending on the platform, fetched with the system `curl` over https only.
+It is installed only if its SHA-256 matches the one pinned in core; otherwise it is deleted and refused.
+Pinned builds: Windows x64, Linux x64 and arm64, macOS x64 and arm64 (unpacked with `tar`). Elsewhere, install cloudflared yourself.
 
 ## Full control means full control
 
@@ -283,7 +330,7 @@ h0x-core bridge log -n 100
 ## Files
 
 The bridge folder is `bridge/` beside config.toml: `~/.config/h0x-core/bridge/`, or `%APPDATA%\h0x-core\bridge\` on Windows.
-It holds `state.json` (paired accounts, the live code, the lock) and `audit.jsonl`.
+It holds `state.json` (paired accounts, the live code, the lock) and `audit.jsonl`, and while a web panel runs, `tunnel.request` and `tunnel.json` (the tunnel's address and its pairing link).
 On Unix, the folder is 0700 and both files are 0600. On Windows, they use the folder's permissions, like the rest of core's state.
 Pairing codes sit in `state.json` for their 10 minutes. Treat that folder like an SSH key.
 
@@ -316,6 +363,8 @@ It does not defend against:
 - **Other programs running as your account.** They can already reach core and its files.
 - **Secrets the redaction patterns don't recognize.**
 - **Someone watching a `--lan` network.** The panel is plain http there; they can see the traffic and a pairing link.
+- **Cloudflare, with the tunnel on.** It sees everything that passes through the tunnel, the pairing link and session tokens included.
 
 The Telegram bot only makes outbound connections.
 The web panel listens on 127.0.0.1, or on a private LAN address with `--lan`, never on a public one.
+With the tunnel on, cloudflared makes an outbound connection to Cloudflare and passes requests on to the panel.
