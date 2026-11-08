@@ -10,6 +10,8 @@
 mod command;
 mod notice;
 mod redact;
+pub mod telegram;
+pub mod web;
 
 pub use command::{Command, Key, Reply, Sender};
 pub use notice::{Kind, Notice, Notices, watch};
@@ -19,13 +21,16 @@ use crate::config::BridgeConfig;
 use crate::rpc::RpcError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
 
 /// Who can pair today.
-pub const TRANSPORTS: &[&str] = &["telegram"];
-const CODE_MS: u64 = 10 * 60_000;
+pub const TRANSPORTS: &[&str] = &["telegram", "web"];
+/// How long a pairing code lives: a web link (shown as a QR code) 5 minutes, a chat code 10.
+fn code_ms(transport: &str) -> u64 {
+    if transport == "web" { 5 * 60_000 } else { 10 * 60_000 }
+}
 const WRONG_CODES: u32 = 5;
 const BLOCK_MS: u64 = 10 * 60_000;
 /// No 0/O or 1/I: read off a screen and typed on a phone. 32 letters: no modulo bias.
@@ -60,6 +65,9 @@ struct State {
     /// whichever process locked (ADR-061 addendum).
     #[serde(default)]
     locks: u64,
+    /// Web devices: their user id and the SHA-256 of their session token.
+    #[serde(default)]
+    sessions: BTreeMap<String, String>,
 }
 
 /// The one live pairing code.
@@ -130,14 +138,19 @@ impl Bridge {
 
     /// Replaces state.json with a new 0600 file.
     fn save(&self, st: &State) -> Result<(), RpcError> {
+        self.write_private("state.json", &serde_json::to_vec_pretty(st).map_err(failed)?)
+    }
+
+    /// Replaces `name` in the bridge folder with a new 0600 file holding `bytes`.
+    fn write_private(&self, name: &str, bytes: &[u8]) -> Result<(), RpcError> {
         let write = || -> std::io::Result<()> {
             crate::platform::private_dir(&self.dir)?;
-            let tmp = self.dir.join("state.json.tmp");
+            let tmp = self.dir.join(format!("{name}.tmp"));
             let _ = std::fs::remove_file(&tmp);
             let mut file = crate::platform::private_file(&tmp)?;
-            file.write_all(&serde_json::to_vec_pretty(st).map_err(std::io::Error::other)?)?;
+            file.write_all(bytes)?;
             file.sync_all()?;
-            std::fs::rename(tmp, self.dir.join("state.json"))
+            std::fs::rename(tmp, self.dir.join(name))
         };
         write().map_err(failed)
     }
@@ -153,7 +166,7 @@ impl Bridge {
         }
         blocked(&st, now)?;
         let code = code();
-        let expires_ms = now + CODE_MS;
+        let expires_ms = now + code_ms(transport);
         st.pending = Some(Pending { code: code.clone(), transport: transport.into(), expires_ms });
         self.save(&st)?;
         Ok((code, expires_ms))
@@ -192,6 +205,9 @@ impl Bridge {
         let mut st = self.load()?;
         let before = st.identities.len();
         st.identities.retain(|i| id.is_some_and(|id| i.id != id));
+        // An unpaired device's session goes with it.
+        let ids = &st.identities;
+        st.sessions.retain(|user, _| ids.iter().any(|i| i.transport == "web" && &i.user_id == user));
         let removed = before - st.identities.len();
         if let (Some(id), 0) = (id, removed) {
             return Err(RpcError::new("not_found", format!("no paired account {id}"), "see `h0x-core bridge ls`"));

@@ -1,8 +1,10 @@
-//! `h0x-core bridge pair|unpair|ls|lock|unlock|log`: who may control this
-//! machine remotely. Local files only: no core needed.
+//! `h0x-core bridge pair|unpair|ls|lock|unlock|reset|log|telegram|run|web|tunnel`:
+//! who may control this machine remotely, the Telegram bot and the web panel.
+//! Local files only, except `run`, `web` and a cloudflared download.
 
 use super::*;
 use crate::bridge::Bridge;
+use crate::bridge::web::tunnel;
 
 #[derive(Subcommand)]
 pub(super) enum BridgeCmd {
@@ -34,6 +36,125 @@ pub(super) enum BridgeCmd {
         #[arg(short = 'n', default_value_t = 20)]
         n: usize,
     },
+    /// The Telegram bot's settings.
+    Telegram {
+        #[command(subcommand)]
+        action: TelegramCmd,
+    },
+    /// Run the Telegram bot until stopped: answers paired accounts, sends notices.
+    /// Under core: h0x-core run --bg --keep -- h0x-core bridge run
+    Run,
+    /// Serve the web panel until stopped: a page and a WebSocket API for paired devices.
+    /// On 127.0.0.1; --lan: this machine's private network address (plain http).
+    Web {
+        /// Listen on this machine's private LAN address instead of 127.0.0.1.
+        #[arg(long)]
+        lan: bool,
+        /// The port (0: any free one).
+        #[arg(long, default_value_t = crate::bridge::web::PORT)]
+        port: u16,
+        /// Reach it through your VPS: the name of an ssh machine (`machine add`).
+        /// Opens a reverse port on the server's loopback; your HTTPS proxy there serves it.
+        #[arg(long = "via", value_name = "MACHINE", requires = "public_host", conflicts_with = "lan")]
+        via: Option<String>,
+        /// The DNS name your HTTPS proxy serves, for the pairing link.
+        #[arg(long, requires = "via")]
+        public_host: Option<String>,
+        /// The port on the server's loopback.
+        #[arg(long, default_value_t = crate::bridge::web::PORT, requires = "via")]
+        remote_port: u16,
+        /// Also reach it from anywhere through a Cloudflare tunnel (https, not end-to-end).
+        #[arg(long)]
+        tunnel: bool,
+        #[command(flatten)]
+        how: TunnelArgs,
+    },
+    /// Turn "access from anywhere" (a Cloudflare tunnel) on or off for the running web panel.
+    Tunnel {
+        #[command(subcommand)]
+        action: TunnelCmd,
+    },
+}
+
+#[derive(clap::Args)]
+pub(super) struct TunnelArgs {
+    /// Stop the tunnel after this many minutes (1 to 1440).
+    #[arg(long = "for", value_name = "MINUTES", default_value_t = tunnel::MINUTES,
+          value_parser = clap::value_parser!(u64).range(1..=tunnel::MAX_MINUTES))]
+    minutes: u64,
+    /// Download the pinned cloudflared without asking, if none is on PATH.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Subcommand)]
+pub(super) enum TunnelCmd {
+    /// Start a tunnel to the running panel and print a pairing link through it.
+    On {
+        #[command(flatten)]
+        how: TunnelArgs,
+    },
+    /// Stop the tunnel.
+    Off,
+}
+
+#[derive(Subcommand)]
+pub(super) enum TelegramCmd {
+    /// Store the bot token from @BotFather, read from stdin (not shown as you type).
+    Token {
+        /// Remove the stored token instead.
+        #[arg(long)]
+        clear: bool,
+    },
+}
+
+/// cloudflared: one on PATH, else the one downloaded before, else the pinned
+/// release, downloaded once the user says yes (`--yes`, or y at a prompt).
+fn cloudflared(yes: bool) -> Result<(), RpcError> {
+    let dir = tunnel::install_dir()?;
+    if tunnel::find(std::env::var_os("PATH").as_deref(), &dir).is_some() {
+        return Ok(());
+    }
+    let refused = |why: &str| RpcError::new("bridge", why, "install cloudflared on PATH, or pass --yes to download it");
+    if !yes {
+        if !std::io::stdin().is_terminal() {
+            return Err(refused("cloudflared is not installed"));
+        }
+        eprint!("{}", tunnel::download_question(&dir));
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer).map_err(|e| RpcError::internal(e.to_string()))?;
+        if !answer.trim().eq_ignore_ascii_case("y") && !answer.trim().eq_ignore_ascii_case("yes") {
+            return Err(refused("cloudflared was not downloaded"));
+        }
+    }
+    eprintln!("downloading cloudflared into {}", dir.display());
+    tunnel::download(&dir).map(drop)
+}
+
+/// The bot token: typed without echo in a terminal, else the first line piped in.
+fn read_token() -> Result<String, RpcError> {
+    if !std::io::stdin().is_terminal() {
+        let mut text = String::new();
+        std::io::stdin().read_to_string(&mut text).map_err(|e| RpcError::internal(e.to_string()))?;
+        return Ok(text.lines().next().unwrap_or_default().to_string());
+    }
+    eprint!("bot token from @BotFather (not shown), then enter: ");
+    let mut token = Vec::new();
+    {
+        let _raw = crate::platform::console::RawMode::enter();
+        let mut input = crate::platform::console::stdin();
+        let mut byte = [0u8];
+        while input.read(&mut byte).map_err(|e| RpcError::internal(e.to_string()))? == 1 {
+            match byte[0] {
+                b'\r' | b'\n' => break,
+                3 | 4 => return Err(cancelled()),
+                8 | 127 => drop(token.pop()),
+                b => token.push(b),
+            }
+        }
+    }
+    eprintln!();
+    String::from_utf8(token).map_err(|_| RpcError::invalid_params("that is not a bot token"))
 }
 
 /// `5m ago`, from two ms timestamps.
@@ -57,9 +178,13 @@ pub(super) fn bridge(paths: &Paths, action: BridgeCmd) -> Result<Out, RpcError> 
     Ok(match action {
         BridgeCmd::Pair { transport } => {
             let (code, expires_ms) = bridge.pair(&transport, now)?;
-            let human = format!(
-                "pairing code for {transport}: {code}\nvalid 10 minutes, once; it gives that account full control of this machine"
+            let minutes = (expires_ms - now) / 60_000;
+            let mut human = format!(
+                "pairing code for {transport}: {code}\nvalid {minutes} minutes, once; it gives that account full control of this machine"
             );
+            if transport == "web" {
+                human.push_str("\nenter it on the web panel, or use the link and QR code `h0x-core bridge web` prints");
+            }
             Out { json: json!({"code": code, "transport": transport, "expires_ms": expires_ms}), human }
         }
         BridgeCmd::Unpair { id, all: _ } => {
@@ -80,7 +205,45 @@ pub(super) fn bridge(paths: &Paths, action: BridgeCmd) -> Result<Out, RpcError> 
                 rows.push("no paired accounts (h0x-core bridge pair)".into());
             }
             rows.push(format!("remote control {}", if locked { "locked" } else { "unlocked" }));
-            Out { json: json!({"identities": identities, "locked": locked}), human: rows.join("\n") }
+            let token = if bridge.telegram_token()?.is_some() { "set" } else { "unset" };
+            rows.push(format!("telegram token: {token}"));
+            let json = json!({"identities": identities, "locked": locked, "telegram_token": token});
+            Out { json, human: rows.join("\n") }
+        }
+        BridgeCmd::Telegram { action: TelegramCmd::Token { clear: true } } => {
+            let human =
+                if bridge.clear_telegram_token()? { "telegram token removed" } else { "no telegram token was set" };
+            Out { json: json!({"telegram_token": "unset"}), human: human.into() }
+        }
+        BridgeCmd::Telegram { action: TelegramCmd::Token { clear: false } } => {
+            bridge.set_telegram_token(&read_token()?)?;
+            Out { json: json!({"telegram_token": "set"}), human: "telegram token stored".into() }
+        }
+        BridgeCmd::Web { lan, port, via, public_host, remote_port, tunnel, how } => {
+            let via = match (via, public_host) {
+                (Some(machine), Some(host)) => {
+                    Some(crate::bridge::web::vps::plan(paths, &machine, &host, remote_port)?)
+                }
+                _ => None,
+            };
+            if tunnel {
+                cloudflared(how.yes)?;
+            }
+            crate::bridge::web::run(paths, lan, port, via, tunnel.then_some(how.minutes))?;
+            Out { json: Value::Null, human: String::new() }
+        }
+        BridgeCmd::Tunnel { action: TunnelCmd::On { how } } => {
+            cloudflared(how.yes)?;
+            let (json, human) = tunnel::ask(&bridge, Some(how.minutes))?;
+            Out { json, human }
+        }
+        BridgeCmd::Tunnel { action: TunnelCmd::Off } => {
+            let (json, human) = tunnel::ask(&bridge, None)?;
+            Out { json, human }
+        }
+        BridgeCmd::Run => {
+            crate::bridge::telegram::run(paths)?;
+            Out { json: Value::Null, human: String::new() }
         }
         BridgeCmd::Lock => {
             bridge.set_locked(true)?;
@@ -130,5 +293,63 @@ mod tests {
             ["0s ago", "59s ago", "1m ago", "59m ago", "1h ago", "1d ago"]
         );
         assert_eq!(super::ago(0, 5_000), "0s ago", "a clock that went back");
+    }
+
+    #[test]
+    fn web_via_needs_a_public_host_and_excludes_lan() {
+        use super::{BridgeCmd, Cli, Cmd};
+        use clap::Parser;
+        let parse = |args: &[&str]| Cli::try_parse_from([&["h0x-core", "bridge", "web"], args].concat());
+        for args in [
+            &["--via", "vps"][..],
+            &["--public-host", "h0x.example.com"],
+            &["--remote-port", "9000"],
+            &["--public-host", "h0x.example.com", "--remote-port", "9000"],
+            &["--via", "vps", "--public-host", "h0x.example.com", "--lan"],
+            &["--via", "vps", "--public-host", "h0x.example.com", "--remote-port", "65536"],
+            &["--via", "vps", "--public-host", "h0x.example.com", "--remote-port", "-1"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?} must be refused");
+        }
+        let Some(Cmd::Bridge { action: BridgeCmd::Web { lan, via, public_host, remote_port, .. } }) =
+            parse(&["--via", "vps", "--public-host", "h0x.example.com"]).unwrap().cmd
+        else {
+            panic!("bridge web")
+        };
+        assert!(!lan);
+        assert_eq!((via.as_deref(), public_host.as_deref()), (Some("vps"), Some("h0x.example.com")));
+        assert_eq!(remote_port, crate::bridge::web::PORT, "default remote port");
+        let Some(Cmd::Bridge { action: BridgeCmd::Web { via, remote_port, .. } }) = parse(&[]).unwrap().cmd else {
+            panic!("bridge web")
+        };
+        assert_eq!(via, None, "plain bridge web still parses");
+        assert_eq!(remote_port, crate::bridge::web::PORT);
+    }
+
+    #[test]
+    fn tunnel_minutes_are_one_to_a_day_and_default_to_an_hour() {
+        use super::{BridgeCmd, TunnelCmd};
+        use clap::Parser;
+        let parse = |args: &[&str]| {
+            let cli = crate::cli::Cli::try_parse_from([&["h0x-core", "bridge"], args].concat()).ok()?;
+            match cli.cmd? {
+                crate::cli::Cmd::Bridge { action: BridgeCmd::Web { tunnel: true, how, .. } }
+                | crate::cli::Cmd::Bridge { action: BridgeCmd::Tunnel { action: TunnelCmd::On { how } } } => {
+                    Some((how.minutes, how.yes))
+                }
+                _ => None,
+            }
+        };
+        for on in [&["web", "--tunnel"][..], &["tunnel", "on"][..]] {
+            let with = |extra: &[&str]| parse(&[on, extra].concat());
+            assert_eq!(with(&[]), Some((60, false)), "{on:?}: an hour by default");
+            assert_eq!(with(&["--for", "1"]), Some((1, false)));
+            assert_eq!(with(&["--for", "1440", "--yes"]), Some((1440, true)));
+            for bad in ["0", "1441", "-1", "", "1.5", "60m", "18446744073709551616"] {
+                assert_eq!(with(&["--for", bad]), None, "{on:?} --for {bad:?}");
+            }
+        }
+        assert!(crate::cli::Cli::try_parse_from(["h0x-core", "bridge", "tunnel", "off", "--for", "5"]).is_err());
+        assert!(crate::cli::Cli::try_parse_from(["h0x-core", "bridge", "tunnel"]).is_err(), "on or off");
     }
 }

@@ -2,9 +2,222 @@
 
 The bridge lets chat accounts you pair drive this machine's terminals while you are away from it.
 They can see what your agents are doing, answer their questions, send text and keys, start agents and commands, and stop them.
-It is built into core and doesn't depend on any one transport. Telegram is the first transport and arrives separately; until then, nothing reaches the bridge from outside.
+It is built into core and doesn't depend on any one transport. Telegram is the only one today: a bot you create, run by `h0x-core bridge run`.
 
 [Back to the README](../README.md) · [Security](security.md) · [Commands](commands.md)
+
+## Telegram setup
+
+1. In Telegram, talk to @BotFather: send `/newbot`, pick a name, and copy the token it gives you.
+2. Store the token on this machine; it is read from stdin and not shown as you type:
+
+   ```sh
+   h0x-core bridge telegram token
+   ```
+
+   It is kept in the bridge folder, mode 0600, and never logged or printed: `h0x-core bridge ls` only says whether it is set. `h0x-core bridge telegram token --clear` removes it.
+3. Print a pairing code:
+
+   ```sh
+   h0x-core bridge pair
+   ```
+
+4. Start the bot so it can hear you. It keeps running until stopped; under core it survives your terminal closing:
+
+   ```sh
+   h0x-core run --bg --keep -- h0x-core bridge run
+   ```
+
+5. In a private chat with your bot, send `/pair CODE` within 10 minutes. The bot answers that you are paired.
+
+The bot only talks to paired accounts in private chats.
+Group chats are ignored. Messages from accounts that aren't paired get no answer, except `/pair`.
+Messages from other bots and commands addressed to another bot (`/agents@OtherBot`) are ignored too; the bot learns its own name from Telegram when it starts.
+
+It only makes outbound connections: it long-polls `api.telegram.org` over https through the system `curl` and never listens on a port.
+The token travels inside the request that curl reads on its stdin, never on a command line that other processes could list.
+Errors keep curl's own message but cut the token out of any URL in it, so the token never reaches a log or a chat.
+Accounts are known by their numeric Telegram user id; a username is only a label and can't pair or act.
+When Telegram can't be reached, it tries again after 1, 2, 4, 8 seconds and so on, up to a minute between tries.
+
+### In the chat
+
+- `/agents`: terminals, with their agent, folder and status
+- `/read <t> [lines]`: its last lines (default 20)
+- `/send <t> <text>`: type text and press enter
+- `/keys <t> <keys…>`: press enter, esc, ctrl+c, up, down, left, right, y, n
+- `/approve <t>`, `/deny <t>`: answer what it is waiting on
+- `/interrupt <t>`: press its stop key
+- `/run <folder> <command>`: start an agent or command (put a folder with spaces in "double quotes")
+- `/kill <t>`: end its program
+- `/lock`: refuse every remote command until `h0x-core bridge unlock` here
+- `/help`: this list
+
+Notices come with buttons: Approve, Deny, Show and Interrupt when an agent needs you; Show for the rest.
+To type into a terminal, reply to its notice.
+A command that needs a confirmation shows Confirm and Cancel buttons. Cancel leaves the confirmation unused, and it expires in 2 minutes.
+Notices stop while the bridge is locked.
+
+## Web panel
+
+`h0x-core bridge web` serves a small web page and a WebSocket API. A phone or an app uses it to see the running agents and control them, the same way the Telegram bot does.
+
+```sh
+h0x-core bridge web          # on 127.0.0.1:8377, this machine only
+h0x-core bridge web --lan    # on this machine's private network address, for a phone on the same Wi-Fi
+h0x-core run --bg --keep -- h0x-core bridge web --lan   # under core, so it keeps running
+```
+
+When it starts, it prints the panel's address and a one-time pairing link, as text and as a QR code to scan.
+The link is valid for 5 minutes and works once. `h0x-core bridge pair --transport web` prints a new code you can type on the panel instead.
+Opening the link pairs the device: it becomes a paired account in `h0x-core bridge ls`, with transport `web` and the device's label, and it receives a session token.
+The token stays on the device. This machine keeps only its SHA-256 and compares it in constant time.
+Each later connection must give that token as its first message.
+`h0x-core bridge unpair <id>` revokes a device at once, and so does a reset.
+Everything else is as for Telegram: confirmations, the lock (no notices go out while locked), rate limits, redaction and the audit log.
+
+`--lan` only binds a private address: 10.x, 172.16–31.x, 192.168.x, or 100.64.0.0/10 (Tailscale and other private overlays).
+It refuses public, loopback and link-local addresses.
+It is plain http: anyone on that network can watch the traffic, the pairing link included. Use it only on a network you trust.
+
+### Ways to reach it
+
+| Way | Command | Who can reach it |
+| --- | --- | --- |
+| Local | `h0x-core bridge web` | This machine only |
+| LAN (plain http) | `h0x-core bridge web --lan` | Devices on your private network |
+| Tunnel (Cloudflare) | `h0x-core bridge web --tunnel`, or `h0x-core bridge tunnel on` for a running panel; `bridge tunnel off` closes it | Anyone with the link, through Cloudflare (https, not end-to-end); see "Access from anywhere" |
+| Your VPS | `h0x-core bridge web --via vps --public-host h0x.example.com` | Anyone who can reach your VPS's HTTPS name |
+| SSH only | `ssh -L 8377:127.0.0.1:8377 you@your-pc`, then open `http://127.0.0.1:8377/` | Only you, with no public exposure at all |
+
+The SSH-only way is for power users: your PC runs `h0x-core bridge web`, and the device you read it from forwards the port with `ssh -L`.
+Nothing is exposed to the internet, and the pairing link works through the forwarded port.
+
+### Through your VPS
+
+Add your server once as a machine, then run the panel with `--via`:
+
+```sh
+h0x-core machine add you@vps.example.com --name vps
+h0x-core bridge web --via vps --public-host h0x.example.com   # --remote-port 8377 by default
+```
+
+The bridge keeps an `ssh -N -R` running that opens the port on the server's **loopback only** (`127.0.0.1`, never `0.0.0.0`).
+It uses the machine's ssh target, adds `ExitOnForwardFailure=yes`, `ServerAliveInterval=15` and `BatchMode=yes`, and never forwards your ssh agent.
+Use an SSH key without a passphrase prompt (or an agent): it cannot ask questions. Connect to the server once by hand first, so its host key is known.
+If ssh ends, it is started again with growing pauses (1 s up to 60 s). It is stopped when the bridge stops, and while the bridge is locked.
+`--via` needs a plain ssh machine (not one added with `--via` a custom command), a `--public-host` that is a DNS name (no IP address, port or wildcard), and a `--remote-port` from 1024 to 65535.
+It cannot be combined with `--lan`.
+
+On the server, put your own HTTPS reverse proxy in front of that port. With Caddy, which gets the certificate for you:
+
+```text
+h0x.example.com {
+    reverse_proxy 127.0.0.1:8377
+}
+```
+
+The pairing link and QR code then use `https://h0x.example.com/#pair=...`, and that name is added to the accepted `Host` and `Origin` values.
+Keep the proxy's `Host` header as it received it (Caddy and nginx's `proxy_set_header Host $host` do), and let it pass WebSocket upgrades.
+
+Security: the proxy on your VPS ends TLS, so it can see the traffic, pairing link included; run it only on a server you control.
+Pairing and session authentication still apply to every device, and so do the lock, the allow-list, rate limits and the audit log.
+Anyone who can reach the name can load the page, so treat a pairing link like a password: it works once, for 5 minutes.
+
+What the server accepts:
+
+- Only its own address (and, with `--via`, your public name) in `Host`, so a hostile web page can't reach it through DNS rebinding.
+  A browser's `Origin`, when sent, must be the panel itself. Apps that send no `Origin` still have to authenticate.
+- No CORS headers, no request bodies (`GET` only), request heads up to 8 KB that arrive within 10 seconds, and WebSocket messages up to 64 KB.
+  Messages must be masked and unfragmented text; anything else closes the connection.
+- A connection must pair or authenticate within 30 seconds and say something at least every 60.
+  The server sends a heartbeat every 20 seconds.
+- Every answer carries `Content-Security-Policy: default-src 'self'; frame-ancestors 'none'`, `Referrer-Policy: no-referrer` and `X-Content-Type-Options: nosniff`.
+
+### WebSocket messages
+
+Every message is JSON `{"name": ..., "data": ...}`.
+
+From the device:
+
+- `pair` `{token, label}`: the one-time token from the link.
+- `auth` `{session}`: every later connection.
+- `command` `{cmd, id, ...}`, where `cmd` is one of:
+  - `list`
+  - `read` `{terminal, lines}`
+  - `send` `{terminal, text}`
+  - `keys` `{terminal, keys}`
+  - `approve`, `deny`, `interrupt`, `kill` `{terminal}`
+  - `run` `{folder, command}`
+  - `lock`
+  - `confirm` `{token}`
+- `snapshot`: the list again.
+- `ping`: answered with `pong`.
+
+From the server:
+
+- `paired` `{session, device, id}`
+- `hello` `{tunnel}`
+- `snapshot` `{lines, tunnel}`: the terminals, as `/agents` lists them.
+  `tunnel` is true on a connection that came through the Cloudflare tunnel, so the page can say it is not end-to-end.
+- `reply` `{id, kind, ...}`, where `kind` is one of:
+  - `done` `{text}`
+  - `needs_confirm` `{token, what}`
+  - `locked`
+  - `rate_limited` `{retry_secs}`
+  - `failed` `{message}`
+  - `not_paired`
+- `notice` `{terminal, agent, folder, kind, excerpt}`
+- `heartbeat`
+- `error` `{message}`, after which the connection usually closes.
+
+Reconnecting is the device's job: authenticate again with the session token.
+
+## Access from anywhere
+
+To reach the panel when the phone is not on your Wi-Fi, switch on a Cloudflare quick tunnel:
+
+```sh
+h0x-core bridge web --tunnel             # serve the panel and open a tunnel at once
+h0x-core bridge web --tunnel --for 30    # the tunnel stops after 30 minutes (default 60, at most 1440)
+h0x-core bridge tunnel on [--for 30]     # open one for a panel that is already running
+h0x-core bridge tunnel off               # close it
+```
+
+The panel starts `cloudflared tunnel --url http://<panel> --no-autoupdate --protocol http2` and reads its address, `https://<random words>.trycloudflare.com`.
+It accepts only an https address with exactly one name before `.trycloudflare.com`.
+It prints that address, a warning, and a new one-time pairing link through the tunnel with its QR code; `bridge tunnel on` prints them too.
+A new link replaces any earlier one; the newest works.
+Only one tunnel runs at a time; `tunnel on` while one is up keeps its address and restarts its timer.
+
+While the tunnel is up, the panel also answers the tunnel's `Host`, and a browser's `Origin` must then be the tunnel's own https page.
+Everything else stays the same: pairing, session tokens, the lock, rate limits, redaction and the audit log.
+
+What passes through Cloudflare: the connection is https from the phone to Cloudflare, and Cloudflare hands it on to cloudflared here.
+Cloudflare can read all of it: the pairing link, session tokens, terminal text and every command.
+It is not end-to-end. The panel tells the device so (`tunnel: true` in `hello` and `snapshot`).
+Anyone who learns the address can reach the page, but not control anything without pairing.
+
+The tunnel stops, and cloudflared is killed:
+
+- when its time is up (`--for`, 60 minutes by default);
+- on `h0x-core bridge tunnel off`;
+- within a second of a lock, from a device or with `h0x-core bridge lock`; `tunnel on` is refused while locked;
+- if cloudflared ends by itself;
+- when the panel stops: Ctrl+C, an error, or its core terminal being killed (on Windows the terminal's job ends cloudflared with it).
+
+If the panel itself is killed some other way, cloudflared may keep running for a while, but the address is no longer accepted: a new panel only answers its own tunnel.
+
+`bridge tunnel on|off` finds the running panel through the bridge folder: it writes `tunnel.request`, which the panel takes within a second, and reads the panel's answer from `tunnel.json`.
+With no panel running, it says so after 3 seconds.
+
+### cloudflared
+
+A `cloudflared` on `PATH` is used first. Otherwise the panel uses one downloaded beside `h0x-core`.
+If there is none, `bridge web --tunnel` and `bridge tunnel on` ask before downloading one (pass `--yes` to skip the question; without a terminal and without `--yes` they refuse).
+The download is a pinned cloudflared release (2026.10.7) from github.com/cloudflare/cloudflared, about 20–55 MB depending on the platform, fetched with the system `curl` over https only.
+It is installed only if its SHA-256 matches the one pinned in core; otherwise it is deleted and refused.
+Pinned builds: Windows x64, Linux x64 and arm64, macOS x64 and arm64 (unpacked with `tar`). Elsewhere, install cloudflared yourself.
 
 ## Full control means full control
 
@@ -117,7 +330,7 @@ h0x-core bridge log -n 100
 ## Files
 
 The bridge folder is `bridge/` beside config.toml: `~/.config/h0x-core/bridge/`, or `%APPDATA%\h0x-core\bridge\` on Windows.
-It holds `state.json` (paired accounts, the live code, the lock) and `audit.jsonl`.
+It holds `state.json` (paired accounts, the live code, the lock) and `audit.jsonl`, and while a web panel runs, `tunnel.request` and `tunnel.json` (the tunnel's address and its pairing link).
 On Unix, the folder is 0700 and both files are 0600. On Windows, they use the folder's permissions, like the rest of core's state.
 Pairing codes sit in `state.json` for their 10 minutes. Treat that folder like an SSH key.
 
@@ -140,6 +353,8 @@ The bridge defends against:
 - **A lost or stolen phone.** Lock from any paired account, or unpair it here. Unlocking takes this machine.
 - **Secrets leaking into chat history.** Known secret shapes are redacted before anything is sent.
 - **Not knowing what happened.** The audit log records every remote command.
+- **Web pages reaching the web panel.** Strict `Host` and `Origin` checks stop DNS rebinding and other sites' pages, and the panel's own CSP keeps it from loading anything from elsewhere.
+- **A leaked device database.** Session tokens are stored only as SHA-256 hashes.
 
 It does not defend against:
 
@@ -147,5 +362,9 @@ It does not defend against:
 - **The chat service itself.** It sees everything sent through it.
 - **Other programs running as your account.** They can already reach core and its files.
 - **Secrets the redaction patterns don't recognize.**
+- **Someone watching a `--lan` network.** The panel is plain http there; they can see the traffic and a pairing link.
+- **Cloudflare, with the tunnel on.** It sees everything that passes through the tunnel, the pairing link and session tokens included.
 
-The bridge only makes outbound connections and never listens on a network port.
+The Telegram bot only makes outbound connections.
+The web panel listens on 127.0.0.1, or on a private LAN address with `--lan`, never on a public one.
+With the tunnel on, cloudflared makes an outbound connection to Cloudflare and passes requests on to the panel.
