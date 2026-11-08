@@ -71,11 +71,15 @@ fn hosts(ip: Ipv4Addr, port: u16) -> Vec<String> {
     hosts
 }
 
+/// Medium error correction, the level every QR code here uses.
+fn encode(text: &str) -> Option<qrcodegen::QrCode> {
+    qrcodegen::QrCode::encode_text(text, qrcodegen::QrCodeEcc::Medium).ok()
+}
+
 /// `text` as a QR code for a terminal: two rows per line, light modules
 /// drawn (scanners read it on dark and light terminals alike), with a quiet zone.
-fn qr(text: &str) -> String {
-    use qrcodegen::{QrCode, QrCodeEcc};
-    let Ok(code) = QrCode::encode_text(text, QrCodeEcc::Medium) else { return String::new() };
+pub fn qr(text: &str) -> String {
+    let Some(code) = encode(text) else { return String::new() };
     let (quiet, size) = (2, code.size());
     let mut out = String::new();
     for y in (-quiet..size + quiet).step_by(2) {
@@ -90,6 +94,33 @@ fn qr(text: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+/// `text` as `{"size": N, "rows": ["0101...", ...]}`: N rows of N modules, 1 dark,
+/// no quiet zone. Empty text, or more than a QR code holds, is refused.
+pub fn qr_json(text: &str) -> Result<Value, RpcError> {
+    if text.is_empty() {
+        return Err(RpcError::invalid_params("no text to encode"));
+    }
+    let code = encode(text).ok_or_else(|| RpcError::invalid_params("that text is too long for a QR code"))?;
+    let size = code.size();
+    let rows: Vec<String> =
+        (0..size).map(|y| (0..size).map(|x| if code.get_module(x, y) { '1' } else { '0' }).collect()).collect();
+    Ok(json!({"size": size, "rows": rows}))
+}
+
+/// The one line `bridge web --json` prints once it is reachable. With a tunnel
+/// the pairing link is the one through it.
+pub fn ready_line(url: &str, pair: Option<&str>, tunnel: Option<&str>, via: Option<&str>) -> Value {
+    json!({"url": url, "pair": pair, "tunnel": tunnel, "via": via})
+}
+
+/// Prints one line to stdout and flushes it, so a reader of the pipe or terminal sees it now.
+fn emit(line: &Value) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    drop(writeln!(out, "{line}"));
+    drop(out.flush());
 }
 
 impl Bridge {
@@ -502,7 +533,15 @@ async fn serve(listener: tokio::net::TcpListener, web: Arc<Web>) {
 /// `h0x-core bridge web`: serves until the process is stopped (or Ctrl+C,
 /// which also ends a tunnel). `via`: reverse the port through your vps.
 /// `tunnel`: open a Cloudflare tunnel at once, for that many minutes.
-pub fn run(paths: &Paths, lan: bool, port: u16, via: Option<vps::Vps>, tunnel: Option<u64>) -> Result<(), RpcError> {
+/// `json`: print one [`ready_line`] instead of the human lines, once reachable.
+pub fn run(
+    paths: &Paths,
+    lan: bool,
+    port: u16,
+    via: Option<vps::Vps>,
+    tunnel: Option<u64>,
+    json: bool,
+) -> Result<(), RpcError> {
     let failed = |e: String| RpcError::new("bridge", e, "see docs/bridge.md, Web panel");
     let ip = if lan { lan_address(outbound_ip()).map_err(failed)? } else { Ipv4Addr::LOCALHOST };
     let bridge = Bridge::open(paths)?;
@@ -512,15 +551,30 @@ pub fn run(paths: &Paths, lan: bool, port: u16, via: Option<vps::Vps>, tunnel: O
     let hosts = vps::with_public(hosts(ip, port), public);
     let local = format!("http://{}", hosts[0]);
     let base = public.map_or_else(|| local.clone(), |host| format!("https://{host}"));
-    println!("web panel: {local}/");
+    let mut pair = None;
+    if !json {
+        println!("web panel: {local}/");
+    }
     if bridge.locked()? {
-        println!("remote control is locked: no pairing until `h0x-core bridge unlock`");
+        if !json {
+            println!("remote control is locked: no pairing until `h0x-core bridge unlock`");
+        }
     } else if tunnel.is_some() {
-        println!("starting a Cloudflare tunnel; its pairing link follows");
+        if !json {
+            println!("starting a Cloudflare tunnel; its pairing link follows");
+        }
     } else {
         let (code, _) = bridge.pair("web", crate::runtime::now_ms())?;
         let link = format!("{base}/#pair={code}");
-        println!("pair a device within 5 minutes (once): {link}\n{}", qr(&link));
+        if !json {
+            println!("pair a device within 5 minutes (once): {link}\n{}", qr(&link));
+        }
+        pair = Some(link);
+    }
+    let url = format!("{local}/");
+    let ready = (json && tunnel.is_some()).then(|| (url.clone(), public.map(String::from)));
+    if json && tunnel.is_none() {
+        emit(&ready_line(&url, pair.as_deref(), None, public));
     }
     if lan {
         eprintln!(
@@ -528,10 +582,12 @@ pub fn run(paths: &Paths, lan: bool, port: u16, via: Option<vps::Vps>, tunnel: O
         );
     }
     let ssh = via.as_ref().map(|plan| {
-        println!(
-            "through your vps: reverse port 127.0.0.1:{} on the server; point your HTTPS proxy there",
-            plan.remote_port
-        );
+        if !json {
+            println!(
+                "through your vps: reverse port 127.0.0.1:{} on the server; point your HTTPS proxy there",
+                plan.remote_port
+            );
+        }
         let locked = vps::lock_check(Bridge::open(paths)?, |why| eprintln!("bridge: vps: {why}"));
         Ok(vps::Tunnel::ssh(plan, port, locked))
     });
@@ -555,7 +611,7 @@ pub fn run(paths: &Paths, lan: bool, port: u16, via: Option<vps::Vps>, tunnel: O
         let stream = crate::client::connect_or_start(&paths)?;
         crate::client::call(&stream, method, params).map_err(|e| crate::client::explain_closed(&paths, e))
     };
-    let manager = tunnel::manage(Bridge::open(paths)?, hosts[0].clone(), tunnel);
+    let manager = tunnel::manage(Bridge::open(paths)?, hosts[0].clone(), tunnel, json, ready);
     let web =
         Arc::new(Web { bridge: Mutex::new(bridge), core: Box::new(core), hosts, notices, strikes: Default::default() });
     let runtime =

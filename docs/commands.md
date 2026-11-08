@@ -54,7 +54,7 @@ More
   update [--version X|--from <file>]   latest release, at least X, or a build
   machine add|ls|login|update|rename|rm   other machines, over ssh or a command
                               (--via 'fly ssh console -a x --pty=false -C')
-  bridge pair|ls|unpair|lock|unlock|reset|log|telegram token|run|web|tunnel
+  bridge pair|ls|unpair|lock|unlock|reset|log|qr|telegram token|run|web|tunnel
                               remote control from paired chat accounts: full
                               control of this machine (docs/bridge.md)
   connect                     the API over stdin/stdout (ssh box h0x-core connect)
@@ -110,6 +110,7 @@ Commands:
   unlock    Allow remote commands again (only here, never remotely)
   reset     Move state.json aside (kept as state.json.bad-<time>) and start empty: no paired accounts, unlocked. For a corrupt state; only here
   log       The last audit log entries: every remote command and pairing attempt
+  qr        A QR code for some text: terminal blocks, or with --json {"size": N, "rows": ["0101...", ...]}
   telegram  The Telegram bot's settings
   run       Run the Telegram bot until stopped: answers paired accounts, sends notices. Under core: h0x-core run --bg --keep -- h0x-core bridge run
   web       Serve the web panel until stopped: a page and a WebSocket API for paired devices. On 127.0.0.1; --lan: this machine's private network address (plain http)
@@ -171,6 +172,21 @@ Options:
   -h, --help                   Print help
 ```
 
+## h0x-core bridge qr
+
+```text
+A QR code for some text: terminal blocks, or with --json {"size": N, "rows": ["0101...", ...]}
+
+Usage: h0x-core bridge qr [OPTIONS] <TEXT>
+
+Arguments:
+  <TEXT>  The text to encode (a pairing link, say)
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
 ## h0x-core bridge reset
 
 ```text
@@ -203,7 +219,7 @@ The Telegram bot's settings
 Usage: h0x-core bridge telegram [OPTIONS] <COMMAND>
 
 Commands:
-  token  Store the bot token from @BotFather, read from stdin (not shown as you type)
+  token  Store the bot token from @BotFather, read from stdin (not shown as you type) or from the first line of a file. The file is left for you to delete
   help   Print this message or the help of the given subcommand(s)
 
 Options:
@@ -214,14 +230,15 @@ Options:
 ## h0x-core bridge telegram token
 
 ```text
-Store the bot token from @BotFather, read from stdin (not shown as you type)
+Store the bot token from @BotFather, read from stdin (not shown as you type) or from the first line of a file. The file is left for you to delete
 
 Usage: h0x-core bridge telegram token [OPTIONS]
 
 Options:
-      --clear  Remove the stored token instead
-      --json   JSON output even in a terminal
-  -h, --help   Print help
+      --clear        Remove the stored token instead
+      --json         JSON output even in a terminal
+      --file <PATH>  Read the token from the first line of this file instead of stdin
+  -h, --help         Print help
 ```
 
 ## h0x-core bridge tunnel

@@ -171,7 +171,11 @@ pub(super) async fn start(
         let (tx, rx) = tokio::sync::oneshot::channel();
         st.pending.insert(id, tx);
         st.reg.terminals.get_mut(&id).expect("just created").restart_env = p.env;
-        let spawn = proto::Spawn { argv: p.argv, env, cwd, cols, rows };
+        let mut argv = p.argv;
+        if let Some(exe) = crate::client::own_exe() {
+            this_core(&mut argv, &exe);
+        }
+        let spawn = proto::Spawn { argv, env, cwd, cols, rows };
         st.reg.terminals.get_mut(&id).expect("just created").holder = Some(instance);
         // Queue the snapshot before spawning; the next start kills any unrecorded spawn.
         core.save(&st);
@@ -209,6 +213,19 @@ pub(super) async fn start(
 }
 
 /// Per-program runtime fields, shared by initial runs and replacement shells.
+/// A terminal that runs `h0x-core` runs this core, not whichever one PATH finds first.
+fn this_core(argv: &mut [String], exe: &std::path::Path) {
+    let Some(first) = argv.first_mut() else { return };
+    let named = if cfg!(windows) {
+        first.eq_ignore_ascii_case("h0x-core") || first.eq_ignore_ascii_case("h0x-core.exe")
+    } else {
+        first == "h0x-core"
+    };
+    if named {
+        *first = exe.to_string_lossy().into_owned();
+    }
+}
+
 pub(crate) fn terminal_env(
     core: &Core,
     id: u32,
@@ -252,6 +269,24 @@ pub(crate) fn child_env(base: BTreeMap<String, String>, extra: BTreeMap<String, 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_bare_h0x_core_is_this_core() {
+        let exe = std::path::Path::new("/opt/this/h0x-core");
+        let run = |a: &[&str]| {
+            let mut v: Vec<String> = a.iter().map(|s| s.to_string()).collect();
+            super::this_core(&mut v, exe);
+            v
+        };
+        let own = exe.to_string_lossy().into_owned();
+        assert_eq!(run(&["h0x-core", "bridge", "run"]), [own.as_str(), "bridge", "run"]);
+        assert_eq!(run(&["h0x-core.exe"])[0], if cfg!(windows) { own.as_str() } else { "h0x-core.exe" });
+        assert_eq!(run(&["H0X-CORE.EXE"])[0], if cfg!(windows) { own.as_str() } else { "H0X-CORE.EXE" });
+        for other in ["./h0x-core", "/usr/bin/h0x-core", "h0x-core-x", "sh"] {
+            assert_eq!(run(&[other])[0], other);
+        }
+        assert!(run(&[]).is_empty());
+    }
+
     #[test]
     fn a_long_output_keeps_whole_lines_from_its_end_even_mid_character() {
         let text = "é".repeat(30_000) + "\nlast line";

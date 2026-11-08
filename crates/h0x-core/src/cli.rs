@@ -634,7 +634,7 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
         Cmd::Update { from: Some(from), force, .. } => update(&paths, &from, force)?,
         Cmd::Machine { action } => machine(&paths, action, call)?,
         Cmd::Session { action } => session(action, call)?,
-        Cmd::Bridge { action } => bridge(&paths, action)?,
+        Cmd::Bridge { action } => bridge(&paths, action, asked)?,
         Cmd::File { action } => match file(action, asked, call)? {
             Some(out) => out,
             None => return Ok(None),
