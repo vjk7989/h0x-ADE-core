@@ -12,11 +12,13 @@ use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::io::{IsTerminal, Read};
 
+mod bridge;
 mod file;
 mod machine;
-mod output;
+pub(crate) mod output;
 mod session;
 mod update;
+use bridge::*;
 use file::*;
 use machine::*;
 use output::*;
@@ -87,6 +89,11 @@ enum Cmd {
     },
     /// Follow fact changes as they happen (one JSON line each when piped).
     Events(SubscribeParams),
+    /// Remote control from paired chat accounts: pair, list, lock, audit log.
+    Bridge {
+        #[command(subcommand)]
+        action: BridgeCmd,
+    },
     /// Templates you can run by name (~/.config/h0x-core/templates).
     Templates,
     /// Swap this h0x-core for another build and restart (terminals keep running).
@@ -627,6 +634,7 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
         Cmd::Update { from: Some(from), force, .. } => update(&paths, &from, force)?,
         Cmd::Machine { action } => machine(&paths, action, call)?,
         Cmd::Session { action } => session(action, call)?,
+        Cmd::Bridge { action } => bridge(&paths, action)?,
         Cmd::File { action } => match file(action, asked, call)? {
             Some(out) => out,
             None => return Ok(None),
@@ -706,7 +714,7 @@ fn to(params: &impl serde::Serialize) -> Value {
 }
 
 /// One string with spaces or shell signs is a shell line, as in a bash tool.
-fn shell_line(argv: &[String]) -> Option<String> {
+pub(crate) fn shell_line(argv: &[String]) -> Option<String> {
     let shell_sign = |c: char| c.is_whitespace() || ";|&<>$`*?(){}~'\"".contains(c);
     match argv {
         [line] if line.contains(shell_sign) => Some(line.clone()),

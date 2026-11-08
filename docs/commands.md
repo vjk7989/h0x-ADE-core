@@ -54,6 +54,9 @@ More
   update [--version X|--from <file>]   latest release, at least X, or a build
   machine add|ls|login|update|rename|rm   other machines, over ssh or a command
                               (--via 'fly ssh console -a x --pty=false -C')
+  bridge pair|ls|unpair|lock|unlock|reset|log|telegram token|run|web|tunnel
+                              remote control from paired chat accounts: full
+                              control of this machine (docs/bridge.md)
   connect                     the API over stdin/stdout (ssh box h0x-core connect)
   schema                      the API as JSON Schema, for app builders
 
@@ -90,6 +93,226 @@ Options:
       --observe            Watch only: never type or resize
       --history <HISTORY>  Scrollback lines to show first (main screen only) [default: 0]
   -h, --help               Print help
+```
+
+## h0x-core bridge
+
+```text
+Remote control from paired chat accounts: pair, list, lock, audit log
+
+Usage: h0x-core bridge [OPTIONS] <COMMAND>
+
+Commands:
+  pair      Print a one-time pairing code (8 characters, valid 10 minutes, single use)
+  unpair    Remove a paired account (its id in `bridge ls`), or every one
+  ls        List paired accounts and whether remote control is locked
+  lock      Refuse every remote command until `bridge unlock` on this machine
+  unlock    Allow remote commands again (only here, never remotely)
+  reset     Move state.json aside (kept as state.json.bad-<time>) and start empty: no paired accounts, unlocked. For a corrupt state; only here
+  log       The last audit log entries: every remote command and pairing attempt
+  telegram  The Telegram bot's settings
+  run       Run the Telegram bot until stopped: answers paired accounts, sends notices. Under core: h0x-core run --bg --keep -- h0x-core bridge run
+  web       Serve the web panel until stopped: a page and a WebSocket API for paired devices. On 127.0.0.1; --lan: this machine's private network address (plain http)
+  tunnel    Turn "access from anywhere" (a Cloudflare tunnel) on or off for the running web panel
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h0x-core bridge lock
+
+```text
+Refuse every remote command until `bridge unlock` on this machine
+
+Usage: h0x-core bridge lock [OPTIONS]
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h0x-core bridge log
+
+```text
+The last audit log entries: every remote command and pairing attempt
+
+Usage: h0x-core bridge log [OPTIONS]
+
+Options:
+      --json  JSON output even in a terminal
+  -n <N>      How many entries [default: 20]
+  -h, --help  Print help
+```
+
+## h0x-core bridge ls
+
+```text
+List paired accounts and whether remote control is locked
+
+Usage: h0x-core bridge ls [OPTIONS]
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h0x-core bridge pair
+
+```text
+Print a one-time pairing code (8 characters, valid 10 minutes, single use)
+
+Usage: h0x-core bridge pair [OPTIONS]
+
+Options:
+      --json                   JSON output even in a terminal
+      --transport <TRANSPORT>  Where the account to pair writes from [default: telegram] [possible values: telegram, web]
+  -h, --help                   Print help
+```
+
+## h0x-core bridge reset
+
+```text
+Move state.json aside (kept as state.json.bad-<time>) and start empty: no paired accounts, unlocked. For a corrupt state; only here
+
+Usage: h0x-core bridge reset [OPTIONS]
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h0x-core bridge run
+
+```text
+Run the Telegram bot until stopped: answers paired accounts, sends notices. Under core: h0x-core run --bg --keep -- h0x-core bridge run
+
+Usage: h0x-core bridge run [OPTIONS]
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h0x-core bridge telegram
+
+```text
+The Telegram bot's settings
+
+Usage: h0x-core bridge telegram [OPTIONS] <COMMAND>
+
+Commands:
+  token  Store the bot token from @BotFather, read from stdin (not shown as you type)
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h0x-core bridge telegram token
+
+```text
+Store the bot token from @BotFather, read from stdin (not shown as you type)
+
+Usage: h0x-core bridge telegram token [OPTIONS]
+
+Options:
+      --clear  Remove the stored token instead
+      --json   JSON output even in a terminal
+  -h, --help   Print help
+```
+
+## h0x-core bridge tunnel
+
+```text
+Turn "access from anywhere" (a Cloudflare tunnel) on or off for the running web panel
+
+Usage: h0x-core bridge tunnel [OPTIONS] <COMMAND>
+
+Commands:
+  on    Start a tunnel to the running panel and print a pairing link through it
+  off   Stop the tunnel
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h0x-core bridge tunnel off
+
+```text
+Stop the tunnel
+
+Usage: h0x-core bridge tunnel off [OPTIONS]
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h0x-core bridge tunnel on
+
+```text
+Start a tunnel to the running panel and print a pairing link through it
+
+Usage: h0x-core bridge tunnel on [OPTIONS]
+
+Options:
+      --for <MINUTES>  Stop the tunnel after this many minutes (1 to 1440) [default: 60]
+      --json           JSON output even in a terminal
+      --yes            Download the pinned cloudflared without asking, if none is on PATH
+  -h, --help           Print help
+```
+
+## h0x-core bridge unlock
+
+```text
+Allow remote commands again (only here, never remotely)
+
+Usage: h0x-core bridge unlock [OPTIONS]
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h0x-core bridge unpair
+
+```text
+Remove a paired account (its id in `bridge ls`), or every one
+
+Usage: h0x-core bridge unpair [OPTIONS] [ID]
+
+Arguments:
+  [ID]  
+
+Options:
+      --all   
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h0x-core bridge web
+
+```text
+Serve the web panel until stopped: a page and a WebSocket API for paired devices. On 127.0.0.1; --lan: this machine's private network address (plain http)
+
+Usage: h0x-core bridge web [OPTIONS]
+
+Options:
+      --json                       JSON output even in a terminal
+      --lan                        Listen on this machine's private LAN address instead of 127.0.0.1
+      --port <PORT>                The port (0: any free one) [default: 8377]
+      --via <MACHINE>              Reach it through your VPS: the name of an ssh machine (`machine add`). Opens a reverse port on the server's loopback; your HTTPS proxy there serves it
+      --public-host <PUBLIC_HOST>  The DNS name your HTTPS proxy serves, for the pairing link
+      --remote-port <REMOTE_PORT>  The port on the server's loopback [default: 8377]
+      --tunnel                     Also reach it from anywhere through a Cloudflare tunnel (https, not end-to-end)
+      --for <MINUTES>              Stop the tunnel after this many minutes (1 to 1440) [default: 60]
+      --yes                        Download the pinned cloudflared without asking, if none is on PATH
+  -h, --help                       Print help
 ```
 
 ## h0x-core connect

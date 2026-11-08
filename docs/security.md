@@ -15,6 +15,10 @@ Templates are shell commands and opening instructions, not isolation rules.
 Do not run core as root or as an administrator unless you intend to give its clients that access.
 A status of blocked can prevent a normal send, but it is not an access boundary against another client.
 
+## Remote control
+
+Accounts paired through the bridge get full control of this machine from a chat service. See [bridge](bridge.md) for pairing, confirmations, the lock, redaction and the audit log.
+
 ## Who can connect
 
 On Unix, core listens on a local Unix socket, not a public TCP port.

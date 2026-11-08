@@ -115,6 +115,7 @@ both run on this core.
 - [Machines](docs/machines.md): work across machines.
 - [Templates](docs/templates.md): reusable agent roles.
 - [Security](docs/security.md): access, state, and updates.
+- [Bridge](docs/bridge.md): remote control from paired chat accounts.
 - [API](schema/README.md): build a client.
 
 For a quick lookup, run `h0x-core --help` or a command's help, such as `h0x-core run --help`.

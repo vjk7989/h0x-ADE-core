@@ -27,6 +27,29 @@ pub struct Config {
     /// timeout on top), and to send anything at all before its line is
     /// given up and dialed again (default 30).
     pub machine_timeout: Option<f64>,
+    /// Remote control limits (`h0x-core bridge`).
+    #[serde(default)]
+    pub bridge: BridgeConfig,
+}
+
+/// `[bridge]`: limits on what paired chat accounts may do.
+#[derive(Deserialize, Default)]
+pub struct BridgeConfig {
+    /// Commands one paired account may send per minute (default 30).
+    pub rate_limit: Option<u32>,
+    /// Seconds between two notices about one terminal (default 10).
+    pub notice_quiet: Option<f64>,
+}
+
+impl BridgeConfig {
+    pub fn rate_limit(&self) -> u32 {
+        self.rate_limit.unwrap_or(30)
+    }
+
+    pub fn notice_quiet_ms(&self) -> u64 {
+        // At most an hour: a longer quiet period would hide that it needs you.
+        (self.notice_quiet.filter(|s| s.is_finite() && *s >= 0.0).unwrap_or(10.0).min(3600.0) * 1000.0) as u64
+    }
 }
 
 impl Config {
@@ -105,6 +128,28 @@ mod tests {
         assert_eq!(key("ctrl+A").unwrap(), DetachKey { byte: 0x01, code: 97 });
         for bad in ["alt+x", "ctrl+", "ctrl+ab", "ctrl+1", "x"] {
             assert_eq!(key(bad).unwrap_err().kind, "config", "{bad}");
+        }
+    }
+
+    #[test]
+    fn notice_quiet_is_capped_at_an_hour() {
+        let quiet = |secs: f64| BridgeConfig { notice_quiet: Some(secs), ..Default::default() }.notice_quiet_ms();
+        assert_eq!((quiet(3600.0), quiet(3601.0), quiet(1e12)), (3_600_000, 3_600_000, 3_600_000));
+    }
+
+    #[test]
+    fn bridge_limits_fall_back_on_odd_values() {
+        let bridge = |text: &str| toml::from_str::<Config>(text).map(|c| c.bridge);
+        let quiet = |value: &str| bridge(&format!("[bridge]\nnotice_quiet = {value}")).unwrap().notice_quiet_ms();
+        assert_eq!(bridge("").unwrap().notice_quiet_ms(), 10_000);
+        assert_eq!(bridge("").unwrap().rate_limit(), 30);
+        for (value, ms) in
+            [("0.0", 0), ("0.0004", 0), ("-1.0", 10_000), ("nan", 10_000), ("inf", 10_000), ("-inf", 10_000)]
+        {
+            assert_eq!(quiet(value), ms, "{value}");
+        }
+        for bad in ["-1", "4294967296", "\"30\""] {
+            assert!(bridge(&format!("[bridge]\nrate_limit = {bad}")).is_err(), "{bad}");
         }
     }
 }

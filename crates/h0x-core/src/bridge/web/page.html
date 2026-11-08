@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<meta name="referrer" content="no-referrer">
+<title>HyperOx</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header class="bar">
+  <h1 class="brand">HyperOx <span class="beta">Beta</span></h1>
+  <span id="pill" class="pill" role="status" aria-live="polite">Connecting</span>
+  <button id="lock" type="button" class="btn ghost" hidden>Lock</button>
+</header>
+
+<p id="insecure" class="banner warn" hidden>Wi-Fi connection is not encrypted. Anyone on this network can see this page's traffic. Use it only on a network you trust.</p>
+<p id="tunnel" class="banner warn" hidden>via Cloudflare — not end-to-end. Cloudflare can see this page's traffic.</p>
+<p id="locked" class="banner bad" hidden>Remote control is locked. Nothing can be run from here until you unlock it on the computer: <code>h0x-core bridge unlock</code></p>
+
+<main>
+  <section id="pair" class="view" hidden aria-labelledby="pair-title">
+    <h2 id="pair-title">Scan the QR code again</h2>
+    <p id="pair-why" class="muted"></p>
+    <ol class="steps">
+      <li>On the computer, run <code>h0x-core bridge web --lan</code> (or <code>h0x-core bridge pair --transport web</code> for a new code).</li>
+      <li>Scan the QR code it prints with this phone's camera, within 5 minutes.</li>
+      <li>Or type the pairing code below.</li>
+    </ol>
+    <form id="pair-form" class="row" autocomplete="off">
+      <label for="pair-code" class="sr">Pairing code</label>
+      <input id="pair-code" name="code" placeholder="Pairing code" autocapitalize="characters" spellcheck="false" required>
+      <button type="submit" class="btn primary">Pair</button>
+    </form>
+  </section>
+
+  <section id="list" class="view" hidden aria-labelledby="list-title">
+    <div class="toolbar">
+      <h2 id="list-title">Agents</h2>
+      <button id="refresh" type="button" class="btn">Refresh</button>
+      <button id="run-open" type="button" class="btn">Run…</button>
+      <button id="alerts" type="button" class="btn" hidden>Enable notifications</button>
+    </div>
+    <p id="pull" class="pull" aria-hidden="true">Release to refresh</p>
+    <ul id="agents" class="agents" aria-live="polite"></ul>
+    <p id="empty" class="muted" hidden>No running agents.</p>
+  </section>
+
+  <section id="agent" class="view" hidden aria-labelledby="agent-title">
+    <div class="toolbar">
+      <button id="back" type="button" class="btn ghost" aria-label="Back to agents">‹ Agents</button>
+      <h2 id="agent-title"></h2>
+    </div>
+    <p id="agent-meta" class="muted"></p>
+    <pre id="out" class="out" tabindex="0" aria-label="Last output"></pre>
+    <div class="row">
+      <button id="more" type="button" class="btn">More</button>
+      <button id="reread" type="button" class="btn">Reload output</button>
+    </div>
+    <form id="send-form" class="row" autocomplete="off">
+      <label for="send-text" class="sr">Text to send</label>
+      <input id="send-text" name="text" placeholder="Type to the agent" spellcheck="false">
+      <button type="submit" class="btn primary">Send</button>
+    </form>
+    <div class="keys" role="group" aria-label="Quick keys">
+      <button type="button" class="btn" data-key="enter">Enter</button>
+      <button type="button" class="btn" data-key="esc">Esc</button>
+      <button type="button" class="btn" data-key="ctrl+c">Ctrl-C</button>
+      <button type="button" class="btn" data-key="up" aria-label="Arrow up">↑</button>
+      <button type="button" class="btn" data-key="down" aria-label="Arrow down">↓</button>
+      <button type="button" class="btn" data-key="y">y</button>
+      <button type="button" class="btn" data-key="n">n</button>
+    </div>
+    <div class="actions" role="group" aria-label="Actions">
+      <button type="button" class="btn good" data-cmd="approve">Approve</button>
+      <button type="button" class="btn" data-cmd="deny">Deny</button>
+      <button type="button" class="btn" data-cmd="interrupt">Interrupt</button>
+      <button type="button" class="btn bad" data-cmd="kill">Kill</button>
+    </div>
+  </section>
+</main>
+
+<dialog id="run" aria-labelledby="run-title">
+  <form id="run-form" autocomplete="off">
+    <h2 id="run-title">Run a command</h2>
+    <label for="run-folder">Folder</label>
+    <input id="run-folder" name="folder" placeholder="~/project" spellcheck="false" required>
+    <label for="run-command">Command</label>
+    <input id="run-command" name="command" placeholder="claude" spellcheck="false" required>
+    <p class="muted">You will be asked to confirm before it starts.</p>
+    <div class="row end">
+      <button id="run-cancel" type="button" class="btn">Cancel</button>
+      <button type="submit" class="btn primary">Run</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="confirm" aria-labelledby="confirm-title">
+  <h2 id="confirm-title">Are you sure?</h2>
+  <p id="confirm-what"></p>
+  <div class="row end">
+    <button id="confirm-no" type="button" class="btn">Cancel</button>
+    <button id="confirm-yes" type="button" class="btn bad">Confirm</button>
+  </div>
+</dialog>
+
+<div id="toasts" class="toasts" role="log" aria-live="polite" aria-label="Notices"></div>
+<script src="/app.js"></script>
+</body>
+</html>
