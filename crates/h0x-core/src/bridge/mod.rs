@@ -166,8 +166,8 @@ impl Bridge {
         secret::put(self, name, value)
     }
 
-    /// Removes the secret `name`; no error when there is none.
-    pub fn secret_del(&self, name: &str) -> std::io::Result<()> {
+    /// Removes the secret `name` (even a damaged one); whether there was one.
+    pub fn secret_del(&self, name: &str) -> std::io::Result<bool> {
         secret::del(self, name)
     }
 

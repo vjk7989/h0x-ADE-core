@@ -72,9 +72,7 @@ impl Bridge {
 
     /// Removes the bot token: whether there was one.
     pub fn clear_telegram_token(&self) -> Result<bool, RpcError> {
-        let had = self.telegram_token()?.is_some();
-        self.secret_del(TOKEN).map_err(super::failed)?;
-        Ok(had)
+        self.secret_del(TOKEN).map_err(super::failed)
     }
 }
 

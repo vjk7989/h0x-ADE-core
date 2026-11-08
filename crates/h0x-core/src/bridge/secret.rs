@@ -24,12 +24,23 @@ fn remove_file(path: &std::path::Path) -> io::Result<()> {
     }
 }
 
+fn check(name: &str) -> io::Result<()> {
+    if name.is_empty() {
+        return Err(io::Error::other("a secret needs a name"));
+    }
+    Ok(())
+}
+
 pub(super) fn get(b: &Bridge, name: &str) -> io::Result<Option<Vec<u8>>> {
+    check(name)?;
+    let path = b.dir.join(name);
     if let Some(value) = imp::get(b, name)? {
+        if imp::STORE_IS_NOT_THE_FILE {
+            remove_file(&path)?; // the store wins; no plaintext may linger
+        }
         return Ok(Some(value));
     }
     // A plaintext file from before the store (or the Linux fallback): move it in.
-    let path = b.dir.join(name);
     let Some(value) = read_file(&path)? else { return Ok(None) };
     if imp::put(b, name, &value).is_ok() && imp::STORE_IS_NOT_THE_FILE {
         remove_file(&path)?;
@@ -38,6 +49,7 @@ pub(super) fn get(b: &Bridge, name: &str) -> io::Result<Option<Vec<u8>>> {
 }
 
 pub(super) fn put(b: &Bridge, name: &str, value: &[u8]) -> io::Result<()> {
+    check(name)?;
     imp::put(b, name, value)?;
     if imp::STORE_IS_NOT_THE_FILE {
         remove_file(&b.dir.join(name))?;
@@ -45,9 +57,15 @@ pub(super) fn put(b: &Bridge, name: &str, value: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn del(b: &Bridge, name: &str) -> io::Result<()> {
-    imp::del(b, name)?;
-    remove_file(&b.dir.join(name))
+/// Removes the secret and any plaintext file; whether anything was there,
+/// found without decrypting it.
+pub(super) fn del(b: &Bridge, name: &str) -> io::Result<bool> {
+    check(name)?;
+    let path = b.dir.join(name);
+    let existed = imp::del(b, name)?;
+    let file = path.exists();
+    remove_file(&path)?;
+    Ok(existed || file)
 }
 
 /// The `security` / `secret-tool` account for `name` in this bridge folder.
@@ -164,8 +182,11 @@ mod imp {
         b.write_private(&blob_file(name), &blob).map_err(|e| io::Error::other(e.message))
     }
 
-    pub fn del(b: &Bridge, name: &str) -> io::Result<()> {
-        remove_file(&b.dir.join(blob_file(name)))
+    pub fn del(b: &Bridge, name: &str) -> io::Result<bool> {
+        let path = b.dir.join(blob_file(name));
+        let existed = path.exists();
+        remove_file(&path)?;
+        Ok(existed)
     }
 }
 
@@ -201,9 +222,10 @@ mod imp {
         run("/usr/bin/security", &["-i"], cmd.as_bytes(), NOT_FOUND).map(|_| ())
     }
 
-    pub fn del(b: &Bridge, name: &str) -> io::Result<()> {
+    pub fn del(b: &Bridge, name: &str) -> io::Result<bool> {
         let acct = account(b, name)?;
-        run("/usr/bin/security", &["delete-generic-password", "-s", SERVICE, "-a", &acct], b"", NOT_FOUND).map(|_| ())
+        let args = ["delete-generic-password", "-s", SERVICE, "-a", &acct];
+        Ok(run("/usr/bin/security", &args, b"", NOT_FOUND)?.is_some())
     }
 }
 
@@ -224,14 +246,15 @@ mod imp {
         });
     }
 
+    /// The raw stored text; `Err` when there is no tool or keyring to ask.
     fn lookup(acct: &str) -> io::Result<Option<Vec<u8>>> {
         let args = ["lookup", "service", "h0x-core bridge", "account", acct];
-        run("secret-tool", &args, b"", NOT_FOUND)?.map(|text| from_text(&text)).transpose()
+        run("secret-tool", &args, b"", NOT_FOUND)
     }
 
     pub fn get(b: &Bridge, name: &str) -> io::Result<Option<Vec<u8>>> {
         match lookup(&account(b, name)?) {
-            Ok(found) => Ok(found),
+            Ok(found) => found.map(|text| from_text(&text)).transpose(), // a bad entry is an error
             Err(_) => {
                 warn_once();
                 Ok(None)
@@ -251,11 +274,12 @@ mod imp {
         }
     }
 
-    pub fn del(b: &Bridge, name: &str) -> io::Result<()> {
+    pub fn del(b: &Bridge, name: &str) -> io::Result<bool> {
         let acct = account(b, name)?;
-        // Missing tool or entry: the file removal that follows is what counts.
+        // Missing tool or keyring: the file removal that follows is what counts.
+        let existed = matches!(lookup(&acct), Ok(Some(_)));
         let _ = run("secret-tool", &["clear", "service", "h0x-core bridge", "account", &acct], b"", NOT_FOUND);
-        Ok(())
+        Ok(existed)
     }
 }
 
@@ -355,6 +379,16 @@ mod tests {
         b.secret_del("c").unwrap();
         assert_eq!(b.secret_get("c").unwrap(), None);
         assert!(!folder_holds(&b, b"cleared-needle-42"), "nothing left holds the secret");
+        let _ = std::fs::remove_dir_all(&b.dir);
+    }
+
+    #[test]
+    fn an_empty_name_is_refused_everywhere() {
+        let b = scratch();
+        assert!(b.secret_put("", b"x").is_err());
+        assert!(b.secret_get("").is_err());
+        assert!(b.secret_del("").is_err());
+        assert!(!b.dir.exists() || std::fs::read_dir(&b.dir).unwrap().next().is_none());
         let _ = std::fs::remove_dir_all(&b.dir);
     }
 
