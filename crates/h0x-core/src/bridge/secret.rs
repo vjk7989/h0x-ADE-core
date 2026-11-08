@@ -316,10 +316,11 @@ mod imp {
                 let data = if i == 0 { format!("{};{piece}", pieces.len()) } else { piece.to_string() };
                 // The command, with the secret in it, goes over stdin, never argv.
                 let cmd = format!(
-                    "add-generic-password -U -s {} -a {} -w {}\n",
+                    "add-generic-password -U -s {} -a {} -w {} {}\n",
                     quote(SERVICE),
                     quote(&piece_account(&acct, i)),
-                    quote(&data)
+                    quote(&data),
+                    quote(&keychain()?)
                 );
                 run(SECURITY, &["-i"], cmd.as_bytes(), NOT_FOUND)?;
             }
