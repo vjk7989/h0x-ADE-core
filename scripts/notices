@@ -23,6 +23,11 @@ jq -r '.packages[] | select(.source != null) | "\(.name) \(.version)\t\(.license
         dir=$(dirname "$manifest")
         printf '\n==== %s (%s)\n\n' "$crate" "$license"
         find "$dir" -maxdepth 1 -type f \( -iname 'license*' -o -iname 'notice*' -o -iname 'copying*' \) | LC_ALL=C sort >"$work/licenses"
+        # A crate whose license text is only in its source: the copy checked in beside the others.
+        checked_in="distribution/notices/${crate%% *}.txt"
+        if [ ! -s "$work/licenses" ] && [ -f "$checked_in" ]; then
+            echo "$checked_in" >"$work/licenses"
+        fi
         if [ ! -s "$work/licenses" ]; then
             echo "error: $crate has no license text; add an explicit notice before shipping" >&2
             exit 1

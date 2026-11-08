@@ -136,7 +136,7 @@ pub fn reset(t: &mut Terminal) -> Change {
     Change { status: had, turn_ended: end_turn(t, was_working), ..Default::default() }
 }
 
-fn base64(bytes: &[u8]) -> String {
+pub(crate) fn base64(bytes: &[u8]) -> String {
     const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in bytes.chunks(3) {
