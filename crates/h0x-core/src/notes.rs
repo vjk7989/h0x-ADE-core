@@ -76,9 +76,10 @@ fn attribute(caller: &str) -> String {
 }
 
 /// A message body, escaped the same way, so its text cannot close the tag or
-/// open another. Line breaks and everything else stay.
+/// open another. Control characters are dropped as in an attribute (the body
+/// is typed into a terminal), except line breaks and tabs.
 fn body(text: &str) -> String {
-    escape(text.chars())
+    escape(text.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t')))
 }
 
 fn escape(chars: impl Iterator<Item = char>) -> String {

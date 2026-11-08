@@ -218,10 +218,10 @@ pub(super) struct Waiting {
 /// Whether what runs in the terminal now is a plain shell: its foreground
 /// program, else the program it was started with.
 fn at_shell(t: &Value) -> bool {
-    let program = t["foreground"]["name"]
-        .as_str()
-        .or_else(|| t["foreground"]["argv"][0].as_str())
-        .or_else(|| t["argv"][0].as_str())
+    let program = [&t["foreground"]["name"], &t["foreground"]["argv"][0], &t["argv"][0]]
+        .into_iter()
+        .filter_map(Value::as_str)
+        .find(|s| !s.is_empty())
         .unwrap_or_default();
     let name = program.rsplit(['/', '\\']).next().unwrap_or_default().to_ascii_lowercase();
     let name = name.strip_suffix(".exe").unwrap_or(&name);
@@ -762,6 +762,9 @@ mod tests {
         assert!(!at_shell(&json!({"argv": ["bash"], "foreground": {"name": "claude"}})));
         assert!(at_shell(&json!({"argv": ["claude"], "foreground": {"name": "fish"}})));
         assert!(!at_shell(&json!({})));
+        // An empty name is a missing one.
+        assert!(at_shell(&json!({"argv": ["zsh"], "foreground": {"name": ""}})));
+        assert!(!at_shell(&json!({"argv": ["zsh"], "foreground": {"name": "", "argv": ["claude"]}})));
     }
 
     #[test]

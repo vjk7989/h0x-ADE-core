@@ -413,21 +413,59 @@ fn read_pipe_salt(state: &Path) -> Option<String> {
     valid_salt(&salt).then_some(salt)
 }
 
+/// Cores starting together take turns on this, so they end on one salt.
+struct SaltLock(OwnedHandle);
+
+impl SaltLock {
+    fn take(file: &Path) -> io::Result<SaltLock> {
+        // FNV-1a of the path: a short name for a mutex.
+        let hash = file
+            .as_os_str()
+            .to_string_lossy()
+            .to_lowercase()
+            .bytes()
+            .fold(0xcbf29ce484222325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3));
+        let name = wide(std::ffi::OsStr::new(&format!("Local\\h0x-core-pipe-salt-{hash:016x}")));
+        unsafe {
+            let handle = CreateMutexW(null(), 0, name.as_ptr());
+            if handle.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let lock = SaltLock(OwnedHandle::from_raw_handle(handle as RawHandle));
+            match WaitForSingleObject(handle, 10_000) {
+                // An owner that died holding it leaves it to us too.
+                WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(lock),
+                _ => Err(io::Error::new(io::ErrorKind::TimedOut, "another core is making the pipe salt")),
+            }
+        }
+    }
+}
+
+impl Drop for SaltLock {
+    fn drop(&mut self) {
+        unsafe { ReleaseMutex(self.0.as_raw_handle() as HANDLE) };
+    }
+}
+
 /// Server side: make the salt once; a missing or damaged one is replaced.
+/// Under a lock shared by every core of this user, a new salt is written to a
+/// file of its own and renamed into place, so readers never see half of one
+/// and the first core's stands.
 pub fn ensure_pipe_salt(state: &Path) -> io::Result<()> {
     let Some(file) = salt_file(state).filter(|_| read_pipe_salt(state).is_none()) else {
         return Ok(());
     };
-    let _ = std::fs::remove_file(&file);
-    let made = std::fs::create_dir_all(file.parent().unwrap_or(state)).and_then(|()| {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&file)?
-            .write_all(crate::platform::random_hex().as_bytes())
-    });
-    // Another core made it first: theirs stands.
-    made.or_else(|e| read_pipe_salt(state).map(|_| ()).ok_or(e))
+    let dir = file.parent().unwrap_or(state);
+    std::fs::create_dir_all(dir)?;
+    let _lock = SaltLock::take(&file)?;
+    if read_pipe_salt(state).is_some() {
+        return Ok(());
+    }
+    let tmp = dir.join(format!("pipe-salt.{}.tmp", crate::platform::random_hex()));
+    std::fs::write(&tmp, crate::platform::random_hex())?;
+    std::fs::rename(&tmp, &file).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
 }
 
 /// The name an older core (without the salt) listens on, for a salted one.

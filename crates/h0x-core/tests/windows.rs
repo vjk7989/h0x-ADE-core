@@ -146,8 +146,11 @@ fn sessions_select_distinct_pipes_even_with_the_same_state_home() {
     };
     let first = status(&a.name);
     let second = status(&b.name);
+    let again = status(&a.name);
+    // b's core runs under a's root: b's own cleanup would look in b's, so stop it here.
+    let _ = cmd(&b.name, &a.root).args(["server", "stop"]).output();
     assert_ne!(first["pid"], second["pid"], "H0X_CORE_SESSION must select the pipe, not just state");
-    assert_eq!(status(&a.name)["pid"], first["pid"]);
+    assert_eq!(again["pid"], first["pid"]);
 }
 
 #[test]
