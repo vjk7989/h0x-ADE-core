@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-11-08
+
+### New
+
+- `bridge qr <text> [--json]` prints a QR code for any text, so the app can draw the pairing code.
+- `bridge telegram token --file <path>` reads the bot token from a file (first line; CRLF and a UTF-8 BOM are accepted).
+- `bridge web --json` prints one line with the panel link, the pairing link, the tunnel and the VPS address.
+
+### Fixed
+
+- A kept terminal that runs `h0x-core` now runs this same core, not whichever `h0x-core` is first on PATH.
+
 ## [0.1.6] - 2026-11-08
 
 ### New
