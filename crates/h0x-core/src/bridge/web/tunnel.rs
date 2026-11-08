@@ -143,11 +143,16 @@ pub fn through(req: &http::Request, tunnel: Option<&str>) -> Result<bool, u16> {
 /// machine, so the header is only believed from a loopback peer on a request
 /// that came through the tunnel), anywhere else the socket's own `peer`.
 pub fn client(req: &http::Request, peer: Option<IpAddr>, via_tunnel: bool) -> Option<IpAddr> {
-    if via_tunnel && peer.is_some_and(|ip| ip.is_loopback()) {
+    if via_tunnel && peer.is_some_and(loopback) {
         let seen = req.header("cf-connecting-ip").and_then(|v| v.parse::<IpAddr>().ok());
         return seen.or(peer);
     }
     peer
+}
+
+/// Loopback, in either family, including `::ffff:127.0.0.1` (a dual-stack socket).
+fn loopback(ip: IpAddr) -> bool {
+    ip.is_loopback() || matches!(ip, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()))
 }
 
 /// The host the panel answers through the tunnel, while one is up.
@@ -287,7 +292,13 @@ pub fn find(path: Option<&std::ffi::OsStr>, install: &Path) -> Option<PathBuf> {
 /// found elsewhere (on PATH) is the user's own and is left alone. A `.tgz`
 /// asset is pinned as the archive, so the unpacked program has no hash to check.
 pub fn trusted(program: &Path, install: &Path, pinned: Option<(&str, &str)>) -> Result<(), String> {
-    if program.parent() != Some(install) {
+    // Same folder by what is on disk, not by spelling: case, `..`, 8.3 names, symlinks.
+    let folder = |p: &Path| std::fs::canonicalize(p).ok();
+    let inside = match (program.parent().and_then(folder), folder(install)) {
+        (Some(a), Some(b)) => a == b,
+        _ => program.parent() == Some(install),
+    };
+    if !inside {
         return Ok(());
     }
     let Some((asset, sum)) = pinned else {
@@ -1245,6 +1256,43 @@ mod hardening_tests {
         }
         assert_eq!(client(&request(&[]), ip("127.0.0.1"), true), ip("127.0.0.1"), "no header");
         assert_eq!(client(&cf, None, true), None, "no socket address, no answer");
+    }
+
+    #[test]
+    fn a_mapped_loopback_peer_is_cloudflared_too() {
+        let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+        let cf = request(&[("cf-connecting-ip", "198.51.100.7")]);
+        assert_eq!(client(&cf, ip("::ffff:127.0.0.1"), true), ip("198.51.100.7"));
+        assert_eq!(client(&cf, ip("::ffff:127.0.0.1"), false), ip("::ffff:127.0.0.1"), "not through the tunnel");
+        assert_eq!(
+            client(&cf, ip("::ffff:192.168.1.20"), true),
+            ip("::ffff:192.168.1.20"),
+            "a mapped LAN address is not"
+        );
+    }
+
+    #[test]
+    fn the_install_folder_is_recognised_by_what_it_is_not_how_it_is_spelled() {
+        let dir = std::env::temp_dir().join(format!("h0x-core-canon-{}", crate::platform::random_hex()));
+        let (install, other) = (dir.join("bin"), dir.join("other"));
+        for d in [&install, &other] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let sum = sha::hex(&sha::sha256(b"real"));
+        let pinned = Some(("cloudflared-linux-amd64", sum.as_str()));
+        std::fs::write(install.join(exe_name()), b"tampered").unwrap();
+        let dotted = other.join("..").join("bin").join(exe_name());
+        assert!(trusted(&dotted, &install, pinned).is_err(), "a `..` spelling is still the install folder");
+        let spelled = dir.join("bin").join(".").join(exe_name());
+        assert!(trusted(&spelled, &install.join("."), pinned).is_err(), "so is a `.` spelling on both sides");
+        #[cfg(windows)]
+        {
+            let upper = std::path::PathBuf::from(install.to_string_lossy().to_uppercase()).join(exe_name());
+            assert!(trusted(&upper, &install, pinned).is_err(), "case does not matter on Windows");
+        }
+        std::fs::write(other.join(exe_name()), b"the user's own").unwrap();
+        assert_eq!(trusted(&other.join(exe_name()), &install, pinned), Ok(()), "another folder is the user's own");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

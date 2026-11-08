@@ -40,7 +40,7 @@ const AUTH_STRIKES: u32 = 5;
 const AUTH_BLOCK_MS: u64 = 60_000;
 /// The same for wrong pairing codes: [`AUTH_STRIKES`] from one source, then [`PAIR_BLOCK_MS`].
 const PAIR_BLOCK_MS: u64 = 10 * 60_000;
-/// Sources remembered at once; past this, only the ones being refused are kept.
+/// Sources remembered at once; the map never grows past this.
 const MAX_SOURCES: usize = 4096;
 /// A web session lives this long from pairing; then the device pairs again.
 const SESSION_MS: u64 = 30 * 24 * 60 * 60_000;
@@ -253,8 +253,13 @@ impl Strikes {
     fn add(&self, source: Option<IpAddr>, now: u64, block_ms: u64) {
         let Some(ip) = source else { return };
         let mut map = self.0.lock().unwrap();
-        if map.len() >= MAX_SOURCES {
-            map.retain(|_, s| now < s.1);
+        // Never past the cap: room is made only from blocks that have ended; if
+        // there is none, this newcomer goes untracked and nobody else's count is touched.
+        if !map.contains_key(&ip) && map.len() >= MAX_SOURCES {
+            map.retain(|_, s| s.0 > 0 || now < s.1);
+            if map.len() >= MAX_SOURCES {
+                return;
+            }
         }
         let strike = map.entry(ip).or_default();
         strike.0 += 1;

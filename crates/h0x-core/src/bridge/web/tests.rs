@@ -1543,14 +1543,33 @@ fn the_strike_map_at_its_cap_forgets_only_the_sources_it_is_not_refusing() {
     assert_eq!(strikes.0.lock().unwrap().len(), MAX_SOURCES, "full, not yet trimmed");
     let late = u32::try_from(MAX_SOURCES).unwrap();
     strikes.add(source(late), T + 1, PAIR_BLOCK_MS);
-    assert_eq!(strikes.0.lock().unwrap().len(), 2, "the refused source and the newcomer");
-    assert!(strikes.refused(source(0), T + 1), "a refused source stays refused past the cap");
-    assert!(!strikes.refused(source(1), T + 1));
-    for _ in 1..AUTH_STRIKES {
-        strikes.add(source(late), T + 2, PAIR_BLOCK_MS);
+    assert_eq!(strikes.0.lock().unwrap().len(), MAX_SOURCES, "never past the cap");
+    assert!(strikes.refused(source(0), T + 1), "a refused source stays refused at the cap");
+    assert!(!strikes.0.lock().unwrap().contains_key(&source(late).unwrap()), "the newcomer goes untracked");
+    for _ in 1..AUTH_STRIKES - 1 {
+        strikes.add(source(1), T + 2, PAIR_BLOCK_MS);
     }
-    assert!(strikes.refused(source(late), T + 2), "the newcomer's first strike was kept");
-    assert!(!strikes.refused(source(late), T + 2 + PAIR_BLOCK_MS), "and its block ends");
+    assert!(!strikes.refused(source(1), T + 2), "a partial count survives the cap: 1 + 3 = 4 strikes");
+    strikes.add(source(1), T + 3, PAIR_BLOCK_MS);
+    assert!(strikes.refused(source(1), T + 3), "and the fifth refuses it, cap or no cap");
+    assert_eq!(strikes.0.lock().unwrap().len(), MAX_SOURCES);
+    // Once a block has ended it is room for a newcomer.
+    strikes.add(source(late), T + PAIR_BLOCK_MS + 10, PAIR_BLOCK_MS);
+    assert!(strikes.0.lock().unwrap().len() <= MAX_SOURCES);
+    assert!(strikes.0.lock().unwrap().contains_key(&source(late).unwrap()), "tracked once a block ended");
+}
+
+#[test]
+fn a_full_map_of_blocked_sources_stays_bounded() {
+    let strikes = Strikes::default();
+    for n in 0..u32::try_from(MAX_SOURCES).unwrap() + 50 {
+        for _ in 0..AUTH_STRIKES {
+            strikes.add(source(n), T, PAIR_BLOCK_MS);
+        }
+    }
+    assert_eq!(strikes.0.lock().unwrap().len(), MAX_SOURCES);
+    assert!(strikes.refused(source(0), T + 1));
+    assert!(!strikes.refused(source(u32::try_from(MAX_SOURCES).unwrap() + 1), T + 1), "untracked, not refused");
 }
 
 #[test]
