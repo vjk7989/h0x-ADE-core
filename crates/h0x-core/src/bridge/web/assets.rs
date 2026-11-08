@@ -1,7 +1,7 @@
 //! The served page must work under `default-src 'self'` and never turn
 //! server text into markup.
 
-use super::{PAGE, SCRIPT, STYLE};
+use super::{NOBLE, PAGE, SCRIPT, STYLE};
 
 /// Every `name="value"` attribute value in `html`.
 fn values<'a>(html: &'a str, name: &str) -> Vec<&'a str> {
@@ -61,6 +61,36 @@ fn script_never_builds_markup_or_reaches_elsewhere() {
 }
 
 #[test]
+fn noble_bundle_is_pinned_and_never_builds_markup_or_reaches_elsewhere() {
+    // The header names exact versions and the license notice for the bundle.
+    for pinned in ["@noble/curves  2.4.0", "@noble/hashes  2.4.0", "@noble/ciphers 2.4.0", "esbuild@0.28.2", "sha512-"]
+    {
+        assert!(NOBLE.contains(pinned), "noble.js header lacks {pinned}");
+    }
+    assert!(NOBLE.starts_with("/* HyperOx web panel"));
+    for banned in [
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.write",
+        "eval(",
+        "new Function",
+        "XMLHttpRequest",
+        "fetch(",
+        "WebSocket",
+    ] {
+        assert!(!NOBLE.contains(banned), "noble.js uses {banned}");
+    }
+    for scheme in ["http://", "https://", "ws://", "wss://", "//cdn", "import("] {
+        assert!(!NOBLE.contains(scheme), "noble.js names {scheme}");
+    }
+    // app.js asks for it by its own path and nothing else is loaded that way.
+    assert!(SCRIPT.contains("el.src = '/noble.js'"));
+    assert_eq!(SCRIPT.matches(".src =").count(), 1);
+    assert!(NOBLE.len() < 64 * 1024, "{} bytes", NOBLE.len());
+}
+
+#[test]
 fn style_loads_nothing() {
     for banned in ["url(", "@import", "expression("] {
         assert!(!STYLE.contains(banned), "style.css uses {banned}");
@@ -78,12 +108,30 @@ fn assets_stay_small() {
 /// var), where a missing node would otherwise hide that the tests never ran.
 #[test]
 fn app_logic_passes_its_node_tests() {
-    let file = concat!(env!("CARGO_MANIFEST_DIR"), "/src/bridge/web/app.test.mjs");
-    let out = match std::process::Command::new("node").arg("--test").arg(file).output() {
+    node_test("app.test.mjs");
+}
+
+/// e2e_vectors.test.mjs recomputes e2e_vectors.json with WebCrypto alone, so
+/// the Rust side is checked against an independent implementation.
+#[test]
+fn e2e_vectors_pass_the_webcrypto_check() {
+    node_test("e2e_vectors.test.mjs");
+}
+
+/// e2e_client.test.mjs runs app.js's own crypto on both paths (WebCrypto and
+/// noble.js) against the same vectors and against each other.
+#[test]
+fn e2e_client_matches_the_vectors_on_both_paths() {
+    node_test("e2e_client.test.mjs");
+}
+
+fn node_test(name: &str) {
+    let file = format!("{}/src/bridge/web/{name}", env!("CARGO_MANIFEST_DIR"));
+    let out = match std::process::Command::new("node").arg("--test").arg(&file).output() {
         Ok(out) => out,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            assert!(std::env::var_os("CI").is_none(), "node not found on CI: app.test.mjs did not run");
-            return eprintln!("node not found: app.test.mjs not run");
+            assert!(std::env::var_os("CI").is_none(), "node not found on CI: {name} did not run");
+            return eprintln!("node not found: {name} not run");
         }
         Err(e) => panic!("node: {e}"),
     };

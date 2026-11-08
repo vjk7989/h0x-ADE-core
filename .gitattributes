@@ -1,0 +1,7 @@
+# The web panel is embedded with include_str!, so its bytes are the served bytes
+# and must not change with the checkout platform (assets_stay_small).
+crates/h0x-core/src/bridge/web/*.js text eol=lf
+crates/h0x-core/src/bridge/web/*.mjs text eol=lf
+crates/h0x-core/src/bridge/web/*.html text eol=lf
+crates/h0x-core/src/bridge/web/*.css text eol=lf
+crates/h0x-core/src/bridge/web/*.json text eol=lf

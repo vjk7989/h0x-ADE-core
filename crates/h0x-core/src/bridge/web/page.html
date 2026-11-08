@@ -15,8 +15,8 @@
   <button id="lock" type="button" class="btn ghost" hidden>Lock</button>
 </header>
 
-<p id="insecure" class="banner warn" hidden>Wi-Fi connection is not encrypted. Anyone on this network can see this page's traffic. Use it only on a network you trust.</p>
-<p id="tunnel" class="banner warn" hidden>via Cloudflare — not end-to-end. Cloudflare can see this page's traffic.</p>
+<p id="insecure" class="banner warn" hidden>Messages are end-to-end encrypted. This page itself comes over plain http, so use it only on a Wi-Fi you trust.</p>
+<p id="tunnel" class="banner warn" hidden>Messages are end-to-end encrypted; Cloudflare only sees ciphertext, but it delivers this page, so you rely on it not to alter the page.</p>
 <p id="locked" class="banner bad" hidden>Remote control is locked. Nothing can be run from here until you unlock it on the computer: <code>h0x-core bridge unlock</code></p>
 
 <main>
@@ -26,13 +26,14 @@
     <ol class="steps">
       <li>On the computer, run <code>h0x-core bridge web --lan</code> (or <code>h0x-core bridge pair --transport web</code> for a new code).</li>
       <li>Scan the QR code it prints with this phone's camera, within 5 minutes.</li>
-      <li>Or type the pairing code below.</li>
+      <li>Or type the pairing code below (only on a device that already knows this computer).</li>
     </ol>
     <form id="pair-form" class="row" autocomplete="off">
       <label for="pair-code" class="sr">Pairing code</label>
       <input id="pair-code" name="code" placeholder="Pairing code" autocapitalize="characters" spellcheck="false" required>
       <button type="submit" class="btn primary">Pair</button>
     </form>
+    <button id="forget" type="button" class="btn bad" hidden>Forget this computer</button>
   </section>
 
   <section id="list" class="view" hidden aria-labelledby="list-title">

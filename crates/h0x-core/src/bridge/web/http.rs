@@ -1,5 +1,5 @@
 //! Just enough HTTP/1.1 and RFC 6455 for the web panel: GET a page, upgrade
-//! to a WebSocket, exchange text frames. Pure functions over bytes.
+//! to a WebSocket, exchange text and binary frames. Pure functions over bytes.
 
 /// Longest request head (request line and headers).
 pub const MAX_HEAD: usize = 8 * 1024;
@@ -136,6 +136,7 @@ pub fn upgrade(req: &Request) -> Result<Vec<u8>, u16> {
 #[derive(Debug, PartialEq)]
 pub enum Frame {
     Text(String),
+    Binary(Vec<u8>),
     Ping(Vec<u8>),
     Pong,
     Close,
@@ -143,7 +144,7 @@ pub enum Frame {
 
 /// One client frame from the front of `buf`: the frame and the bytes it
 /// took, None until it has all arrived, Err when it breaks the rules (not
-/// masked, fragmented, binary, too big, not UTF-8): the connection closes.
+/// masked, fragmented, too big, text not UTF-8): the connection closes.
 pub fn decode(buf: &[u8], max: usize) -> Result<Option<(Frame, usize)>, &'static str> {
     let [b0, b1, ..] = *buf else { return Ok(None) };
     if b0 & 0x70 != 0 {
@@ -181,7 +182,7 @@ pub fn decode(buf: &[u8], max: usize) -> Result<Option<(Frame, usize)>, &'static
         8 => Frame::Close,
         9 => Frame::Ping(data),
         10 => Frame::Pong,
-        2 => return Err("binary frames are not accepted"),
+        2 => Frame::Binary(data),
         _ => return Err("unknown opcode"),
     };
     Ok(Some((frame, at + len)))
@@ -323,7 +324,7 @@ mod tests {
         let mut part = client_frame(1, b"hi");
         part[0] &= 0x7f;
         assert_eq!(decode(&part, MAX_FRAME), Err("fragmented messages are not accepted"));
-        assert_eq!(decode(&client_frame(2, b"hi"), MAX_FRAME), Err("binary frames are not accepted"));
+        assert_eq!(decode(&client_frame(2, b"hi"), MAX_FRAME), Ok(Some((Frame::Binary(b"hi".to_vec()), 8))));
         assert_eq!(decode(&client_frame(1, &[0xff, 0xfe]), MAX_FRAME), Err("text is not UTF-8"));
         assert_eq!(decode(&client_frame(9, b"p"), MAX_FRAME), Ok(Some((Frame::Ping(b"p".to_vec()), 7))));
         assert_eq!(decode(&client_frame(8, b""), MAX_FRAME).unwrap().unwrap().0, Frame::Close);

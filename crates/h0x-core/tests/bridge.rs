@@ -246,6 +246,7 @@ fn the_web_panel_prints_a_pairing_link_and_serves_only_its_own_host() {
     let base = lines[0].trim().strip_prefix("web panel: ").unwrap().trim_end_matches('/').to_string();
     let addr = base.strip_prefix("http://127.0.0.1:").map(|port| format!("127.0.0.1:{port}")).unwrap();
     assert!(lines[1].contains(&format!("{base}/#pair=")), "{}", lines[1]);
+    assert!(lines[1].contains("&fp="), "the link pins the key: {}", lines[1]);
     let get = |host: &str| {
         let mut stream = std::net::TcpStream::connect(&addr).unwrap();
         stream.write_all(format!("GET / HTTP/1.1\r\nHost: {host}\r\n\r\n").as_bytes()).unwrap();
@@ -338,6 +339,7 @@ fn bridge_web_json_prints_one_line_and_keeps_serving() {
     assert!(url.starts_with("http://127.0.0.1:") && url.ends_with('/'), "{url}");
     let pair = ready["pair"].as_str().unwrap();
     assert!(pair.starts_with(&format!("{url}#pair=")), "{pair}");
+    assert!(pair.contains("&fp="), "the link pins the key: {pair}");
     assert_eq!((&ready["tunnel"], &ready["via"]), (&Value::Null, &Value::Null));
 
     let addr = url.strip_prefix("http://").unwrap().trim_end_matches('/');

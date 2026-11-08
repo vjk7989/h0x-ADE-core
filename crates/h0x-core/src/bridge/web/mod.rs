@@ -6,8 +6,11 @@
 //! bridge like any other transport: allow-list, lock, rate limit, redaction
 //! and audit.
 //!
-//! Messages are JSON `{name, data}` both ways (see docs/bridge.md).
+//! Messages are JSON `{name, data}` both ways (see docs/bridge.md), but never in
+//! the clear: the first frame is the client hello, the answer is the server
+//! hello, and every later frame is one sealed message (ADR-064, `e2e`).
 
+mod e2e;
 mod http;
 mod sha;
 pub mod tunnel;
@@ -42,6 +45,8 @@ const LINGER: Duration = Duration::from_secs(1);
 const PAGE: &str = include_str!("page.html");
 const SCRIPT: &str = include_str!("app.js");
 const STYLE: &str = include_str!("style.css");
+/// The pure-JS crypto for pages without `crypto.subtle`; app.js fetches it only then.
+const NOBLE: &str = include_str!("noble.js");
 
 /// The address `--lan` binds: the private IPv4 address this machine reaches
 /// the network from (home, office, or a private overlay like Tailscale's
@@ -124,16 +129,19 @@ fn emit(line: &Value) {
 }
 
 impl Bridge {
-    /// Remembers a web device's session token, hashed.
-    fn add_session(&self, user: &str, token: &str) -> Result<(), RpcError> {
+    /// Remembers a web device's session token, hashed, and the device key it paired with.
+    fn add_session(&self, user: &str, token: &str, device: &[u8]) -> Result<(), RpcError> {
         let mut st = self.load()?;
         st.sessions.insert(user.into(), sha::hex(&sha::sha256(token.as_bytes())));
+        st.devices.insert(user.into(), e2e::b64(device));
         self.save(&st)
     }
 
-    /// The paired web device a session token belongs to, if any. Every
-    /// stored hash is compared, each in constant time.
-    fn session_user(&self, token: &str) -> Result<Option<String>, RpcError> {
+    /// The paired web device a session token belongs to, if any, and only
+    /// when the connection's device key is the one it paired with (a session
+    /// from before device keys has none, so it is refused). Every stored hash
+    /// is compared, each in constant time.
+    fn session_user(&self, token: &str, device: &[u8]) -> Result<Option<String>, RpcError> {
         let st = self.load()?;
         let hash = sha::hex(&sha::sha256(token.as_bytes()));
         let mut found = None;
@@ -142,8 +150,31 @@ impl Bridge {
                 found = Some(user.clone());
             }
         }
-        Ok(found.filter(|user| st.identities.iter().any(|i| i.transport == "web" && &i.user_id == user)))
+        let bound = |user: &String| st.devices.get(user).is_some_and(|d| *d == e2e::b64(device));
+        Ok(found.filter(bound).filter(|user| st.identities.iter().any(|i| i.transport == "web" && &i.user_id == user)))
     }
+}
+
+/// The panel's long-term key S, kept in the secret store so the pairing
+/// fingerprint survives restarts; made on first use. Never printed or logged.
+fn server_key(bridge: &Bridge) -> Result<e2e::ServerKey, RpcError> {
+    let failed = |e: String| RpcError::new("bridge", e, "see docs/bridge.md, Web panel");
+    let stored = bridge.secret_get("web.key").map_err(|e| failed(format!("web.key: {e}")))?;
+    if let Some(key) = stored.as_deref().and_then(|bytes| e2e::ServerKey::from_bytes(bytes).ok()) {
+        return Ok(key);
+    }
+    if stored.is_some() {
+        eprintln!("bridge: web.key was damaged; made a new one, so paired phones must pair again");
+    }
+    let key = e2e::ServerKey::generate();
+    bridge.secret_put("web.key", &key.to_bytes()).map_err(|e| failed(format!("web.key: {e}")))?;
+    Ok(key)
+}
+
+/// The link a device opens to pair: the one-time code and the fingerprint of
+/// the panel's key, which the page pins before it says anything (ADR-064).
+fn pair_link(base: &str, code: &str, key: &e2e::ServerKey) -> String {
+    format!("{base}/#pair={code}&fp={}", key.fp())
 }
 
 /// A call into the core, from any thread.
@@ -154,16 +185,18 @@ pub(crate) struct Web {
     bridge: Mutex<Bridge>,
     core: Box<CoreCall>,
     hosts: Vec<String>,
+    key: e2e::ServerKey,
     notices: tokio::sync::broadcast::Sender<Notice>,
     /// Failed `auth`s per peer address: (strikes, refused until ms).
     strikes: Mutex<std::collections::HashMap<IpAddr, (u32, u64)>>,
 }
 
-/// One connection's device, once it paired or authenticated, and whether it
-/// came through the Cloudflare tunnel.
+/// One connection's device once it paired or authenticated, the device key from its
+/// hello, and whether it came through the Cloudflare tunnel.
 #[derive(Clone, Default)]
 struct Conn {
     device: Option<Sender>,
+    device_key: Option<[u8; 65]>,
     tunnel: bool,
     peer: Option<IpAddr>,
 }
@@ -288,6 +321,7 @@ impl Web {
         if token.chars().all(|c| matches!(c, ' ' | '-')) {
             return refuse("usage: pair needs the code from `h0x-core bridge pair`");
         }
+        let Some(device_key) = conn.device_key else { return refuse("no device key") };
         let label = data["label"].as_str().unwrap_or_default().replace(char::is_control, "");
         let label: String = label.trim().chars().take(40).collect();
         let label = if label.is_empty() { "web device".to_string() } else { label };
@@ -300,7 +334,7 @@ impl Web {
         let mut secret = [0u8; 32];
         crate::platform::random_bytes(&mut secret);
         let session = sha::hex(&secret);
-        if let Err(e) = bridge.add_session(&user, &session) {
+        if let Err(e) = bridge.add_session(&user, &session, &device_key) {
             return refuse(&e.message);
         }
         drop(bridge);
@@ -311,13 +345,14 @@ impl Web {
     }
 
     fn auth(&self, conn: &mut Conn, data: &Value, now: u64) -> Step {
+        let Some(device_key) = conn.device_key else { return refuse("no device key") };
         let token = data["session"].as_str().unwrap_or_default();
         let peer = conn.peer;
         if peer.is_some_and(|ip| self.strikes.lock().unwrap().get(&ip).is_some_and(|s| now < s.1)) {
             return refuse("too many failed attempts; try again later");
         }
         // The guard must be gone before a failure takes the lock again.
-        let found = self.bridge.lock().unwrap().session_user(token);
+        let found = self.bridge.lock().unwrap().session_user(token, &device_key);
         let user = match found {
             Ok(Some(user)) => user,
             Ok(None) => return self.auth_failed(peer, "unknown or revoked session; pair again", now),
@@ -404,6 +439,7 @@ async fn connection(mut stream: tokio::net::TcpStream, web: Arc<Web>) {
         "/" => page(PAGE, "text/html; charset=utf-8"),
         "/app.js" => page(SCRIPT, "text/javascript; charset=utf-8"),
         "/style.css" => page(STYLE, "text/css; charset=utf-8"),
+        "/noble.js" => page(NOBLE, "text/javascript; charset=utf-8"),
         "/ws" => match http::upgrade(&req) {
             Ok(head) => {
                 if stream.write_all(&head).await.is_ok() {
@@ -418,15 +454,21 @@ async fn connection(mut stream: tokio::net::TcpStream, web: Arc<Web>) {
     let _ = stream.write_all(&out).await;
 }
 
-async fn send(wr: &mut tokio::net::tcp::OwnedWriteHalf, msg: &Value) -> bool {
-    wr.write_all(&http::encode(1, msg.to_string().as_bytes())).await.is_ok()
+/// Seals `msg` as one binary frame. Before the handshake there is no channel
+/// and nothing is sent: no byte ever goes out in the clear.
+async fn send(wr: &mut tokio::net::tcp::OwnedWriteHalf, chan: &mut Option<e2e::Channel>, msg: &Value) -> bool {
+    let Some(chan) = chan else { return true };
+    let Ok(sealed) = chan.seal(msg.to_string().as_bytes()) else { return false };
+    wr.write_all(&http::encode(2, &sealed)).await.is_ok()
 }
+
+/// The client hello is about 200 bytes; this is generous and still small.
+const MAX_HELLO: usize = 1024;
 
 /// The close code for a frame the decoder refused.
 fn close_code(why: &str) -> u16 {
     match why {
         "frame too big" => 1009,
-        "binary frames are not accepted" => 1003,
         "text is not UTF-8" => 1007,
         _ => 1002,
     }
@@ -447,6 +489,7 @@ async fn websocket(stream: tokio::net::TcpStream, mut buf: Vec<u8>, web: Arc<Web
     let peer = stream.peer_addr().ok().map(|a| a.ip());
     let (mut rd, mut wr) = stream.into_split();
     let mut conn = Conn { peer, tunnel, ..Conn::default() };
+    let mut chan: Option<e2e::Channel> = None;
     let mut notices = web.notices.subscribe();
     let mut beat = tokio::time::interval(HEARTBEAT);
     let (opened, mut last) = (tokio::time::Instant::now(), tokio::time::Instant::now());
@@ -463,35 +506,56 @@ async fn websocket(stream: tokio::net::TcpStream, mut buf: Vec<u8>, web: Arc<Web
                 Err(why) => return hang_up(rd, wr, &close_code(why).to_be_bytes()).await,
             };
             last = tokio::time::Instant::now();
-            match frame {
-                http::Frame::Text(text) => {
-                    let (shared, now) = (web.clone(), crate::runtime::now_ms());
-                    let mut mine = conn.clone();
-                    let Ok((mine, step)) = tokio::task::spawn_blocking(move || {
-                        let step = shared.incoming(&mut mine, &text, now);
-                        (mine, step)
-                    })
-                    .await
-                    else {
-                        return;
+            let text = match frame {
+                // The first frame, and only the first, is the client hello.
+                http::Frame::Text(hello) => {
+                    let accepted = match chan {
+                        None if hello.len() <= MAX_HELLO => e2e::server_accept(hello.as_bytes(), &web.key).ok(),
+                        _ => None,
                     };
-                    conn = mine;
-                    for msg in &step.out {
-                        if !send(&mut wr, msg).await {
-                            return;
-                        }
+                    let Some(accepted) = accepted else { return hang_up(rd, wr, &1008u16.to_be_bytes()).await };
+                    if wr.write_all(&http::encode(1, &accepted.server_hello)).await.is_err() {
+                        return;
                     }
-                    if step.close {
-                        return hang_up(rd, wr, &1008u16.to_be_bytes()).await;
+                    conn.device_key = Some(accepted.device);
+                    chan = Some(accepted.channel);
+                    continue;
+                }
+                // Everything after it is one sealed message; any failure closes.
+                http::Frame::Binary(sealed) => {
+                    let plain = chan.as_mut().and_then(|c| c.open(&sealed).ok());
+                    match plain.and_then(|p| String::from_utf8(p).ok()) {
+                        Some(text) => text,
+                        None => return hang_up(rd, wr, &1008u16.to_be_bytes()).await,
                     }
                 }
                 http::Frame::Ping(data) => {
                     if wr.write_all(&http::encode(10, &data)).await.is_err() {
                         return;
                     }
+                    continue;
                 }
-                http::Frame::Pong => {}
+                http::Frame::Pong => continue,
                 http::Frame::Close => return hang_up(rd, wr, &[]).await,
+            };
+            let (shared, now) = (web.clone(), crate::runtime::now_ms());
+            let mut mine = conn.clone();
+            let Ok((mine, step)) = tokio::task::spawn_blocking(move || {
+                let step = shared.incoming(&mut mine, &text, now);
+                (mine, step)
+            })
+            .await
+            else {
+                return;
+            };
+            conn = mine;
+            for msg in &step.out {
+                if !send(&mut wr, &mut chan, msg).await {
+                    return;
+                }
+            }
+            if step.close {
+                return hang_up(rd, wr, &1008u16.to_be_bytes()).await;
             }
         }
         let idle = last + IDLE;
@@ -505,7 +569,7 @@ async fn websocket(stream: tokio::net::TcpStream, mut buf: Vec<u8>, web: Arc<Web
                 Ok(n) => {
                     let (shared, mine) = (web.clone(), conn.clone());
                     let msg = tokio::task::spawn_blocking(move || shared.notice_for(&mine, &n)).await.ok().flatten();
-                    if let Some(msg) = msg && !send(&mut wr, &msg).await {
+                    if let Some(msg) = msg && !send(&mut wr, &mut chan, &msg).await {
                         return;
                     }
                 }
@@ -514,7 +578,7 @@ async fn websocket(stream: tokio::net::TcpStream, mut buf: Vec<u8>, web: Arc<Web
             },
             _ = tokio::time::sleep_until(due) => return hang_up(rd, wr, &1001u16.to_be_bytes()).await,
             _ = beat.tick() => {
-                if !send(&mut wr, &message("heartbeat", Value::Null)).await {
+                if !send(&mut wr, &mut chan, &message("heartbeat", Value::Null)).await {
                     return;
                 }
             }
@@ -545,6 +609,7 @@ pub fn run(
     let failed = |e: String| RpcError::new("bridge", e, "see docs/bridge.md, Web panel");
     let ip = if lan { lan_address(outbound_ip()).map_err(failed)? } else { Ipv4Addr::LOCALHOST };
     let bridge = Bridge::open(paths)?;
+    let key = server_key(&bridge)?;
     let listener = std::net::TcpListener::bind((ip, port)).map_err(|e| failed(format!("{ip}:{port}: {e}")))?;
     let port = listener.local_addr().map_err(|e| failed(e.to_string()))?.port();
     let public = via.as_ref().map(|v| v.public_host.as_str());
@@ -565,7 +630,7 @@ pub fn run(
         }
     } else {
         let (code, _) = bridge.pair("web", crate::runtime::now_ms())?;
-        let link = format!("{base}/#pair={code}");
+        let link = pair_link(&base, &code, &key);
         if !json {
             println!("pair a device within 5 minutes (once): {link}\n{}", qr(&link));
         }
@@ -578,7 +643,7 @@ pub fn run(
     }
     if lan {
         eprintln!(
-            "warning: this is plain http on your network; anyone on it can see the traffic, pairing links included"
+            "warning: this is plain http on your network; the traffic is encrypted, but anyone on it could alter the page you load"
         );
     }
     let ssh = via.as_ref().map(|plan| {
@@ -612,8 +677,14 @@ pub fn run(
         crate::client::call(&stream, method, params).map_err(|e| crate::client::explain_closed(&paths, e))
     };
     let manager = tunnel::manage(Bridge::open(paths)?, hosts[0].clone(), tunnel, json, ready);
-    let web =
-        Arc::new(Web { bridge: Mutex::new(bridge), core: Box::new(core), hosts, notices, strikes: Default::default() });
+    let web = Arc::new(Web {
+        bridge: Mutex::new(bridge),
+        core: Box::new(core),
+        hosts,
+        key,
+        notices,
+        strikes: Default::default(),
+    });
     let runtime =
         tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| failed(e.to_string()))?;
     runtime

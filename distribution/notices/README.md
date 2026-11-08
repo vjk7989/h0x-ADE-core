@@ -11,7 +11,9 @@ Non-Cargo inputs are checked in so regeneration doesn't depend on a license serv
 - `musl.txt`: [musl v1.2.5 COPYRIGHT](https://github.com/ifduyue/musl/blob/v1.2.5/COPYRIGHT). Rust 1.95.0's `src/ci/docker/scripts/musl.sh` and `musl-toolchain.sh` select 1.2.5 with security patches for the release Linux targets. The patches do not replace its license.
 - `rust.txt`: Rust 1.95.0's installed `share/doc/rust/COPYRIGHT-library.html`, converted to plain text, followed by `library/compiler-builtins/LICENSE.txt` from the same toolchain's rust-src. These cover the standard library and compiler runtime, which Cargo.lock does not list.
 - `qrcodegen.txt`: qrcodegen 1.8.0 (Project Nayuki, MIT) ships no LICENSE file; this is the MIT notice from the top of its `src/lib.rs`. `scripts/notices` uses it for that crate. Refresh it when qrcodegen changes.
+- `r-efi.txt`: r-efi (MIT OR Apache-2.0 OR LGPL-2.1-or-later) ships no license file in its crate; this is the MIT notice, chosen from its license expression. It is only used on UEFI targets. `scripts/notices` uses it for that crate.
 - `sqlite.txt`: SQLite's public-domain dedication (the blessing at the top of `sqlite3.c`), for the SQLite 3.54.1 amalgamation that `libsqlite3-sys` 0.39.1 compiles in with rusqlite's `bundled` feature. Its crate's LICENSE covers only the Rust bindings. Refresh the version when libsqlite3-sys changes.
+- `noble.txt`: the MIT license of paulmillr's `@noble/curves`, `@noble/hashes` and `@noble/ciphers` 2.4.0 (the ciphers copy adds a Thomas Pornin line), bundled into `crates/h0x-core/src/bridge/web/noble.js` for web panel pages without `crypto.subtle`. The rebuild command is in that file's header. Refresh the versions when the bundle changes.
 
 Windows archives also carry Microsoft's ConPTY LICENSE and NOTICE from `distribution/windows/`, checked against the pinned package by `scripts/fetch-conpty.ps1`.
 
