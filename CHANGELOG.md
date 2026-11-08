@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-11-08
+
+### New
+
+- The phone panel is end-to-end encrypted. Everything between your phone and this computer goes through an encrypted channel (P-256 key agreement, HKDF-SHA256, AES-256-GCM), so the Wi-Fi, Cloudflare or your VPS only see ciphertext.
+- The QR link carries this computer's fingerprint. Your phone remembers it and refuses a different computer, so nobody in between can pretend to be yours.
+- Each paired phone is bound to its own device key; a stolen session token alone does not log in.
+- Bridge secrets (the Telegram bot token and the panel's server key) are kept in the system's secret store: Windows DPAPI, the macOS Keychain or the Linux Secret Service, with an owner-only file as the fallback. Tokens saved by older versions are moved in automatically.
+
+### Changed
+
+- Phones paired with an older version must scan the QR code once more.
+- The panel's warnings now say plainly what the encryption covers: the page itself is still delivered by your Wi-Fi, Cloudflare or VPS.
+
 ## [0.1.7] - 2026-11-08
 
 ### New
