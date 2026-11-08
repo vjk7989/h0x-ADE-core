@@ -10,6 +10,7 @@
 mod command;
 mod notice;
 mod redact;
+mod secret;
 pub mod telegram;
 pub mod web;
 
@@ -153,6 +154,21 @@ impl Bridge {
             std::fs::rename(tmp, self.dir.join(name))
         };
         write().map_err(failed)
+    }
+
+    /// The secret `name` from the OS secret store (a legacy plaintext file is moved in).
+    pub fn secret_get(&self, name: &str) -> std::io::Result<Option<Vec<u8>>> {
+        secret::get(self, name)
+    }
+
+    /// Stores (replaces) the secret `name` in the OS secret store.
+    pub fn secret_put(&self, name: &str, value: &[u8]) -> std::io::Result<()> {
+        secret::put(self, name, value)
+    }
+
+    /// Removes the secret `name`; no error when there is none.
+    pub fn secret_del(&self, name: &str) -> std::io::Result<()> {
+        secret::del(self, name)
     }
 
     /// A new single-use code for `transport`, valid 10 minutes; replaces any earlier one.

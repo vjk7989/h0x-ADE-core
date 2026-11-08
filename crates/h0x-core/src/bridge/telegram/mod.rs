@@ -35,21 +35,22 @@ const HELP: &str = "Commands:
 /lock - refuse every remote command until unlocked at the machine
 Reply to a notice to type into its terminal.";
 
-impl Bridge {
-    fn token_file(&self) -> std::path::PathBuf {
-        self.dir.join("telegram.token")
-    }
+/// The secret name of the bot token.
+const TOKEN: &str = "telegram.token";
 
+impl Bridge {
     /// The bot token, if one is stored.
     pub fn telegram_token(&self) -> Result<Option<String>, RpcError> {
-        match std::fs::read_to_string(self.token_file()) {
-            Ok(text) => Ok(Some(text.trim().to_string()).filter(|t| !t.is_empty())),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        match self.secret_get(TOKEN) {
+            Ok(found) => Ok(found
+                .and_then(|b| String::from_utf8(b).ok())
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())),
             Err(e) => Err(super::failed(e)),
         }
     }
 
-    /// Stores the bot token from @BotFather (0600). It must look like one:
+    /// Stores the bot token from @BotFather (OS secret store). It must look like one:
     /// digits, a colon, then letters, digits, `_` and `-`.
     pub fn set_telegram_token(&self, token: &str) -> Result<(), RpcError> {
         let token = token.trim();
@@ -66,16 +67,14 @@ impl Bridge {
                 "copy the token @BotFather gave you, like 123456789:AA...",
             ));
         }
-        self.write_private("telegram.token", token.as_bytes())
+        self.secret_put(TOKEN, token.as_bytes()).map_err(super::failed)
     }
 
     /// Removes the bot token: whether there was one.
     pub fn clear_telegram_token(&self) -> Result<bool, RpcError> {
-        match std::fs::remove_file(self.token_file()) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(super::failed(e)),
-        }
+        let had = self.telegram_token()?.is_some();
+        self.secret_del(TOKEN).map_err(super::failed)?;
+        Ok(had)
     }
 }
 

@@ -382,7 +382,7 @@ mod tests {
             assert_eq!((e.kind.as_str(), e.message.as_str()), ("invalid_params", "that is not a bot token"), "{why}");
             assert!(!format!("{}{}", e.message, e.hint).contains("ABCdef"), "{why}: the token is never in an error");
         }
-        assert!(!dir.join("bridge/telegram.token").exists(), "nothing stored");
+        assert_eq!(bridge.telegram_token().unwrap(), None, "nothing stored");
 
         for content in [
             format!("  {TOKEN}  \r\nsecond line\r\n"),
@@ -391,7 +391,7 @@ mod tests {
             TOKEN.to_string(),
         ] {
             store(content.as_bytes()).unwrap_or_else(|e| panic!("{content:?}: {}", e.message));
-            assert_eq!(std::fs::read_to_string(dir.join("bridge/telegram.token")).unwrap(), TOKEN, "{content:?}");
+            assert_eq!(bridge.telegram_token().unwrap().as_deref(), Some(TOKEN), "{content:?}");
             assert!(path.exists(), "the file is left for the caller to delete");
         }
 
@@ -414,6 +414,7 @@ mod tests {
             format!("cannot read the token file {}: {}", path.display(), std::io::ErrorKind::InvalidData),
             "not UTF-8"
         );
+        bridge.clear_telegram_token().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
