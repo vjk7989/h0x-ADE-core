@@ -68,7 +68,7 @@ pub(super) enum BridgeCmd {
         /// The port on the server's loopback.
         #[arg(long, default_value_t = crate::bridge::web::PORT, requires = "via")]
         remote_port: u16,
-        /// Also reach it from anywhere through a Cloudflare tunnel (https, not end-to-end).
+        /// Also reach it from anywhere through a Cloudflare tunnel (end-to-end encrypted; Cloudflare delivers the page).
         #[arg(long)]
         tunnel: bool,
         #[command(flatten)]

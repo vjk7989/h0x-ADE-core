@@ -21,9 +21,6 @@
 //!   bytes. Wire payload = ciphertext then tag. Any open failure is an error and
 //!   the caller must close the connection. The counter never wraps or repeats.
 
-// Wired into the connection by SEC-2b.
-#![allow(dead_code)]
-
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes256Gcm, KeyInit};
 use hkdf::Hkdf;
@@ -173,6 +170,7 @@ struct ClientHello {
     n: String,
 }
 
+#[cfg(test)]
 #[derive(Deserialize)]
 struct ServerHello {
     v: u64,
@@ -242,6 +240,7 @@ fn accept(client_hello: &[u8], key: &ServerKey, es: SecretKey, s_nonce: [u8; NON
     Ok(Accepted { server_hello, channel, device })
 }
 
+#[cfg(test)]
 /// Client side, after sending the hello and before the server's answer.
 pub struct ClientPending {
     d: SecretKey,
@@ -250,12 +249,14 @@ pub struct ClientPending {
     hello: Vec<u8>,
 }
 
+#[cfg(test)]
 /// Client side: build the hello from the long-term device key `D` (32-byte secret).
 pub fn client_start(device_secret: &[u8]) -> Result<ClientPending> {
     let d = secret_key(device_secret)?;
     Ok(start(d, SecretKey::generate(), random_nonce()))
 }
 
+#[cfg(test)]
 fn start(d: SecretKey, ec: SecretKey, c_nonce: [u8; NONCE_LEN]) -> ClientPending {
     let hello = format!(
         r#"{{"v":1,"d":"{}","e":"{}","n":"{}"}}"#,
@@ -267,6 +268,7 @@ fn start(d: SecretKey, ec: SecretKey, c_nonce: [u8; NONCE_LEN]) -> ClientPending
     ClientPending { d, ec, c_nonce, hello }
 }
 
+#[cfg(test)]
 impl ClientPending {
     /// The text to send first.
     pub fn hello(&self) -> &[u8] {
@@ -293,6 +295,7 @@ impl ClientPending {
     }
 }
 
+#[cfg(test)]
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }

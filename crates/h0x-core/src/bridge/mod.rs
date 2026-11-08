@@ -69,6 +69,10 @@ struct State {
     /// Web devices: their user id and the SHA-256 of their session token.
     #[serde(default)]
     sessions: BTreeMap<String, String>,
+    /// Web devices: their user id and the device public key (base64url) they paired with;
+    /// a session is only good from that key (ADR-064). Older sessions have none and are refused.
+    #[serde(default)]
+    devices: BTreeMap<String, String>,
 }
 
 /// The one live pairing code.
@@ -230,6 +234,7 @@ impl Bridge {
         // An unpaired device's session goes with it.
         let ids = &st.identities;
         st.sessions.retain(|user, _| ids.iter().any(|i| i.transport == "web" && &i.user_id == user));
+        st.devices.retain(|user, _| ids.iter().any(|i| i.transport == "web" && &i.user_id == user));
         let removed = before - st.identities.len();
         if let (Some(id), 0) = (id, removed) {
             return Err(RpcError::new("not_found", format!("no paired account {id}"), "see `h0x-core bridge ls`"));

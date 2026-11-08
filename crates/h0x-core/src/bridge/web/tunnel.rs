@@ -338,7 +338,7 @@ pub fn download_question(dir: &Path) -> String {
 fn announce(status: &Value) -> String {
     let mut out = format!(
         "tunnel: {} for {} minutes (`h0x-core bridge tunnel off` stops it)\n\
-         warning: traffic passes through Cloudflare; it is https to Cloudflare, not end-to-end",
+         warning: messages are end-to-end encrypted, so Cloudflare sees only ciphertext, but it delivers the page and could alter it",
         status["url"].as_str().unwrap_or_default(),
         status["minutes"],
     );
@@ -393,7 +393,12 @@ fn ready_once(ready: &mut Option<(String, Option<String>)>, status: Option<&Valu
 /// A started tunnel: the pairing link through it, the answer for `bridge
 /// tunnel on`, and the panel's own printout.
 fn opened(bridge: &Bridge, host: &str, minutes: u64, until_ms: u64, now: u64, json: bool) -> Value {
-    let pair = bridge.pair("web", now).ok().map(|(code, _)| format!("https://{host}/#pair={code}"));
+    let key = super::server_key(bridge);
+    let pair = bridge
+        .pair("web", now)
+        .ok()
+        .zip(key.ok())
+        .map(|((code, _), key)| super::pair_link(&format!("https://{host}"), &code, &key));
     let status = json!({"url": format!("https://{host}/"), "minutes": minutes, "until_ms": until_ms, "pair": pair});
     let _ = bridge.write_private(STATUS, status.to_string().as_bytes());
     say(json, &announce(&status));
@@ -832,9 +837,9 @@ mod tests {
         let status = opened(&bridge, "abc.trycloudflare.com", 60, 42, 1_000, false);
         assert_eq!(status["url"], "https://abc.trycloudflare.com/");
         let link = status["pair"].as_str().unwrap();
-        assert!(link.starts_with("https://abc.trycloudflare.com/#pair="), "{link}");
+        assert!(link.starts_with("https://abc.trycloudflare.com/#pair=") && link.contains("&fp="), "{link}");
         let text = announce(&status);
-        assert!(text.contains("not end-to-end") && text.contains(link) && text.contains("60 minutes"), "{text}");
+        assert!(text.contains("end-to-end encrypted") && text.contains(link) && text.contains("60 minutes"), "{text}");
         let saved: Value = serde_json::from_slice(&std::fs::read(bridge.dir.join(STATUS)).unwrap()).unwrap();
         assert_eq!(saved, status, "what `bridge tunnel on` reads");
 

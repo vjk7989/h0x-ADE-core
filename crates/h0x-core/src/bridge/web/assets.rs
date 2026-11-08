@@ -1,11 +1,7 @@
 //! The served page must work under `default-src 'self'` and never turn
 //! server text into markup.
 
-use super::{PAGE, SCRIPT, STYLE};
-
-/// The pure-JS crypto for pages without `crypto.subtle`; app.js fetches it
-/// only then, so it is not counted in the page's weight.
-const NOBLE: &str = include_str!("noble.js");
+use super::{NOBLE, PAGE, SCRIPT, STYLE};
 
 /// Every `name="value"` attribute value in `html`.
 fn values<'a>(html: &'a str, name: &str) -> Vec<&'a str> {
