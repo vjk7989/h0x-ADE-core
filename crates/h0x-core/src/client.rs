@@ -19,6 +19,11 @@ pub fn remember_exe() {
     build_id();
 }
 
+/// This core's own executable, as remembered at startup.
+pub(crate) fn own_exe() -> Option<std::path::PathBuf> {
+    EXE.get().cloned().or_else(|| std::env::current_exe().ok())
+}
+
 /// The package manager this h0x-core came from, or "system package manager" as a
 /// compatibility marker when its folder isn't writable. None for a replaceable install.
 pub fn installed_by() -> Option<&'static str> {

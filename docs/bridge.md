@@ -58,6 +58,14 @@ To type into a terminal, reply to its notice.
 A command that needs a confirmation shows Confirm and Cancel buttons. Cancel leaves the confirmation unused, and it expires in 2 minutes.
 Notices stop while the bridge is locked.
 
+## For the app
+
+The desktop app's Settings page drives the same commands; they all print JSON with `--json`.
+
+- `h0x-core bridge qr <text> --json` prints `{"size": N, "rows": ["0101...", ...]}`: N rows of N modules, `1` dark, no quiet zone. Without `--json` it draws the code in the terminal. Empty text, or text longer than a QR code holds, is an error.
+- `h0x-core bridge telegram token --file <path>` reads the token from the first line of that file instead of stdin, and checks it the same way. The file is not deleted: the caller does that. It cannot be combined with `--clear`.
+- `h0x-core bridge web --json` prints one line once the panel is reachable (after the tunnel's address is known when `--tunnel` is set), then keeps serving: `{"url": "http://ip:port/", "pair": "<link>", "tunnel": "<https address or null>", "via": "<public host or null>"}`. With a tunnel, `pair` is the link through it; `pair` is null when remote control is locked, and `tunnel` is null if the tunnel could not start. Its text output, the QR code included, goes away. Read the line with `h0x-core read <terminal>` when the panel runs under `h0x-core run --bg --keep`.
+
 ## Web panel
 
 `h0x-core bridge web` serves a small web page and a WebSocket API. A phone or an app uses it to see the running agents and control them, the same way the Telegram bot does.

@@ -374,3 +374,13 @@ fn stopped_kept_terminal_returns_at_next_start() {
     assert_eq!(r["state"], "live");
     wait_until("shell after start", || get(&s, &t)["pid"].is_number());
 }
+
+#[test]
+fn a_terminal_running_h0x_core_runs_this_core_even_without_it_on_path() {
+    let mut s = Session::new();
+    s.env.push(("PATH".into(), "/usr/bin:/bin".into()));
+    let t = run(&s, &["--keep", "h0x-core", "--version"]);
+    wait_until("version printed", || text(&s, &t).contains("h0x-core "));
+    assert!(text(&s, &t).contains(&format!("h0x-core {}", env!("CARGO_PKG_VERSION"))));
+    s.json(&["kill", &t]);
+}

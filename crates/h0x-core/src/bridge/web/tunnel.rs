@@ -371,13 +371,32 @@ fn take(bridge: &Bridge, now_ms: u64) -> Option<Option<u64>> {
     }
 }
 
+/// A line of the panel's human output: on stdout, or on stderr when stdout carries JSON.
+fn say(json: bool, text: &str) {
+    if json {
+        eprintln!("{text}");
+    } else {
+        println!("{text}");
+    }
+}
+
+/// `bridge web --json`'s one line, once the first tunnel start has an answer
+/// (its address, or none when it failed). `ready`: the panel's url and `via`.
+fn ready_once(ready: &mut Option<(String, Option<String>)>, status: Option<&Value>) {
+    if let Some((url, via)) = ready.take() {
+        let tunnel = status.and_then(|s| s["url"].as_str());
+        let pair = status.and_then(|s| s["pair"].as_str());
+        super::emit(&super::ready_line(&url, pair, tunnel, via.as_deref()));
+    }
+}
+
 /// A started tunnel: the pairing link through it, the answer for `bridge
 /// tunnel on`, and the panel's own printout.
-fn opened(bridge: &Bridge, host: &str, minutes: u64, until_ms: u64, now: u64) -> Value {
+fn opened(bridge: &Bridge, host: &str, minutes: u64, until_ms: u64, now: u64, json: bool) -> Value {
     let pair = bridge.pair("web", now).ok().map(|(code, _)| format!("https://{host}/#pair={code}"));
     let status = json!({"url": format!("https://{host}/"), "minutes": minutes, "until_ms": until_ms, "pair": pair});
     let _ = bridge.write_private(STATUS, status.to_string().as_bytes());
-    println!("{}", announce(&status));
+    say(json, &announce(&status));
     status
 }
 
@@ -385,7 +404,13 @@ fn opened(bridge: &Bridge, host: &str, minutes: u64, until_ms: u64, now: u64) ->
 /// now when `first` says for how long, then each second takes `bridge
 /// tunnel on|off` requests and stops the tunnel when [`must_stop`] says so.
 /// The tunnel ends with this future.
-pub async fn manage(bridge: Bridge, origin: String, first: Option<u64>) {
+pub async fn manage(
+    bridge: Bridge,
+    origin: String,
+    first: Option<u64>,
+    json: bool,
+    mut ready: Option<(String, Option<String>)>,
+) {
     // Whatever was asked before this panel started is nobody's request now.
     let _ = std::fs::remove_file(bridge.dir.join(STATUS));
     let _ = std::fs::remove_file(bridge.dir.join(REQUEST));
@@ -400,11 +425,12 @@ pub async fn manage(bridge: Bridge, origin: String, first: Option<u64>) {
                 let locked = bridge.locked().unwrap_or(true);
                 if let Some((tunnel, until_ms)) = up.as_mut().filter(|_| !locked) {
                     *until_ms = until(now, minutes);
-                    opened(&bridge, &tunnel.host, minutes, *until_ms, now);
+                    opened(&bridge, &tunnel.host, minutes, *until_ms, now, json);
                 } else if locked {
                     let why = LOCKED;
                     let _ = bridge.write_private(STATUS, json!({"error": why}).to_string().as_bytes());
                     eprintln!("tunnel: {why}");
+                    ready_once(&mut ready, None);
                 } else {
                     let program = install_dir().ok().and_then(|dir| find(std::env::var_os("PATH").as_deref(), &dir));
                     let started = match program {
@@ -414,12 +440,14 @@ pub async fn manage(bridge: Bridge, origin: String, first: Option<u64>) {
                     match started {
                         Ok(tunnel) => {
                             let until_ms = until(now, minutes);
-                            opened(&bridge, &tunnel.host, minutes, until_ms, now);
+                            let status = opened(&bridge, &tunnel.host, minutes, until_ms, now, json);
+                            ready_once(&mut ready, Some(&status));
                             up = Some((tunnel, until_ms));
                         }
                         Err(why) => {
                             let _ = bridge.write_private(STATUS, json!({"error": why}).to_string().as_bytes());
                             eprintln!("tunnel: {why}");
+                            ready_once(&mut ready, None);
                         }
                     }
                 }
@@ -427,7 +455,7 @@ pub async fn manage(bridge: Bridge, origin: String, first: Option<u64>) {
             Some(None) => {
                 if let Some((tunnel, _)) = up.take() {
                     tunnel.stop().await;
-                    println!("tunnel stopped: turned off");
+                    say(json, "tunnel stopped: turned off");
                 }
                 let _ = std::fs::remove_file(bridge.dir.join(STATUS));
             }
@@ -440,7 +468,7 @@ pub async fn manage(bridge: Bridge, origin: String, first: Option<u64>) {
                 tunnel.stop().await;
             }
             let _ = std::fs::remove_file(bridge.dir.join(STATUS));
-            println!("tunnel stopped: {why}");
+            say(json, &format!("tunnel stopped: {why}"));
         }
     }
 }
@@ -779,7 +807,9 @@ mod tests {
         let panel = Bridge::at(bridge.dir.clone(), crate::config::BridgeConfig::default());
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
         runtime.block_on(async {
-            let _ = tokio::time::timeout(Duration::from_secs(3), manage(panel, "127.0.0.1:9".into(), None)).await;
+            let _ =
+                tokio::time::timeout(Duration::from_secs(3), manage(panel, "127.0.0.1:9".into(), None, false, None))
+                    .await;
         });
         assert!(!bridge.dir.join(REQUEST).exists(), "deleted at start");
         assert!(!bridge.dir.join(STATUS).exists(), "and not answered: nobody asked this panel");
@@ -799,7 +829,7 @@ mod tests {
     #[test]
     fn a_started_tunnel_prints_its_warning_and_a_pairing_link_through_it() {
         let bridge = crate::bridge::scratch();
-        let status = opened(&bridge, "abc.trycloudflare.com", 60, 42, 1_000);
+        let status = opened(&bridge, "abc.trycloudflare.com", 60, 42, 1_000, false);
         assert_eq!(status["url"], "https://abc.trycloudflare.com/");
         let link = status["pair"].as_str().unwrap();
         assert!(link.starts_with("https://abc.trycloudflare.com/#pair="), "{link}");
@@ -809,7 +839,7 @@ mod tests {
         assert_eq!(saved, status, "what `bridge tunnel on` reads");
 
         bridge.set_locked(true).unwrap();
-        let locked = opened(&bridge, "abc.trycloudflare.com", 60, 42, 1_000);
+        let locked = opened(&bridge, "abc.trycloudflare.com", 60, 42, 1_000, false);
         assert_eq!(locked["pair"], Value::Null, "no pairing while locked");
         assert!(!announce(&locked).contains("#pair="));
         let _ = std::fs::remove_dir_all(&bridge.dir);
@@ -987,7 +1017,10 @@ mod tests {
                         bridge.write_private(REQUEST, asked.as_bytes()).unwrap();
                     }
                 };
-                let panel = tokio::time::timeout(Duration::from_secs(3), manage(panel(), "127.0.0.1:9".into(), first));
+                let panel = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    manage(panel(), "127.0.0.1:9".into(), first, false, None),
+                );
                 let _ = tokio::join!(panel, client);
             })
         };
@@ -1030,7 +1063,11 @@ mod tests {
         let running = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             runtime.block_on(async {
-                let _ = tokio::time::timeout(Duration::from_secs(8), manage(panel, "127.0.0.1:9".into(), None)).await;
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(8),
+                    manage(panel, "127.0.0.1:9".into(), None, false, None),
+                )
+                .await;
             });
         });
         std::thread::sleep(Duration::from_millis(700));

@@ -1,4 +1,4 @@
-//! `h0x-core bridge pair|unpair|ls|lock|unlock|reset|log|telegram|run|web|tunnel`:
+//! `h0x-core bridge pair|unpair|ls|lock|unlock|reset|log|qr|telegram|run|web|tunnel`:
 //! who may control this machine remotely, the Telegram bot and the web panel.
 //! Local files only, except `run`, `web` and a cloudflared download.
 
@@ -35,6 +35,11 @@ pub(super) enum BridgeCmd {
         /// How many entries.
         #[arg(short = 'n', default_value_t = 20)]
         n: usize,
+    },
+    /// A QR code for some text: terminal blocks, or with --json {"size": N, "rows": ["0101...", ...]}.
+    Qr {
+        /// The text to encode (a pairing link, say).
+        text: String,
     },
     /// The Telegram bot's settings.
     Telegram {
@@ -100,11 +105,15 @@ pub(super) enum TunnelCmd {
 
 #[derive(Subcommand)]
 pub(super) enum TelegramCmd {
-    /// Store the bot token from @BotFather, read from stdin (not shown as you type).
+    /// Store the bot token from @BotFather, read from stdin (not shown as you type)
+    /// or from the first line of a file. The file is left for you to delete.
     Token {
         /// Remove the stored token instead.
         #[arg(long)]
         clear: bool,
+        /// Read the token from the first line of this file instead of stdin.
+        #[arg(long, value_name = "PATH", conflicts_with = "clear")]
+        file: Option<std::path::PathBuf>,
     },
 }
 
@@ -131,8 +140,16 @@ fn cloudflared(yes: bool) -> Result<(), RpcError> {
     tunnel::download(&dir).map(drop)
 }
 
-/// The bot token: typed without echo in a terminal, else the first line piped in.
-fn read_token() -> Result<String, RpcError> {
+/// The bot token: the first line of `file`, else typed without echo in a
+/// terminal, else the first line piped in.
+fn read_token(file: Option<&std::path::Path>) -> Result<String, RpcError> {
+    if let Some(file) = file {
+        let text = std::fs::read_to_string(file).map_err(|e| {
+            RpcError::invalid_params(format!("cannot read the token file {}: {}", file.display(), e.kind()))
+        })?;
+        // Windows PowerShell 5.1 and Notepad start a UTF-8 file with a BOM.
+        return Ok(text.trim_start_matches('\u{feff}').lines().next().unwrap_or_default().to_string());
+    }
     if !std::io::stdin().is_terminal() {
         let mut text = String::new();
         std::io::stdin().read_to_string(&mut text).map_err(|e| RpcError::internal(e.to_string()))?;
@@ -168,7 +185,8 @@ fn ago(now: u64, then: u64) -> String {
     }
 }
 
-pub(super) fn bridge(paths: &Paths, action: BridgeCmd) -> Result<Out, RpcError> {
+/// `json`: --json was asked for (not merely piped); `web` then prints one JSON line.
+pub(super) fn bridge(paths: &Paths, action: BridgeCmd, json: bool) -> Result<Out, RpcError> {
     let bridge = Bridge::open(paths)?;
     let now = crate::runtime::now_ms();
     let locked = |locked: bool| {
@@ -210,13 +228,16 @@ pub(super) fn bridge(paths: &Paths, action: BridgeCmd) -> Result<Out, RpcError> 
             let json = json!({"identities": identities, "locked": locked, "telegram_token": token});
             Out { json, human: rows.join("\n") }
         }
-        BridgeCmd::Telegram { action: TelegramCmd::Token { clear: true } } => {
+        BridgeCmd::Telegram { action: TelegramCmd::Token { clear: true, .. } } => {
             let human =
                 if bridge.clear_telegram_token()? { "telegram token removed" } else { "no telegram token was set" };
             Out { json: json!({"telegram_token": "unset"}), human: human.into() }
         }
-        BridgeCmd::Telegram { action: TelegramCmd::Token { clear: false } } => {
-            bridge.set_telegram_token(&read_token()?)?;
+        BridgeCmd::Qr { text } => {
+            Out { json: crate::bridge::web::qr_json(&text)?, human: crate::bridge::web::qr(&text) }
+        }
+        BridgeCmd::Telegram { action: TelegramCmd::Token { clear: false, file } } => {
+            bridge.set_telegram_token(&read_token(file.as_deref())?)?;
             Out { json: json!({"telegram_token": "set"}), human: "telegram token stored".into() }
         }
         BridgeCmd::Web { lan, port, via, public_host, remote_port, tunnel, how } => {
@@ -229,7 +250,7 @@ pub(super) fn bridge(paths: &Paths, action: BridgeCmd) -> Result<Out, RpcError> 
             if tunnel {
                 cloudflared(how.yes)?;
             }
-            crate::bridge::web::run(paths, lan, port, via, tunnel.then_some(how.minutes))?;
+            crate::bridge::web::run(paths, lan, port, via, tunnel.then_some(how.minutes), json)?;
             Out { json: Value::Null, human: String::new() }
         }
         BridgeCmd::Tunnel { action: TunnelCmd::On { how } } => {
@@ -324,6 +345,102 @@ mod tests {
         };
         assert_eq!(via, None, "plain bridge web still parses");
         assert_eq!(remote_port, crate::bridge::web::PORT);
+    }
+
+    #[test]
+    fn a_token_file_may_start_with_a_utf8_bom() {
+        const TOKEN: &str = "123456:ABCdef_ghi-JKLmnoPQRstuVWXyz0123";
+        let dir = std::env::temp_dir().join(format!("h0x core bom {}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token.txt");
+        std::fs::write(&path, format!("\u{feff}{TOKEN}\r\n")).unwrap();
+        assert_eq!(super::read_token(Some(&path)).unwrap(), TOKEN);
+        std::fs::write(&path, "\u{feff}").unwrap();
+        assert_eq!(super::read_token(Some(&path)).unwrap(), "", "a BOM alone is an empty file");
+        drop(std::fs::remove_dir_all(&dir));
+    }
+
+    #[test]
+    fn a_token_file_gives_its_first_line_validated_like_stdin_and_names_only_the_file_on_failure() {
+        const TOKEN: &str = "123456:ABCdef_ghi-JKLmnoPQRstuVWXyz0123";
+        let dir = std::env::temp_dir().join(format!("h0x core token {}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bridge = crate::bridge::Bridge::at(dir.join("bridge"), Default::default());
+        let path = dir.join("bot token.txt");
+        let store = |content: &[u8]| {
+            std::fs::write(&path, content).unwrap();
+            super::read_token(Some(&path)).and_then(|line| bridge.set_telegram_token(&line))
+        };
+
+        for (content, why) in [
+            (&b"\r\n"[..], "only a line end"),
+            (b"", "an empty file"),
+            (b"\n123456:ABCdef_ghi-JKLmnoPQRstuVWXyz0123\n", "the token on the second line"),
+            (b"123456:short\r\n", "the wrong shape"),
+        ] {
+            let e = store(content).unwrap_err();
+            assert_eq!((e.kind.as_str(), e.message.as_str()), ("invalid_params", "that is not a bot token"), "{why}");
+            assert!(!format!("{}{}", e.message, e.hint).contains("ABCdef"), "{why}: the token is never in an error");
+        }
+        assert!(!dir.join("bridge/telegram.token").exists(), "nothing stored");
+
+        for content in [
+            format!("  {TOKEN}  \r\nsecond line\r\n"),
+            format!("\t{TOKEN}\n{TOKEN}x\n"),
+            format!("{TOKEN}\r"),
+            TOKEN.to_string(),
+        ] {
+            store(content.as_bytes()).unwrap_or_else(|e| panic!("{content:?}: {}", e.message));
+            assert_eq!(std::fs::read_to_string(dir.join("bridge/telegram.token")).unwrap(), TOKEN, "{content:?}");
+            assert!(path.exists(), "the file is left for the caller to delete");
+        }
+
+        let gone = dir.join("no such dir").join("token.txt");
+        let e = super::read_token(Some(&gone)).unwrap_err();
+        assert_eq!(e.kind, "invalid_params");
+        assert_eq!(
+            e.message,
+            format!("cannot read the token file {}: {}", gone.display(), std::io::ErrorKind::NotFound)
+        );
+
+        let e = super::read_token(Some(&dir)).unwrap_err();
+        assert_eq!(e.kind, "invalid_params", "a directory, not a file");
+        assert!(e.message.starts_with(&format!("cannot read the token file {}: ", dir.display())), "{}", e.message);
+
+        std::fs::write(&path, [0xff, 0xfe, b'1', b'\n']).unwrap();
+        let e = super::read_token(Some(&path)).unwrap_err();
+        assert_eq!(
+            e.message,
+            format!("cannot read the token file {}: {}", path.display(), std::io::ErrorKind::InvalidData),
+            "not UTF-8"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn token_file_takes_a_windows_path_with_spaces_and_conflicts_with_clear() {
+        use super::{BridgeCmd, TelegramCmd};
+        use clap::Parser;
+        let parse = |args: &[&str]| {
+            let cli = crate::cli::Cli::try_parse_from([&["h0x-core", "bridge", "telegram", "token"], args].concat());
+            match cli.map_err(|e| e.kind())?.cmd {
+                Some(crate::cli::Cmd::Bridge {
+                    action: BridgeCmd::Telegram { action: TelegramCmd::Token { clear, file } },
+                }) => Ok((clear, file)),
+                _ => panic!("bridge telegram token"),
+            }
+        };
+        let windows = r"C:\Users\Jane Doe\My Tokens\bot token.txt";
+        assert_eq!(parse(&["--file", windows]), Ok((false, Some(std::path::PathBuf::from(windows)))));
+        assert_eq!(
+            parse(&["--file", r"\\server\share\bot.txt"]).unwrap().1.unwrap().to_str(),
+            Some(r"\\server\share\bot.txt")
+        );
+        assert_eq!(parse(&[]), Ok((false, None)), "stdin, as before");
+        assert_eq!(parse(&["--clear"]), Ok((true, None)));
+        assert_eq!(parse(&["--clear", "--file", windows]), Err(clap::error::ErrorKind::ArgumentConflict));
+        assert_eq!(parse(&["--file", windows, "--clear"]), Err(clap::error::ErrorKind::ArgumentConflict));
+        assert_eq!(parse(&["--file"]), Err(clap::error::ErrorKind::InvalidValue), "a path is required");
     }
 
     #[test]

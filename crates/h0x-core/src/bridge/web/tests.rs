@@ -822,3 +822,92 @@ fn an_empty_pair_code_is_usage_and_not_a_wrong_guess() {
     let paired = f.say(&mut Conn::default(), "pair", json!({"token": code}), T + 5);
     assert_eq!(paired.out[0]["name"], "paired", "four real guesses, not five");
 }
+
+#[test]
+fn qr_json_is_a_square_of_ones_and_zeros_and_refuses_empty_or_huge_text() {
+    let q = qr_json("http://127.0.0.1:7777/#pair=ABCD2345").unwrap();
+    assert_eq!(q["size"], 29);
+    let rows: Vec<&str> = q["rows"].as_array().unwrap().iter().map(|r| r.as_str().unwrap()).collect();
+    assert_eq!(rows.len(), 29);
+    assert!(rows.iter().all(|r| r.len() == 29 && r.bytes().all(|b| b == b'0' || b == b'1')));
+    assert_eq!(&rows[0][..7], "1111111");
+    assert_eq!(&rows[1][..7], "1000001");
+    let long = qr_json(&"x".repeat(2000)).unwrap();
+    assert_eq!(long["rows"].as_array().unwrap().len() as u64, long["size"].as_u64().unwrap());
+    assert_eq!(qr_json("").unwrap_err().kind, "invalid_params");
+    assert_eq!(qr_json(&"x".repeat(3000)).unwrap_err().message, "that text is too long for a QR code");
+    assert_eq!(qr(&"x".repeat(3000)), "", "no drawing for text that does not fit");
+}
+
+#[test]
+fn the_ready_line_has_exactly_four_keys_with_nulls_for_what_is_absent() {
+    let plain = ready_line("http://127.0.0.1:7777/", Some("http://127.0.0.1:7777/#pair=ABCD2345"), None, None);
+    assert_eq!(
+        plain,
+        json!({"url": "http://127.0.0.1:7777/", "pair": "http://127.0.0.1:7777/#pair=ABCD2345", "tunnel": null, "via": null})
+    );
+    let all = ready_line("http://10.0.0.5:7777/", None, Some("https://a.trycloudflare.com/"), Some("h0x.example.com"));
+    assert_eq!(all["pair"], Value::Null);
+    assert_eq!(
+        (all["tunnel"].as_str(), all["via"].as_str()),
+        (Some("https://a.trycloudflare.com/"), Some("h0x.example.com"))
+    );
+    assert_eq!(all.as_object().unwrap().len(), 4);
+    assert!(!all.to_string().contains('\n'), "one line");
+}
+
+#[test]
+fn qr_json_takes_one_character_multibyte_text_and_a_newline_up_to_the_exact_byte_capacity() {
+    let size = |text: &str| qr_json(text).map(|q| q["size"].as_u64().unwrap());
+    assert_eq!(size("a"), Ok(21), "one character: version 1");
+    let one = qr_json("a").unwrap();
+    let rows: Vec<&str> = one["rows"].as_array().unwrap().iter().map(|r| r.as_str().unwrap()).collect();
+    assert_eq!(rows.len(), 21);
+    assert!(rows.iter().all(|r| r.len() == 21), "no quiet zone");
+    assert_eq!(&rows[20][..7], "1111111", "the bottom-left finder starts at the edge");
+
+    let line = qr_json("a\nb").unwrap();
+    assert_eq!(line["size"], 21, "a newline is just a byte");
+    assert!(line["rows"].as_array().unwrap().iter().all(|r| !r.as_str().unwrap().contains('\n')));
+    assert!(size("héllo 🙂 ünïcode").is_ok());
+
+    // Version 40 at medium correction holds 2331 bytes.
+    assert_eq!(size(&"x".repeat(2331)), Ok(177), "exactly at capacity");
+    let over = qr_json(&"x".repeat(2332)).unwrap_err();
+    assert_eq!((over.kind.as_str(), over.message.as_str()), ("invalid_params", "that text is too long for a QR code"));
+    // Capacity counts UTF-8 bytes, not characters: four bytes per emoji.
+    assert_eq!(size(&"🙂".repeat(582)), Ok(177), "2328 bytes");
+    assert_eq!(qr_json(&"🙂".repeat(583)).unwrap_err().message, "that text is too long for a QR code", "2332 bytes");
+    assert_eq!(qr(&"🙂".repeat(583)), "");
+    assert_eq!(qr_json("").unwrap_err().message, "no text to encode");
+}
+
+#[test]
+fn qr_draws_terminal_blocks_two_module_rows_per_line_inside_a_quiet_zone() {
+    let drawn = qr("a");
+    let lines: Vec<&str> = drawn.lines().collect();
+    assert_eq!(lines.len(), 13, "21 modules and a 2-module quiet zone, two rows per line");
+    assert!(lines.iter().all(|l| l.chars().count() == 25), "{drawn}");
+    assert!(drawn.chars().all(|c| matches!(c, ' ' | '▀' | '▄' | '█' | '\n')), "{drawn}");
+    assert!(lines[0].chars().all(|c| c == '█'), "the quiet zone is light, drawn as full blocks");
+}
+
+#[test]
+fn the_ready_line_keeps_null_pair_and_tunnel_when_locked_or_the_tunnel_failed() {
+    let url = "http://127.0.0.1:7777/";
+    for (line, via) in [
+        (ready_line(url, None, None, None), Value::Null),
+        (ready_line(url, None, None, Some("h0x.example.com")), json!("h0x.example.com")),
+    ] {
+        let text = line.to_string();
+        let parsed: Value = serde_json::from_str(&text).unwrap();
+        let keys = parsed.as_object().unwrap();
+        assert_eq!(keys.len(), 4, "{text}");
+        for key in ["url", "pair", "tunnel", "via"] {
+            assert!(keys.contains_key(key), "{key} is present even when null: {text}");
+        }
+        assert_eq!((&parsed["url"], &parsed["pair"], &parsed["tunnel"]), (&json!(url), &Value::Null, &Value::Null));
+        assert_eq!(parsed["via"], via);
+        assert!(!text.contains('\n'), "one line");
+    }
+}

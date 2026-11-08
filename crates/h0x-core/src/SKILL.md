@@ -241,7 +241,9 @@ paths start at your current folder. Prefer explicit paths for remote work.
   `bridge pair` get full control of this machine through a Telegram bot
   (`bridge run`) or a web panel (`bridge web`, reachable from anywhere with
   `--tunnel` or `bridge tunnel on`, through Cloudflare). Never pair, unpair,
-  reset, set the bot token, serve the panel, open a tunnel or
+  reset, set the bot token (`bridge telegram token`, from stdin or `--file`),
+  serve the panel (`bridge web`, `--json` prints one line with its address and
+  pairing link), open a tunnel or
   `h0x-core bridge unlock` on your own; `h0x-core bridge ls` and
   `h0x-core bridge log` are safe to read. A person may answer your blocked
   prompt from their phone.
