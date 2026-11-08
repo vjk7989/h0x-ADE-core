@@ -277,6 +277,16 @@ pub fn fetch(m: &Manifest, target: &str, scratch: &Path) -> Result<PathBuf, RpcE
     Ok(file)
 }
 
+/// The release signature of an archive `fetch` got, saved beside it
+/// (`<archive>.minisig`) for a machine that checks it itself. None for a test
+/// site (H0X_CORE_RELEASES_URL), which is not signed.
+pub fn fetch_signature(m: &Manifest, target: &str, archive: &Path) -> Result<Option<PathBuf>, RpcError> {
+    let Some(t) = m.targets.get(target).filter(|_| overridden().is_none()) else { return Ok(None) };
+    let sig = minisig(archive);
+    curl(&format!("{}.minisig", t.url), &sig)?;
+    Ok(Some(sig))
+}
+
 /// A private folder for one download, removed when dropped.
 pub struct Scratch(pub PathBuf);
 

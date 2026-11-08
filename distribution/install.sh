@@ -83,8 +83,13 @@ mkdir -p "$bin"
 
 if [ -x "$bin/h0x-core" ]; then
   # Swapped the planned way, so its terminals keep running.
+  # The signed archive; a core older than this one takes only the bare binary
+  # (verified above, so only who swaps changes).
   if [ -n "${H0X_CORE_RELEASES_URL:-}" ]; then from=$tmp/h0x-core; else from=$archive; fi
-  "$bin/h0x-core" update --from "$from" >/dev/null || fail "updating $bin/h0x-core failed (see above)"
+  if ! "$bin/h0x-core" update --from "$from" >/dev/null 2>"$tmp/update.err"; then
+    "$bin/h0x-core" update --from "$tmp/h0x-core" >/dev/null 2>>"$tmp/update.err" ||
+      { cat "$tmp/update.err" >&2; fail "updating $bin/h0x-core failed (see above)"; }
+  fi
   say "h0x-core updated to $version."
 else
   cp "$tmp/h0x-core" "$bin/h0x-core.new"

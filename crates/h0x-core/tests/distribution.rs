@@ -390,3 +390,89 @@ fn the_install_script_refuses_a_download_without_the_release_signature() {
     assert!(install(false).contains(&format!("no signature for {name}")));
     assert!(install(true).contains(&format!("{name} is not signed by the h0x-core release key")));
 }
+
+/// Upgrading an h0x-core older than release signing: it takes only a bare
+/// binary for `update --from`, so install.sh hands it the binary the new
+/// h0x-core already verified. A bad signature swaps nothing. The new h0x-core
+/// is a script standing in (`--check` passes or fails as told); the real
+/// check needs the release secret key.
+#[test]
+fn the_install_script_upgrades_a_core_that_takes_only_a_bare_binary_after_verifying() {
+    let s = Session::new();
+    let dir = s.root.join("old-core");
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = format!("h0x-core-{}.tar.gz", here());
+    let make_new = |check_exit: i32| {
+        let new = dir.join("h0x-core");
+        std::fs::write(
+            &new,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  --version) echo 'h0x-core 9.9.9'; exit 0 ;;\n  *--check*) exit {check_exit} ;;\nesac\nexit 0 # new core {check_exit}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&new, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let tar = dir.join(&name);
+        assert!(
+            Command::new("tar").arg("-czf").arg(&tar).arg("-C").arg(&dir).arg("h0x-core").status().unwrap().success()
+        );
+        (std::fs::read(&new).unwrap(), tar)
+    };
+    let sum = |tar: &Path| {
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!("sha256sum {0} 2>/dev/null || shasum -a 256 {0}", tar.display()))
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().split_whitespace().next().unwrap().to_owned()
+    };
+    let stub = s.root.join("stub");
+    std::fs::create_dir_all(&stub).unwrap();
+    let old_core = "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'h0x-core 0.1.8' ;;\n  update) case \"$3\" in *.tar.gz | *.zip) echo 'not a working h0x-core' >&2; exit 1 ;; esac; cp \"$3\" \"$0\" ;;\nesac\n";
+    for (check_exit, upgraded) in [(0, true), (1, false)] {
+        let (new_bytes, tar) = make_new(check_exit);
+        let url = format!("https://github.com/vjk7989/h0x-ADE-core/releases/download/v1.0.0/{name}");
+        let manifest = dir.join("latest.json");
+        std::fs::write(
+            &manifest,
+            format!(
+                r#"{{"version":"1.0.0","generation":1,"targets":{{"{}":{{"url":"{url}","sha256":"{}"}}}}}}"#,
+                here(),
+                sum(&tar)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            stub.join("curl"),
+            format!(
+                "#!/bin/sh\nout=; url=; prev=\nfor a; do\n  if [ \"$prev\" = -o ]; then out=$a; else case $a in -*) ;; *) url=$a ;; esac; fi\n  prev=$a\ndone\ncase $url in\n  */latest.json) cp {manifest} \"$out\" ;;\n  */{name}.minisig) echo sig > \"$out\" ;;\n  */{name}) cp {tar} \"$out\" ;;\n  *) exit 22 ;;\nesac\n",
+                manifest = manifest.display(),
+                tar = tar.display()
+            ),
+        )
+        .unwrap();
+        Command::new("chmod").arg("755").arg(stub.join("curl")).status().unwrap();
+        let bin = s.root.join(format!("installed-{check_exit}"));
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("h0x-core"), old_core).unwrap();
+        Command::new("chmod").arg("755").arg(bin.join("h0x-core")).status().unwrap();
+        let out = Command::new("sh")
+            .arg(format!("{ROOT}/../../distribution/install.sh"))
+            .env("PATH", format!("{}:/usr/bin:/bin", stub.display()))
+            .env_remove("H0X_CORE_RELEASES_URL")
+            .env_remove("H0X_CORE_VERSION")
+            .env("H0X_CORE_INSTALL_DIR", &bin)
+            .output()
+            .unwrap();
+        let installed = std::fs::read(bin.join("h0x-core")).unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        if upgraded {
+            assert!(out.status.success(), "{err}");
+            assert_eq!(installed, new_bytes, "the verified new binary is in place");
+        } else {
+            assert!(!out.status.success());
+            assert!(err.contains("is not signed by the h0x-core release key"), "{err}");
+            assert_eq!(installed, old_core.as_bytes(), "a bad signature swaps nothing");
+        }
+    }
+}

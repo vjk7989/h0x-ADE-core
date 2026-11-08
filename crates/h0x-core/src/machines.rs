@@ -559,10 +559,11 @@ fn install_windows(paths: &crate::paths::Paths, target: &str, session: Option<&s
         )
     })?;
     let zip = crate::releases::fetch(&m, "windows-x86_64", &scratch.0)?;
+    // The release's signature goes along, under the asset's own name: the installer there checks it.
+    let sig = crate::releases::fetch_signature(&m, "windows-x86_64", &zip)?;
     let script = scratch.0.join("h0x-core-install.ps1");
     std::fs::write(&script, include_str!("../../../distribution/install.ps1"))
         .map_err(|e| RpcError::internal(e.to_string()))?;
-    std::fs::copy(&zip, scratch.0.join("h0x-core-install.zip")).map_err(|e| RpcError::internal(e.to_string()))?;
     let mut scp = std::process::Command::new("scp");
     scp.arg("-q");
     #[cfg(unix)]
@@ -570,7 +571,7 @@ fn install_windows(paths: &crate::paths::Paths, target: &str, session: Option<&s
         .arg(format!("ControlPath={}", control_path(paths, target).display()))
         .args(["-o", "ControlMaster=no"]);
     scp.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]);
-    scp.arg("--").arg(scratch.0.join("h0x-core-install.zip")).arg(&script).arg(format!("{target}:"));
+    scp.arg("--").arg(&zip).args(&sig).arg(&script).arg(format!("{target}:"));
     let to = Reach { target, via: false };
     let out = scp.output().map_err(|e| unreachable(to, &format!("cannot run scp: {e}")))?;
     if !out.status.success() {
@@ -586,7 +587,7 @@ fn install_windows(paths: &crate::paths::Paths, target: &str, session: Option<&s
         paths,
         to,
         &format!(
-            "powershell -NoProfile -ExecutionPolicy Bypass -File h0x-core-install.ps1 h0x-core-install.zip{session}"
+            "powershell -NoProfile -ExecutionPolicy Bypass -File h0x-core-install.ps1 h0x-core-windows-x86_64.zip{session}"
         ),
         b"",
     )?;

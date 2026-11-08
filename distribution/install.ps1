@@ -48,7 +48,14 @@ try {
   $archive = "$tmp\h0x-core.zip"
   $signed = $false
   if ($zip) {
+    # Named as the release names it, its .minisig (if it came along) beside it.
+    $asset = Split-Path -Leaf $zip
+    $archive = Join-Path $tmp $asset
     Copy-Item $zip $archive
+    if (Test-Path "$zip.minisig") {
+      Copy-Item "$zip.minisig" "$archive.minisig"
+      $signed = $true
+    }
   } else {
     $manifest = if ($env:H0X_CORE_VERSION) { "$releases/download/v$($env:H0X_CORE_VERSION)/manifest.json" } else { "$releases/latest/download/latest.json" }
     Check $manifest
@@ -106,8 +113,11 @@ try {
     $exe = Join-Path $dir "h0x-core.exe"
     if (Test-Path $exe) {
         # Swapped the planned way, so its terminals keep running.
+        # The signed archive; a core older than this one takes only the bare binary
+        # (checked above, so only who swaps changes).
         $from = if ($signed) { $archive } else { $new }
         & $exe update --from $from | Out-Null
+        if ($LASTEXITCODE -and $from -ne $new) { & $exe update --from $new | Out-Null }
         if ($LASTEXITCODE) { Fail "updating $exe failed (see above)" }
         Write-Host "h0x-core updated to $version."
     } else {
@@ -133,6 +143,6 @@ try {
     Write-Host "Agents: h0x-core --skill. People: h0x-core --help."
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
-    if ($zip) { Remove-Item -Force $zip, $PSCommandPath -ErrorAction SilentlyContinue }
+    if ($zip) { Remove-Item -Force $zip, "$zip.minisig", $PSCommandPath -ErrorAction SilentlyContinue }
 }
 } @args
