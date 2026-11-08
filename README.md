@@ -7,27 +7,57 @@ take over. It draws nothing: use it from your shell, an agent, or your own app.
 
 ## Install
 
-Linux and macOS:
+HyperOx is in Beta: expect rough edges and breaking changes between releases.
+
+### Linux and macOS
 
 ```sh
 curl -fsSL https://github.com/vjk7989/h0x-ADE-core/releases/latest/download/install.sh | sh
 ```
 
-Windows (PowerShell):
+This installs `h0x-core` into `~/.local/bin`; make sure that is on your PATH.
+
+### Windows (PowerShell)
 
 ```powershell
-powershell -c "irm https://github.com/vjk7989/h0x-ADE-core/releases/latest/download/install.ps1 | iex"
+irm https://github.com/vjk7989/h0x-ADE-core/releases/latest/download/install.ps1 | iex
 ```
 
-Or download a release asset for your platform (Linux and macOS on x86_64 and
-aarch64, Windows on x86_64) and put `h0x-core` on your PATH. Linux builds are
-static. On Windows, templates and quoted shell commands need `sh` on PATH, such
-as Git for Windows provides.
+This installs into `%LOCALAPPDATA%\Programs\h0x-core` and adds it to your PATH. No admin needed; open a new terminal afterwards. Templates and quoted shell commands need `sh` on PATH, such as Git for Windows provides.
 
-Run `h0x-core update` to update. Running terminals keep running.
+### Manual download
+
+Pick the file for your platform from the [latest release](https://github.com/vjk7989/h0x-ADE-core/releases/latest), unpack it and put `h0x-core` on your PATH:
+
+| Platform | Asset |
+|---|---|
+| Linux x86_64 / aarch64 | `h0x-core-linux-x86_64.tar.gz` / `h0x-core-linux-aarch64.tar.gz` |
+| macOS Intel / Apple Silicon | `h0x-core-macos-x86_64.tar.gz` / `h0x-core-macos-aarch64.tar.gz` |
+| Windows x86_64 | `h0x-core-windows-x86_64.zip` |
+
+Linux builds are static.
+
+### Verify a download
+
+Every release file has a [minisign](https://jedisct1.github.io/minisign/) signature beside it (`<file>.minisig`, same folder). The public key is:
+
+```text
+RWTEdqtOBn6VKQ/x9x3qWk/gIWUb/I1OlZXsTlHyrkp9Yq30qBki+tdt
+```
+
+```sh
+base=https://github.com/vjk7989/h0x-ADE-core/releases/latest/download
+curl -fsSLO $base/h0x-core-linux-x86_64.tar.gz
+curl -fsSLO $base/h0x-core-linux-x86_64.tar.gz.minisig
+minisign -Vm h0x-core-linux-x86_64.tar.gz -P RWTEdqtOBn6VKQ/x9x3qWk/gIWUb/I1OlZXsTlHyrkp9Yq30qBki+tdt
+```
+
+`h0x-core update` checks these signatures itself. Run it to update; running terminals keep running.
 See [security](docs/security.md) for the trust and signing details.
 
 ## Quick start
+
+Check the install with `h0x-core --version`, then:
 
 ```sh
 h0x-core run cargo test                  # stream output and wait for it
@@ -96,6 +126,11 @@ A program can say it is working, done, blocked, or in error through OSC 7501,
 the Program Status Protocol. Core stores what it reports and never guesses from
 screen text. A program that does not report status has none.
 Use `h0x-core get review` for a snapshot or `h0x-core events` to follow changes.
+
+## Remote control
+
+Pair a chat account to see and drive this machine's terminals while you are away.
+See [Remote control (bridge)](docs/bridge.md).
 
 ## Build your own client
 
