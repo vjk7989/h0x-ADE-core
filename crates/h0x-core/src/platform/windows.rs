@@ -146,7 +146,17 @@ impl Write for &Stream {
     }
 }
 
+/// A core of this version listens on a salted name; one still running from
+/// before the salt (an update in progress) on the older. Both are checked to
+/// be served by this account.
 pub fn connect(path: &Path) -> io::Result<Stream> {
+    match connect_one(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => unsalted(path).map_or(Err(e), |older| connect_one(&older)),
+        found => found,
+    }
+}
+
+fn connect_one(path: &Path) -> io::Result<Stream> {
     let name = wide(path.as_os_str());
     for _ in 0..50 {
         let h = unsafe {
@@ -388,29 +398,52 @@ pub fn data_dirs() -> (PathBuf, PathBuf) {
 pub const MAX_SOCKET_PATH: usize = 256;
 
 /// Anyone can create a pipe under a guessable name first. The name therefore
-/// carries a random salt kept in this user's profile (one for all sessions;
-/// the profile folder is the user's alone); clients read the same file. Made
-/// once; a missing or damaged one is replaced.
-fn pipe_salt(dir: &Path) -> String {
-    let file = dir.join("pipe-salt");
-    let valid = |s: &String| s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit());
-    let read = || std::fs::read_to_string(&file).ok().map(|s| s.trim().to_string()).filter(valid);
-    if let Some(salt) = read() {
-        return salt;
-    }
-    let salt = crate::platform::random_hex();
-    let written = std::fs::create_dir_all(dir).and_then(|()| {
-        let _ = std::fs::remove_file(&file);
-        std::fs::OpenOptions::new().write(true).create_new(true).open(&file)?.write_all(salt.as_bytes())
-    });
-    // Another process made it first: use theirs.
-    if written.is_err() { read().unwrap_or(salt) } else { salt }
+/// carries a random salt kept beside the sessions' state (this user's folder;
+/// the same for all sessions), which the server makes and clients only read.
+fn salt_file(state: &Path) -> Option<PathBuf> {
+    state.parent().map(|dir| dir.join("pipe-salt"))
 }
 
-pub fn endpoints(_state: &Path) -> (PathBuf, String) {
+fn valid_salt(s: &str) -> bool {
+    s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn read_pipe_salt(state: &Path) -> Option<String> {
+    let salt = std::fs::read_to_string(salt_file(state)?).ok()?.trim().to_string();
+    valid_salt(&salt).then_some(salt)
+}
+
+/// Server side: make the salt once; a missing or damaged one is replaced.
+pub fn ensure_pipe_salt(state: &Path) -> io::Result<()> {
+    let Some(file) = salt_file(state).filter(|_| read_pipe_salt(state).is_none()) else {
+        return Ok(());
+    };
+    let _ = std::fs::remove_file(&file);
+    let made = std::fs::create_dir_all(file.parent().unwrap_or(state)).and_then(|()| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file)?
+            .write_all(crate::platform::random_hex().as_bytes())
+    });
+    // Another core made it first: theirs stands.
+    made.or_else(|e| read_pipe_salt(state).map(|_| ()).ok_or(e))
+}
+
+/// The name an older core (without the salt) listens on, for a salted one.
+fn unsalted(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let (user, rest) = name.strip_prefix("h0x-core-")?.split_once('-')?;
+    let (salt, rest) = rest.split_once('-')?;
+    valid_salt(salt).then(|| path.with_file_name(format!("h0x-core-{user}-{rest}")))
+}
+
+/// Without a salt yet (no core of this version has run), the older name.
+pub fn endpoints(state: &Path) -> (PathBuf, String) {
     let user: String =
         std::env::var("USERNAME").unwrap_or_default().chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-    (PathBuf::from(r"\\.\pipe\"), format!("h0x-core-{user}-{}-", pipe_salt(&data_dirs().0.join("h0x-core"))))
+    let salt = read_pipe_salt(state).map(|s| format!("{s}-")).unwrap_or_default();
+    (PathBuf::from(r"\\.\pipe\"), format!("h0x-core-{user}-{salt}"))
 }
 
 pub fn private_dir(path: &Path) -> io::Result<()> {
@@ -1254,7 +1287,7 @@ pub mod console {
 
 #[cfg(test)]
 mod tests {
-    use super::{RELEASE, endpoints, pipe_salt};
+    use super::{RELEASE, endpoints, ensure_pipe_salt, read_pipe_salt, unsalted};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -1268,31 +1301,58 @@ mod tests {
     fn a_release_ships_h0x_core_exe_and_no_hc_alias() {
         assert_eq!(RELEASE[0], "h0x-core.exe");
         assert!(RELEASE.iter().all(|f| !f.contains("hc.exe") && !f.contains("herdr")), "{RELEASE:?}");
-        let (namespace, prefix) = endpoints(Path::new("unused"));
+        let root = std::env::temp_dir().join(format!("h0x-core-salt-{}", crate::platform::random_hex()));
+        let state = root.join("h0x-core").join("session");
+        // No salt yet (a client before any server): the older name, and nothing created.
+        let (namespace, prefix) = endpoints(&state);
         assert_eq!(namespace, PathBuf::from(r"\\.\pipe\"));
-        let rest = prefix.strip_prefix("h0x-core-").and_then(|p| p.strip_suffix('-')).expect(&prefix);
-        let (user, salt) = rest.rsplit_once('-').expect(&prefix);
+        let user = prefix.strip_prefix("h0x-core-").and_then(|p| p.strip_suffix('-')).expect(&prefix);
         assert!(user.chars().all(|c| c.is_ascii_alphanumeric()), "{prefix:?}");
+        assert!(!root.exists(), "a client made the salt");
+        ensure_pipe_salt(&state).unwrap();
+        let (_, prefix) = endpoints(&state);
+        let (_, salt) =
+            prefix.strip_prefix("h0x-core-").and_then(|p| p.strip_suffix('-')).unwrap().rsplit_once('-').unwrap();
         assert_eq!(salt.len(), 32, "{prefix:?}");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn the_pipe_salt_is_made_once_read_back_and_replaced_when_damaged() {
-        let state = std::env::temp_dir().join(format!("h0x-core-salt-{}", crate::platform::random_hex()));
-        let first = pipe_salt(&state);
-        assert_eq!(first.len(), 32);
-        assert_eq!(pipe_salt(&state), first, "a second call reads the same file");
+        let root = std::env::temp_dir().join(format!("h0x-core-salt-{}", crate::platform::random_hex()));
+        let state = root.join("h0x-core").join("session");
+        let file = root.join("h0x-core").join("pipe-salt");
+        assert_eq!(read_pipe_salt(&state), None);
+        ensure_pipe_salt(&state).unwrap();
+        let first = read_pipe_salt(&state).unwrap();
+        ensure_pipe_salt(&state).unwrap();
+        assert_eq!(read_pipe_salt(&state), Some(first), "a second call keeps the file");
         assert_eq!(endpoints(&state).1, endpoints(&state).1);
         for damaged in ["", "short", "zz".repeat(16).as_str(), "ab".repeat(17).as_str()] {
-            std::fs::write(state.join("pipe-salt"), damaged).unwrap();
-            let fresh = pipe_salt(&state);
-            assert!(fresh.len() == 32 && fresh.chars().all(|c| c.is_ascii_hexdigit()), "{damaged:?}");
+            std::fs::write(&file, damaged).unwrap();
+            assert_eq!(read_pipe_salt(&state), None, "{damaged:?}");
+            ensure_pipe_salt(&state).unwrap();
+            let fresh = read_pipe_salt(&state).expect(damaged);
             assert_ne!(fresh, damaged);
-            assert_eq!(std::fs::read_to_string(state.join("pipe-salt")).unwrap(), fresh);
         }
-        let other = std::env::temp_dir().join(format!("h0x-core-salt-{}", crate::platform::random_hex()));
-        assert_ne!(pipe_salt(&other), pipe_salt(&state), "each state folder has its own");
-        let _ = std::fs::remove_dir_all(state);
-        let _ = std::fs::remove_dir_all(other);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_salted_name_falls_back_to_the_older_one_and_only_that() {
+        let salt = "ab".repeat(16);
+        let salted = PathBuf::from(format!(r"\\.\pipe\h0x-core-vijay-{salt}-default.sock"));
+        assert_eq!(unsalted(&salted), Some(PathBuf::from(r"\\.\pipe\h0x-core-vijay-default.sock")));
+        let holder = PathBuf::from(format!(r"\\.\pipe\h0x-core-vijay-{salt}-default.holder.sock"));
+        assert_eq!(unsalted(&holder), Some(PathBuf::from(r"\\.\pipe\h0x-core-vijay-default.holder.sock")));
+        assert_eq!(unsalted(Path::new(r"\\.\pipe\h0x-core-vijay-default.sock")), None);
+        assert_eq!(unsalted(Path::new(r"\\.\pipe\other")), None);
+        // A client of this version reaches a core that still listens on the older name.
+        let tag = crate::platform::random_hex();
+        let older = PathBuf::from(format!(r"\\.\pipe\h0x-core-fallback-{tag}.sock"));
+        let wanted = PathBuf::from(format!(r"\\.\pipe\h0x-core-fallback-{salt}-{tag}.sock"));
+        assert!(super::connect(&wanted).is_err(), "nothing listens yet");
+        let _listener = super::listen(&older).unwrap();
+        super::connect(&wanted).unwrap();
     }
 }

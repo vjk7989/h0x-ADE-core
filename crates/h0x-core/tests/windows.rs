@@ -324,8 +324,7 @@ fn only_this_account_may_open_the_cores_pipe() {
     let s = Session::new();
     s.out(&["server", "start"]);
     let user: String = std::env::var("USERNAME").unwrap().chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-    let local = std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA");
-    let salt = std::fs::read_to_string(Path::new(&local).join(r"h0x-core\pipe-salt")).expect("the pipe salt");
+    let salt = std::fs::read_to_string(s.root.join("state").join("h0x-core").join("pipe-salt")).expect("the pipe salt");
     assert_eq!(salt.trim().len(), 32, "{salt:?}");
     let pipe = format!(r"\\.\pipe\h0x-core-{user}-{}-{}.sock", salt.trim(), s.name);
     // From Windows itself: Get-Acl sometimes answers for the pipe root instead.
@@ -628,7 +627,7 @@ fn planned_restarts_preserve_the_environment_for_new_terminals() {
         let (code, out) = s.out(&["run", "--timeout", "15", "powershell", "-NoProfile", "-File", &probe]);
         assert_eq!(code, 0, "{out}");
         assert!(out.contains("ENV:|original|"), "{args:?}: {out}");
-        let (directory, prefix) = h0x_core::platform::endpoints(&s.root);
+        let (directory, prefix) = h0x_core::platform::endpoints(&s.root.join("state").join("h0x-core").join(&s.name));
         let stream = h0x_core::platform::connect(&directory.join(format!("{prefix}{}.sock", s.name))).unwrap();
         let terminal = h0x_core::client::call(
             &stream,
