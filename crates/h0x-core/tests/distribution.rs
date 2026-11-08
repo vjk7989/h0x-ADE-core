@@ -476,3 +476,127 @@ fn the_install_script_upgrades_a_core_that_takes_only_a_bare_binary_after_verify
         }
     }
 }
+
+/// A stubbed signed release for install.sh: `new_core` (a script) packed as this
+/// target's archive, listed at its release URL plus `query`, and a curl in the
+/// returned folder that serves the list, the archive and a `.minisig`, logging
+/// every URL into `<root>/curl.log`. Also the archive's name and the script's bytes.
+fn stubbed_release(s: &Session, query: &str, new_core: &str) -> (PathBuf, String, Vec<u8>) {
+    let dir = s.root.join("release");
+    std::fs::create_dir_all(&dir).unwrap();
+    let new = dir.join("h0x-core");
+    std::fs::write(&new, new_core).unwrap();
+    std::fs::set_permissions(&new, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let name = format!("h0x-core-{}.tar.gz", here());
+    let tar = dir.join(&name);
+    assert!(Command::new("tar").arg("-czf").arg(&tar).arg("-C").arg(&dir).arg("h0x-core").status().unwrap().success());
+    let sum = Command::new("sh")
+        .arg("-c")
+        .arg(format!("sha256sum {0} 2>/dev/null || shasum -a 256 {0}", tar.display()))
+        .output()
+        .unwrap();
+    let sum = String::from_utf8(sum.stdout).unwrap().split_whitespace().next().unwrap().to_owned();
+    let url = format!("https://github.com/vjk7989/h0x-ADE-core/releases/download/v1.0.0/{name}{query}");
+    let manifest = dir.join("latest.json");
+    std::fs::write(
+        &manifest,
+        format!(
+            r#"{{"version":"1.0.0","generation":1,"targets":{{"{}":{{"url":"{url}","sha256":"{sum}"}}}}}}"#,
+            here()
+        ),
+    )
+    .unwrap();
+    let stub = s.root.join("stub");
+    std::fs::create_dir_all(&stub).unwrap();
+    std::fs::write(
+        stub.join("curl"),
+        format!(
+            "#!/bin/sh\nout=; url=; prev=\nfor a; do\n  if [ \"$prev\" = -o ]; then out=$a; else case $a in -*) ;; *) url=$a ;; esac; fi\n  prev=$a\ndone\nprintf '%s\\n' \"$url\" >> '{log}'\ncase $url in\n  */latest.json) cp '{manifest}' \"$out\" ;;\n  *.minisig) echo sig > \"$out\" ;;\n  *) cp '{tar}' \"$out\" ;;\nesac\n",
+            log = s.root.join("curl.log").display(),
+            manifest = manifest.display(),
+            tar = tar.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(stub.join("curl"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    (stub, name, std::fs::read(&new).unwrap())
+}
+
+/// install.sh against the default (signed) site, curl from `stub`, into `bin`.
+fn install_signed(stub: &Path, bin: &Path) -> std::process::Output {
+    Command::new("sh")
+        .arg(format!("{ROOT}/../../distribution/install.sh"))
+        .env("PATH", format!("{}:/usr/bin:/bin", stub.display()))
+        .env_remove("H0X_CORE_RELEASES_URL")
+        .env_remove("H0X_CORE_VERSION")
+        .env("H0X_CORE_INSTALL_DIR", bin)
+        .output()
+        .unwrap()
+}
+
+/// A new h0x-core stand-in whose `--check` passes and logs its arguments.
+fn checking_core(s: &Session) -> String {
+    format!(
+        "#!/bin/sh\ncase \"$*\" in\n  --version) echo 'h0x-core 9.9.9' ;;\n  *--check*) printf '%s\\n' \"$*\" >> '{}' ;;\nesac\nexit 0\n",
+        s.root.join("check.log").display()
+    )
+}
+
+/// When the installed h0x-core takes neither the archive nor the bare binary,
+/// both refusals reach the person and the installed h0x-core stays as it was.
+#[test]
+fn the_install_script_shows_both_refusals_when_no_update_takes_and_keeps_the_old_core() {
+    let s = Session::new();
+    let (stub, name, _) = stubbed_release(&s, "", &checking_core(&s));
+    let bin = s.root.join("installed");
+    std::fs::create_dir_all(&bin).unwrap();
+    let old_core = "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'h0x-core 0.1.8' ;;\n  update) echo \"cannot take $3\" >&2; exit 1 ;;\nesac\n";
+    std::fs::write(bin.join("h0x-core"), old_core).unwrap();
+    std::fs::set_permissions(bin.join("h0x-core"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let out = install_signed(&stub, &bin);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    let refusals: Vec<&str> = err.lines().filter(|l| l.starts_with("cannot take ")).collect();
+    assert_eq!(refusals.len(), 2, "{err}");
+    assert!(refusals[0].ends_with(&format!("/{name}")), "the archive first: {err}");
+    assert!(refusals[1].ends_with("/h0x-core"), "then the verified binary: {err}");
+    assert!(err.contains(&format!("updating {}/h0x-core failed", bin.display())), "{err}");
+    assert_eq!(std::fs::read(bin.join("h0x-core")).unwrap(), old_core.as_bytes(), "nothing swapped");
+    assert!(!bin.join("h0x-core.new").exists());
+}
+
+/// A fresh install (no h0x-core there yet) into a folder with spaces, from a
+/// list whose URL carries a query: the `.minisig` is asked for without the
+/// query, and `--check` gets the archive under its release name.
+#[test]
+fn the_install_script_installs_fresh_from_a_url_with_a_query_into_a_folder_with_spaces() {
+    let s = Session::new();
+    let (stub, name, new_bytes) = stubbed_release(&s, "?sig=abc&exp=1#top", &checking_core(&s));
+    let bin = s.root.join("my bin ü");
+    let out = install_signed(&stub, &bin);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(std::fs::read(bin.join("h0x-core")).unwrap(), new_bytes, "the checked binary is installed");
+    let base = format!("https://github.com/vjk7989/h0x-ADE-core/releases/download/v1.0.0/{name}");
+    let asked = std::fs::read_to_string(s.root.join("curl.log")).unwrap();
+    assert!(asked.lines().any(|l| l == format!("{base}?sig=abc&exp=1#top")), "the archive as listed: {asked}");
+    assert!(asked.lines().any(|l| l == format!("{base}.minisig")), "the signature without the query: {asked}");
+    let checked = std::fs::read_to_string(s.root.join("check.log")).unwrap();
+    let line = checked.lines().next().unwrap_or_default();
+    assert!(line.starts_with("update --from ") && line.ends_with(&format!("/{name} --check")), "{checked}");
+}
+
+/// The signature is bound to the asset's file name, so the archive must be
+/// saved under it even when the list's URL has a `/` in its query.
+#[test]
+fn the_install_script_names_the_archive_after_the_path_even_when_the_query_has_a_slash() {
+    let s = Session::new();
+    let (stub, name, _) = stubbed_release(&s, "?token=a/b", &checking_core(&s));
+    let bin = s.root.join("installed");
+    let out = install_signed(&stub, &bin);
+    let checked = std::fs::read_to_string(s.root.join("check.log")).unwrap_or_default();
+    assert!(
+        checked.lines().any(|l| l.ends_with(&format!("/{name} --check"))),
+        "--check got: {checked}; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

@@ -507,6 +507,120 @@ ZJhj3MtbsDPyt278bwB0BcVRB5ZoKqA6VCCZ5s51lq49BobYTBUuzlJqofyqGhaBwWB6iLyCd1cVXXQh
         let err = super::from_file(&archive, None, &scratch.0).unwrap_err();
         assert!(err.message.contains("not signed by the h0x-core release key"), "{}", err.message);
     }
+
+    #[test]
+    fn a_signature_saved_with_windows_line_endings_still_verifies() {
+        let (_scratch, file, sig) = signed(PAYLOAD, Some(SIG.replace('\n', "\r\n").as_str()));
+        super::verify_archive_by(&file, None, TEST_KEY).unwrap();
+        assert!(file.exists() && sig.exists());
+    }
+
+    #[test]
+    fn a_signature_given_as_a_folder_is_refused_as_missing() {
+        let (_scratch, file, sig) = signed(PAYLOAD, Some(SIG));
+        let folder = file.with_file_name("sigs");
+        std::fs::create_dir(&folder).unwrap();
+        let err = super::verify_archive_by(&file, Some(&folder), TEST_KEY).unwrap_err();
+        assert_eq!(err.kind, "refused");
+        assert!(err.message.contains("it has no signature"), "{}", err.message);
+        assert!(file.exists() && sig.exists() && folder.is_dir(), "nothing of the person's is deleted");
+    }
+
+    /// Only the archive's file name is bound: any folder holds it (spaces,
+    /// non-ASCII), but a browser's renamed copy (` (1)`) is another file.
+    #[test]
+    fn the_folder_does_not_matter_but_the_archive_file_name_does() {
+        let (scratch, file, sig) = signed(PAYLOAD, Some(SIG));
+        let folder = scratch.0.join("Jane Doe Ünïcödé");
+        std::fs::create_dir(&folder).unwrap();
+        let moved = folder.join(NAME);
+        std::fs::rename(&file, &moved).unwrap();
+        std::fs::rename(&sig, super::minisig(&moved)).unwrap();
+        super::verify_archive_by(&moved, None, TEST_KEY).unwrap();
+        let copy = folder.join("h0x-core-linux-x86_64 (1).tar.gz");
+        std::fs::copy(&moved, &copy).unwrap();
+        std::fs::copy(super::minisig(&moved), super::minisig(&copy)).unwrap();
+        let err = super::verify_archive_by(&copy, None, TEST_KEY).unwrap_err();
+        assert!(
+            err.message.contains("its signature is for another file, not h0x-core-linux-x86_64 (1).tar.gz"),
+            "{}",
+            err.message
+        );
+        // The same signature handed over explicitly for the renamed copy: still refused.
+        assert!(super::verify_archive_by(&copy, Some(&super::minisig(&moved)), TEST_KEY).is_err());
+        assert!(copy.exists() && moved.exists());
+    }
+
+    #[test]
+    fn only_tar_gz_and_zip_names_count_as_release_archives() {
+        for name in ["h0x-core-linux-x86_64.tar.gz", "h0x-core-windows-x86_64.zip", "a b.zip", ".zip"] {
+            assert!(super::is_archive(std::path::Path::new(name)), "{name}");
+        }
+        for name in ["", "h0x-core", "h0x-core.exe", "h0x-core.tgz", "h0x-core.tar", "h0x-core.gz", "x.zip.minisig"] {
+            assert!(!super::is_archive(std::path::Path::new(name)), "{name}");
+        }
+    }
+
+    /// An uncompressed ustar archive of `entries` (tar -x reads it whatever its name).
+    fn ustar(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (name, data) in entries {
+            let mut h = [0u8; 512];
+            h[..name.len()].copy_from_slice(name.as_bytes());
+            h[100..108].copy_from_slice(b"0000755\0");
+            h[108..116].copy_from_slice(b"0000000\0");
+            h[116..124].copy_from_slice(b"0000000\0");
+            h[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
+            h[136..148].copy_from_slice(b"00000000000\0");
+            h[148..156].copy_from_slice(b"        ");
+            h[156] = b'0';
+            h[257..263].copy_from_slice(b"ustar\0");
+            h[263..265].copy_from_slice(b"00");
+            let sum: u32 = h.iter().map(|&b| u32::from(b)).sum();
+            h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+            out.extend_from_slice(&h);
+            out.extend_from_slice(data);
+            out.resize(out.len().div_ceil(512) * 512, 0);
+        }
+        out.resize(out.len() + 1024, 0);
+        out
+    }
+
+    #[test]
+    fn an_archive_without_the_h0x_core_binary_is_refused_and_extra_files_do_not_matter() {
+        let scratch = super::Scratch::new().unwrap();
+        let archive = scratch.0.join(NAME);
+        std::fs::write(&archive, ustar(&[("README", b"hi"), ("h0x-core.exe", b"x")])).unwrap();
+        let into = scratch.0.join("a");
+        std::fs::create_dir(&into).unwrap();
+        let err = super::unpack(&archive, &into).unwrap_err();
+        assert_eq!(err.kind, "refused");
+        assert!(err.message.ends_with("holds no h0x-core binary"), "{}", err.message);
+        // An empty archive, and a file that is no archive at all.
+        std::fs::write(&archive, ustar(&[])).unwrap();
+        assert!(super::unpack(&archive, &into).is_err());
+        std::fs::write(&archive, b"").unwrap();
+        assert!(super::unpack(&archive, &into).is_err());
+        // The binary beside extra files and a folder: found.
+        std::fs::write(&archive, ustar(&[("LICENSE", b"l"), ("conpty/x", b"c"), ("h0x-core", b"#!")])).unwrap();
+        let into = scratch.0.join("b");
+        std::fs::create_dir(&into).unwrap();
+        assert_eq!(super::unpack(&archive, &into).unwrap(), into.join("h0x-core"));
+    }
+
+    #[test]
+    fn unpacking_never_writes_outside_its_folder() {
+        let scratch = super::Scratch::new().unwrap();
+        let archive = scratch.0.join(NAME);
+        std::fs::write(&archive, ustar(&[("../escaped", b"e"), ("sub/../../escaped-too", b"e"), ("h0x-core", b"#!")]))
+            .unwrap();
+        let into = scratch.0.join("into");
+        std::fs::create_dir(&into).unwrap();
+        let _ = super::unpack(&archive, &into);
+        assert!(!scratch.0.join("escaped").exists(), "a ../ entry stays inside");
+        assert!(!scratch.0.join("escaped-too").exists(), "a sub/../../ entry stays inside");
+    }
+
     #[test]
     fn a_list_for_another_version_than_the_one_asked_for_is_refused() {
         let list = br#"{"version":"0.1.0","generation":1,"targets":{}}"#;

@@ -1100,4 +1100,39 @@ mod tests {
         };
         assert_eq!(to(&p), json!({"agent": "opencode", "id": "ses_1"}), "no `on` here");
     }
+
+    #[test]
+    fn update_check_and_signature_need_from_and_check_never_forces() {
+        for args in [
+            &["update", "--check"][..],
+            &["update", "--signature", "a.minisig"],
+            &["update", "--check", "--signature", "a.minisig"],
+            &["update", "--from", "a.tar.gz", "--check", "--force"],
+            &["update", "--from", "a.tar.gz", "--signature"],
+            &["update", "--from", "a.tar.gz", "--check", "yes"],
+        ] {
+            assert!(Cli::try_parse_from([&["h0x-core"], args].concat()).is_err(), "{args:?}");
+        }
+        // Windows paths with spaces reach the check exactly as given.
+        let Cmd::Update { from, signature, check, force, version } = parsed(&[
+            "update",
+            "--from",
+            r"C:\Users\Jane Doe\Downloads\h0x-core-windows-x86_64.zip",
+            "--signature",
+            r"D:\sigs\h0x-core-windows-x86_64.zip.minisig",
+            "--check",
+        ]) else {
+            panic!()
+        };
+        assert_eq!(from.unwrap(), std::path::Path::new(r"C:\Users\Jane Doe\Downloads\h0x-core-windows-x86_64.zip"));
+        assert_eq!(signature.unwrap(), std::path::Path::new(r"D:\sigs\h0x-core-windows-x86_64.zip.minisig"));
+        assert!(check && !force && version.is_none());
+        // Without --check, --from with --signature swaps (and may force).
+        let Cmd::Update { check, force, .. } =
+            parsed(&["update", "--from", "a.tar.gz", "--signature", "b.minisig", "--force"])
+        else {
+            panic!()
+        };
+        assert!(!check && force);
+    }
 }
