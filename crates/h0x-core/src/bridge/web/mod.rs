@@ -8,6 +8,7 @@
 //!
 //! Messages are JSON `{name, data}` both ways (see docs/bridge.md).
 
+mod e2e;
 mod http;
 mod sha;
 pub mod tunnel;
