@@ -765,6 +765,30 @@ mod tests {
     }
 
     #[test]
+    fn shell_detection_reads_program_paths_with_spaces_and_skips_look_alikes() {
+        // Windows paths with spaces and arguments after the program; mixed separators and case.
+        for argv in [
+            json!(["C:\\Program Files\\PowerShell\\7\\pwsh.exe", "-NoLogo"]),
+            json!(["C:/Program Files/Git/usr/bin/bash.EXE", "--login", "-i"]),
+            json!(["\\\\server\\share\\tools\\CMD.exe", "/k"]),
+        ] {
+            assert!(at_shell(&json!({ "argv": argv })), "{argv}");
+        }
+        // Names that only start or end like a shell are programs of their own.
+        for p in ["shellcheck", "C:\\tools\\shellcheck.exe", "/usr/bin/bash-language-server", "zsh.exe.bak", "pwsh."] {
+            assert!(!at_shell(&json!({"argv": [p]})), "{p}");
+        }
+        // No program at all, or not a string: not a shell.
+        for t in [json!({"argv": []}), json!({"argv": [null]}), json!({"argv": [7]}), json!({"foreground": {}})] {
+            assert!(!at_shell(&t), "{t}");
+        }
+        // A foreground without a name falls back to its argv, then to the start argv.
+        assert!(at_shell(&json!({"argv": ["claude"], "foreground": {"name": null, "argv": ["/bin/zsh", "-l"]}})));
+        assert!(at_shell(&json!({"argv": ["pwsh.exe"], "foreground": {"argv": []}})));
+        assert!(!at_shell(&json!({"argv": ["bash"], "foreground": {"argv": ["C:\\agents\\codex.exe"]}})));
+    }
+
+    #[test]
     fn agents_take_text_and_answers_directly_plain_shells_after_confirming() {
         let mut f = fixture(BridgeConfig::default());
         let send = |t: &str| Command::Send { terminal: t.into(), text: "fix the test".into() };

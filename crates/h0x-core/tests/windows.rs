@@ -151,6 +151,36 @@ fn sessions_select_distinct_pipes_even_with_the_same_state_home() {
 }
 
 #[test]
+fn two_cores_starting_at_once_over_a_damaged_salt_share_one_and_both_answer() {
+    let a = Session::new();
+    let b = Session::new();
+    let salt_file = a.root.join("state").join("h0x-core").join("pipe-salt");
+    std::fs::create_dir_all(salt_file.parent().unwrap()).unwrap();
+    std::fs::write(&salt_file, "not a salt\r\n").unwrap();
+    // Both cores share a's state home; b's own root stays empty.
+    LIVE.lock().unwrap().push((b.name.clone(), a.root.clone()));
+    let starts = [&a.name, &b.name].map(|name| {
+        let piped = || std::process::Stdio::piped();
+        cmd(name, &a.root).args(["server", "start"]).stdout(piped()).stderr(piped()).spawn().unwrap()
+    });
+    for start in starts {
+        let out = start.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+    let salt = std::fs::read_to_string(&salt_file).unwrap();
+    assert!(salt.trim().len() == 32 && salt.trim().chars().all(|c| c.is_ascii_hexdigit()), "{salt:?}");
+    let status = |name: &str| {
+        let out = cmd(name, &a.root).args(["server", "status"]).output().unwrap();
+        assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["pid"].clone()
+    };
+    let (first, second) = (status(&a.name), status(&b.name));
+    assert!(first.is_number() && second.is_number(), "{first} {second}");
+    assert_ne!(first, second);
+    let _ = cmd(&b.name, &a.root).args(["server", "stop"]).output();
+}
+
+#[test]
 fn ssh_reaches_the_host_without_a_control_socket() {
     use std::net::TcpListener;
     use std::sync::{Arc, atomic::AtomicBool};

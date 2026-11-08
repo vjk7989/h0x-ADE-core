@@ -1355,4 +1355,127 @@ mod tests {
         let _listener = super::listen(&older).unwrap();
         super::connect(&wanted).unwrap();
     }
+
+    #[test]
+    fn only_a_well_formed_salted_name_has_an_older_one() {
+        let salt = "0123456789abcdef".repeat(2);
+        // A user name with no letters left (USERNAME empty or all symbols).
+        let empty_user = PathBuf::from(format!(r"\\.\pipe\h0x-core--{salt}-s.sock"));
+        assert_eq!(unsalted(&empty_user), Some(PathBuf::from(r"\\.\pipe\h0x-core--s.sock")));
+        // Session names may hold dashes of their own.
+        let dashed = PathBuf::from(format!(r"\\.\pipe\h0x-core-vijay-{salt}-my-session-2.sock"));
+        assert_eq!(unsalted(&dashed), Some(PathBuf::from(r"\\.\pipe\h0x-core-vijay-my-session-2.sock")));
+        // One character short or long, or not hex: not a salt.
+        for bad in [&salt[1..], &format!("{salt}0"), &"g".repeat(32)] {
+            let name = PathBuf::from(format!(r"\\.\pipe\h0x-core-vijay-{bad}-s.sock"));
+            assert_eq!(unsalted(&name), None, "{bad}");
+        }
+        assert_eq!(unsalted(Path::new("")), None);
+        assert_eq!(unsalted(Path::new(r"\\.\pipe\")), None);
+        assert_eq!(unsalted(Path::new(&format!(r"\\.\pipe\other-vijay-{salt}-s.sock"))), None);
+    }
+
+    #[test]
+    fn a_salt_with_surrounding_whitespace_is_read_and_kept() {
+        let root = std::env::temp_dir().join(format!("h0x-core-salt-{}", crate::platform::random_hex()));
+        let state = root.join("h0x-core").join("session");
+        let file = root.join("h0x-core").join("pipe-salt");
+        std::fs::create_dir_all(&state).unwrap();
+        let salt = "ABCDEF0123456789".repeat(2);
+        std::fs::write(&file, format!("  {salt}\r\n")).unwrap();
+        assert_eq!(read_pipe_salt(&state), Some(salt.clone()));
+        ensure_pipe_salt(&state).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), format!("  {salt}\r\n"), "a valid salt was rewritten");
+        assert!(endpoints(&state).1.ends_with(&format!("-{salt}-")), "{:?}", endpoints(&state).1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_state_without_a_parent_gets_no_salt_and_the_older_name() {
+        let state = Path::new("");
+        assert_eq!(read_pipe_salt(state), None);
+        ensure_pipe_salt(state).unwrap();
+        let (_, prefix) = endpoints(state);
+        let user = prefix.strip_prefix("h0x-core-").and_then(|p| p.strip_suffix('-')).expect(&prefix);
+        assert!(!user.contains('-'), "{prefix:?}");
+    }
+
+    #[test]
+    fn a_salt_that_cannot_be_read_or_replaced_fails_the_server_and_leaves_clients_on_the_older_name() {
+        let root = std::env::temp_dir().join(format!("h0x-core-salt-{}", crate::platform::random_hex()));
+        let state = root.join("h0x-core").join("session");
+        let file = root.join("h0x-core").join("pipe-salt");
+        // A directory where the salt file belongs: unreadable, and remove_file can't take it.
+        std::fs::create_dir_all(file.join("inside")).unwrap();
+        assert_eq!(read_pipe_salt(&state), None);
+        assert!(ensure_pipe_salt(&state).is_err(), "a server would listen on a name no client can find");
+        assert!(file.join("inside").is_dir(), "the directory was removed");
+        let (_, prefix) = endpoints(&state);
+        let user = prefix.strip_prefix("h0x-core-").and_then(|p| p.strip_suffix('-')).expect(&prefix);
+        assert!(!user.contains('-'), "{prefix:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cores_starting_at_once_all_end_on_one_salt() {
+        let root = std::env::temp_dir().join(format!("h0x-core-salt-{}", crate::platform::random_hex()));
+        for round in 0..20 {
+            let state = root.join(round.to_string()).join("h0x-core").join("session");
+            let file = state.parent().unwrap().join("pipe-salt");
+            // Half the rounds race to replace a damaged salt, half to make the first one.
+            if round % 2 == 1 {
+                std::fs::create_dir_all(state.parent().unwrap()).unwrap();
+                std::fs::write(&file, "damaged").unwrap();
+            }
+            let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let cores: Vec<_> = (0..8)
+                .map(|_| {
+                    let (start, state) = (start.clone(), state.clone());
+                    std::thread::spawn(move || {
+                        start.wait();
+                        ensure_pipe_salt(&state).map(|()| read_pipe_salt(&state))
+                    })
+                })
+                .collect();
+            let seen: Vec<_> = cores.into_iter().map(|c| c.join().unwrap()).collect();
+            let kept = read_pipe_salt(&state).unwrap_or_else(|| panic!("round {round}: no salt left"));
+            for got in seen {
+                let got = got.unwrap_or_else(|e| panic!("round {round}: a core failed to start: {e}"));
+                assert_eq!(got.as_deref(), Some(kept.as_str()), "round {round}: a core named another pipe");
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_salted_pipe_that_answers_with_an_error_is_not_swapped_for_the_older_name() {
+        use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+        use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, PIPE_TYPE_BYTE, PIPE_WAIT};
+        let tag = crate::platform::random_hex();
+        let salt = "cd".repeat(16);
+        let older = PathBuf::from(format!(r"\\.\pipe\h0x-core-busy-{tag}.sock"));
+        let wanted = PathBuf::from(format!(r"\\.\pipe\h0x-core-busy-{salt}-{tag}.sock"));
+        let _older = super::listen(&older).unwrap();
+        // The salted name exists with its only instance taken: busy, not missing.
+        let name = super::wide(wanted.as_os_str());
+        let h = unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_WAIT,
+                1,
+                512,
+                512,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(h, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
+        let _server = unsafe {
+            <std::os::windows::io::OwnedHandle as std::os::windows::io::FromRawHandle>::from_raw_handle(h as _)
+        };
+        let _taken = super::connect(&wanted).unwrap();
+        let busy = super::connect(&wanted).map(|_| ()).unwrap_err();
+        assert_eq!(busy.kind(), std::io::ErrorKind::TimedOut, "{busy}");
+    }
 }

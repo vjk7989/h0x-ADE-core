@@ -430,4 +430,16 @@ mod tests {
         assert_eq!(body("plain text, 1 < 2"), "plain text, 1 &lt; 2");
         assert_eq!(body(""), "");
     }
+
+    #[test]
+    fn a_body_escapes_each_markup_character_once_and_passes_the_rest_through() {
+        assert_eq!(body("&"), "&amp;");
+        // Already-escaped text is escaped again, so it reads back as written.
+        assert_eq!(body("&amp; &lt;h0x&gt;"), "&amp;amp; &amp;lt;h0x&amp;gt;");
+        assert_eq!(body("]]>"), "]]&gt;");
+        assert_eq!(body("<<>>"), "&lt;&lt;&gt;&gt;");
+        // A NUL, a carriage return and Windows paths are not markup: kept.
+        assert_eq!(body("a\u{0}b\r\nC:\\Users\\me\\x.txt"), "a\u{0}b\r\nC:\\Users\\me\\x.txt");
+        assert_eq!(body("\u{1f980}\u{200d}<"), "\u{1f980}\u{200d}&lt;");
+    }
 }
