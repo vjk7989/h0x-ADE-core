@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### New
+
+- Remote control (bridge) groundwork: `bridge pair|unpair|ls|lock|unlock|log` pair chat accounts with one-time codes. Paired accounts can list, read, send, press keys, approve or deny, interrupt, run and kill. Destructive commands need a single-use confirmation, and every command is rate limited, redacted and audited. See docs/bridge.md.
+- Telegram bot for the bridge: `bridge telegram token` stores the bot token (0600, never shown), and `bridge run` long-polls Telegram through the system curl, outbound and https only. It sends notices with Approve, Deny, Show and Interrupt buttons, answers `/agents`, `/read`, `/send`, `/keys`, `/approve`, `/deny`, `/interrupt`, `/run`, `/kill` and `/lock` from paired accounts in private chats, and asks for a confirmation tap before destructive commands.
+- Web panel for the bridge: `bridge web [--lan] [--port N]` serves a page and a WebSocket API, on 127.0.0.1 or on the private LAN address. Pairing uses a 5-minute one-time link printed with a QR code; each device gets a session token (stored hashed and revocable) and is listed in `bridge ls`. Host and Origin are checked, there is no CORS, requests and messages have size and time limits, and every answer carries a strict CSP.
+
 ## [0.1.5] - 2026-11-05
 
 ### New
