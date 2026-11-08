@@ -78,12 +78,23 @@ fn assets_stay_small() {
 /// var), where a missing node would otherwise hide that the tests never ran.
 #[test]
 fn app_logic_passes_its_node_tests() {
-    let file = concat!(env!("CARGO_MANIFEST_DIR"), "/src/bridge/web/app.test.mjs");
-    let out = match std::process::Command::new("node").arg("--test").arg(file).output() {
+    node_test("app.test.mjs");
+}
+
+/// e2e_vectors.test.mjs recomputes e2e_vectors.json with WebCrypto alone, so
+/// the Rust side is checked against an independent implementation.
+#[test]
+fn e2e_vectors_pass_the_webcrypto_check() {
+    node_test("e2e_vectors.test.mjs");
+}
+
+fn node_test(name: &str) {
+    let file = format!("{}/src/bridge/web/{name}", env!("CARGO_MANIFEST_DIR"));
+    let out = match std::process::Command::new("node").arg("--test").arg(&file).output() {
         Ok(out) => out,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            assert!(std::env::var_os("CI").is_none(), "node not found on CI: app.test.mjs did not run");
-            return eprintln!("node not found: app.test.mjs not run");
+            assert!(std::env::var_os("CI").is_none(), "node not found on CI: {name} did not run");
+            return eprintln!("node not found: {name} not run");
         }
         Err(e) => panic!("node: {e}"),
     };

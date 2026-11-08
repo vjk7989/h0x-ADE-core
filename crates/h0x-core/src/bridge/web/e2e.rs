@@ -585,4 +585,99 @@ mod tests {
             }
         }
     }
+
+    /// Unknown fields and other whitespace are accepted: the transcript is the
+    /// exact received bytes, so both sides still bind the same text.
+    #[test]
+    fn hello_with_extra_field_and_whitespace_still_agrees() {
+        let server = ServerKey::generate();
+        let mut pending = client_start(&SecretKey::generate().to_bytes()).unwrap();
+        let text = String::from_utf8(pending.hello.clone()).unwrap();
+        pending.hello =
+            format!(" {}, \"x\": [1, {{}}] }}\n", text.trim_end_matches('}').replace(",", " ,\t")).into_bytes();
+        let mut accepted = server_accept(&pending.hello, &server).unwrap();
+        let mut client = pending.finish(&accepted.server_hello, &server.fp()).unwrap();
+        assert_eq!(accepted.channel.open(&client.seal(b"up").unwrap()).unwrap(), b"up");
+        assert_eq!(client.open(&accepted.channel.seal(b"down").unwrap()).unwrap(), b"down");
+    }
+
+    #[test]
+    fn hello_reformatted_in_transit_breaks_the_channel() {
+        let server = ServerKey::generate();
+        let pending = client_start(&SecretKey::generate().to_bytes()).unwrap();
+        let sent = String::from_utf8(pending.hello().to_vec()).unwrap();
+        let received = sent.replace("\"v\":1", "\"v\": 1");
+        let mut accepted = server_accept(received.as_bytes(), &server).unwrap();
+        let mut client = pending.finish(&accepted.server_hello, &server.fp()).unwrap();
+        assert!(accepted.channel.open(&client.seal(b"up").unwrap()).is_err());
+        let pending = client_start(&SecretKey::generate().to_bytes()).unwrap();
+        let mut accepted = server_accept(pending.hello(), &server).unwrap();
+        let server_hello = String::from_utf8(accepted.server_hello.clone()).unwrap().replace(',', ", ");
+        let mut client = pending.finish(server_hello.as_bytes(), &server.fp()).unwrap();
+        assert!(client.open(&accepted.channel.seal(b"down").unwrap()).is_err());
+    }
+
+    #[test]
+    fn duplicate_hello_keys_are_rejected() {
+        let server = ServerKey::generate();
+        let pending = client_start(&SecretKey::generate().to_bytes()).unwrap();
+        let text = String::from_utf8(pending.hello().to_vec()).unwrap();
+        let other_e = b64(&public_bytes(&SecretKey::generate()));
+        let dup = format!("{},\"e\":\"{other_e}\"}}", text.trim_end_matches('}'));
+        assert!(server_accept(dup.as_bytes(), &server).is_err());
+        let accepted = server_accept(pending.hello(), &server).unwrap();
+        let reply = String::from_utf8(accepted.server_hello).unwrap();
+        let dup = format!("{},\"s\":\"{}\"}}", reply.trim_end_matches('}'), b64(&server.public()));
+        assert!(pending.finish(dup.as_bytes(), &server.fp()).is_err());
+    }
+
+    #[test]
+    fn identity_point_and_out_of_range_scalars_are_rejected() {
+        let server = ServerKey::generate();
+        let pending = client_start(&SecretKey::generate().to_bytes()).unwrap();
+        let mut hello: Value = serde_json::from_slice(pending.hello()).unwrap();
+        hello["e"] = b64(&[&[4u8][..], &[0u8; 64]].concat()).into();
+        assert!(server_accept(hello.to_string().as_bytes(), &server).is_err(), "all-zero point");
+        hello["e"] = b64(&[0u8]).into();
+        assert!(server_accept(hello.to_string().as_bytes(), &server).is_err(), "sec1 identity encoding");
+        // The P-256 group order n is not a key; n - 1 is the largest one.
+        let n = unhex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551");
+        let mut n_minus_1 = n.clone();
+        n_minus_1[31] -= 1;
+        assert!(ServerKey::from_bytes(&n).is_err());
+        assert!(ServerKey::from_bytes(&[0xff; 32]).is_err());
+        assert!(client_start(&n).is_err());
+        assert!(client_start(&[0xff; 33]).is_err());
+        let top = ServerKey::from_bytes(&n_minus_1).unwrap();
+        assert_eq!(top.to_bytes().to_vec(), n_minus_1);
+        let mut one = [0u8; 32];
+        one[31] = 1;
+        assert!(client_start(&one).is_ok());
+    }
+
+    #[test]
+    fn same_keys_with_other_nonces_derive_other_channels() {
+        let server = ServerKey::from_bytes(&[0x11; 32]).unwrap();
+        let fixed = |b: u8| SecretKey::from_slice(&[b; 32]).unwrap();
+        let first_frame = |c_nonce: [u8; NONCE_LEN], s_nonce: [u8; NONCE_LEN]| {
+            let pending = start(fixed(0x22), fixed(0x33), c_nonce);
+            let accepted = accept(pending.hello(), &server, fixed(0x44), s_nonce).unwrap();
+            pending.finish(&accepted.server_hello, &server.fp()).unwrap().seal(b"same").unwrap()
+        };
+        let base = first_frame([5; NONCE_LEN], [6; NONCE_LEN]);
+        assert_eq!(base, first_frame([5; NONCE_LEN], [6; NONCE_LEN]), "deterministic for fixed inputs");
+        assert_ne!(base, first_frame([7; NONCE_LEN], [6; NONCE_LEN]), "client nonce");
+        assert_ne!(base, first_frame([5; NONCE_LEN], [7; NONCE_LEN]), "server nonce");
+    }
+
+    #[test]
+    fn one_mebibyte_frame_round_trips() {
+        let (_, mut accepted, mut client) = pair();
+        let big: Vec<u8> = (0..1 << 20).map(|i: u32| (i % 251) as u8).collect();
+        let wire = client.seal(&big).unwrap();
+        assert_eq!(wire.len(), big.len() + 16);
+        assert_eq!(accepted.channel.open(&wire).unwrap(), big);
+        let down = accepted.channel.seal(&big).unwrap();
+        assert_eq!(client.open(&down).unwrap(), big);
+    }
 }
