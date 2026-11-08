@@ -666,4 +666,43 @@ mod audit_and_pairing_tests {
         assert!(b.pair_verify("web", "u99", "", &web, T + 51).is_ok(), "web verify is not");
         std::fs::remove_dir_all(&b.dir).unwrap();
     }
+
+    #[test]
+    fn a_full_audit_log_that_cannot_be_moved_aside_refuses_the_entry_and_keeps_the_log() {
+        let b = scratch();
+        fill_audit(&b, AUDIT_MAX);
+        std::fs::create_dir(b.dir.join("audit.jsonl.1")).unwrap();
+        assert!(b.audit(json!({"n": 1})).is_err(), "the old slot is not a file: an error, not a lost log");
+        assert_eq!(std::fs::metadata(b.dir.join("audit.jsonl")).unwrap().len(), AUDIT_MAX, "the full log is untouched");
+        assert!(b.dir.join("audit.jsonl.1").is_dir());
+        std::fs::remove_dir_all(&b.dir).unwrap();
+    }
+
+    #[test]
+    fn a_read_only_old_audit_log_never_costs_the_current_one() {
+        let b = scratch();
+        fill_audit(&b, AUDIT_MAX);
+        let old = b.dir.join("audit.jsonl.1");
+        std::fs::write(&old, b"older").unwrap();
+        let mut perms = std::fs::metadata(&old).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&old, perms).unwrap();
+        match b.audit(json!({"n": 1})) {
+            Ok(()) => {
+                assert_eq!(std::fs::metadata(&old).unwrap().len(), AUDIT_MAX, "the full log replaced the older one");
+                assert_eq!(b.log(10).unwrap(), [json!({"n": 1})]);
+            }
+            Err(_) => {
+                assert_eq!(std::fs::metadata(b.dir.join("audit.jsonl")).unwrap().len(), AUDIT_MAX, "nothing lost");
+                assert_eq!(std::fs::read(&old).unwrap(), b"older");
+            }
+        }
+        if let Ok(meta) = std::fs::metadata(&old) {
+            let mut perms = meta.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            std::fs::set_permissions(&old, perms).unwrap();
+        }
+        std::fs::remove_dir_all(&b.dir).unwrap();
+    }
 }

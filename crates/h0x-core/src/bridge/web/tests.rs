@@ -1515,3 +1515,127 @@ fn a_full_server_refuses_the_extra_connection_with_503_and_serves_again_when_one
     });
     assert!(served, "the slots came back");
 }
+
+#[test]
+fn the_warning_names_every_path_in_one_fixed_order() {
+    for (lan, cloudflare, vps, path) in
+        [(true, false, true, "by your Wi-Fi, your VPS, so"), (false, true, true, "by Cloudflare, your VPS, so")]
+    {
+        let said = integrity_warning(lan, cloudflare, vps).unwrap();
+        assert!(said.contains(path), "{said}");
+    }
+}
+
+/// The `n`th of many distinct sources.
+fn source(n: u32) -> Option<IpAddr> {
+    Some(IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + n)))
+}
+
+#[test]
+fn the_strike_map_at_its_cap_forgets_only_the_sources_it_is_not_refusing() {
+    let strikes = Strikes::default();
+    for _ in 0..AUTH_STRIKES {
+        strikes.add(source(0), T, PAIR_BLOCK_MS);
+    }
+    for n in 1..u32::try_from(MAX_SOURCES).unwrap() {
+        strikes.add(source(n), T, PAIR_BLOCK_MS);
+    }
+    assert_eq!(strikes.0.lock().unwrap().len(), MAX_SOURCES, "full, not yet trimmed");
+    let late = u32::try_from(MAX_SOURCES).unwrap();
+    strikes.add(source(late), T + 1, PAIR_BLOCK_MS);
+    assert_eq!(strikes.0.lock().unwrap().len(), 2, "the refused source and the newcomer");
+    assert!(strikes.refused(source(0), T + 1), "a refused source stays refused past the cap");
+    assert!(!strikes.refused(source(1), T + 1));
+    for _ in 1..AUTH_STRIKES {
+        strikes.add(source(late), T + 2, PAIR_BLOCK_MS);
+    }
+    assert!(strikes.refused(source(late), T + 2), "the newcomer's first strike was kept");
+    assert!(!strikes.refused(source(late), T + 2 + PAIR_BLOCK_MS), "and its block ends");
+}
+
+#[test]
+fn an_unknown_source_is_never_counted_nor_refused() {
+    let strikes = Strikes::default();
+    for n in 0..20 {
+        strikes.add(None, T + n, PAIR_BLOCK_MS);
+    }
+    assert!(strikes.0.lock().unwrap().is_empty());
+    assert!(!strikes.refused(None, T + 20));
+    strikes.clear(None);
+    strikes.clear(source(1));
+}
+
+#[test]
+fn failed_auths_and_wrong_pairing_codes_are_counted_apart() {
+    let f = fixture(Vec::new());
+    let (_, session) = f.paired();
+    for n in 0..5 {
+        assert!(f.say(&mut from("203.0.113.7"), "auth", json!({"session": "nope"}), T + n).close);
+    }
+    let refused = f.say(&mut from("203.0.113.7"), "auth", json!({"session": session}), T + 10);
+    assert!(refused.out[0]["data"]["message"].as_str().unwrap().contains("too many"), "{refused:?}");
+    let step = f.say(&mut from("203.0.113.7"), "pair", json!({"token": f.code(T + 11)}), T + 11);
+    assert_eq!(names(&step), ["paired", "snapshot"], "auth failures do not block pairing");
+
+    f.code(T + 20);
+    for n in 0..5 {
+        assert!(f.say(&mut from("203.0.113.8"), "pair", json!({"token": "AAAAAAAA"}), T + 20 + n).close);
+    }
+    let auth = f.say(&mut from("203.0.113.8"), "auth", json!({"session": session}), T + 30);
+    assert_eq!(names(&auth), ["hello", "snapshot"], "wrong codes do not block auth");
+}
+
+#[test]
+fn web_and_telegram_pairing_blocks_end_independently() {
+    let f = fixture(Vec::new());
+    f.code(T);
+    for n in 0..5 {
+        assert!(f.say(&mut from("203.0.113.5"), "pair", json!({"token": "AAAAAAAA"}), T + n).close);
+    }
+    let web_ends = T + 4 + PAIR_BLOCK_MS;
+    let chat = T + 100_000;
+    let bridge = f.web.bridge.lock().unwrap();
+    bridge.pair("telegram", chat).unwrap();
+    for n in 0..5 {
+        assert!(bridge.pair_verify("telegram", "666", "", "AAAAAAAA", chat + n).is_err());
+    }
+    let chat_ends = chat + 4 + crate::bridge::BLOCK_MS;
+    assert!(web_ends < chat_ends);
+    drop(bridge);
+
+    let step = f.say(&mut from("203.0.113.5"), "pair", json!({"token": f.code(web_ends)}), web_ends);
+    assert_eq!(names(&step), ["paired", "snapshot"], "the web block ended on its own clock");
+    let bridge = f.web.bridge.lock().unwrap();
+    assert!(bridge.pair("telegram", web_ends).is_err(), "telegram is still blocked");
+    assert!(bridge.pair("telegram", chat_ends - 1).is_err());
+    let (code, _) = bridge.pair("telegram", chat_ends).unwrap();
+    assert!(bridge.pair_verify("telegram", "42", "me", &code, chat_ends + 1).is_ok(), "and telegram's on its own");
+}
+
+#[test]
+fn a_session_survives_the_clock_going_back_but_still_expires_thirty_days_after_pairing() {
+    let f = fixture(Vec::new());
+    let (_, session) = f.paired();
+    let auth = |now: u64| f.say(&mut from("192.168.1.9"), "auth", json!({"session": session}), now);
+    assert_eq!(names(&auth(T / 2)), ["hello", "snapshot"], "a clock set back");
+    assert_eq!(names(&auth(0)), ["hello", "snapshot"], "a clock at the epoch");
+    assert_eq!(names(&auth(T + 30 * DAY - 1)), ["hello", "snapshot"]);
+    assert!(auth(T + 30 * DAY).close, "going back did not move the pairing date");
+}
+
+#[test]
+fn a_new_pairing_gets_a_new_thirty_days_and_unpairing_forgets_the_date() {
+    let f = fixture(Vec::new());
+    let (_, old) = f.paired();
+    let later = T + 20 * DAY;
+    let (_, session) = f.paired_at(later);
+    let auth = |token: &str, now: u64| f.say(&mut from("192.168.1.9"), "auth", json!({"session": token}), now);
+    assert!(auth(&old, later + 10 * DAY).close, "the first pairing's 30 days are its own");
+    assert_eq!(names(&auth(&session, later + 30 * DAY - 1)), ["hello", "snapshot"]);
+    assert!(auth(&session, later + 30 * DAY).close);
+
+    assert_eq!(f.web.bridge.lock().unwrap().unpair(None).unwrap(), 2);
+    let state: Value = serde_json::from_slice(&std::fs::read(f.dir.join("state.json")).unwrap()).unwrap();
+    assert_eq!(state["session_times"], json!({}), "{state}");
+    assert!(auth(&session, later).close, "an unpaired device's session is gone");
+}
