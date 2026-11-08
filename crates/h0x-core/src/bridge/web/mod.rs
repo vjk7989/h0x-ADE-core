@@ -572,7 +572,7 @@ pub fn run(
         pair = Some(link);
     }
     let url = format!("{local}/");
-    let ready = json.then(|| (url.clone(), public.map(String::from)));
+    let ready = (json && tunnel.is_some()).then(|| (url.clone(), public.map(String::from)));
     if json && tunnel.is_none() {
         emit(&ready_line(&url, pair.as_deref(), None, public));
     }
@@ -611,7 +611,7 @@ pub fn run(
         let stream = crate::client::connect_or_start(&paths)?;
         crate::client::call(&stream, method, params).map_err(|e| crate::client::explain_closed(&paths, e))
     };
-    let manager = tunnel::manage(Bridge::open(paths)?, hosts[0].clone(), tunnel, ready);
+    let manager = tunnel::manage(Bridge::open(paths)?, hosts[0].clone(), tunnel, json, ready);
     let web =
         Arc::new(Web { bridge: Mutex::new(bridge), core: Box::new(core), hosts, notices, strikes: Default::default() });
     let runtime =

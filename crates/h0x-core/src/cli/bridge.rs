@@ -147,7 +147,8 @@ fn read_token(file: Option<&std::path::Path>) -> Result<String, RpcError> {
         let text = std::fs::read_to_string(file).map_err(|e| {
             RpcError::invalid_params(format!("cannot read the token file {}: {}", file.display(), e.kind()))
         })?;
-        return Ok(text.lines().next().unwrap_or_default().to_string());
+        // Windows PowerShell 5.1 and Notepad start a UTF-8 file with a BOM.
+        return Ok(text.trim_start_matches('\u{feff}').lines().next().unwrap_or_default().to_string());
     }
     if !std::io::stdin().is_terminal() {
         let mut text = String::new();
@@ -344,6 +345,19 @@ mod tests {
         };
         assert_eq!(via, None, "plain bridge web still parses");
         assert_eq!(remote_port, crate::bridge::web::PORT);
+    }
+
+    #[test]
+    fn a_token_file_may_start_with_a_utf8_bom() {
+        const TOKEN: &str = "123456:ABCdef_ghi-JKLmnoPQRstuVWXyz0123";
+        let dir = std::env::temp_dir().join(format!("h0x core bom {}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token.txt");
+        std::fs::write(&path, format!("\u{feff}{TOKEN}\r\n")).unwrap();
+        assert_eq!(super::read_token(Some(&path)).unwrap(), TOKEN);
+        std::fs::write(&path, "\u{feff}").unwrap();
+        assert_eq!(super::read_token(Some(&path)).unwrap(), "", "a BOM alone is an empty file");
+        drop(std::fs::remove_dir_all(&dir));
     }
 
     #[test]

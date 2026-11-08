@@ -404,8 +404,13 @@ fn opened(bridge: &Bridge, host: &str, minutes: u64, until_ms: u64, now: u64, js
 /// now when `first` says for how long, then each second takes `bridge
 /// tunnel on|off` requests and stops the tunnel when [`must_stop`] says so.
 /// The tunnel ends with this future.
-pub async fn manage(bridge: Bridge, origin: String, first: Option<u64>, mut ready: Option<(String, Option<String>)>) {
-    let json = ready.is_some();
+pub async fn manage(
+    bridge: Bridge,
+    origin: String,
+    first: Option<u64>,
+    json: bool,
+    mut ready: Option<(String, Option<String>)>,
+) {
     // Whatever was asked before this panel started is nobody's request now.
     let _ = std::fs::remove_file(bridge.dir.join(STATUS));
     let _ = std::fs::remove_file(bridge.dir.join(REQUEST));
@@ -802,7 +807,9 @@ mod tests {
         let panel = Bridge::at(bridge.dir.clone(), crate::config::BridgeConfig::default());
         let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
         runtime.block_on(async {
-            let _ = tokio::time::timeout(Duration::from_secs(3), manage(panel, "127.0.0.1:9".into(), None, None)).await;
+            let _ =
+                tokio::time::timeout(Duration::from_secs(3), manage(panel, "127.0.0.1:9".into(), None, false, None))
+                    .await;
         });
         assert!(!bridge.dir.join(REQUEST).exists(), "deleted at start");
         assert!(!bridge.dir.join(STATUS).exists(), "and not answered: nobody asked this panel");
@@ -1010,8 +1017,10 @@ mod tests {
                         bridge.write_private(REQUEST, asked.as_bytes()).unwrap();
                     }
                 };
-                let panel =
-                    tokio::time::timeout(Duration::from_secs(3), manage(panel(), "127.0.0.1:9".into(), first, None));
+                let panel = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    manage(panel(), "127.0.0.1:9".into(), first, false, None),
+                );
                 let _ = tokio::join!(panel, client);
             })
         };
@@ -1054,8 +1063,11 @@ mod tests {
         let running = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             runtime.block_on(async {
-                let _ =
-                    tokio::time::timeout(Duration::from_secs(8), manage(panel, "127.0.0.1:9".into(), None, None)).await;
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(8),
+                    manage(panel, "127.0.0.1:9".into(), None, false, None),
+                )
+                .await;
             });
         });
         std::thread::sleep(Duration::from_millis(700));
