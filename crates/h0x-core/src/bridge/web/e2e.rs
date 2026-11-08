@@ -7,6 +7,9 @@
 //! - Client hello (UTF-8 JSON text): `{"v":1,"d":b64(D_pub),"e":b64(Ec_pub),"n":b64(32 random bytes)}`.
 //!   Server hello: `{"v":1,"s":b64(S_pub),"e":b64(Es_pub),"n":b64(32 random bytes)}`.
 //!   `transcript` = the exact client hello bytes then the exact server hello bytes.
+//!   Unknown hello fields are accepted on purpose (the exact bytes are in the
+//!   transcript); duplicate fields are rejected. A reformatted hello is caught at
+//!   the first frame, so the caller must close on the first `open` error.
 //! - The client checks `b64(SHA-256(S_pub)) == pinned fp` (constant time).
 //! - `ikm = ECDH(Ec,Es) || ECDH(Ec,S) || ECDH(D,Es)` (each the 32-byte x coordinate);
 //!   the server computes the mirror `ECDH(Es,Ec) || ECDH(S,Ec) || ECDH(Es,D)`.
@@ -122,6 +125,14 @@ fn random_nonce() -> [u8; NONCE_LEN] {
     <[u8; NONCE_LEN]>::generate()
 }
 
+/// Exactly 32 bytes: `from_slice` would left-pad a truncated key into a different one.
+fn secret_key(bytes: &[u8]) -> Result<SecretKey> {
+    if bytes.len() != 32 {
+        return Err(Error("bad secret key"));
+    }
+    SecretKey::from_slice(bytes).map_err(|_| Error("bad secret key"))
+}
+
 /// The server's long-term identity key S.
 pub struct ServerKey(SecretKey);
 
@@ -131,7 +142,7 @@ impl ServerKey {
     }
 
     pub fn from_bytes(secret: &[u8]) -> Result<Self> {
-        SecretKey::from_slice(secret).map(Self).map_err(|_| Error("bad secret key"))
+        secret_key(secret).map(Self)
     }
 
     pub fn to_bytes(&self) -> [u8; 32] {
@@ -241,7 +252,7 @@ pub struct ClientPending {
 
 /// Client side: build the hello from the long-term device key `D` (32-byte secret).
 pub fn client_start(device_secret: &[u8]) -> Result<ClientPending> {
-    let d = SecretKey::from_slice(device_secret).map_err(|_| Error("bad secret key"))?;
+    let d = secret_key(device_secret)?;
     Ok(start(d, SecretKey::generate(), random_nonce()))
 }
 
@@ -536,6 +547,10 @@ mod tests {
         assert_eq!(key.fp().len(), 43);
         assert!(ServerKey::from_bytes(&[0; 32]).is_err());
         assert!(ServerKey::from_bytes(&[]).is_err());
+        for len in [0, 31, 33] {
+            assert!(ServerKey::from_bytes(&vec![7; len]).is_err(), "server {len}");
+            assert!(client_start(&vec![7; len]).is_err(), "device {len}");
+        }
     }
 
     /// The frozen contract the browser client tests against (SEC-3): every
