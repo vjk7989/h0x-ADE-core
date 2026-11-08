@@ -387,10 +387,30 @@ pub fn data_dirs() -> (PathBuf, PathBuf) {
 /// Pipe names: up to 256 characters.
 pub const MAX_SOCKET_PATH: usize = 256;
 
+/// Anyone can create a pipe under a guessable name first. The name therefore
+/// carries a random salt kept in this user's profile (one for all sessions;
+/// the profile folder is the user's alone); clients read the same file. Made
+/// once; a missing or damaged one is replaced.
+fn pipe_salt(dir: &Path) -> String {
+    let file = dir.join("pipe-salt");
+    let valid = |s: &String| s.len() == 32 && s.chars().all(|c| c.is_ascii_hexdigit());
+    let read = || std::fs::read_to_string(&file).ok().map(|s| s.trim().to_string()).filter(valid);
+    if let Some(salt) = read() {
+        return salt;
+    }
+    let salt = crate::platform::random_hex();
+    let written = std::fs::create_dir_all(dir).and_then(|()| {
+        let _ = std::fs::remove_file(&file);
+        std::fs::OpenOptions::new().write(true).create_new(true).open(&file)?.write_all(salt.as_bytes())
+    });
+    // Another process made it first: use theirs.
+    if written.is_err() { read().unwrap_or(salt) } else { salt }
+}
+
 pub fn endpoints(_state: &Path) -> (PathBuf, String) {
     let user: String =
         std::env::var("USERNAME").unwrap_or_default().chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-    (PathBuf::from(r"\\.\pipe\"), format!("h0x-core-{user}-"))
+    (PathBuf::from(r"\\.\pipe\"), format!("h0x-core-{user}-{}-", pipe_salt(&data_dirs().0.join("h0x-core"))))
 }
 
 pub fn private_dir(path: &Path) -> io::Result<()> {
@@ -1038,7 +1058,12 @@ pub fn spawn_pty(
         check(started)?;
         let handle = OwnedHandle::from_raw_handle(pi.hProcess as RawHandle);
         let thread = OwnedHandle::from_raw_handle(pi.hThread as RawHandle);
-        AssignProcessToJobObject(job.as_raw_handle() as HANDLE, handle.as_raw_handle() as HANDLE);
+        // Unjobbed, it would outlive the core: end it, still suspended, instead.
+        if let Err(e) = check(AssignProcessToJobObject(job.as_raw_handle() as HANDLE, handle.as_raw_handle() as HANDLE))
+        {
+            TerminateProcess(handle.as_raw_handle() as HANDLE, 1);
+            return Err(e);
+        }
         ResumeThread(thread.as_raw_handle() as HANDLE);
         // The console holds its own ends now.
         drop((in_r, out_w));
@@ -1229,7 +1254,7 @@ pub mod console {
 
 #[cfg(test)]
 mod tests {
-    use super::{RELEASE, endpoints};
+    use super::{RELEASE, endpoints, pipe_salt};
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -1243,9 +1268,31 @@ mod tests {
     fn a_release_ships_h0x_core_exe_and_no_hc_alias() {
         assert_eq!(RELEASE[0], "h0x-core.exe");
         assert!(RELEASE.iter().all(|f| !f.contains("hc.exe") && !f.contains("herdr")), "{RELEASE:?}");
-        let (namespace, prefix) = endpoints(Path::new(r"C:\state"));
+        let (namespace, prefix) = endpoints(Path::new("unused"));
         assert_eq!(namespace, PathBuf::from(r"\\.\pipe\"));
-        let user = prefix.strip_prefix("h0x-core-").and_then(|p| p.strip_suffix('-')).expect(&prefix);
+        let rest = prefix.strip_prefix("h0x-core-").and_then(|p| p.strip_suffix('-')).expect(&prefix);
+        let (user, salt) = rest.rsplit_once('-').expect(&prefix);
         assert!(user.chars().all(|c| c.is_ascii_alphanumeric()), "{prefix:?}");
+        assert_eq!(salt.len(), 32, "{prefix:?}");
+    }
+
+    #[test]
+    fn the_pipe_salt_is_made_once_read_back_and_replaced_when_damaged() {
+        let state = std::env::temp_dir().join(format!("h0x-core-salt-{}", crate::platform::random_hex()));
+        let first = pipe_salt(&state);
+        assert_eq!(first.len(), 32);
+        assert_eq!(pipe_salt(&state), first, "a second call reads the same file");
+        assert_eq!(endpoints(&state).1, endpoints(&state).1);
+        for damaged in ["", "short", "zz".repeat(16).as_str(), "ab".repeat(17).as_str()] {
+            std::fs::write(state.join("pipe-salt"), damaged).unwrap();
+            let fresh = pipe_salt(&state);
+            assert!(fresh.len() == 32 && fresh.chars().all(|c| c.is_ascii_hexdigit()), "{damaged:?}");
+            assert_ne!(fresh, damaged);
+            assert_eq!(std::fs::read_to_string(state.join("pipe-salt")).unwrap(), fresh);
+        }
+        let other = std::env::temp_dir().join(format!("h0x-core-salt-{}", crate::platform::random_hex()));
+        assert_ne!(pipe_salt(&other), pipe_salt(&state), "each state folder has its own");
+        let _ = std::fs::remove_dir_all(state);
+        let _ = std::fs::remove_dir_all(other);
     }
 }

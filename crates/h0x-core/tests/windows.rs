@@ -324,7 +324,10 @@ fn only_this_account_may_open_the_cores_pipe() {
     let s = Session::new();
     s.out(&["server", "start"]);
     let user: String = std::env::var("USERNAME").unwrap().chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-    let pipe = format!(r"\\.\pipe\h0x-core-{user}-{}.sock", s.name);
+    let local = std::env::var_os("LOCALAPPDATA").expect("LOCALAPPDATA");
+    let salt = std::fs::read_to_string(Path::new(&local).join(r"h0x-core\pipe-salt")).expect("the pipe salt");
+    assert_eq!(salt.trim().len(), 32, "{salt:?}");
+    let pipe = format!(r"\\.\pipe\h0x-core-{user}-{}-{}.sock", salt.trim(), s.name);
     // From Windows itself: Get-Acl sometimes answers for the pipe root instead.
     let sddl = unsafe {
         use windows_sys::Win32::Security::Authorization::*;
