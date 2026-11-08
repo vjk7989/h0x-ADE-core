@@ -3,6 +3,10 @@
 
 use super::{PAGE, SCRIPT, STYLE};
 
+/// The pure-JS crypto for pages without `crypto.subtle`; app.js fetches it
+/// only then, so it is not counted in the page's weight.
+const NOBLE: &str = include_str!("noble.js");
+
 /// Every `name="value"` attribute value in `html`.
 fn values<'a>(html: &'a str, name: &str) -> Vec<&'a str> {
     let key = format!(" {name}=\"");
@@ -61,6 +65,36 @@ fn script_never_builds_markup_or_reaches_elsewhere() {
 }
 
 #[test]
+fn noble_bundle_is_pinned_and_never_builds_markup_or_reaches_elsewhere() {
+    // The header names exact versions and the license notice for the bundle.
+    for pinned in ["@noble/curves  2.4.0", "@noble/hashes  2.4.0", "@noble/ciphers 2.4.0", "esbuild@0.28.2", "sha512-"]
+    {
+        assert!(NOBLE.contains(pinned), "noble.js header lacks {pinned}");
+    }
+    assert!(NOBLE.starts_with("/* HyperOx web panel"));
+    for banned in [
+        "innerHTML",
+        "outerHTML",
+        "insertAdjacentHTML",
+        "document.write",
+        "eval(",
+        "new Function",
+        "XMLHttpRequest",
+        "fetch(",
+        "WebSocket",
+    ] {
+        assert!(!NOBLE.contains(banned), "noble.js uses {banned}");
+    }
+    for scheme in ["http://", "https://", "ws://", "wss://", "//cdn", "import("] {
+        assert!(!NOBLE.contains(scheme), "noble.js names {scheme}");
+    }
+    // app.js asks for it by its own path and nothing else is loaded that way.
+    assert!(SCRIPT.contains("el.src = '/noble.js'"));
+    assert_eq!(SCRIPT.matches(".src =").count(), 1);
+    assert!(NOBLE.len() < 64 * 1024, "{} bytes", NOBLE.len());
+}
+
+#[test]
 fn style_loads_nothing() {
     for banned in ["url(", "@import", "expression("] {
         assert!(!STYLE.contains(banned), "style.css uses {banned}");
@@ -86,6 +120,13 @@ fn app_logic_passes_its_node_tests() {
 #[test]
 fn e2e_vectors_pass_the_webcrypto_check() {
     node_test("e2e_vectors.test.mjs");
+}
+
+/// e2e_client.test.mjs runs app.js's own crypto on both paths (WebCrypto and
+/// noble.js) against the same vectors and against each other.
+#[test]
+fn e2e_client_matches_the_vectors_on_both_paths() {
+    node_test("e2e_client.test.mjs");
 }
 
 fn node_test(name: &str) {

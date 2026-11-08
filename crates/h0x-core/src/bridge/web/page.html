@@ -26,13 +26,14 @@
     <ol class="steps">
       <li>On the computer, run <code>h0x-core bridge web --lan</code> (or <code>h0x-core bridge pair --transport web</code> for a new code).</li>
       <li>Scan the QR code it prints with this phone's camera, within 5 minutes.</li>
-      <li>Or type the pairing code below.</li>
+      <li>Or type the pairing code below (only on a device that already knows this computer).</li>
     </ol>
     <form id="pair-form" class="row" autocomplete="off">
       <label for="pair-code" class="sr">Pairing code</label>
       <input id="pair-code" name="code" placeholder="Pairing code" autocapitalize="characters" spellcheck="false" required>
       <button type="submit" class="btn primary">Pair</button>
     </form>
+    <button id="forget" type="button" class="btn bad" hidden>Forget this computer</button>
   </section>
 
   <section id="list" class="view" hidden aria-labelledby="list-title">
