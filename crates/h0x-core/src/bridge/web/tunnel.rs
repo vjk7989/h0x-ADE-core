@@ -779,6 +779,7 @@ mod tests {
         bridge.write_private(REQUEST, b"garbage").unwrap();
         assert_eq!(take(&bridge, now), None, "unreadable: dropped");
         assert!(!bridge.dir.join(REQUEST).exists());
+        let _ = bridge.secret_del("web.key");
         let _ = std::fs::remove_dir_all(&bridge.dir);
     }
 
@@ -799,6 +800,7 @@ mod tests {
             assert_eq!(take(&bridge, now).is_some(), taken, "made at {at}, now {now}");
             assert!(!bridge.dir.join(REQUEST).exists(), "gone either way");
         }
+        let _ = bridge.secret_del("web.key");
         let _ = std::fs::remove_dir_all(&bridge.dir);
     }
 
@@ -819,6 +821,7 @@ mod tests {
         assert!(!bridge.dir.join(REQUEST).exists(), "deleted at start");
         assert!(!bridge.dir.join(STATUS).exists(), "and not answered: nobody asked this panel");
         drop(runtime);
+        let _ = bridge.secret_del("web.key");
         let _ = std::fs::remove_dir_all(&bridge.dir);
     }
 
@@ -828,6 +831,7 @@ mod tests {
         let err = ask(&bridge, None).unwrap_err();
         assert!(err.message.contains("no web panel"), "{}", err.message);
         assert!(!bridge.dir.join(REQUEST).exists(), "the request is not left behind");
+        let _ = bridge.secret_del("web.key");
         let _ = std::fs::remove_dir_all(&bridge.dir);
     }
 
@@ -847,6 +851,7 @@ mod tests {
         let locked = opened(&bridge, "abc.trycloudflare.com", 60, 42, 1_000, false);
         assert_eq!(locked["pair"], Value::Null, "no pairing while locked");
         assert!(!announce(&locked).contains("#pair="));
+        let _ = bridge.secret_del("web.key");
         let _ = std::fs::remove_dir_all(&bridge.dir);
     }
 
@@ -1073,6 +1078,7 @@ mod tests {
         assert!(!bridge.dir.join(REQUEST).exists(), "corrupt: dropped");
         assert!(!bridge.dir.join(STATUS).exists(), "and nothing started or answered");
         drop(runtime);
+        let _ = bridge.secret_del("web.key");
         let _ = std::fs::remove_dir_all(&bridge.dir);
     }
 
@@ -1099,6 +1105,7 @@ mod tests {
         assert_eq!(human, "tunnel off");
         assert!(!bridge.dir.join(REQUEST).exists());
         running.join().unwrap();
+        let _ = bridge.secret_del("web.key");
         let _ = std::fs::remove_dir_all(&bridge.dir);
     }
 
