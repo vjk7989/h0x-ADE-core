@@ -10,6 +10,7 @@
 
 mod http;
 mod sha;
+pub mod vps;
 
 use super::{Bridge, Command, Key, Kind, Notice, Reply, Sender};
 use crate::paths::Paths;
@@ -349,7 +350,10 @@ async fn connection(mut stream: tokio::net::TcpStream, web: Arc<Web>) {
         Ok(Err(status)) => return drop(stream.write_all(&http::error(status)).await),
         Err(_) => return drop(stream.write_all(&http::error(408)).await),
     };
-    let answer = http::parse(&buf[..end]).and_then(|req| http::allowed(&req, &web.hosts).map(|()| req));
+    let answer = http::parse(&buf[..end]).and_then(|mut req| {
+        vps::https_origin_as_http(&mut req, &web.hosts);
+        http::allowed(&req, &web.hosts).map(|()| req)
+    });
     let req = match answer {
         Ok(req) => req,
         Err(status) => return drop(stream.write_all(&http::error(status)).await),
@@ -486,15 +490,17 @@ async fn serve(listener: tokio::net::TcpListener, web: Arc<Web>) {
 }
 
 /// `h0x-core bridge web`: serves until the process is stopped.
-pub fn run(paths: &Paths, lan: bool, port: u16) -> Result<(), RpcError> {
+pub fn run(paths: &Paths, lan: bool, port: u16, via: Option<vps::Vps>) -> Result<(), RpcError> {
     let failed = |e: String| RpcError::new("bridge", e, "see docs/bridge.md, Web panel");
     let ip = if lan { lan_address(outbound_ip()).map_err(failed)? } else { Ipv4Addr::LOCALHOST };
     let bridge = Bridge::open(paths)?;
     let listener = std::net::TcpListener::bind((ip, port)).map_err(|e| failed(format!("{ip}:{port}: {e}")))?;
     let port = listener.local_addr().map_err(|e| failed(e.to_string()))?.port();
-    let hosts = hosts(ip, port);
-    let base = format!("http://{}", hosts[0]);
-    println!("web panel: {base}/");
+    let public = via.as_ref().map(|v| v.public_host.as_str());
+    let hosts = vps::with_public(hosts(ip, port), public);
+    let local = format!("http://{}", hosts[0]);
+    let base = public.map_or_else(|| local.clone(), |host| format!("https://{host}"));
+    println!("web panel: {local}/");
     if bridge.locked()? {
         println!("remote control is locked: no pairing until `h0x-core bridge unlock`");
     } else {
@@ -507,6 +513,15 @@ pub fn run(paths: &Paths, lan: bool, port: u16) -> Result<(), RpcError> {
             "warning: this is plain http on your network; anyone on it can see the traffic, pairing links included"
         );
     }
+    let tunnel = via.as_ref().map(|plan| {
+        println!(
+            "through your vps: reverse port 127.0.0.1:{} on the server; point your HTTPS proxy there",
+            plan.remote_port
+        );
+        let locked = vps::lock_check(Bridge::open(paths)?, |why| eprintln!("bridge: vps: {why}"));
+        Ok(vps::Tunnel::ssh(plan, port, locked))
+    });
+    let tunnel = tunnel.transpose()?;
     let (notices, _) = tokio::sync::broadcast::channel(64);
     let feed = notices.clone();
     let quiet = bridge.config.notice_quiet_ms();
@@ -530,12 +545,34 @@ pub fn run(paths: &Paths, lan: bool, port: u16) -> Result<(), RpcError> {
         Arc::new(Web { bridge: Mutex::new(bridge), core: Box::new(core), hosts, notices, strikes: Default::default() });
     let runtime =
         tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| failed(e.to_string()))?;
-    runtime.block_on(async {
-        listener.set_nonblocking(true).map_err(|e| failed(e.to_string()))?;
-        let listener = tokio::net::TcpListener::from_std(listener).map_err(|e| failed(e.to_string()))?;
-        serve(listener, web).await;
-        Ok(())
-    })
+    runtime
+        .block_on(async {
+            listener.set_nonblocking(true).map_err(|e| failed(e.to_string()))?;
+            let listener = tokio::net::TcpListener::from_std(listener).map_err(|e| failed(e.to_string()))?;
+            tokio::select! {
+                () = serve(listener, web) => {}
+                () = stopped() => {}
+            }
+            Ok(())
+        })
+        // The tunnel is stopped (ssh killed) as it drops here, on every way out.
+        .inspect(|()| drop(tunnel))
+}
+
+/// Ctrl-C, or on Unix a termination signal.
+async fn stopped() {
+    #[cfg(unix)]
+    {
+        let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) else {
+            return std::future::pending().await;
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    drop(tokio::signal::ctrl_c().await);
 }
 
 #[cfg(test)]

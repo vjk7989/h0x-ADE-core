@@ -145,6 +145,13 @@ pub fn check_target(to: Reach) -> Result<(), RpcError> {
     }
     let host = target.strip_prefix("ssh://").unwrap_or(target);
     let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+    if !target.starts_with("ssh://")
+        && host
+            .split_once(':')
+            .is_some_and(|(h, port)| !h.is_empty() && !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(RpcError::invalid_params(format!("bad ssh target {target:?}: write a port as ssh://{target}")));
+    }
     if target.is_empty()
         || target.starts_with('-')
         || host.starts_with('-')
@@ -619,6 +626,10 @@ mod tests {
         let ssh = |target| Reach { target, via: false };
         for bad in ["", "-oProxyCommand=x", "can@-oProxyCommand=x", "ssh://-oProxyCommand=x", "ssh://can@-p22"] {
             assert!(check_target(ssh(bad)).is_err(), "{bad:?}");
+        }
+        for bad_port in ["can@rohan:2222", "rohan:22"] {
+            let err = check_target(ssh(bad_port)).unwrap_err();
+            assert!(err.message.contains(&format!("ssh://{bad_port}")), "{bad_port:?}: {}", err.message);
         }
         for ok in ["rohan", "can@rohan", "ssh://can@rohan:2222", "can-1@rohan-2", "can@fe80::1"] {
             assert!(check_target(ssh(ok)).is_ok(), "{ok:?}");

@@ -259,10 +259,13 @@ Serve the web panel until stopped: a page and a WebSocket API for paired devices
 Usage: h0x-core bridge web [OPTIONS]
 
 Options:
-      --json         JSON output even in a terminal
-      --lan          Listen on this machine's private LAN address instead of 127.0.0.1
-      --port <PORT>  The port (0: any free one) [default: 8377]
-  -h, --help         Print help
+      --json                       JSON output even in a terminal
+      --lan                        Listen on this machine's private LAN address instead of 127.0.0.1
+      --port <PORT>                The port (0: any free one) [default: 8377]
+      --via <MACHINE>              Reach it through your VPS: the name of an ssh machine (`machine add`). Opens a reverse port on the server's loopback; your HTTPS proxy there serves it
+      --public-host <PUBLIC_HOST>  The DNS name your HTTPS proxy serves, for the pairing link
+      --remote-port <REMOTE_PORT>  The port on the server's loopback [default: 8377]
+  -h, --help                       Print help
 ```
 
 ## h0x-core connect
