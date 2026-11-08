@@ -259,3 +259,96 @@ fn the_web_panel_prints_a_pairing_link_and_serves_only_its_own_host() {
     web.kill().unwrap();
     web.wait().unwrap();
 }
+
+#[test]
+fn qr_prints_json_rows_or_terminal_blocks_and_refuses_bad_text() {
+    let s = Session::new();
+    let q = s.json(&["bridge", "qr", "http://127.0.0.1:7777/#pair=ABCD2345"]);
+    let size = q["size"].as_u64().unwrap() as usize;
+    assert_eq!(size, 29, "version 3 at medium correction");
+    let rows = q["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), size);
+    assert!(
+        rows.iter().all(|r| r.as_str().is_some_and(|r| r.len() == size && r.bytes().all(|b| b == b'0' || b == b'1')))
+    );
+    assert_eq!(&rows[0].as_str().unwrap()[..7], "1111111", "the finder pattern's top edge");
+
+    let long = "x".repeat(2000);
+    let q = s.json(&["bridge", "qr", &long]);
+    assert_eq!(q["rows"].as_array().unwrap().len() as u64, q["size"].as_u64().unwrap());
+
+    assert_eq!(s.err(&["bridge", "qr", ""]).1["error"]["kind"], "invalid_params", "empty text");
+    let (code, err) = s.err(&["bridge", "qr", &"x".repeat(3000)]);
+    assert_eq!((code, err["error"]["message"].as_str()), (6, Some("that text is too long for a QR code")));
+}
+
+#[test]
+fn a_token_comes_from_the_first_line_of_a_file_which_stays() {
+    let s = Session::new();
+    let stored = s.root.join("config/h0x-core/bridge/telegram.token");
+    let path = s.root.join("token.txt");
+    let run = |content: &[u8]| {
+        std::fs::write(&path, content).unwrap();
+        s.core(&["bridge", "telegram", "token", "--file", path.to_str().unwrap()])
+    };
+    let said = |out: &std::process::Output| {
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+    };
+
+    for bad in ["", "\n", "123456:short\n", "\n123456:ABCdef_ghi-JKLmnoPQRstuVWXyz0123\n"] {
+        let out = run(bad.as_bytes());
+        assert!(!out.status.success(), "{bad:?}");
+        assert!(said(&out).contains("invalid_params") && !said(&out).contains("ABCdef"), "{bad:?}: {}", said(&out));
+        assert!(!stored.exists(), "{bad:?}: nothing stored");
+    }
+    let out = run(&[0xff, 0xfe, b'\n']);
+    assert!(!out.status.success() && !stored.exists(), "not text");
+
+    let out = run(format!("{TOKEN}\r\nsecond line\r\n").as_bytes());
+    assert!(out.status.success(), "{}", said(&out));
+    assert!(!said(&out).contains("ABCdef"), "the token is never echoed");
+    assert_eq!(std::fs::read_to_string(&stored).unwrap(), TOKEN, "CRLF is not part of the token");
+    assert_eq!(std::fs::metadata(&stored).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(path.exists(), "the caller deletes the file");
+
+    let gone = s.root.join("missing.txt");
+    let out = s.core(&["bridge", "telegram", "token", "--file", gone.to_str().unwrap()]);
+    assert!(!out.status.success() && said(&out).contains("cannot read the token file"), "{}", said(&out));
+    let out = s.core(&["bridge", "telegram", "token", "--clear", "--file", path.to_str().unwrap()]);
+    assert!(!out.status.success(), "--file and --clear conflict");
+    assert!(stored.exists(), "a refused command removed nothing");
+}
+
+#[test]
+fn bridge_web_json_prints_one_line_and_keeps_serving() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let s = Session::new();
+    let mut web = s
+        .cmd()
+        .args(["--json", "bridge", "web", "--port", "0"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut out = BufReader::new(web.stdout.take().unwrap());
+    let mut line = String::new();
+    out.read_line(&mut line).unwrap();
+    let ready: Value = serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line}"));
+    let url = ready["url"].as_str().unwrap();
+    assert!(url.starts_with("http://127.0.0.1:") && url.ends_with('/'), "{url}");
+    let pair = ready["pair"].as_str().unwrap();
+    assert!(pair.starts_with(&format!("{url}#pair=")), "{pair}");
+    assert_eq!((&ready["tunnel"], &ready["via"]), (&Value::Null, &Value::Null));
+
+    let addr = url.strip_prefix("http://").unwrap().trim_end_matches('/');
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    stream.write_all(format!("GET / HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes()).unwrap();
+    let mut page = String::new();
+    let _ = stream.read_to_string(&mut page);
+    assert!(page.starts_with("HTTP/1.1 200 "), "still serving: {page}");
+    web.kill().unwrap();
+    let mut rest = String::new();
+    out.read_to_string(&mut rest).unwrap();
+    web.wait().unwrap();
+    assert_eq!(rest, "", "nothing else on stdout: no banner, no QR");
+}

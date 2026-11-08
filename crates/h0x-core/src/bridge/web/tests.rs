@@ -822,3 +822,36 @@ fn an_empty_pair_code_is_usage_and_not_a_wrong_guess() {
     let paired = f.say(&mut Conn::default(), "pair", json!({"token": code}), T + 5);
     assert_eq!(paired.out[0]["name"], "paired", "four real guesses, not five");
 }
+
+#[test]
+fn qr_json_is_a_square_of_ones_and_zeros_and_refuses_empty_or_huge_text() {
+    let q = qr_json("http://127.0.0.1:7777/#pair=ABCD2345").unwrap();
+    assert_eq!(q["size"], 29);
+    let rows: Vec<&str> = q["rows"].as_array().unwrap().iter().map(|r| r.as_str().unwrap()).collect();
+    assert_eq!(rows.len(), 29);
+    assert!(rows.iter().all(|r| r.len() == 29 && r.bytes().all(|b| b == b'0' || b == b'1')));
+    assert_eq!(&rows[0][..7], "1111111");
+    assert_eq!(&rows[1][..7], "1000001");
+    let long = qr_json(&"x".repeat(2000)).unwrap();
+    assert_eq!(long["rows"].as_array().unwrap().len() as u64, long["size"].as_u64().unwrap());
+    assert_eq!(qr_json("").unwrap_err().kind, "invalid_params");
+    assert_eq!(qr_json(&"x".repeat(3000)).unwrap_err().message, "that text is too long for a QR code");
+    assert_eq!(qr(&"x".repeat(3000)), "", "no drawing for text that does not fit");
+}
+
+#[test]
+fn the_ready_line_has_exactly_four_keys_with_nulls_for_what_is_absent() {
+    let plain = ready_line("http://127.0.0.1:7777/", Some("http://127.0.0.1:7777/#pair=ABCD2345"), None, None);
+    assert_eq!(
+        plain,
+        json!({"url": "http://127.0.0.1:7777/", "pair": "http://127.0.0.1:7777/#pair=ABCD2345", "tunnel": null, "via": null})
+    );
+    let all = ready_line("http://10.0.0.5:7777/", None, Some("https://a.trycloudflare.com/"), Some("h0x.example.com"));
+    assert_eq!(all["pair"], Value::Null);
+    assert_eq!(
+        (all["tunnel"].as_str(), all["via"].as_str()),
+        (Some("https://a.trycloudflare.com/"), Some("h0x.example.com"))
+    );
+    assert_eq!(all.as_object().unwrap().len(), 4);
+    assert!(!all.to_string().contains('\n'), "one line");
+}
