@@ -244,13 +244,26 @@ mod imp {
         format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
     }
 
+    /// The user's login keychain, named on every call so `security` never asks
+    /// which one to use. Without the file (a scratch HOME, a headless account)
+    /// `security` would wait on a dialog, so that is "unusable" at once.
+    fn keychain() -> io::Result<String> {
+        let home = std::env::var_os("HOME").ok_or_else(|| io::Error::other("no HOME"))?;
+        let path = std::path::Path::new(&home).join("Library/Keychains/login.keychain-db");
+        if !path.is_file() {
+            return Err(io::Error::other("no login keychain"));
+        }
+        Ok(path.to_string_lossy().into_owned())
+    }
+
     /// Piece `i` of the entry: the first is under the plain account.
     fn piece_account(acct: &str, i: usize) -> String {
         if i == 0 { acct.to_string() } else { format!("{acct}#{i}") }
     }
 
     fn read_piece(acct: &str, i: usize) -> io::Result<Option<String>> {
-        let args = ["find-generic-password", "-s", SERVICE, "-a", &piece_account(acct, i), "-w"];
+        let keychain = keychain()?;
+        let args = ["find-generic-password", "-s", SERVICE, "-a", &piece_account(acct, i), "-w", &keychain];
         Ok(run(SECURITY, &args, b"", NOT_FOUND)?.map(|out| String::from_utf8_lossy(&out).trim().to_string()))
     }
 
@@ -278,7 +291,8 @@ mod imp {
     }
 
     fn delete_piece(acct: &str, i: usize) -> io::Result<bool> {
-        let args = ["delete-generic-password", "-s", SERVICE, "-a", &piece_account(acct, i)];
+        let keychain = keychain()?;
+        let args = ["delete-generic-password", "-s", SERVICE, "-a", &piece_account(acct, i), &keychain];
         Ok(run(SECURITY, &args, b"", NOT_FOUND)?.is_some())
     }
 
