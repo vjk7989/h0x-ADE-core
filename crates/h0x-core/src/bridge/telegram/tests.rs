@@ -327,6 +327,42 @@ fn the_token_is_kept_owner_only_and_checked() {
     std::fs::remove_dir_all(&b.dir).unwrap();
 }
 
+#[test]
+fn a_legacy_plaintext_token_is_moved_in_on_first_read() {
+    let b = crate::bridge::scratch();
+    std::fs::create_dir_all(&b.dir).unwrap();
+    std::fs::write(b.dir.join("telegram.token"), format!("  {TOKEN}\r\n")).unwrap();
+    assert_eq!(b.telegram_token().unwrap().as_deref(), Some(TOKEN), "read and trimmed");
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        assert!(!b.dir.join("telegram.token").exists(), "the plaintext file is removed");
+        for entry in std::fs::read_dir(&b.dir).unwrap() {
+            let path = entry.unwrap().path();
+            let bytes = std::fs::read(&path).unwrap();
+            assert!(!bytes.windows(TOKEN.len()).any(|w| w == TOKEN.as_bytes()), "{path:?} holds the token");
+        }
+    }
+    assert_eq!(b.telegram_token().unwrap().as_deref(), Some(TOKEN), "still there on the second read");
+    assert!(b.clear_telegram_token().unwrap());
+    assert_eq!(b.telegram_token().unwrap(), None);
+    assert!(!b.dir.join("telegram.token").exists());
+    std::fs::remove_dir_all(&b.dir).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn a_damaged_stored_token_is_an_error_without_the_token_and_can_be_cleared() {
+    let b = crate::bridge::scratch();
+    b.set_telegram_token(TOKEN).unwrap();
+    std::fs::write(b.dir.join("telegram.token.dpapi"), b"not a blob").unwrap();
+    let e = b.telegram_token().unwrap_err();
+    assert!(!format!("{}{}", e.message, e.hint).contains(TOKEN), "the token is never in an error");
+    b.clear_telegram_token().expect("--clear removes a damaged token like it removed any file before");
+    assert!(!b.dir.join("telegram.token.dpapi").exists());
+    assert_eq!(b.telegram_token().unwrap(), None);
+    std::fs::remove_dir_all(&b.dir).unwrap();
+}
+
 /// A loopback Bot API: answers each request with `answer(method, body)` and
 /// records (path, body).
 struct Stub {

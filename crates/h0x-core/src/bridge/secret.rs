@@ -306,4 +306,117 @@ mod tests {
         b.secret_del("d").unwrap();
         let _ = std::fs::remove_dir_all(&b.dir);
     }
+
+    /// Whether any file in the bridge folder holds `needle`.
+    fn folder_holds(b: &super::Bridge, needle: &[u8]) -> bool {
+        let Ok(entries) = std::fs::read_dir(&b.dir) else { return false };
+        entries
+            .map(|e| std::fs::read(e.unwrap().path()).unwrap_or_default())
+            .any(|bytes| bytes.windows(needle.len()).any(|w| w == needle))
+    }
+
+    #[test]
+    fn two_bridge_folders_never_see_each_others_secrets() {
+        let (a, b) = (scratch(), scratch());
+        a.secret_put("t", b"secret-of-a").unwrap();
+        assert_eq!(b.secret_get("t").unwrap(), None, "b sees nothing of a");
+        b.secret_put("t", b"secret-of-b").unwrap();
+        assert_eq!(a.secret_get("t").unwrap().as_deref(), Some(&b"secret-of-a"[..]), "b's put leaves a alone");
+        b.secret_del("t").unwrap();
+        assert_eq!(a.secret_get("t").unwrap().as_deref(), Some(&b"secret-of-a"[..]), "b's delete leaves a alone");
+        assert_eq!(b.secret_get("t").unwrap(), None);
+        a.secret_del("t").unwrap();
+        assert_eq!(a.secret_get("t").unwrap(), None);
+        let _ = std::fs::remove_dir_all(&a.dir);
+        let _ = std::fs::remove_dir_all(&b.dir);
+    }
+
+    #[test]
+    fn a_second_put_replaces_the_first_and_four_kib_round_trips() {
+        let b = scratch();
+        b.secret_put("r", b"first-value").unwrap();
+        b.secret_put("r", b"second-value").unwrap();
+        assert_eq!(b.secret_get("r").unwrap().as_deref(), Some(&b"second-value"[..]), "the latest wins");
+        let large: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        b.secret_put("r", &large).unwrap();
+        assert_eq!(b.secret_get("r").unwrap().as_deref(), Some(&large[..]), "4 KiB, every byte value");
+        let leftovers: Vec<_> = std::fs::read_dir(&b.dir)
+            .map(|d| d.map(|e| e.unwrap().file_name()).filter(|n| n.to_string_lossy().ends_with(".tmp")).collect())
+            .unwrap_or_default();
+        assert!(leftovers.is_empty(), "no temp files left: {leftovers:?}");
+        b.secret_del("r").unwrap();
+        let _ = std::fs::remove_dir_all(&b.dir);
+    }
+
+    #[test]
+    fn delete_then_get_is_none_and_no_file_keeps_the_secret() {
+        let b = scratch();
+        b.secret_put("c", b"cleared-needle-42").unwrap();
+        b.secret_del("c").unwrap();
+        assert_eq!(b.secret_get("c").unwrap(), None);
+        assert!(!folder_holds(&b, b"cleared-needle-42"), "nothing left holds the secret");
+        let _ = std::fs::remove_dir_all(&b.dir);
+    }
+
+    #[test]
+    fn a_legacy_file_beside_a_stored_entry_does_not_survive_a_read() {
+        let b = scratch();
+        b.secret_put("both", b"stored-value").unwrap();
+        std::fs::write(b.dir.join("both"), b"legacy-plaintext").unwrap();
+        let got = b.secret_get("both").unwrap();
+        #[cfg(any(windows, target_os = "macos"))]
+        {
+            assert_eq!(got.as_deref(), Some(&b"stored-value"[..]), "the store wins");
+            assert!(!b.dir.join("both").exists(), "the legacy plaintext is removed even when the store had an entry");
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        assert!(got.is_some());
+        b.secret_del("both").unwrap();
+        assert!(!b.dir.join("both").exists());
+        let _ = std::fs::remove_dir_all(&b.dir);
+    }
+
+    #[test]
+    fn a_bridge_folder_with_spaces_and_non_ascii_keeps_its_secret() {
+        let dir = std::env::temp_dir()
+            .join(format!("h0x core brücke 秘密 {}", crate::platform::random_hex()))
+            .join("bridge dir");
+        let b = super::Bridge::at(dir, crate::config::BridgeConfig::default());
+        b.secret_put("telegram.token", b"spaced-value").unwrap();
+        assert_eq!(b.secret_get("telegram.token").unwrap().as_deref(), Some(&b"spaced-value"[..]));
+        assert_eq!(scratch().secret_get("telegram.token").unwrap(), None, "another folder sees nothing");
+        b.secret_del("telegram.token").unwrap();
+        assert_eq!(b.secret_get("telegram.token").unwrap(), None);
+        let _ = std::fs::remove_dir_all(b.dir.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bridge_folder_with_a_control_character_is_refused_without_the_secret() {
+        let dir = std::env::temp_dir().join(format!("h0x-core-bridge-{}\nx", crate::platform::random_hex()));
+        let b = super::Bridge::at(dir, crate::config::BridgeConfig::default());
+        let e = b.secret_put("s", b"ctl-needle").unwrap_err();
+        assert!(!e.to_string().contains("ctl-needle"), "{e}");
+        assert!(b.secret_get("s").is_err());
+        assert!(!b.dir.exists() || !folder_holds(&b, b"ctl-needle"), "nothing written");
+        let _ = std::fs::remove_dir_all(&b.dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn empty_or_cut_blobs_are_errors_that_name_no_secret_bytes() {
+        let b = scratch();
+        b.secret_put("d", b"cut-blob-needle").unwrap();
+        let blob = std::fs::read(b.dir.join("d.dpapi")).unwrap();
+        for (why, damaged) in
+            [("empty", &blob[..0]), ("half", &blob[..blob.len() / 2]), ("one short", &blob[..blob.len() - 1])]
+        {
+            std::fs::write(b.dir.join("d.dpapi"), damaged).unwrap();
+            let e = b.secret_get("d").unwrap_err();
+            assert!(!e.to_string().contains("cut-blob-needle"), "{why}: {e}");
+        }
+        b.secret_del("d").unwrap();
+        assert!(!b.dir.join("d.dpapi").exists(), "a damaged entry can still be deleted");
+        let _ = std::fs::remove_dir_all(&b.dir);
+    }
 }
