@@ -98,9 +98,16 @@ enum Cmd {
     Templates,
     /// Swap this h0x-core for another build and restart (terminals keep running).
     Update {
-        /// An h0x-core binary to use (default: download the latest release).
+        /// A release archive (h0x-core-<target>.tar.gz or .zip) to use, with its
+        /// .minisig beside it (default: download the latest release).
         #[arg(long, value_name = "FILE", conflicts_with = "version")]
         from: Option<std::path::PathBuf>,
+        /// The signature of --from, if not <FILE>.minisig.
+        #[arg(long, value_name = "FILE", requires = "from")]
+        signature: Option<std::path::PathBuf>,
+        /// Only check the signature of --from: nothing is swapped, no core starts.
+        #[arg(long, requires = "from", conflicts_with = "force")]
+        check: bool,
         /// At least this release (`0.1.4`): nothing changes when this h0x-core is
         /// already that or newer.
         #[arg(long, value_name = "X.Y.Z", value_parser = release_version)]
@@ -596,7 +603,7 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             Out { json: r, human }
         }
         Cmd::Server { action: ServerCmd::Stop } => stop(&paths)?,
-        Cmd::Update { from: None, version, force } => {
+        Cmd::Update { from: None, version, force, .. } => {
             let this = format!("h0x-core {}", env!("CARGO_PKG_VERSION"));
             if let Some(v) = &version
                 && !force
@@ -631,7 +638,15 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
                 out
             }
         }
-        Cmd::Update { from: Some(from), force, .. } => update(&paths, &from, force)?,
+        Cmd::Update { from: Some(from), signature, check: true, .. } => {
+            crate::releases::verify_archive(&from, signature.as_deref())?;
+            let human = format!("{}: signed by the h0x-core release key", from.display());
+            Out { json: json!({"verified": from.display().to_string()}), human }
+        }
+        Cmd::Update { from: Some(from), signature, force, .. } => {
+            let scratch = crate::releases::Scratch::new()?;
+            update(&paths, &crate::releases::from_file(&from, signature.as_deref(), &scratch.0)?, force)?
+        }
         Cmd::Machine { action } => machine(&paths, action, call)?,
         Cmd::Session { action } => session(action, call)?,
         Cmd::Bridge { action } => bridge(&paths, action, asked)?,

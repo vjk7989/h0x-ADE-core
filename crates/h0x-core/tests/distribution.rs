@@ -277,3 +277,116 @@ fn a_machine_of_another_cpu_gets_the_released_build_for_it() {
     odd.bin = odd.root.join(".local/bin/h0x-core");
     drop(r);
 }
+
+/// A release archive of this build named as the release names it, in a fresh folder.
+fn archive_of_this_build(s: &Session, tag: &str) -> PathBuf {
+    let dir = s.root.join(format!("archive-{tag}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let tar = dir.join(format!("h0x-core-{}.tar.gz", here()));
+    let bin_dir = Path::new(BIN).parent().unwrap();
+    assert!(
+        Command::new("tar").arg("-czf").arg(&tar).arg("-C").arg(bin_dir).arg("h0x-core").status().unwrap().success()
+    );
+    tar
+}
+
+/// `update --from` takes a release archive only with the release key's
+/// signature for that very file; every refusal leaves the installed h0x-core
+/// byte for byte as it was. (A good signature needs the release secret key:
+/// the unit tests in releases.rs cover it with a throwaway key.)
+#[test]
+fn update_from_an_archive_without_a_good_signature_swaps_nothing() {
+    let mut s = Session::new();
+    let dir = s.root.join("bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(BIN, dir.join("h0x-core")).unwrap();
+    s.bin = dir.join("h0x-core");
+    let before = std::fs::read(&s.bin).unwrap();
+    let tar = archive_of_this_build(&s, "a");
+    let sig = tar.with_file_name(format!("{}.minisig", tar.file_name().unwrap().to_str().unwrap()));
+    let stray = s.root.join("elsewhere.minisig");
+    let tar_arg = tar.to_str().unwrap();
+    let sig_arg = sig.to_str().unwrap();
+    let junk = "untrusted comment: x\nnot a signature\ntrusted comment: file:x\nnot a signature\n";
+    let refusals = |args: &[&str], why: &str| {
+        let mut all = vec!["--json", "update"];
+        all.extend_from_slice(args);
+        let (_, e) = s.err(&all);
+        assert_eq!(e["error"]["kind"], "refused", "{args:?}: {e}");
+        let message = e["error"]["message"].as_str().unwrap();
+        assert!(message.contains(why), "{args:?}: {message}");
+        assert_eq!(std::fs::read(dir.join("h0x-core")).unwrap(), before, "nothing was swapped: {args:?}");
+        assert!(tar.exists(), "the person's archive stays");
+    };
+    // No signature at all, then garbage, then a signature that is not the release key's.
+    refusals(&["--from", tar_arg], "it has no signature");
+    refusals(&["--from", tar_arg, "--check"], "it has no signature");
+    std::fs::write(&sig, junk).unwrap();
+    refusals(&["--from", tar_arg], "its signature is unreadable");
+    std::fs::write(&stray, junk).unwrap();
+    refusals(&["--from", tar_arg, "--signature", stray.to_str().unwrap()], "its signature is unreadable");
+    refusals(&["--from", tar_arg, "--signature", s.root.join("none.minisig").to_str().unwrap()], "it has no signature");
+    std::fs::remove_file(&sig).unwrap();
+    // A tampered archive: still no valid signature.
+    std::fs::write(&tar, b"not what was signed").unwrap();
+    std::fs::write(&sig, junk).unwrap();
+    refusals(&["--from", tar_arg], "not signed by the h0x-core release key");
+    // A signature file given for a bare binary is no way around it.
+    refusals(&["--from", BIN, "--signature", sig_arg], "is not a signed release archive");
+}
+
+/// install.sh without a test site asks for the asset's `.minisig` and lets the
+/// downloaded h0x-core check it before anything lands in the install folder.
+/// curl is stubbed to serve a manifest and this build's archive.
+#[test]
+fn the_install_script_refuses_a_download_without_the_release_signature() {
+    let s = Session::new();
+    let tar = archive_of_this_build(&s, "i");
+    let name = tar.file_name().unwrap().to_str().unwrap().to_owned();
+    let sum = Command::new("sh")
+        .arg("-c")
+        .arg(format!("sha256sum {0} 2>/dev/null || shasum -a 256 {0}", tar.display()))
+        .output()
+        .unwrap();
+    let sum = String::from_utf8(sum.stdout).unwrap().split_whitespace().next().unwrap().to_owned();
+    let url = format!("https://github.com/vjk7989/h0x-ADE-core/releases/download/v1.0.0/{name}");
+    let manifest = tar.with_file_name("latest.json");
+    std::fs::write(
+        &manifest,
+        format!(
+            r#"{{"version":"1.0.0","generation":1,"targets":{{"{}":{{"url":"{url}","sha256":"{sum}"}}}}}}"#,
+            here()
+        ),
+    )
+    .unwrap();
+    let junk = tar.with_file_name("junk.minisig");
+    std::fs::write(&junk, "untrusted comment: x\nnot a signature\ntrusted comment: file:x\nnot a signature\n").unwrap();
+    let stub = s.root.join("stub");
+    std::fs::create_dir_all(&stub).unwrap();
+    let script = |serve_sig: bool| {
+        format!(
+            "#!/bin/sh\nout=; url=; prev=\nfor a; do\n  if [ \"$prev\" = -o ]; then out=$a; else case $a in -*) ;; *) url=$a ;; esac; fi\n  prev=$a\ndone\ncase $url in\n  */latest.json) cp {manifest} \"$out\" ;;\n  */{name}.minisig) {sig} ;;\n  */{name}) cp {tar} \"$out\" ;;\n  *) exit 22 ;;\nesac\n",
+            manifest = manifest.display(),
+            tar = tar.display(),
+            sig = if serve_sig { format!("cp {} \"$out\"", junk.display()) } else { "exit 22".to_owned() },
+        )
+    };
+    let install = |serve_sig: bool| {
+        std::fs::write(stub.join("curl"), script(serve_sig)).unwrap();
+        Command::new("chmod").arg("755").arg(stub.join("curl")).status().unwrap();
+        let bin = s.root.join(format!("installed-{serve_sig}"));
+        let out = Command::new("sh")
+            .arg(format!("{ROOT}/../../distribution/install.sh"))
+            .env("PATH", format!("{}:/usr/bin:/bin", stub.display()))
+            .env_remove("H0X_CORE_RELEASES_URL")
+            .env_remove("H0X_CORE_VERSION")
+            .env("H0X_CORE_INSTALL_DIR", &bin)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{}", String::from_utf8_lossy(&out.stdout));
+        assert!(!bin.join("h0x-core").exists(), "nothing is installed");
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    assert!(install(false).contains(&format!("no signature for {name}")));
+    assert!(install(true).contains(&format!("{name} is not signed by the h0x-core release key")));
+}

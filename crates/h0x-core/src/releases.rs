@@ -108,35 +108,78 @@ fn minisig(file: &Path) -> PathBuf {
     sig.into()
 }
 
-/// Checks `file` against its minisign signature `sig` by `key`, made for the
-/// release asset `name` (its trusted comment's `file:`, so one signed file
-/// cannot stand in for another); on any failure both are deleted and the
-/// download is refused.
+/// Why `file` is not the release asset `name` signed by `key` (its trusted
+/// comment's `file:`, so one signed file cannot stand in for another).
+fn check(file: &Path, sig: &Path, key: &str, name: &str) -> Result<(), String> {
+    let key = minisign_verify::PublicKey::from_base64(key).map_err(|e| e.to_string())?;
+    let text = std::fs::read_to_string(sig).map_err(|_| "it has no signature".to_string())?;
+    let signature =
+        minisign_verify::Signature::decode(&text).map_err(|e| format!("its signature is unreadable: {e}"))?;
+    let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
+    key.verify(&bytes, &signature, false).map_err(|e| format!("its signature does not match: {e}"))?;
+    let file_field = format!("file:{name}");
+    if signature.trusted_comment().split('\t').any(|f| f == file_field) {
+        Ok(())
+    } else {
+        Err(format!("its signature is for another file, not {name}"))
+    }
+}
+
+fn not_signed(file: &Path, why: String) -> RpcError {
+    let name = file.file_name().unwrap_or_default().to_string_lossy();
+    RpcError::new(
+        "refused",
+        format!("the download {name} is not signed by the h0x-core release key: {why}"),
+        "the download may have been tampered with; try again later",
+    )
+}
+
+/// Checks a download `file` against its signature `sig`, made for the release
+/// asset `name`; on any failure both are deleted and the download is refused.
 fn verify(file: &Path, sig: &Path, key: &str, name: &str) -> Result<(), RpcError> {
-    let checked = (|| {
-        let key = minisign_verify::PublicKey::from_base64(key).map_err(|e| e.to_string())?;
-        let text = std::fs::read_to_string(sig).map_err(|_| "it has no signature".to_string())?;
-        let signature =
-            minisign_verify::Signature::decode(&text).map_err(|e| format!("its signature is unreadable: {e}"))?;
-        let bytes = std::fs::read(file).map_err(|e| e.to_string())?;
-        key.verify(&bytes, &signature, false).map_err(|e| format!("its signature does not match: {e}"))?;
-        let file_field = format!("file:{name}");
-        if signature.trusted_comment().split('\t').any(|f| f == file_field) {
-            Ok(())
-        } else {
-            Err(format!("its signature is for another file, not {name}"))
-        }
-    })();
+    let checked = check(file, sig, key, name);
     let _ = std::fs::remove_file(sig);
     checked.map_err(|why| {
         let _ = std::fs::remove_file(file);
-        let name = file.file_name().unwrap_or_default().to_string_lossy();
-        RpcError::new(
-            "refused",
-            format!("the download {name} is not signed by the h0x-core release key: {why}"),
-            "the download may have been tampered with; try again later",
-        )
+        not_signed(file, why)
     })
+}
+
+/// A release archive, by name (`h0x-core-linux-x86_64.tar.gz`, `h0x-core-windows-x86_64.zip`).
+fn is_archive(file: &Path) -> bool {
+    let name = file.file_name().unwrap_or_default().to_string_lossy();
+    name.ends_with(".tar.gz") || name.ends_with(".zip")
+}
+
+/// `update --from`: checks a release archive the person has against the
+/// release key, with `sig` or the `<archive>.minisig` beside it, bound to the
+/// archive's own file name. The files are the person's: never deleted.
+pub fn verify_archive(archive: &Path, sig: Option<&Path>) -> Result<(), RpcError> {
+    verify_archive_by(archive, sig, PUBLIC_KEY)
+}
+
+fn verify_archive_by(archive: &Path, sig: Option<&Path>, key: &str) -> Result<(), RpcError> {
+    let sig = sig.map(Path::to_path_buf).unwrap_or_else(|| minisig(archive));
+    let name = archive.file_name().unwrap_or_default().to_string_lossy();
+    check(archive, &sig, key, &name).map_err(|why| not_signed(archive, why))
+}
+
+/// The h0x-core inside what `update --from` was given: a signed release
+/// archive, unpacked into `scratch` once its signature checked out. Debug and
+/// test builds also take a bare binary as it is (the tests' own builds).
+pub fn from_file(from: &Path, sig: Option<&Path>, scratch: &Path) -> Result<PathBuf, RpcError> {
+    if is_archive(from) {
+        verify_archive(from, sig)?;
+        return unpack(from, scratch);
+    }
+    if cfg!(any(debug_assertions, test)) && sig.is_none() {
+        return Ok(from.to_path_buf());
+    }
+    Err(RpcError::new(
+        "refused",
+        format!("{} is not a signed release archive", from.display()),
+        "give the release's h0x-core-<target>.tar.gz or .zip, with its .minisig beside it",
+    ))
 }
 
 /// The latest release's list, or one version's.
@@ -193,18 +236,22 @@ fn sha256(file: &Path) -> Option<String> {
 /// unpacks it.
 pub fn download(m: &Manifest, target: &str, scratch: &Path) -> Result<PathBuf, RpcError> {
     let tar = fetch(m, target, scratch)?;
-    let exe = if target.starts_with("windows") { "h0x-core.exe" } else { "h0x-core" };
+    unpack(&tar, scratch).map_err(|_| {
+        RpcError::new("refused", format!("h0x-core {}'s download for {target} holds no h0x-core binary", m.version), "")
+    })
+}
+
+/// Unpacks a release archive into `scratch`: the path of its h0x-core.
+fn unpack(archive: &Path, scratch: &Path) -> Result<PathBuf, RpcError> {
+    let exe = if archive.extension().is_some_and(|e| e == "zip") { "h0x-core.exe" } else { "h0x-core" };
     let ok =
-        Command::new(tar_program()).arg("-xf").arg(&tar).arg("-C").arg(scratch).status().is_ok_and(|s| s.success());
+        Command::new(tar_program()).arg("-xf").arg(archive).arg("-C").arg(scratch).status().is_ok_and(|s| s.success());
     let bin = scratch.join(exe);
-    if !ok || !bin.is_file() {
-        return Err(RpcError::new(
-            "refused",
-            format!("h0x-core {}'s download for {target} holds no h0x-core binary", m.version),
-            "",
-        ));
+    if ok && bin.is_file() {
+        Ok(bin)
+    } else {
+        Err(RpcError::new("refused", format!("{} holds no h0x-core binary", archive.display()), ""))
     }
-    Ok(bin)
 }
 
 /// Downloads `m`'s archive for `target` into `scratch` and checks it against
@@ -391,6 +438,65 @@ ZJhj3MtbsDPyt278bwB0BcVRB5ZoKqA6VCCZ5s51lq49BobYTBUuzlJqofyqGhaBwWB6iLyCd1cVXXQh
         assert!(!file.exists() && !sig.exists(), "a refused download and its signature are deleted");
     }
 
+    /// `update --from`: the person's own files, checked and never deleted.
+    #[test]
+    fn a_local_archive_needs_its_own_signature_and_is_never_deleted() {
+        let (_scratch, file, sig) = signed(PAYLOAD, Some(SIG));
+        super::verify_archive_by(&file, None, TEST_KEY).unwrap();
+        assert!(file.exists() && sig.exists(), "the person's files stay");
+        // The signature may live elsewhere.
+        let elsewhere = file.with_file_name("other-place.minisig");
+        std::fs::rename(&sig, &elsewhere).unwrap();
+        assert!(super::verify_archive_by(&file, None, TEST_KEY).is_err(), "nothing beside the archive");
+        super::verify_archive_by(&file, Some(&elsewhere), TEST_KEY).unwrap();
+        // Tampered, wrong key, signed for another file, empty signature: all refused, all kept.
+        let (_scratch, file, sig) = signed("h0x-core test releasE\n", Some(SIG));
+        let err = super::verify_archive_by(&file, None, TEST_KEY).unwrap_err();
+        assert_eq!(err.kind, "refused");
+        assert!(err.message.contains("its signature does not match"), "{}", err.message);
+        assert!(file.exists() && sig.exists());
+        for (text, why) in [
+            (OTHER_KEY_SIG, "its signature does not match"),
+            (OTHER_FILE_SIG, "its signature is for another file, not h0x-core-linux-x86_64.tar.gz"),
+            ("", "its signature is unreadable"),
+        ] {
+            let (_scratch, file, sig) = signed(PAYLOAD, Some(text));
+            let err = super::verify_archive_by(&file, None, TEST_KEY).unwrap_err();
+            assert!(err.message.contains(why), "{why}: {}", err.message);
+            assert!(file.exists() && sig.exists());
+        }
+        let (_scratch, file, _) = signed(PAYLOAD, None);
+        let err = super::verify_archive_by(&file, None, TEST_KEY).unwrap_err();
+        assert!(err.message.contains("it has no signature"), "{}", err.message);
+        // The embedded release key does not take the test key's signature.
+        let (_scratch, file, _) = signed(PAYLOAD, Some(SIG));
+        assert!(super::verify_archive(&file, None).is_err());
+    }
+
+    #[test]
+    fn a_signature_for_another_file_name_refuses_a_renamed_archive() {
+        let (_scratch, file, _) = signed(PAYLOAD, Some(SIG));
+        let renamed = file.with_file_name("h0x-core-linux-aarch64.tar.gz");
+        std::fs::rename(&file, &renamed).unwrap();
+        std::fs::rename(super::minisig(&file), super::minisig(&renamed)).unwrap();
+        let err = super::verify_archive_by(&renamed, None, TEST_KEY).unwrap_err();
+        assert!(err.message.contains("its signature is for another file, not h0x-core-linux-aarch64.tar.gz"));
+    }
+
+    #[test]
+    fn from_takes_only_a_signed_archive_or_a_debug_binary() {
+        let scratch = super::Scratch::new().unwrap();
+        let bare = scratch.0.join("h0x-core");
+        std::fs::write(&bare, "x").unwrap();
+        // Debug and test builds: a bare binary as it is; a signature given for it makes no sense.
+        assert_eq!(super::from_file(&bare, None, &scratch.0).unwrap(), bare);
+        let err = super::from_file(&bare, Some(&bare), &scratch.0).unwrap_err();
+        assert_eq!(err.kind, "refused");
+        // An archive is always checked, here against the embedded key: refused.
+        let (_s, archive, _) = signed(PAYLOAD, Some(SIG));
+        let err = super::from_file(&archive, None, &scratch.0).unwrap_err();
+        assert!(err.message.contains("not signed by the h0x-core release key"), "{}", err.message);
+    }
     #[test]
     fn a_list_for_another_version_than_the_one_asked_for_is_refused() {
         let list = br#"{"version":"0.1.0","generation":1,"targets":{}}"#;

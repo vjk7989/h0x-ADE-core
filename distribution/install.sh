@@ -5,6 +5,7 @@
 #
 # Into ~/.local/bin/h0x-core. An h0x-core that is already there is swapped
 # the planned way (h0x-core update --from): running terminals keep running.
+# The download must carry the release key's signature (its .minisig).
 # H0X_CORE_VERSION=0.2.0 picks a version; H0X_CORE_RELEASES_URL points
 # elsewhere (tests); H0X_CORE_INSTALL_DIR installs elsewhere.
 set -eu
@@ -60,16 +61,30 @@ if [ -z "${H0X_CORE_RELEASES_URL:-}" ]; then
     *) fail "refusing to download $url: not an https link on GitHub" ;;
   esac
 fi
-# Fetched exactly as the list gives it (a mirror's signed URL included).
-curl -fsSL --proto "$proto" --proto-redir "$proto" "$url" -o "$tmp/h0x-core.tar.gz" || fail "download failed: $url"
-[ "$(sha256 "$tmp/h0x-core.tar.gz")" = "$want" ] || fail "the download is damaged (checksum mismatch); try again"
-tar -xzf "$tmp/h0x-core.tar.gz" -C "$tmp"
+# Fetched exactly as the list gives it (a mirror's signed URL included),
+# under the release's own file name: its signature is bound to that name.
+asset=${url##*/}
+asset=${asset%%[?#]*}
+archive="$tmp/$asset"
+curl -fsSL --proto "$proto" --proto-redir "$proto" "$url" -o "$archive" || fail "download failed: $url"
+[ "$(sha256 "$archive")" = "$want" ] || fail "the download is damaged (checksum mismatch); try again"
+tar -xzf "$archive" -C "$tmp"
 "$tmp/h0x-core" --version >/dev/null 2>&1 || fail "the downloaded h0x-core does not run on this machine"
+# The checksum comes from the same place as the file: the signature is what
+# proves the release key made it. The downloaded h0x-core checks it with its
+# embedded key before anything is installed (it has to be trusted to say so:
+# that first step rests on TLS to GitHub; every later update is checked by the
+# h0x-core already installed). A site set by H0X_CORE_RELEASES_URL (tests) is not signed.
+if [ -z "${H0X_CORE_RELEASES_URL:-}" ]; then
+  curl -fsSL --proto "$proto" --proto-redir "$proto" "${url%%[?#]*}.minisig" -o "$archive.minisig" || fail "no signature for $asset: ${url%%[?#]*}.minisig"
+  "$tmp/h0x-core" update --from "$archive" --check >/dev/null || fail "$asset is not signed by the h0x-core release key (see above)"
+fi
 mkdir -p "$bin"
 
 if [ -x "$bin/h0x-core" ]; then
   # Swapped the planned way, so its terminals keep running.
-  "$bin/h0x-core" update --from "$tmp/h0x-core" >/dev/null || fail "updating $bin/h0x-core failed (see above)"
+  if [ -n "${H0X_CORE_RELEASES_URL:-}" ]; then from=$tmp/h0x-core; else from=$archive; fi
+  "$bin/h0x-core" update --from "$from" >/dev/null || fail "updating $bin/h0x-core failed (see above)"
   say "h0x-core updated to $version."
 else
   cp "$tmp/h0x-core" "$bin/h0x-core.new"

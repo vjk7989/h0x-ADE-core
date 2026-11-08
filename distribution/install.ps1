@@ -5,6 +5,7 @@
 # Into %LOCALAPPDATA%\Programs\h0x-core (h0x-core.exe, Microsoft's ConPTY
 # beside it), added to your PATH. An h0x-core that is already there is
 # swapped the planned way (h0x-core update --from): running terminals keep
+# running. The download must carry the release key's signature (its .minisig).
 # running. No admin needed. H0X_CORE_VERSION=0.2.0 picks a version;
 # H0X_CORE_RELEASES_URL points elsewhere (tests); H0X_CORE_INSTALL_DIR
 # installs elsewhere.
@@ -44,8 +45,10 @@ if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue) -or -not (Test-Pat
 $tmp = Join-Path ([IO.Path]::GetTempPath()) "h0x-core-install-$PID"
 New-Item -ItemType Directory -Force $tmp | Out-Null
 try {
+  $archive = "$tmp\h0x-core.zip"
+  $signed = $false
   if ($zip) {
-    Copy-Item $zip "$tmp\h0x-core.zip"
+    Copy-Item $zip $archive
   } else {
     $manifest = if ($env:H0X_CORE_VERSION) { "$releases/download/v$($env:H0X_CORE_VERSION)/manifest.json" } else { "$releases/latest/download/latest.json" }
     Check $manifest
@@ -57,25 +60,54 @@ try {
 
     # Fetched exactly as the list gives it (a mirror's signed URL included).
     Check $t.url
-    curl.exe -fsSL --proto "=https" --proto-redir "=https" $t.url -o "$tmp\h0x-core.zip"
+    # Under the release's own file name: its signature is bound to that name.
+    $asset = ($t.url -replace "[?#].*", "") -replace ".*/", ""
+    $archive = Join-Path $tmp $asset
+    curl.exe -fsSL --proto "=https" --proto-redir "=https" $t.url -o $archive
     if ($LASTEXITCODE) { Fail "download failed: $($t.url)" }
     # .NET, not Get-FileHash: that one fails when PowerShell 7 starts 5.1.
-    $stream = [IO.File]::OpenRead("$tmp\h0x-core.zip")
+    $stream = [IO.File]::OpenRead($archive)
     try { $got = -join ([Security.Cryptography.SHA256]::Create().ComputeHash($stream) | ForEach-Object { $_.ToString("x2") }) } finally { $stream.Close() }
     if ($got -ne $t.sha256) { Fail "the download is damaged (checksum mismatch); try again" }
+    $signed = -not $env:H0X_CORE_RELEASES_URL
+    if ($signed) {
+        $sigUrl = ($t.url -replace "[?#].*", "") + ".minisig"
+        Check $sigUrl
+        curl.exe -fsSL --proto "=https" --proto-redir "=https" $sigUrl -o "$archive.minisig"
+        if ($LASTEXITCODE) { Fail "no signature for ${asset}: $sigUrl" }
+    }
   }
     New-Item -ItemType Directory -Force "$tmp\h0x-core" | Out-Null
-    & $tar -xf "$tmp\h0x-core.zip" -C "$tmp\h0x-core"
+    & $tar -xf $archive -C "$tmp\h0x-core"
     $new = "$tmp\h0x-core\h0x-core.exe"
     if ($LASTEXITCODE -or -not (Test-Path "$tmp\h0x-core\conpty\conpty.dll")) { Fail "the download holds no complete h0x-core" }
     $version = (& $new --version) -replace "^h0x-core ", ""
     if ($LASTEXITCODE) { Fail "the downloaded h0x-core does not run on this machine" }
+    if ($signed) {
+        # The checksum comes from the same place as the file: the signature proves the
+        # release key made it. The downloaded h0x-core checks it with its embedded key
+        # before anything is installed (it has to be trusted to say so: that first step
+        # rests on TLS to GitHub; later updates are checked by the installed h0x-core).
+        & $new update --from $archive --check | Out-Null
+        if ($LASTEXITCODE) { Fail "$asset is not signed by the h0x-core release key (see above)" }
+    }
 
     New-Item -ItemType Directory -Force $dir | Out-Null
+    # Outside the user profile the folder would inherit the drive's ACL (often
+    # Authenticated Users: Modify), and anyone could replace the h0x-core on the PATH:
+    # only this user, SYSTEM and Administrators keep access (by SID: any language).
+    $profileDir = [IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd("\") + "\"
+    if (-not ([IO.Path]::GetFullPath($dir).TrimEnd("\") + "\").StartsWith($profileDir, [StringComparison]::OrdinalIgnoreCase)) {
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        icacls.exe $dir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*${me}:(OI)(CI)F" | Out-Null
+        if ($LASTEXITCODE) { Fail "cannot lock the ACL of $dir" }
+        Write-Host "Locked ${dir}: only you, SYSTEM and Administrators can change it."
+    }
     $exe = Join-Path $dir "h0x-core.exe"
     if (Test-Path $exe) {
         # Swapped the planned way, so its terminals keep running.
-        & $exe update --from $new | Out-Null
+        $from = if ($signed) { $archive } else { $new }
+        & $exe update --from $from | Out-Null
         if ($LASTEXITCODE) { Fail "updating $exe failed (see above)" }
         Write-Host "h0x-core updated to $version."
     } else {
