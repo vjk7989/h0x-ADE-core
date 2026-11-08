@@ -352,3 +352,124 @@ fn bridge_web_json_prints_one_line_and_keeps_serving() {
     web.wait().unwrap();
     assert_eq!(rest, "", "nothing else on stdout: no banner, no QR");
 }
+
+#[test]
+fn qr_takes_one_character_a_newline_and_emoji_and_refuses_one_byte_over_capacity() {
+    let s = Session::new();
+    assert_eq!(s.json(&["bridge", "qr", "a"])["size"], 21, "one character");
+    let line = s.json(&["bridge", "qr", "first\nsecond"]);
+    assert_eq!(line["rows"].as_array().unwrap().len() as u64, line["size"].as_u64().unwrap(), "a newline in the text");
+    assert!(s.json(&["bridge", "qr", "pair 🙂 ünïcode"])["size"].as_u64().unwrap() >= 21);
+    assert_eq!(s.json(&["bridge", "qr", &"x".repeat(2331)])["size"], 177, "exactly at capacity");
+    let (code, err) = s.err(&["bridge", "qr", &"x".repeat(2332)]);
+    assert_eq!((code, err["error"]["message"].as_str()), (6, Some("that text is too long for a QR code")));
+    let (code, err) = s.err(&["bridge", "qr", &"🙂".repeat(583)]);
+    assert_eq!((code, err["error"]["kind"].as_str()), (6, Some("invalid_params")), "capacity is in bytes");
+    assert_eq!(s.err(&["bridge", "qr", ""]).0, 6, "empty text");
+}
+
+#[test]
+fn a_token_file_with_spaces_in_its_path_or_only_a_line_end_and_the_token_never_shows() {
+    let s = Session::new();
+    let dir = s.root.join("config/h0x-core/bridge");
+    let stored = dir.join("telegram.token");
+    let path = s.root.join("my tokens").join("bot token.txt");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let file = path.to_str().unwrap();
+
+    std::fs::write(&path, "\r\n").unwrap();
+    let (code, err) = s.err(&["bridge", "telegram", "token", "--file", file]);
+    assert_eq!((code, err["error"]["message"].as_str()), (6, Some("that is not a bot token")), "only CRLF");
+    assert!(!stored.exists());
+
+    let folder = s.root.join("my tokens");
+    let (code, err) = s.err(&["bridge", "telegram", "token", "--file", folder.to_str().unwrap()]);
+    let message = err["error"]["message"].as_str().unwrap();
+    assert_eq!(code, 6, "a directory");
+    assert!(message.starts_with(&format!("cannot read the token file {}: ", folder.display())), "{message}");
+
+    std::fs::write(&path, format!(" \t{TOKEN} \r\nsecond line\r\n")).unwrap();
+    let out = s.core(&["--json", "bridge", "telegram", "token", "--file", file]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), json!({"telegram_token": "set"}));
+    assert_eq!(std::fs::read_to_string(&stored).unwrap(), TOKEN, "blanks trimmed, second line ignored");
+    assert!(path.exists(), "never deleted");
+
+    let ls = s.core(&["bridge", "ls"]);
+    let log = s.core(&["bridge", "log"]);
+    for (what, out) in [("stdout", &out.stdout), ("stderr", &out.stderr), ("ls", &ls.stdout), ("log", &log.stdout)] {
+        assert!(!String::from_utf8_lossy(out).contains("ABCdef"), "the token is never in {what}");
+    }
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let entry = entry.unwrap().path();
+        if entry != stored && entry.is_file() {
+            let bytes = std::fs::read(&entry).unwrap();
+            assert!(!String::from_utf8_lossy(&bytes).contains("ABCdef"), "the token is only in {}", stored.display());
+        }
+    }
+}
+
+#[test]
+fn bridge_web_json_while_locked_has_all_four_keys_with_a_null_pair() {
+    use std::io::{BufRead, BufReader, Read};
+    let s = Session::new();
+    assert_eq!(s.json(&["bridge", "lock"]), json!({"locked": true}));
+    let mut web = s
+        .cmd()
+        .args(["--json", "bridge", "web", "--port", "0"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut out = BufReader::new(web.stdout.take().unwrap());
+    let mut line = String::new();
+    out.read_line(&mut line).unwrap();
+    let ready: Value = serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line}"));
+    let keys = ready.as_object().unwrap();
+    assert_eq!(keys.len(), 4, "{line}");
+    for key in ["url", "pair", "tunnel", "via"] {
+        assert!(keys.contains_key(key), "{key} present, even as null: {line}");
+    }
+    assert!(ready["url"].as_str().unwrap().starts_with("http://127.0.0.1:"), "{line}");
+    assert_eq!((&ready["pair"], &ready["tunnel"], &ready["via"]), (&Value::Null, &Value::Null, &Value::Null), "locked");
+    web.kill().unwrap();
+    let mut rest = String::new();
+    out.read_to_string(&mut rest).unwrap();
+    web.wait().unwrap();
+    assert_eq!(rest, "", "no locked banner on stdout");
+}
+
+#[test]
+fn bridge_web_json_without_tunnel_stays_one_line_after_a_later_tunnel_request() {
+    use std::io::{BufRead, BufReader, Read};
+    let s = Session::new();
+    let dir = s.root.join("config/h0x-core/bridge");
+    let mut web = s
+        .cmd()
+        .args(["--json", "bridge", "web", "--port", "0"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut out = BufReader::new(web.stdout.take().unwrap());
+    let mut line = String::new();
+    out.read_line(&mut line).unwrap();
+    let ready: Value = serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line}"));
+    assert!(ready["pair"].is_string(), "{line}");
+
+    // Locked, so the panel answers a `bridge tunnel on` with an error and never needs cloudflared.
+    assert_eq!(s.json(&["bridge", "lock"]), json!({"locked": true}));
+    // Asked again while missing: the panel deletes any request it finds when it starts.
+    wait_until("the panel answers a `bridge tunnel on`", || {
+        if !dir.join("tunnel.request").exists() {
+            let asked = json!({"at_ms": now_ms(), "minutes": 1}).to_string();
+            std::fs::write(dir.join("tunnel.request"), asked).unwrap();
+        }
+        std::fs::read_to_string(dir.join("tunnel.json")).is_ok_and(|status| status.contains("error"))
+    });
+    web.kill().unwrap();
+    let mut rest = String::new();
+    out.read_to_string(&mut rest).unwrap();
+    web.wait().unwrap();
+    assert_eq!(rest, "", "exactly one startup line on stdout");
+}

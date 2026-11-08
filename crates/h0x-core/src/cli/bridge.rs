@@ -347,6 +347,89 @@ mod tests {
     }
 
     #[test]
+    fn a_token_file_gives_its_first_line_validated_like_stdin_and_names_only_the_file_on_failure() {
+        const TOKEN: &str = "123456:ABCdef_ghi-JKLmnoPQRstuVWXyz0123";
+        let dir = std::env::temp_dir().join(format!("h0x core token {}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bridge = crate::bridge::Bridge::at(dir.join("bridge"), Default::default());
+        let path = dir.join("bot token.txt");
+        let store = |content: &[u8]| {
+            std::fs::write(&path, content).unwrap();
+            super::read_token(Some(&path)).and_then(|line| bridge.set_telegram_token(&line))
+        };
+
+        for (content, why) in [
+            (&b"\r\n"[..], "only a line end"),
+            (b"", "an empty file"),
+            (b"\n123456:ABCdef_ghi-JKLmnoPQRstuVWXyz0123\n", "the token on the second line"),
+            (b"123456:short\r\n", "the wrong shape"),
+        ] {
+            let e = store(content).unwrap_err();
+            assert_eq!((e.kind.as_str(), e.message.as_str()), ("invalid_params", "that is not a bot token"), "{why}");
+            assert!(!format!("{}{}", e.message, e.hint).contains("ABCdef"), "{why}: the token is never in an error");
+        }
+        assert!(!dir.join("bridge/telegram.token").exists(), "nothing stored");
+
+        for content in [
+            format!("  {TOKEN}  \r\nsecond line\r\n"),
+            format!("\t{TOKEN}\n{TOKEN}x\n"),
+            format!("{TOKEN}\r"),
+            TOKEN.to_string(),
+        ] {
+            store(content.as_bytes()).unwrap_or_else(|e| panic!("{content:?}: {}", e.message));
+            assert_eq!(std::fs::read_to_string(dir.join("bridge/telegram.token")).unwrap(), TOKEN, "{content:?}");
+            assert!(path.exists(), "the file is left for the caller to delete");
+        }
+
+        let gone = dir.join("no such dir").join("token.txt");
+        let e = super::read_token(Some(&gone)).unwrap_err();
+        assert_eq!(e.kind, "invalid_params");
+        assert_eq!(
+            e.message,
+            format!("cannot read the token file {}: {}", gone.display(), std::io::ErrorKind::NotFound)
+        );
+
+        let e = super::read_token(Some(&dir)).unwrap_err();
+        assert_eq!(e.kind, "invalid_params", "a directory, not a file");
+        assert!(e.message.starts_with(&format!("cannot read the token file {}: ", dir.display())), "{}", e.message);
+
+        std::fs::write(&path, [0xff, 0xfe, b'1', b'\n']).unwrap();
+        let e = super::read_token(Some(&path)).unwrap_err();
+        assert_eq!(
+            e.message,
+            format!("cannot read the token file {}: {}", path.display(), std::io::ErrorKind::InvalidData),
+            "not UTF-8"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn token_file_takes_a_windows_path_with_spaces_and_conflicts_with_clear() {
+        use super::{BridgeCmd, TelegramCmd};
+        use clap::Parser;
+        let parse = |args: &[&str]| {
+            let cli = crate::cli::Cli::try_parse_from([&["h0x-core", "bridge", "telegram", "token"], args].concat());
+            match cli.map_err(|e| e.kind())?.cmd {
+                Some(crate::cli::Cmd::Bridge {
+                    action: BridgeCmd::Telegram { action: TelegramCmd::Token { clear, file } },
+                }) => Ok((clear, file)),
+                _ => panic!("bridge telegram token"),
+            }
+        };
+        let windows = r"C:\Users\Jane Doe\My Tokens\bot token.txt";
+        assert_eq!(parse(&["--file", windows]), Ok((false, Some(std::path::PathBuf::from(windows)))));
+        assert_eq!(
+            parse(&["--file", r"\\server\share\bot.txt"]).unwrap().1.unwrap().to_str(),
+            Some(r"\\server\share\bot.txt")
+        );
+        assert_eq!(parse(&[]), Ok((false, None)), "stdin, as before");
+        assert_eq!(parse(&["--clear"]), Ok((true, None)));
+        assert_eq!(parse(&["--clear", "--file", windows]), Err(clap::error::ErrorKind::ArgumentConflict));
+        assert_eq!(parse(&["--file", windows, "--clear"]), Err(clap::error::ErrorKind::ArgumentConflict));
+        assert_eq!(parse(&["--file"]), Err(clap::error::ErrorKind::InvalidValue), "a path is required");
+    }
+
+    #[test]
     fn tunnel_minutes_are_one_to_a_day_and_default_to_an_hour() {
         use super::{BridgeCmd, TunnelCmd};
         use clap::Parser;
