@@ -97,7 +97,7 @@ function toast(text, cls = '', terminal = null, ms = 8000) {
   if (ms) setTimeout(() => el.remove(), ms);
 }
 
-// Reached through a Cloudflare tunnel (REM-3b): say it is not end-to-end.
+// Reached through a Cloudflare tunnel (REM-3b): say who delivers the page.
 function tunnel(data) {
   if (data.tunnel) $('tunnel').hidden = false;
 }
