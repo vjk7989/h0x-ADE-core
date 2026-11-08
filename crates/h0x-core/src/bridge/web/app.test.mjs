@@ -798,7 +798,7 @@ test('two tabs making the device key at once both connect and then share the one
     assert.equal(idb.size, 1);
     const kept = Buffer.from(Array.from(idb.get('device').pub)).toString('base64url');
     const d = (w) => JSON.parse(w.ws().hellos[0]).d;
-    assert.ok(tabs.some((w) => d(w) === kept), 'the kept key is one of the two');
+    for (const w of tabs) assert.equal(d(w), kept, 'both tabs say hello with the one kept key');
     for (const w of tabs) assert.deepEqual(w.ws().sent, [{ name: 'auth', data: { session: 'S1' } }]);
     for (const w of tabs) {
       await w.ws().close();
@@ -857,4 +857,56 @@ test('a handshake failure while pairing from a link waits before it reconnects',
   assert.equal(first.readyState, 3);
   assert.deepEqual(first.sent, []);
   assert.equal(w.sockets.length, 1, 'no new socket at once: a lasting failure would reconnect in a loop with no delay');
+});
+
+test('a link that does not match, on a device that never paired, does not claim a pairing', async () => {
+  const w = load({ href: LINK, pinned: null, serverKey: '7'.repeat(64) });
+  await w.ws().open();
+  assert.equal(w.ws().readyState, 3);
+  assert.equal(w.$('pair-why').textContent, "This link does not match the computer's identity; scan the QR code again.");
+  assert.deepEqual(w.ws().sent, []);
+});
+
+test('repeated handshake failures keep one error toast and back off', async () => {
+  const w = load({ stored: 'S1', subtle: false });
+  w.run('document.head').append = (el) => { w.scripts.push(el.src); el.fire('error'); };
+  await w.ws().open();
+  for (const wait of [1000, 2000, 4000]) {
+    assert.equal(w.reconnect(), wait);
+    await w.ws().open();
+  }
+  assert.equal(w.sockets.length, 4);
+  assert.deepEqual(w.toasts(), ['Secure connection failed: could not load the crypto script']);
+  const link = load({ href: LINK, pinned: null, subtle: false });
+  link.run('document.head').append = (el) => { link.scripts.push(el.src); el.fire('error'); };
+  await link.ws().open();
+  assert.equal(link.sockets.length, 1, 'a code that was not used waits for the backoff');
+  assert.equal(link.reconnect(), 1000);
+  await link.ws().open();
+  assert.equal(link.toasts().length, 1);
+});
+
+test('an unusable stored device key is replaced, the session dropped, and a new pairing asked for', async () => {
+  for (const [opts, rec] of [
+    [{}, { kind: 'webcrypto', secret: {}, pub: new Uint8Array(65) }],
+    [NOBLE_ONLY, { kind: 'noble', secret: new Uint8Array(3), pub: new Uint8Array(65) }],
+    [{}, { kind: 'noble', secret: new Uint8Array(32), pub: new Uint8Array(65) }],
+  ]) {
+    const idb = new Map([['device', rec]]);
+    const w = load({ stored: 'S1', idb, ...opts });
+    await w.ws().open();
+    assert.equal(w.ws().readyState, 3);
+    assert.deepEqual([w.ws().hellos, w.ws().sent], [[], []], 'nothing went out');
+    assert.match(w.$('pair-why').textContent, /^Scan the QR code again/);
+    assert.equal(w.saved.has('h0x-session'), false);
+    assert.equal(w.timers.size, 0, 'no retry loop');
+    assert.notEqual(idb.get('device'), rec, 'a new key was kept');
+    assert.equal(idb.get('device').pub.length, 65);
+
+    // The next pairing uses the new key and works.
+    const again = load({ href: LINK, pinned: null, idb, ...opts });
+    await again.ws().open();
+    assert.equal(again.ws().sent[0].name, 'pair');
+    assert.equal(JSON.parse(again.ws().hellos[0]).d, Buffer.from(Array.from(idb.get('device').pub)).toString('base64url'));
+  }
 });

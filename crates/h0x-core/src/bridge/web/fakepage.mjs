@@ -85,7 +85,16 @@ function fakeIndexedDB(rows) {
               later(() => later(() => tx.oncomplete && tx.oncomplete()));
               return r;
             };
-            tx.objectStore = () => ({ get: (k) => request(rows.get(k)), put: (v, k) => request(rows.set(k, v) && k) });
+            tx.objectStore = () => ({
+              get: (k) => request(rows.get(k)),
+              put: (v, k) => request(rows.set(k, v) && k),
+              // Like IndexedDB: adding a key that exists aborts the transaction.
+              add: (v, k) => {
+                if (!rows.has(k)) return request(rows.set(k, v) && k);
+                later(() => later(() => tx.onerror && tx.onerror()));
+                return { result: undefined };
+              },
+            });
             return tx;
           },
         };

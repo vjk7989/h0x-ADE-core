@@ -36,6 +36,7 @@ if (location.hash) history.replaceState(null, '', location.pathname + location.s
 let ws = null;
 let chan = null; // the sealed channel of the current socket, after the handshake
 let blocked = false; // the computer is not the one this device pinned
+let failToast = null; // the one visible handshake or frame error
 let usedFp = ''; // the fingerprint the last handshake matched
 let tail = Promise.resolve(); // everything that touches the socket runs in this order
 let ready = false; // paired or authenticated on this socket
@@ -95,6 +96,7 @@ function toast(text, cls = '', terminal = null, ms = 8000) {
   box.append(el);
   while (box.children.length > 4) box.firstElementChild.remove();
   if (ms) setTimeout(() => el.remove(), ms);
+  return el;
 }
 
 // Reached through a Cloudflare tunnel (REM-3b): say who delivers the page.
@@ -112,8 +114,7 @@ function needPair(why) {
   show('pair');
 }
 
-// The computer is not the one this device trusts: stop, and stay stopped until
-// the person forgets it (a reload with a good link also clears this).
+// Not the computer this device trusts: stay stopped until it is forgotten.
 function block(why) {
   blocked = true;
   ready = false;
@@ -125,8 +126,7 @@ function block(why) {
 
 // ---- end-to-end encryption (ADR-064) ----
 // The same bytes as e2e.rs and e2e_vectors.json. WebCrypto where the page has
-// it; on plain-http LAN pages it does not, so noble.js (pure JS, served beside
-// this file) takes over. Never a fallback to an unencrypted socket.
+// it, else noble.js (pure JS) on plain-http pages. Never an unencrypted socket.
 
 const enc = new TextEncoder();
 const dec = new TextDecoder('utf-8', { fatal: true });
@@ -260,9 +260,8 @@ function backend() {
   return backendOnce;
 }
 
-// The device key D: made once per origin and kept in IndexedDB. With WebCrypto
-// it is a non-extractable CryptoKey; noble has no such thing, so the scalar is
-// stored (the origin's own storage, as the session token is).
+// The device key D: one per origin in IndexedDB. A non-extractable CryptoKey
+// with WebCrypto; noble has no such thing, so its scalar is stored.
 function database() {
   return new Promise((resolve, reject) => {
     if (typeof indexedDB === 'undefined') return reject(new Error('this browser cannot keep a device key'));
@@ -288,13 +287,31 @@ async function keyStore(mode, run) {
   }
 }
 
+// A stored key that is of this backend and can do an ECDH.
+async function usable(be, rec) {
+  if (!rec || rec.kind !== be.kind || !rec.secret || !rec.pub) return false;
+  try { await be.ecdh(rec.secret, rec.pub); return true; } catch { return false; }
+}
+
+// { rec, replaced }: the one kept key. It is made with `add`, which fails if
+// another tab got there first; then the kept one is read back and used.
+// `replaced` is true when an unusable key was thrown away for a new one.
 async function device(be) {
-  const rec = await keyStore('readonly', (s) => s.get('device'));
-  if (rec && rec.kind === be.kind && rec.secret && rec.pub) return rec;
+  const old = await keyStore('readonly', (s) => s.get('device'));
+  if (await usable(be, old)) return { rec: old, replaced: false };
   const made = await be.generate();
   const fresh = { kind: be.kind, secret: made.secret, pub: made.pub };
+  if (!old) {
+    try {
+      await keyStore('readwrite', (s) => s.add(fresh, 'device'));
+      return { rec: fresh, replaced: false };
+    } catch {
+      const kept = await keyStore('readonly', (s) => s.get('device'));
+      if (await usable(be, kept)) return { rec: kept, replaced: false };
+    }
+  }
   await keyStore('readwrite', (s) => s.put(fresh, 'device'));
-  return fresh;
+  return { rec: fresh, replaced: !!old };
 }
 
 function clientHello(dPub, ecPub, nonce) {
@@ -326,7 +343,12 @@ async function frame(be, lane, op, data) {
 
 // Our half of the handshake: the hello to send first.
 async function begin(be) {
-  const dev = await device(be);
+  const { rec: dev, replaced } = await device(be);
+  if (replaced && !pairCode) {
+    const e = new Error('the device key was replaced');
+    e.rescan = true; // the server knows the old key: a new pairing is needed
+    throw e;
+  }
   const eph = await be.generate();
   const nonce = crypto.getRandomValues(new Uint8Array(32));
   const text = clientHello(dev.pub, eph.pub, nonce);
@@ -369,11 +391,17 @@ function step(sock, fn, closing = false) {
 function stop(sock, e) {
   chan = null;
   sock.dead = true; // frames already queued are not looked at
-  if (e.block) {
-    block('This is not the computer this device was paired with, so nothing was sent. If you replaced or reinstalled that computer, forget it below and scan its QR code again; otherwise someone may be impersonating it.');
+  if (e.rescan) {
+    sock.keep = true;
+    needPair('Scan the QR code again: this device had to make a new key, so the computer no longer knows it.');
+  } else if (e.block) {
+    block(pinned
+      ? 'This is not the computer this device was paired with, so nothing was sent. If you replaced that computer, forget it below and scan its QR code again; otherwise someone may be impersonating it.'
+      : "This link does not match the computer's identity; scan the QR code again.");
   } else {
     sock.refused = `secure connection failed (${e.message})`;
-    toast(`Secure connection failed: ${e.message}`, 'bad', null, 0);
+    if (failToast) failToast.remove(); // one error at a time
+    failToast = toast(`Secure connection failed: ${e.message}`, 'bad', null, 0);
   }
   sock.close();
 }
@@ -383,7 +411,7 @@ function connect() {
   if (ws || blocked) return;
   if (!session && !pairCode) return needPair('This device is not paired yet.');
   if (linkFp && pinned && linkFp !== pinned) {
-    return block('This link is for a different computer than the one this device is paired with, so it was not opened. If that is not what you expected, someone may be impersonating it. To switch computers, forget this one below.');
+    return block('This link is for a different computer than the one this device is paired with, so it was not opened. Someone may be impersonating it; to switch computers, forget this one below.');
   }
   const want = linkFp || pinned;
   if (!want) return needPair('Scan the QR code again: this page needs the fingerprint that is in the QR code link.');
@@ -411,6 +439,8 @@ function connect() {
     if (!chan) {
       if (!hs || typeof event.data !== 'string') throw new Error('unexpected frame during the handshake');
       chan = await establish(hs, event.data, want);
+      if (failToast) failToast.remove();
+      failToast = null;
       usedFp = want;
       lastHeard = Date.now();
       if (pairCode) {
@@ -440,11 +470,11 @@ function connect() {
     ready = false;
     for (const [, done] of pending) done({ kind: 'failed', message: 'connection lost' });
     pending.clear();
-    if (blocked) return;
+    if (blocked || sock.keep) return;
     if (!was && pairing) return needPair(refused ? `Pairing failed: ${refused}` : 'Pairing failed.');
     if (!was && refused && /pair/i.test(refused)) return needPair(`This device is no longer paired (${refused}).`);
-    if (pairCode) return connect(); // a code was typed while this one closed
-    if (!session) return needPair('');
+    if (pairCode && !sock.dead) return connect(); // a code was typed while this one closed
+    if (!session && !pairCode) return needPair('');
     const wait = Math.min(30, 2 ** Math.min(retries, 5));
     retries += 1;
     pill(`Reconnecting in ${wait}s`, 'wait');
