@@ -439,8 +439,11 @@ mod tests {
         assert_eq!(body("&amp; &lt;h0x&gt;"), "&amp;amp; &amp;lt;h0x&amp;gt;");
         assert_eq!(body("]]>"), "]]&gt;");
         assert_eq!(body("<<>>"), "&lt;&lt;&gt;&gt;");
-        // A NUL, a carriage return and Windows paths are not markup: kept.
-        assert_eq!(body("a\u{0}b\r\nC:\\Users\\me\\x.txt"), "a\u{0}b\r\nC:\\Users\\me\\x.txt");
+        // Control characters are dropped (the body is typed into a terminal);
+        // a carriage return, a tab and Windows paths are kept.
+        assert_eq!(body("a\u{0}b\r\nC:\\Users\\me\\x.txt"), "ab\r\nC:\\Users\\me\\x.txt");
+        assert_eq!(body("a\u{1b}[31mb\u{7}c\u{9b}d"), "a[31mbcd");
+        assert_eq!(body("a\tb"), "a\tb");
         assert_eq!(body("\u{1f980}\u{200d}<"), "\u{1f980}\u{200d}&lt;");
     }
 }
