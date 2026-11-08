@@ -825,3 +825,43 @@ fn configured_shell_uses_argv_and_is_read_live_for_new_and_recovered_terminals()
         assert_eq!(err["error"]["kind"], kind, "{err}");
     }
 }
+
+#[test]
+fn a_running_core_sees_machines_added_and_removed_while_it_runs() {
+    let rohan = Session::new();
+    let s = Session::new();
+    // A stand-in for ssh: runs the remote core's `connect` as that session.
+    let ssh = s.file(
+        "ssh-rohan.cmd",
+        &format!(
+            "@echo off\r\nset H0X_CORE_SESSION={}\r\nset XDG_STATE_HOME={}\r\nset XDG_CONFIG_HOME={}\r\n\"{BIN}\" connect\r\n",
+            rohan.name,
+            rohan.root.join("state").display(),
+            rohan.root.join("config").display()
+        ),
+    );
+    let run = |args: &[&str]| cmd(&s.name, &s.root).env("H0X_CORE_SSH", &ssh).args(args).output().unwrap();
+    let names = || -> Vec<String> {
+        let out = run(&["--json", "machine", "ls"]);
+        let list: Value = serde_json::from_slice(&out.stdout).unwrap();
+        list["machines"].as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap().to_string()).collect()
+    };
+    assert!(run(&["server", "start"]).status.success());
+    let added = run(&["--json", "machine", "add", "rohan", "--name", "vps"]);
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+    assert_eq!(names(), ["vps"], "the running core lists what it just added");
+    let again = run(&["--json", "machine", "add", "rohan", "--name", "vps"]);
+    assert!(!again.status.success(), "a second add is refused");
+    // `bridge web --via vps` reads the same registry from the state folder.
+    let state = s.root.join("state").join("h0x-core").join(&s.name);
+    let paths =
+        h0x_core::paths::Paths { socket: PathBuf::new(), holder_socket: PathBuf::new(), config: PathBuf::new(), state };
+    let found = h0x_core::bridge::web::vps::plan(&paths, "vps", "h0x.example.com", 8377);
+    assert_eq!(found.unwrap().target, "rohan");
+    let gone = run(&["--json", "machine", "rm", "vps"]);
+    assert!(gone.status.success(), "{}", String::from_utf8_lossy(&gone.stderr));
+    assert!(names().is_empty());
+    let back = run(&["--json", "machine", "add", "rohan", "--name", "vps"]);
+    assert!(back.status.success(), "{}", String::from_utf8_lossy(&back.stderr));
+    assert_eq!(names(), ["vps"]);
+}
