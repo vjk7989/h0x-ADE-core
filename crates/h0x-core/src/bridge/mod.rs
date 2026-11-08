@@ -166,6 +166,12 @@ impl Bridge {
         secret::put(self, name, value)
     }
 
+    /// True when this process kept a secret in an owner-only file because the OS
+    /// secret store was unusable.
+    pub fn secrets_in_file() -> bool {
+        secret::fell_back()
+    }
+
     /// Removes the secret `name` (even a damaged one); whether there was one.
     pub fn secret_del(&self, name: &str) -> std::io::Result<bool> {
         secret::del(self, name)

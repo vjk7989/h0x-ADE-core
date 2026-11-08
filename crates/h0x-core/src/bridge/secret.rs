@@ -35,26 +35,42 @@ pub(super) fn get(b: &Bridge, name: &str) -> io::Result<Option<Vec<u8>>> {
     check(name)?;
     let path = b.dir.join(name);
     if let Some(value) = imp::get(b, name)? {
-        if imp::STORE_IS_NOT_THE_FILE {
-            remove_file(&path)?; // the store wins; no plaintext may linger
-        }
+        remove_file(&path)?; // the store wins; no plaintext may linger
         return Ok(Some(value));
     }
-    // A plaintext file from before the store (or the Linux fallback): move it in.
+    // A plaintext file from before the store (or the no-store fallback): move it in.
     let Some(value) = read_file(&path)? else { return Ok(None) };
-    if imp::put(b, name, &value).is_ok() && imp::STORE_IS_NOT_THE_FILE {
+    if imp::put(b, name, &value).unwrap_or(false) {
         remove_file(&path)?;
     }
     Ok(Some(value))
 }
 
+/// Stores `value`; a plaintext `<name>` file is only left when the OS store is unusable.
 pub(super) fn put(b: &Bridge, name: &str, value: &[u8]) -> io::Result<()> {
     check(name)?;
-    imp::put(b, name, value)?;
-    if imp::STORE_IS_NOT_THE_FILE {
+    crate::platform::private_dir(&b.dir)?;
+    if imp::put(b, name, value)? {
         remove_file(&b.dir.join(name))?;
     }
     Ok(())
+}
+
+/// True once this process had to keep a secret in the owner-only file because
+/// the OS store was unusable. The CLI shows it; the library prints nothing.
+pub(super) fn fell_back() -> bool {
+    FELL_BACK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+static FELL_BACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The owner-only file used when the OS store is unusable (no `secret-tool`,
+/// no keyring, a locked or absent keychain, a tool that hangs).
+#[cfg(unix)]
+fn file_instead(b: &Bridge, name: &str, value: &[u8]) -> io::Result<bool> {
+    FELL_BACK.store(true, std::sync::atomic::Ordering::Relaxed);
+    b.write_private(name, value).map_err(|e| io::Error::other(e.message))?;
+    Ok(false)
 }
 
 /// Removes the secret and any plaintext file; whether anything was there,
@@ -78,20 +94,43 @@ fn account(b: &Bridge, name: &str) -> io::Result<String> {
     Ok(account)
 }
 
+/// How long a `security` / `secret-tool` call may take before it counts as unusable.
+#[cfg(unix)]
+const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Runs `program` with `input` on stdin; its stdout when it exits 0.
 /// `Ok(None)` for exit code `not_found`. Errors never carry the output.
+/// A tool that outlives [`TIMEOUT`] is killed and is an error.
 #[cfg(unix)]
 fn run(program: &str, args: &[&str], input: &[u8], not_found: i32) -> io::Result<Option<Vec<u8>>> {
-    use std::io::Write;
+    use std::io::{Read, Write};
     use std::process::{Command, Stdio};
     let mut child =
         Command::new(program).args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
     let mut stdin = child.stdin.take().expect("stdin is piped");
     let _ = stdin.write_all(input); // a tool that exits early is judged by its status
     drop(stdin);
-    let out = child.wait_with_output()?;
-    match out.status.code() {
-        Some(0) => Ok(Some(out.stdout)),
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = stdout.read_to_end(&mut out);
+        out
+    });
+    let deadline = std::time::Instant::now() + TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::other(format!("{program} did not answer")));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let stdout = reader.join().unwrap_or_default();
+    match status.code() {
+        Some(0) => Ok(Some(stdout)),
         Some(code) if code == not_found => Ok(None),
         code => Err(io::Error::other(format!("{program} failed ({code:?})"))),
     }
@@ -119,8 +158,6 @@ mod imp {
     use windows_sys::Win32::Security::Cryptography::{
         CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
     };
-
-    pub const STORE_IS_NOT_THE_FILE: bool = true;
 
     fn blob_file(name: &str) -> String {
         format!("{name}.dpapi")
@@ -177,9 +214,10 @@ mod imp {
         }
     }
 
-    pub fn put(b: &Bridge, name: &str, value: &[u8]) -> io::Result<()> {
+    pub fn put(b: &Bridge, name: &str, value: &[u8]) -> io::Result<bool> {
         let blob = crypt(value, true)?;
-        b.write_private(&blob_file(name), &blob).map_err(|e| io::Error::other(e.message))
+        b.write_private(&blob_file(name), &blob).map_err(|e| io::Error::other(e.message))?;
+        Ok(true)
     }
 
     pub fn del(b: &Bridge, name: &str) -> io::Result<bool> {
@@ -194,57 +232,109 @@ mod imp {
 mod imp {
     use super::*;
 
-    pub const STORE_IS_NOT_THE_FILE: bool = true;
+    const SECURITY: &str = "/usr/bin/security";
     const SERVICE: &str = "h0x-core bridge";
     /// `security` exit code for "item not found".
     const NOT_FOUND: i32 = 44;
+    /// `security -i` refuses long lines, so a value is stored in pieces of this many characters.
+    const PIECE: usize = 1200;
 
     /// A double-quoted argument for `security -i`.
     fn quote(s: &str) -> String {
         format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
     }
 
-    pub fn get(b: &Bridge, name: &str) -> io::Result<Option<Vec<u8>>> {
-        let acct = account(b, name)?;
-        let found =
-            run("/usr/bin/security", &["find-generic-password", "-s", SERVICE, "-a", &acct, "-w"], b"", NOT_FOUND)?;
-        found.map(|text| from_text(&text)).transpose()
+    /// Piece `i` of the entry: the first is under the plain account.
+    fn piece_account(acct: &str, i: usize) -> String {
+        if i == 0 { acct.to_string() } else { format!("{acct}#{i}") }
     }
 
-    pub fn put(b: &Bridge, name: &str, value: &[u8]) -> io::Result<()> {
-        // The command, with the secret in it, goes over stdin, never argv.
-        let cmd = format!(
-            "add-generic-password -U -s {} -a {} -w {}\n",
-            quote(SERVICE),
-            quote(&account(b, name)?),
-            quote(&to_text(value))
-        );
-        run("/usr/bin/security", &["-i"], cmd.as_bytes(), NOT_FOUND).map(|_| ())
+    fn read_piece(acct: &str, i: usize) -> io::Result<Option<String>> {
+        let args = ["find-generic-password", "-s", SERVICE, "-a", &piece_account(acct, i), "-w"];
+        Ok(run(SECURITY, &args, b"", NOT_FOUND)?.map(|out| String::from_utf8_lossy(&out).trim().to_string()))
+    }
+
+    /// The first piece reads `<pieces>;<text>`. The stored text and how many pieces; `Err` when `security` is unusable.
+    fn read_all(acct: &str) -> io::Result<Option<String>> {
+        let Some(first) = read_piece(acct, 0)? else { return Ok(None) };
+        let Some((count, mut text)) =
+            first.split_once(';').and_then(|(n, t)| Some((n.parse::<usize>().ok()?, t.to_string())))
+        else {
+            return Ok(Some(first)); // not our form: let the decoder reject it
+        };
+        for i in 1..count {
+            text += &read_piece(acct, i)?.ok_or_else(|| io::Error::other("a piece of the stored secret is missing"))?;
+        }
+        Ok(Some(text))
+    }
+
+    /// How many pieces the current entry has (0 when none or unreadable).
+    fn count(acct: &str) -> usize {
+        read_piece(acct, 0)
+            .ok()
+            .flatten()
+            .map(|first| first.split_once(';').and_then(|(n, _)| n.parse().ok()).unwrap_or(1))
+            .unwrap_or(0)
+    }
+
+    fn delete_piece(acct: &str, i: usize) -> io::Result<bool> {
+        let args = ["delete-generic-password", "-s", SERVICE, "-a", &piece_account(acct, i)];
+        Ok(run(SECURITY, &args, b"", NOT_FOUND)?.is_some())
+    }
+
+    pub fn get(b: &Bridge, name: &str) -> io::Result<Option<Vec<u8>>> {
+        match read_all(&account(b, name)?) {
+            Ok(found) => found.map(|text| from_text(text.as_bytes())).transpose(), // a bad entry is an error
+            Err(_) => Ok(None), // no usable keychain: only a file can hold it
+        }
+    }
+
+    /// Whether the value went into the keychain (else it is in the owner-only file).
+    pub fn put(b: &Bridge, name: &str, value: &[u8]) -> io::Result<bool> {
+        let acct = account(b, name)?;
+        let old = count(&acct);
+        let text = to_text(value);
+        let pieces: Vec<&[u8]> = text.as_bytes().chunks(PIECE).collect();
+        let write = || -> io::Result<()> {
+            // The last piece first, so the first (which says how many) lands last.
+            for (i, piece) in pieces.iter().enumerate().rev() {
+                let piece = String::from_utf8_lossy(piece);
+                let data = if i == 0 { format!("{};{piece}", pieces.len()) } else { piece.to_string() };
+                // The command, with the secret in it, goes over stdin, never argv.
+                let cmd = format!(
+                    "add-generic-password -U -s {} -a {} -w {}\n",
+                    quote(SERVICE),
+                    quote(&piece_account(&acct, i)),
+                    quote(&data)
+                );
+                run(SECURITY, &["-i"], cmd.as_bytes(), NOT_FOUND)?;
+            }
+            for i in pieces.len()..old {
+                delete_piece(&acct, i)?;
+            }
+            Ok(())
+        };
+        match write() {
+            Ok(()) => Ok(true),
+            Err(_) => file_instead(b, name, value),
+        }
     }
 
     pub fn del(b: &Bridge, name: &str) -> io::Result<bool> {
         let acct = account(b, name)?;
-        let args = ["delete-generic-password", "-s", SERVICE, "-a", &acct];
-        Ok(run("/usr/bin/security", &args, b"", NOT_FOUND)?.is_some())
+        let mut existed = false;
+        for i in 0..count(&acct).max(1) {
+            existed |= delete_piece(&acct, i).unwrap_or(false); // no keychain: nothing there to delete
+        }
+        Ok(existed)
     }
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
 mod imp {
     use super::*;
-    use std::sync::Once;
-
-    /// The fallback is the file itself.
-    pub const STORE_IS_NOT_THE_FILE: bool = false;
     /// `secret-tool lookup` and `clear` exit 1 for no match.
     const NOT_FOUND: i32 = 1;
-
-    fn warn_once() {
-        static ONCE: Once = Once::new();
-        ONCE.call_once(|| {
-            eprintln!("h0x-core: no usable secret-tool/keyring; bridge secrets stay in an owner-only file instead");
-        });
-    }
 
     /// The raw stored text; `Err` when there is no tool or keyring to ask.
     fn lookup(acct: &str) -> io::Result<Option<Vec<u8>>> {
@@ -255,22 +345,17 @@ mod imp {
     pub fn get(b: &Bridge, name: &str) -> io::Result<Option<Vec<u8>>> {
         match lookup(&account(b, name)?) {
             Ok(found) => found.map(|text| from_text(&text)).transpose(), // a bad entry is an error
-            Err(_) => {
-                warn_once();
-                Ok(None)
-            }
+            Err(_) => Ok(None),                                          // no tool or keyring: only a file can hold it
         }
     }
 
-    pub fn put(b: &Bridge, name: &str, value: &[u8]) -> io::Result<()> {
+    /// Whether the value went into the keyring (else it is in the owner-only file).
+    pub fn put(b: &Bridge, name: &str, value: &[u8]) -> io::Result<bool> {
         let acct = account(b, name)?;
         let args = ["store", "--label=h0x-core bridge", "service", "h0x-core bridge", "account", &acct];
         match run("secret-tool", &args, to_text(value).as_bytes(), i32::MAX) {
-            Ok(_) => Ok(()),
-            Err(_) => {
-                warn_once();
-                b.write_private(name, value).map_err(|e| io::Error::other(e.message))
-            }
+            Ok(_) => Ok(true),
+            Err(_) => file_instead(b, name, value),
         }
     }
 

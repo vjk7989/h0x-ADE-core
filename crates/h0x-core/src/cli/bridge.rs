@@ -238,7 +238,9 @@ pub(super) fn bridge(paths: &Paths, action: BridgeCmd, json: bool) -> Result<Out
         }
         BridgeCmd::Telegram { action: TelegramCmd::Token { clear: false, file } } => {
             bridge.set_telegram_token(&read_token(file.as_deref())?)?;
-            Out { json: json!({"telegram_token": "set"}), human: "telegram token stored".into() }
+            let note =
+                if Bridge::secrets_in_file() { " (no usable OS secret store: kept in an owner-only file)" } else { "" };
+            Out { json: json!({"telegram_token": "set"}), human: format!("telegram token stored{note}") }
         }
         BridgeCmd::Web { lan, port, via, public_host, remote_port, tunnel, how } => {
             let via = match (via, public_host) {

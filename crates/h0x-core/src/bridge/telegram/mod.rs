@@ -531,6 +531,9 @@ pub fn run(paths: &Paths) -> Result<(), RpcError> {
     let token = bridge
         .telegram_token()?
         .ok_or_else(|| RpcError::new("bridge", "no bot token", "store one first: h0x-core bridge telegram token"))?;
+    if Bridge::secrets_in_file() {
+        eprintln!("bridge: no usable OS secret store; the bot token is in an owner-only file");
+    }
     let api = Api::new(token)?;
     // Who we are, so commands for other bots in a chat are left alone.
     let mut failures = 0;
