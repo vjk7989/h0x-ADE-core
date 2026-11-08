@@ -6,17 +6,19 @@
 # beside it), added to your PATH. An h0x-core that is already there is
 # swapped the planned way (h0x-core update --from): running terminals keep
 # running. The download must carry the release key's signature (its .minisig).
-# running. No admin needed. H0X_CORE_VERSION=0.2.0 picks a version;
+# No admin needed. H0X_CORE_VERSION=0.2.0 picks a version;
 # H0X_CORE_RELEASES_URL points elsewhere (tests); H0X_CORE_INSTALL_DIR
 # installs elsewhere.
 #
-# `-File install.ps1 <release zip> [session]` installs from a zip already
-# here, checked by whoever put it here, and removes both files after
-# (`h0x-core machine add` from another machine does that).
+# `-File install.ps1 <release zip> [session] [-Unsigned]` installs from a zip
+# already here, removes both files after (`h0x-core machine add` from another
+# machine does that), and needs `<zip>.minisig` beside it unless -Unsigned
+# (a zip you built yourself, or the unsigned test site).
 
 # Its own scope: under `irm | iex` it would otherwise set the caller's variables.
 & {
-$zip, $session = $args
+$unsigned = $args -contains "-Unsigned"
+$zip, $session = @($args | Where-Object { $_ -ne "-Unsigned" })
 if ($session) { $env:H0X_CORE_SESSION = $session }
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
@@ -55,6 +57,8 @@ try {
     if (Test-Path "$zip.minisig") {
       Copy-Item "$zip.minisig" "$archive.minisig"
       $signed = $true
+    } elseif (-not $unsigned) {
+      Fail "no signature for ${asset}: ${zip}.minisig is missing (-Unsigned installs a zip you trust)"
     }
   } else {
     $manifest = if ($env:H0X_CORE_VERSION) { "$releases/download/v$($env:H0X_CORE_VERSION)/manifest.json" } else { "$releases/latest/download/latest.json" }

@@ -11,7 +11,7 @@ New-Item -ItemType Directory -Force $tmp | Out-Null
 Copy-Item distribution\install.ps1 $tmp
 & "$env:SystemRoot\System32\tar.exe" -a -cf "$tmp\h0x-core.zip" -C target\release h0x-core.exe conpty
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
-powershell -NoProfile -ExecutionPolicy Bypass -File "$tmp\install.ps1" "$tmp\h0x-core.zip"
+powershell -NoProfile -ExecutionPolicy Bypass -File "$tmp\install.ps1" "$tmp\h0x-core.zip" -Unsigned
 $code = $LASTEXITCODE
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 exit $code

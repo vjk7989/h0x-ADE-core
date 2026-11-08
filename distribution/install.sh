@@ -63,8 +63,8 @@ if [ -z "${H0X_CORE_RELEASES_URL:-}" ]; then
 fi
 # Fetched exactly as the list gives it (a mirror's signed URL included),
 # under the release's own file name: its signature is bound to that name.
-asset=${url##*/}
-asset=${asset%%[?#]*}
+asset=${url%%[?#]*}
+asset=${asset##*/}
 archive="$tmp/$asset"
 curl -fsSL --proto "$proto" --proto-redir "$proto" "$url" -o "$archive" || fail "download failed: $url"
 [ "$(sha256 "$archive")" = "$want" ] || fail "the download is damaged (checksum mismatch); try again"

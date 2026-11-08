@@ -583,11 +583,12 @@ fn install_windows(paths: &crate::paths::Paths, target: &str, session: Option<&s
     }
     // No quotes or $ in it: cmd and PowerShell read it the same.
     let session = session.map(|s| format!(" {s}")).unwrap_or_default();
+    let unsigned = if sig.is_none() { " -Unsigned" } else { "" };
     run_there(
         paths,
         to,
         &format!(
-            "powershell -NoProfile -ExecutionPolicy Bypass -File h0x-core-install.ps1 h0x-core-windows-x86_64.zip{session}"
+            "powershell -NoProfile -ExecutionPolicy Bypass -File h0x-core-install.ps1 h0x-core-windows-x86_64.zip{session}{unsigned}"
         ),
         b"",
     )?;

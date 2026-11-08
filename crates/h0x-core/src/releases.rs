@@ -247,7 +247,8 @@ fn unpack(archive: &Path, scratch: &Path) -> Result<PathBuf, RpcError> {
     let ok =
         Command::new(tar_program()).arg("-xf").arg(archive).arg("-C").arg(scratch).status().is_ok_and(|s| s.success());
     let bin = scratch.join(exe);
-    if ok && bin.is_file() {
+    // A regular file: not a link to somewhere else, not a folder.
+    if ok && std::fs::symlink_metadata(&bin).is_ok_and(|m| m.file_type().is_file()) {
         Ok(bin)
     } else {
         Err(RpcError::new("refused", format!("{} holds no h0x-core binary", archive.display()), ""))
@@ -619,6 +620,36 @@ ZJhj3MtbsDPyt278bwB0BcVRB5ZoKqA6VCCZ5s51lq49BobYTBUuzlJqofyqGhaBwWB6iLyCd1cVXXQh
         let _ = super::unpack(&archive, &into);
         assert!(!scratch.0.join("escaped").exists(), "a ../ entry stays inside");
         assert!(!scratch.0.join("escaped-too").exists(), "a sub/../../ entry stays inside");
+    }
+
+    #[test]
+    fn the_unpacked_binary_must_be_a_regular_file() {
+        let scratch = super::Scratch::new().unwrap();
+        let archive = scratch.0.join(NAME);
+        // A folder named h0x-core.
+        std::fs::write(&archive, ustar(&[("h0x-core/inner", b"x")])).unwrap();
+        let into = scratch.0.join("dir");
+        std::fs::create_dir(&into).unwrap();
+        assert_eq!(super::unpack(&archive, &into).unwrap_err().kind, "refused");
+        // An archive without it.
+        std::fs::write(&archive, ustar(&[("other", b"x")])).unwrap();
+        let empty = scratch.0.join("none");
+        std::fs::create_dir(&empty).unwrap();
+        assert_eq!(super::unpack(&archive, &empty).unwrap_err().kind, "refused");
+        // A regular file is taken.
+        std::fs::write(&archive, ustar(&[("h0x-core", b"#!")])).unwrap();
+        let good = scratch.0.join("good");
+        std::fs::create_dir(&good).unwrap();
+        assert_eq!(super::unpack(&archive, &good).unwrap(), good.join("h0x-core"));
+        // A link already in the folder (the archive brings no h0x-core of its own).
+        #[cfg(unix)]
+        {
+            std::fs::write(&archive, ustar(&[("other", b"x")])).unwrap();
+            let linked = scratch.0.join("linked");
+            std::fs::create_dir(&linked).unwrap();
+            std::os::unix::fs::symlink("/bin/sh", linked.join("h0x-core")).unwrap();
+            assert_eq!(super::unpack(&archive, &linked).unwrap_err().kind, "refused");
+        }
     }
 
     #[test]
