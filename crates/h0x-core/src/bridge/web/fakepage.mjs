@@ -136,7 +136,7 @@ class El {
 }
 
 // `href` is where the page was served from; `stored` a session already kept;
-// `pinned` the fingerprint a paired device kept (null: never paired);
+// `pinned` the fingerprint a paired device kept (null: never paired; '' is kept as an empty value);
 // `storage: 'throws'` is a private-mode localStorage; `subtle: false` a page
 // without crypto.subtle (plain http), which fetches noble.js; `idb` shares
 // the device key store between pages; `serverKey` is the server's identity.
@@ -168,7 +168,7 @@ export function load({
   const keys = marked('key');
   const cmds = marked('cmd');
 
-  const saved = new Map([...(stored ? [['h0x-session', stored]] : []), ...(pinned ? [['h0x-fp', pinned]] : [])]);
+  const saved = new Map([...(stored ? [['h0x-session', stored]] : []), ...(pinned != null ? [['h0x-fp', pinned]] : [])]);
   const nope = () => { throw new Error('SecurityError'); };
   const localStorage = storage === 'throws'
     ? { getItem: nope, setItem: nope, removeItem: nope }

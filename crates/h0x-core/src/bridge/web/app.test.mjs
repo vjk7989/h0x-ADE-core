@@ -633,3 +633,228 @@ test('without crypto.subtle the page fetches noble.js once and works the same', 
   assert.deepEqual(w.scripts, ['/noble.js'], 'not fetched again');
   assert.deepEqual(w.ws().sent, [{ name: 'auth', data: { session: 'S9' } }]);
 });
+
+test('the link fingerprint is read like the pair code: decoded, trimmed, first one wins, otherwise exact', async () => {
+  const pct = `%${V.fp.charCodeAt(0).toString(16)}${V.fp.slice(1)}`;
+  const base = 'http://192.168.1.20:8377/';
+  for (const hash of [
+    `#pair=ABCD2345&fp=%20${V.fp}%20`,
+    `#pair=ABCD2345&fp=${pct}`,
+    `#fp=${V.fp}&x=1&pair=ABCD2345`,
+    `#pair=ABCD2345&fp=${V.fp}&fp=${'A'.repeat(43)}`,
+  ]) {
+    const w = load({ href: base + hash, pinned: null });
+    await w.ws().open();
+    assert.equal(w.ws().sent[0]?.name, 'pair', hash);
+    await w.ws().msg('paired', { session: 'S9' });
+    assert.equal(w.saved.get('h0x-fp'), V.fp, `${hash}: the decoded fingerprint is pinned`);
+  }
+  for (const fp of [
+    V.fp.toUpperCase(),
+    V.fp.toLowerCase(),
+    `${V.fp}=`,
+    `${V.fp}A`,
+    V.fp.slice(1),
+    `${V.fp}#junk`,
+    '%3Cscript%3E',
+    'A'.repeat(100000),
+  ]) {
+    const w = load({ href: `${base}#pair=ABCD2345&fp=${fp}`, pinned: null });
+    const sock = w.ws();
+    await sock.open();
+    const label = fp.slice(0, 50);
+    assert.equal(sock.readyState, 3, label);
+    assert.deepEqual(sock.sent, [], `${label}: the pair code never went out`);
+    assert.deepEqual(sock.leaks, [], label);
+    assert.equal(w.saved.has('h0x-fp'), false, `${label}: nothing pinned`);
+    assert.equal(w.timers.size, 0, `${label}: no retry`);
+    assert.equal(w.$('forget').hidden, false, label);
+    assert.doesNotMatch(w.$('pair-why').textContent, /script/, label);
+  }
+});
+
+test('an empty, corrupted or unreadable pinned fingerprint never connects unchecked', async () => {
+  const empty = load({ stored: 'S1', pinned: '' });
+  assert.equal(empty.sockets.length, 0, 'an empty pin is no pin');
+  assert.match(empty.$('pair-why').textContent, /^Scan the QR code again/);
+
+  const linked = load({ href: `http://192.168.1.20:8377/#pair=ABCD2345&fp=${V.fp}`, pinned: '' });
+  await linked.ws().open();
+  assert.equal(linked.ws().sent[0].name, 'pair', 'an empty pin does not block a link');
+
+  const garbage = load({ stored: 'S1', pinned: 'not a fingerprint' });
+  await garbage.ws().open();
+  assert.equal(garbage.ws().readyState, 3);
+  assert.deepEqual(garbage.ws().sent, [], 'the session token is not sent to an unchecked computer');
+  assert.match(garbage.$('pair-why').textContent, /not the computer this device was paired with/);
+
+  const relinked = load({ href: `http://192.168.1.20:8377/#pair=ABCD2345&fp=${V.fp}`, pinned: `${V.fp} ` });
+  assert.equal(relinked.sockets.length, 0, 'a pin with stray whitespace is still a different computer');
+  assert.match(relinked.$('pair-why').textContent, /different computer/);
+
+  const privateMode = load({ href: 'http://192.168.1.20:8377/#pair=ABCD2345', storage: 'throws', stored: 'S1' });
+  assert.equal(privateMode.sockets.length, 0, 'a throwing localStorage gives no pin to fall back on');
+  assert.match(privateMode.$('pair-why').textContent, /^Scan the QR code again/);
+});
+
+test('the server hello arriving twice closes the socket before anything is sent', async () => {
+  for (const opts of [{}, NOBLE_ONLY]) {
+    const w = load({ stored: 'S1', ...opts });
+    const sock = w.ws();
+    const emit = sock.emit.bind(sock);
+    sock.emit = (type, event) => {
+      emit(type, event);
+      if (type === 'message' && typeof event.data === 'string') emit(type, event);
+    };
+    await sock.open();
+    assert.equal(sock.readyState, 3);
+    assert.deepEqual(sock.sent, [], 'the auth queued after the first hello is dropped');
+    assert.deepEqual(sock.leaks, []);
+    assert.deepEqual(w.toasts(), ['Secure connection failed: unencrypted frame']);
+  }
+});
+
+test('a socket closed mid-handshake reconnects with a fresh handshake and ignores the old socket', async () => {
+  const w = load({ stored: 'S1' });
+  const first = w.ws();
+  const emit = first.emit.bind(first);
+  let late = null;
+  first.emit = (type, event) => (type === 'message' && typeof event.data === 'string' ? (late = event) : emit(type, event));
+  await first.open();
+  assert.equal(first.hellos.length, 1);
+  assert.deepEqual(first.sent, []);
+  await first.close();
+  assert.deepEqual(w.toasts(), [], 'a dropped connection is not a security failure');
+  assert.equal(w.reconnect(), 1000);
+
+  const second = w.ws();
+  await second.open();
+  const [a, b] = [first, second].map((s) => JSON.parse(s.hellos[0]));
+  assert.equal(b.d, a.d, 'the same device key');
+  assert.notEqual(b.e, a.e, 'a new ephemeral key');
+  assert.notEqual(b.n, a.n, 'a new nonce');
+  assert.deepEqual(second.sent, [{ name: 'auth', data: { session: 'S1' } }], 'the new lane starts at counter 0');
+
+  emit('message', late); // the old socket's hello, too late
+  await w.settle();
+  assert.equal(second.readyState, 1);
+  await second.msg('hello', null);
+  w.run("send('ping', null)");
+  await w.settle();
+  assert.equal(second.sent.at(-1).name, 'ping');
+
+  await second.close();
+  w.reconnect();
+  await w.ws().open();
+  assert.deepEqual(w.ws().sent, [{ name: 'auth', data: { session: 'S1' } }], 'counters reset after a used socket too');
+});
+
+test('an IndexedDB that cannot open or store the device key fails the connection, never in the clear', async () => {
+  const later = (fn) => Promise.resolve().then(fn);
+  const cannotOpen = { open() { const req = {}; later(() => req.onerror()); return req; } };
+  const cannotStore = {
+    open() {
+      const req = {};
+      later(() => {
+        req.result = {
+          createObjectStore() {},
+          close() {},
+          transaction() {
+            const tx = {};
+            tx.objectStore = () => ({
+              get: () => { later(() => tx.oncomplete()); return { result: undefined }; },
+              put: () => { later(() => tx.onabort()); return {}; },
+            });
+            return tx;
+          },
+        };
+        req.onsuccess();
+      });
+      return req;
+    },
+  };
+  for (const [name, idb, why] of [
+    ['missing', undefined, 'this browser cannot keep a device key'],
+    ['open error', cannotOpen, 'this browser cannot keep a device key'],
+    ['put aborted', cannotStore, 'could not store the device key'],
+  ]) {
+    const w = load({ stored: 'S1' });
+    w.run('globalThis').indexedDB = idb;
+    const sock = w.ws();
+    await sock.open();
+    assert.equal(sock.readyState, 3, name);
+    assert.deepEqual([sock.hellos, sock.sent, sock.leaks], [[], [], []], `${name}: nothing went out`);
+    assert.deepEqual(w.toasts(), [`Secure connection failed: ${why}`], name);
+    assert.equal(w.$('forget').hidden, true, `${name}: not an impostor`);
+    assert.equal(w.reconnect(), 1000, `${name}: retried later`);
+  }
+});
+
+test('two tabs making the device key at once both connect and then share the one kept key', async () => {
+  for (const opts of [{}, NOBLE_ONLY]) {
+    const idb = new Map();
+    const tabs = [load({ stored: 'S1', idb, ...opts }), load({ stored: 'S1', idb, ...opts })];
+    await Promise.all(tabs.map((w) => w.ws().open()));
+    assert.equal(idb.size, 1);
+    const kept = Buffer.from(Array.from(idb.get('device').pub)).toString('base64url');
+    const d = (w) => JSON.parse(w.ws().hellos[0]).d;
+    assert.ok(tabs.some((w) => d(w) === kept), 'the kept key is one of the two');
+    for (const w of tabs) assert.deepEqual(w.ws().sent, [{ name: 'auth', data: { session: 'S1' } }]);
+    for (const w of tabs) {
+      await w.ws().close();
+      w.reconnect();
+      await w.ws().open();
+      assert.equal(d(w), kept, 'the next handshake uses the kept key');
+    }
+  }
+});
+
+test('noble.js that fails to load or loads empty is a clear error, no socket traffic, retried later', async () => {
+  for (const [name, append, why] of [
+    ['404', (w) => (el) => { w.scripts.push(el.src); el.fire('error'); }, 'could not load the crypto script'],
+    ['empty', (w) => (el) => { w.scripts.push(el.src); el.fire('load'); }, 'crypto script is empty'],
+  ]) {
+    const w = load({ stored: 'S1', subtle: false });
+    const head = w.run('document.head');
+    const good = head.append;
+    head.append = append(w);
+    const sock = w.ws();
+    await sock.open();
+    assert.equal(sock.readyState, 3, name);
+    assert.deepEqual([sock.hellos, sock.sent, sock.leaks], [[], [], []], `${name}: nothing went out`);
+    assert.deepEqual(w.toasts(), [`Secure connection failed: ${why}`], name);
+    head.append = good;
+    assert.equal(w.reconnect(), 1000, name);
+    await w.ws().open();
+    assert.deepEqual(w.scripts, ['/noble.js', '/noble.js'], `${name}: fetched again after a failure`);
+    assert.deepEqual(w.ws().sent, [{ name: 'auth', data: { session: 'S1' } }], name);
+  }
+});
+
+test('a 1 MiB message goes both ways sealed and the lanes stay in step', async () => {
+  for (const opts of [{}, NOBLE_ONLY]) {
+    const w = await connected(opts);
+    const sock = w.ws();
+    const big = 'x'.repeat(1 << 20);
+    w.run(`send('echo', { text: 'x'.repeat(${1 << 20}) })`);
+    await w.settle();
+    assert.equal(sock.sent.at(-1).data.text, big);
+    await sock.msg('error', { message: big });
+    assert.equal(w.toasts().at(-1), big);
+    w.run("send('ping', null)");
+    await w.settle();
+    assert.equal(sock.sent.at(-1).name, 'ping');
+    assert.equal(sock.readyState, 1);
+    assert.deepEqual(sock.leaks, []);
+  }
+});
+
+test('a handshake failure while pairing from a link waits before it reconnects', async () => {
+  const w = load({ href: LINK, pinned: null, subtle: false });
+  w.run('document.head').append = (el) => { w.scripts.push(el.src); el.fire('error'); };
+  const first = w.ws();
+  await first.open();
+  assert.equal(first.readyState, 3);
+  assert.deepEqual(first.sent, []);
+  assert.equal(w.sockets.length, 1, 'no new socket at once: a lasting failure would reconnect in a loop with no delay');
+});
