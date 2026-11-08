@@ -2,11 +2,14 @@
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-11-08
+
 ### New
 
-- Remote control (bridge) groundwork: `bridge pair|unpair|ls|lock|unlock|log` pair chat accounts with one-time codes. Paired accounts can list, read, send, press keys, approve or deny, interrupt, run and kill. Destructive commands need a single-use confirmation, and every command is rate limited, redacted and audited. See docs/bridge.md.
-- Telegram bot for the bridge: `bridge telegram token` stores the bot token (0600, never shown), and `bridge run` long-polls Telegram through the system curl, outbound and https only. It sends notices with Approve, Deny, Show and Interrupt buttons, answers `/agents`, `/read`, `/send`, `/keys`, `/approve`, `/deny`, `/interrupt`, `/run`, `/kill` and `/lock` from paired accounts in private chats, and asks for a confirmation tap before destructive commands.
-- Web panel for the bridge: `bridge web [--lan] [--port N]` serves a page and a WebSocket API, on 127.0.0.1 or on the private LAN address. Pairing uses a 5-minute one-time link printed with a QR code; each device gets a session token (stored hashed and revocable) and is listed in `bridge ls`. Host and Origin are checked, there is no CORS, requests and messages have size and time limits, and every answer carries a strict CSP.
+- Remote control (`h0x-core bridge`):
+  - Pair your Telegram account and control agents from chat: alerts with Approve, Deny, Show and Interrupt buttons, reply to type into a terminal, and the commands /agents, /read, /send, /keys, /run, /kill and /lock.
+  - A web panel for your phone (`bridge web`): QR pairing on the same Wi-Fi (`--lan`), from anywhere through a Cloudflare tunnel (`--tunnel`), or through your own VPS over SSH (`--via`).
+  - Safety: one-time pairing codes, a confirm step for risky actions, an audit log, rate limits, secrets hidden in anything sent out, and `bridge lock` as a kill switch.
 
 ## [0.1.5] - 2026-11-05
 
