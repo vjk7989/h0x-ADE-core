@@ -326,7 +326,7 @@ Options:
       --via <MACHINE>              Reach it through your VPS: the name of an ssh machine (`machine add`). Opens a reverse port on the server's loopback; your HTTPS proxy there serves it
       --public-host <PUBLIC_HOST>  The DNS name your HTTPS proxy serves, for the pairing link
       --remote-port <REMOTE_PORT>  The port on the server's loopback [default: 8377]
-      --tunnel                     Also reach it from anywhere through a Cloudflare tunnel (https, not end-to-end)
+      --tunnel                     Also reach it from anywhere through a Cloudflare tunnel (end-to-end encrypted; Cloudflare delivers the page)
       --for <MINUTES>              Stop the tunnel after this many minutes (1 to 1440) [default: 60]
       --yes                        Download the pinned cloudflared without asking, if none is on PATH
   -h, --help                       Print help

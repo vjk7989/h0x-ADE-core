@@ -10,6 +10,7 @@
 mod command;
 mod notice;
 mod redact;
+mod secret;
 pub mod telegram;
 pub mod web;
 
@@ -68,6 +69,10 @@ struct State {
     /// Web devices: their user id and the SHA-256 of their session token.
     #[serde(default)]
     sessions: BTreeMap<String, String>,
+    /// Web devices: their user id and the device public key (base64url) they paired with;
+    /// a session is only good from that key (ADR-064). Older sessions have none and are refused.
+    #[serde(default)]
+    devices: BTreeMap<String, String>,
 }
 
 /// The one live pairing code.
@@ -155,6 +160,27 @@ impl Bridge {
         write().map_err(failed)
     }
 
+    /// The secret `name` from the OS secret store (a legacy plaintext file is moved in).
+    pub fn secret_get(&self, name: &str) -> std::io::Result<Option<Vec<u8>>> {
+        secret::get(self, name)
+    }
+
+    /// Stores (replaces) the secret `name` in the OS secret store.
+    pub fn secret_put(&self, name: &str, value: &[u8]) -> std::io::Result<()> {
+        secret::put(self, name, value)
+    }
+
+    /// True when this process kept a secret in an owner-only file because the OS
+    /// secret store was unusable.
+    pub fn secrets_in_file() -> bool {
+        secret::fell_back()
+    }
+
+    /// Removes the secret `name` (even a damaged one); whether there was one.
+    pub fn secret_del(&self, name: &str) -> std::io::Result<bool> {
+        secret::del(self, name)
+    }
+
     /// A new single-use code for `transport`, valid 10 minutes; replaces any earlier one.
     pub fn pair(&self, transport: &str, now: u64) -> Result<(String, u64), RpcError> {
         if !TRANSPORTS.contains(&transport) {
@@ -208,6 +234,7 @@ impl Bridge {
         // An unpaired device's session goes with it.
         let ids = &st.identities;
         st.sessions.retain(|user, _| ids.iter().any(|i| i.transport == "web" && &i.user_id == user));
+        st.devices.retain(|user, _| ids.iter().any(|i| i.transport == "web" && &i.user_id == user));
         let removed = before - st.identities.len();
         if let (Some(id), 0) = (id, removed) {
             return Err(RpcError::new("not_found", format!("no paired account {id}"), "see `h0x-core bridge ls`"));

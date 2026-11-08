@@ -338,7 +338,7 @@ pub fn download_question(dir: &Path) -> String {
 fn announce(status: &Value) -> String {
     let mut out = format!(
         "tunnel: {} for {} minutes (`h0x-core bridge tunnel off` stops it)\n\
-         warning: traffic passes through Cloudflare; it is https to Cloudflare, not end-to-end",
+         warning: messages are end-to-end encrypted, so Cloudflare sees only ciphertext, but it delivers the page and could alter it",
         status["url"].as_str().unwrap_or_default(),
         status["minutes"],
     );
@@ -393,7 +393,12 @@ fn ready_once(ready: &mut Option<(String, Option<String>)>, status: Option<&Valu
 /// A started tunnel: the pairing link through it, the answer for `bridge
 /// tunnel on`, and the panel's own printout.
 fn opened(bridge: &Bridge, host: &str, minutes: u64, until_ms: u64, now: u64, json: bool) -> Value {
-    let pair = bridge.pair("web", now).ok().map(|(code, _)| format!("https://{host}/#pair={code}"));
+    let key = super::server_key(bridge);
+    let pair = bridge
+        .pair("web", now)
+        .ok()
+        .zip(key.ok())
+        .map(|((code, _), key)| super::pair_link(&format!("https://{host}"), &code, &key));
     let status = json!({"url": format!("https://{host}/"), "minutes": minutes, "until_ms": until_ms, "pair": pair});
     let _ = bridge.write_private(STATUS, status.to_string().as_bytes());
     say(json, &announce(&status));
@@ -774,6 +779,7 @@ mod tests {
         bridge.write_private(REQUEST, b"garbage").unwrap();
         assert_eq!(take(&bridge, now), None, "unreadable: dropped");
         assert!(!bridge.dir.join(REQUEST).exists());
+        let _ = bridge.secret_del("web.key");
         let _ = std::fs::remove_dir_all(&bridge.dir);
     }
 
@@ -794,6 +800,7 @@ mod tests {
             assert_eq!(take(&bridge, now).is_some(), taken, "made at {at}, now {now}");
             assert!(!bridge.dir.join(REQUEST).exists(), "gone either way");
         }
+        let _ = bridge.secret_del("web.key");
         let _ = std::fs::remove_dir_all(&bridge.dir);
     }
 
@@ -814,6 +821,7 @@ mod tests {
         assert!(!bridge.dir.join(REQUEST).exists(), "deleted at start");
         assert!(!bridge.dir.join(STATUS).exists(), "and not answered: nobody asked this panel");
         drop(runtime);
+        let _ = bridge.secret_del("web.key");
         let _ = std::fs::remove_dir_all(&bridge.dir);
     }
 
@@ -823,6 +831,7 @@ mod tests {
         let err = ask(&bridge, None).unwrap_err();
         assert!(err.message.contains("no web panel"), "{}", err.message);
         assert!(!bridge.dir.join(REQUEST).exists(), "the request is not left behind");
+        let _ = bridge.secret_del("web.key");
         let _ = std::fs::remove_dir_all(&bridge.dir);
     }
 
@@ -832,9 +841,9 @@ mod tests {
         let status = opened(&bridge, "abc.trycloudflare.com", 60, 42, 1_000, false);
         assert_eq!(status["url"], "https://abc.trycloudflare.com/");
         let link = status["pair"].as_str().unwrap();
-        assert!(link.starts_with("https://abc.trycloudflare.com/#pair="), "{link}");
+        assert!(link.starts_with("https://abc.trycloudflare.com/#pair=") && link.contains("&fp="), "{link}");
         let text = announce(&status);
-        assert!(text.contains("not end-to-end") && text.contains(link) && text.contains("60 minutes"), "{text}");
+        assert!(text.contains("end-to-end encrypted") && text.contains(link) && text.contains("60 minutes"), "{text}");
         let saved: Value = serde_json::from_slice(&std::fs::read(bridge.dir.join(STATUS)).unwrap()).unwrap();
         assert_eq!(saved, status, "what `bridge tunnel on` reads");
 
@@ -842,6 +851,23 @@ mod tests {
         let locked = opened(&bridge, "abc.trycloudflare.com", 60, 42, 1_000, false);
         assert_eq!(locked["pair"], Value::Null, "no pairing while locked");
         assert!(!announce(&locked).contains("#pair="));
+        let _ = bridge.secret_del("web.key");
+        let _ = std::fs::remove_dir_all(&bridge.dir);
+    }
+
+    #[test]
+    fn the_tunnel_link_pins_the_same_fingerprint_as_the_lan_link() {
+        let bridge = crate::bridge::scratch();
+        let status = opened(&bridge, "abc.trycloudflare.com", 60, 42, 1_000, false);
+        let link = status["pair"].as_str().unwrap();
+        let key = super::super::server_key(&bridge).unwrap();
+        assert!(link.ends_with(&format!("&fp={}", key.fp())), "{link}");
+        let lan = super::super::pair_link("http://192.168.1.20:8377", "ABCD2345", &key);
+        assert_eq!(
+            lan.rsplit_once("&fp="),
+            link.rsplit_once("&fp=").map(|(_, fp)| ("http://192.168.1.20:8377/#pair=ABCD2345", fp))
+        );
+        let _ = bridge.secret_del("web.key");
         let _ = std::fs::remove_dir_all(&bridge.dir);
     }
 
@@ -1052,6 +1078,7 @@ mod tests {
         assert!(!bridge.dir.join(REQUEST).exists(), "corrupt: dropped");
         assert!(!bridge.dir.join(STATUS).exists(), "and nothing started or answered");
         drop(runtime);
+        let _ = bridge.secret_del("web.key");
         let _ = std::fs::remove_dir_all(&bridge.dir);
     }
 
@@ -1078,6 +1105,7 @@ mod tests {
         assert_eq!(human, "tunnel off");
         assert!(!bridge.dir.join(REQUEST).exists());
         running.join().unwrap();
+        let _ = bridge.secret_del("web.key");
         let _ = std::fs::remove_dir_all(&bridge.dir);
     }
 

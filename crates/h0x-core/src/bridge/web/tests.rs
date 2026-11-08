@@ -36,8 +36,14 @@ fn fixture(hosts: Vec<String>) -> Fixture {
     let bridge = crate::bridge::scratch();
     let dir = bridge.dir.clone();
     let (notices, _) = tokio::sync::broadcast::channel(16);
-    let web =
-        Web { bridge: Mutex::new(bridge), core: Box::new(fake_core), hosts, notices, strikes: Default::default() };
+    let web = Web {
+        bridge: Mutex::new(bridge),
+        core: Box::new(fake_core),
+        hosts,
+        key: e2e::ServerKey::generate(),
+        notices,
+        strikes: Default::default(),
+    };
     Fixture { web: Arc::new(web), dir }
 }
 
@@ -52,12 +58,28 @@ impl Fixture {
 
     /// A paired connection and its session token.
     fn paired(&self) -> (Conn, String) {
-        let mut conn = Conn::default();
+        let mut conn = phone();
         let code = self.code(T);
         let step = self.say(&mut conn, "pair", json!({"token": code, "label": "phone"}), T);
         let session = step.out[0]["data"]["session"].as_str().unwrap().to_string();
         (conn, session)
     }
+}
+
+/// Two devices' long-term keys (32-byte secrets).
+const PHONE: [u8; 32] = [7; 32];
+const STRANGER: [u8; 32] = [9; 32];
+
+/// A connection that came through the handshake with the phone's device key.
+fn phone() -> Conn {
+    with_device(&PHONE)
+}
+
+/// A connection whose hello carried the public half of `secret`.
+fn with_device(secret: &[u8; 32]) -> Conn {
+    let pending = e2e::client_start(secret).unwrap();
+    let key = e2e::ServerKey::generate();
+    Conn { device_key: Some(e2e::server_accept(pending.hello(), &key).unwrap().device), ..Conn::default() }
 }
 
 fn names(step: &Step) -> Vec<&str> {
@@ -98,13 +120,13 @@ fn the_pairing_link_draws_as_a_square_qr_code() {
 #[test]
 fn a_one_time_token_pairs_one_device_once() {
     let f = fixture(Vec::new());
-    let mut conn = Conn::default();
+    let mut conn = phone();
     let refused = f.say(&mut conn, "pair", json!({"token": "WRONGONE"}), T);
     assert_eq!((names(&refused), refused.close), (vec!["error"], true));
     assert_eq!(refused.out[0]["data"]["message"], "wrong or expired code");
 
     let code = f.code(T);
-    let late = f.say(&mut Conn::default(), "pair", json!({"token": code}), T + 5 * 60_000);
+    let late = f.say(&mut phone(), "pair", json!({"token": code}), T + 5 * 60_000);
     assert!(late.close, "5 minutes for a web link");
     let code = f.code(T);
     let step = f.say(&mut conn, "pair", json!({"token": code.to_lowercase(), "label": "  Vijay's phone  "}), T);
@@ -113,7 +135,7 @@ fn a_one_time_token_pairs_one_device_once() {
     assert_eq!(session.len(), 64);
     assert_eq!(step.out[0]["data"]["device"], "Vijay's phone");
     assert_eq!(step.out[1]["data"]["lines"], json!(["t2 · claude · /w · blocked"]));
-    assert!(f.say(&mut Conn::default(), "pair", json!({"token": code}), T).close, "single use");
+    assert!(f.say(&mut phone(), "pair", json!({"token": code}), T).close, "single use");
 
     let bridge = f.web.bridge.lock().unwrap();
     let me = bridge.identities().unwrap().into_iter().find(|i| i.transport == "web").unwrap();
@@ -128,9 +150,9 @@ fn guessing_tokens_disables_pairing() {
     let f = fixture(Vec::new());
     let code = f.code(T);
     for n in 0..5 {
-        assert!(f.say(&mut Conn::default(), "pair", json!({"token": "AAAAAAAA"}), T + n).close);
+        assert!(f.say(&mut phone(), "pair", json!({"token": "AAAAAAAA"}), T + n).close);
     }
-    let blocked = f.say(&mut Conn::default(), "pair", json!({"token": code}), T + 10);
+    let blocked = f.say(&mut phone(), "pair", json!({"token": code}), T + 10);
     assert!(blocked.out[0]["data"]["message"].as_str().unwrap().contains("disabled"), "{blocked:?}");
 }
 
@@ -138,13 +160,13 @@ fn guessing_tokens_disables_pairing() {
 fn sessions_authenticate_until_revoked_and_obey_the_lock() {
     let f = fixture(Vec::new());
     let (_, session) = f.paired();
-    let mut conn = Conn::default();
+    let mut conn = phone();
     assert!(f.say(&mut conn, "command", json!({"cmd": "list"}), T).close, "pair or auth first");
     assert!(!f.say(&mut conn, "ping", Value::Null, T).close, "a ping is fine before");
     for bad in
         [json!({}), json!({"session": ""}), json!({"session": "0".repeat(64)}), json!({"session": session[..63]})]
     {
-        let step = f.say(&mut Conn::default(), "auth", bad.clone(), T);
+        let step = f.say(&mut phone(), "auth", bad.clone(), T);
         assert_eq!((names(&step), step.close), (vec!["error"], true), "{bad}");
     }
     let step = f.say(&mut conn, "auth", json!({"session": session}), T);
@@ -163,15 +185,16 @@ fn sessions_authenticate_until_revoked_and_obey_the_lock() {
     assert_eq!(f.web.notice_for(&conn, &notice), None, "no notices while locked");
     f.web.bridge.lock().unwrap().set_locked(false).unwrap();
     assert_eq!(f.web.notice_for(&conn, &notice).unwrap()["data"]["kind"], "needs_you");
-    assert_eq!(f.web.notice_for(&Conn::default(), &notice), None, "not to strangers");
+    assert_eq!(f.web.notice_for(&phone(), &notice), None, "not to strangers");
 
     f.web.bridge.lock().unwrap().unpair(None).unwrap();
     let revoked = f.say(&mut conn, "command", json!({"cmd": "list"}), T);
     assert_eq!((revoked.out[0]["data"]["kind"].as_str(), revoked.close), (Some("not_paired"), true));
     assert_eq!(f.web.notice_for(&conn, &notice), None);
-    assert!(f.say(&mut Conn::default(), "auth", json!({"session": session}), T).close, "revoked for good");
+    assert!(f.say(&mut phone(), "auth", json!({"session": session}), T).close, "revoked for good");
     let state = std::fs::read_to_string(f.dir.join("state.json")).unwrap();
     assert!(state.contains("\"sessions\": {}"), "its hash went too: {state}");
+    assert!(state.contains("\"devices\": {}"), "its device key went too: {state}");
 }
 
 #[test]
@@ -238,6 +261,7 @@ fn request(addr: SocketAddr, head: &str) -> String {
 
 struct Client {
     stream: TcpStream,
+    chan: Option<e2e::Channel>,
 }
 
 fn ws(addr: SocketAddr, origin: &str) -> Client {
@@ -256,13 +280,25 @@ fn ws(addr: SocketAddr, origin: &str) -> Client {
     }
     let answer = String::from_utf8(answer).unwrap();
     assert!(answer.starts_with("HTTP/1.1 101 ") && answer.contains("s3pPLMBiTxaQ9kYGzzhZRbK+xOo="), "{answer}");
-    Client { stream }
+    Client { stream, chan: None }
+}
+
+/// A WebSocket that has done the hello exchange as the device with this secret.
+fn ws_secure(f: &Fixture, addr: SocketAddr, device: &[u8; 32]) -> Client {
+    let mut client = ws(addr, &format!("http://{addr}"));
+    client.secure(f, device);
+    client
 }
 
 impl Client {
+    /// One message: sealed once there is a handshake, a legacy clear text frame before it.
     fn send(&mut self, name: &str, data: Value) {
         let text = json!({"name": name, "data": data}).to_string();
-        self.stream.write_all(&http::client_frame(1, text.as_bytes())).unwrap();
+        if self.chan.is_some() {
+            self.send_sealed(text.as_bytes());
+        } else {
+            self.stream.write_all(&http::client_frame(1, text.as_bytes())).unwrap();
+        }
     }
 
     /// The next server frame: its opcode and payload.
@@ -287,26 +323,50 @@ impl Client {
         Some((head[0] & 0x0f, payload))
     }
 
-    /// The next message other than a heartbeat; None once closed.
+    /// The next message other than a heartbeat; None once closed. Every message
+    /// is one sealed binary frame: anything else fails the test.
     fn recv(&mut self) -> Option<Value> {
         loop {
             let (opcode, payload) = self.frame()?;
             if opcode == 8 {
                 return None;
             }
-            let msg: Value = serde_json::from_slice(&payload).unwrap();
+            assert_eq!(opcode, 2, "a message that is not sealed: {payload:?}");
+            let plain = self.chan.as_mut().expect("a handshake first").open(&payload).unwrap();
+            let msg: Value = serde_json::from_slice(&plain).unwrap();
             if msg["name"] != "heartbeat" {
                 return Some(msg);
             }
         }
+    }
+
+    /// The hello exchange, as the page does it, from the device with this secret.
+    fn secure(&mut self, f: &Fixture, device: &[u8; 32]) {
+        let pending = e2e::client_start(device).unwrap();
+        self.stream.write_all(&http::client_frame(1, pending.hello())).unwrap();
+        let (opcode, hello) = self.frame().unwrap();
+        assert_eq!(opcode, 1, "the server hello is the one text frame");
+        self.chan = Some(pending.finish(&hello, &f.web.key.fp()).unwrap());
+    }
+
+    /// Sends `frame` after sealing it, as if it were a message.
+    fn send_sealed(&mut self, plain: &[u8]) {
+        let sealed = self.chan.as_mut().expect("a handshake first").seal(plain).unwrap();
+        self.stream.write_all(&http::client_frame(2, &sealed)).unwrap();
+    }
+
+    /// True when the server hangs up (a close frame, then nothing) without any
+    /// message in between that is not sealed.
+    fn hung_up(&mut self) -> bool {
+        let last = std::iter::from_fn(|| self.frame()).find(|(op, _)| *op != 2);
+        last.is_some_and(|(op, _)| op == 8) && self.frame().is_none()
     }
 }
 
 #[test]
 fn a_phone_pairs_reconnects_commands_and_hears_notices_over_a_websocket() {
     let (f, addr) = start();
-    let origin = format!("http://{addr}");
-    let mut phone = ws(addr, &origin);
+    let mut phone = ws_secure(&f, addr, &PHONE);
     phone.send("pair", json!({"token": f.code(crate::runtime::now_ms()), "label": "phone"}));
     let paired = phone.recv().unwrap();
     assert_eq!(paired["name"], "paired");
@@ -314,7 +374,7 @@ fn a_phone_pairs_reconnects_commands_and_hears_notices_over_a_websocket() {
     let session = paired["data"]["session"].as_str().unwrap().to_string();
     drop(phone);
 
-    let mut phone = ws(addr, &origin);
+    let mut phone = ws_secure(&f, addr, &PHONE);
     phone.send("auth", json!({"session": session}));
     assert_eq!(phone.recv().unwrap()["name"], "hello");
     assert_eq!(phone.recv().unwrap()["data"]["lines"][0], "t2 · claude · /w · blocked");
@@ -347,7 +407,7 @@ fn a_phone_pairs_reconnects_commands_and_hears_notices_over_a_websocket() {
     // A ping is answered with a pong carrying the same bytes.
     phone.stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     phone.stream.write_all(&http::client_frame(9, b"hi")).unwrap();
-    let pong = std::iter::from_fn(|| phone.frame()).find(|(op, _)| *op != 1).unwrap();
+    let pong = std::iter::from_fn(|| phone.frame()).find(|(op, _)| *op == 10).unwrap();
     assert_eq!(pong, (10, b"hi".to_vec()));
 }
 
@@ -387,13 +447,14 @@ fn strangers_by_host_or_origin_and_oversized_frames_are_turned_away() {
 }
 
 #[test]
-fn the_page_and_its_two_assets_are_served_whole_with_the_security_headers_and_nothing_else_is() {
+fn the_page_and_its_assets_are_served_whole_with_the_security_headers_and_nothing_else_is() {
     let (_f, addr) = start();
     let ask = |method: &str, path: &str| request(addr, &format!("{method} {path} HTTP/1.1\nHost: {addr}\n\n"));
     for (path, kind, content) in [
         ("/", "text/html", PAGE),
         ("/app.js", "text/javascript", SCRIPT),
         ("/style.css", "text/css", STYLE),
+        ("/noble.js", "text/javascript", NOBLE),
         ("/app.js?v=2", "text/javascript", SCRIPT),
         ("/style.css?", "text/css", STYLE),
         ("/app.js#top", "text/javascript", SCRIPT),
@@ -420,6 +481,8 @@ fn the_page_and_its_two_assets_are_served_whole_with_the_security_headers_and_no
         "/APP.JS",
         "/Style.css",
         "/app.js.map",
+        "/NOBLE.JS",
+        "/noble.js/",
         "/style.css.map",
         "/static/app.js",
         "/./app.js",
@@ -437,7 +500,7 @@ fn the_page_and_its_two_assets_are_served_whole_with_the_security_headers_and_no
     }
     assert!(ask("GET", "app.js").starts_with("HTTP/1.1 400 "), "a path without its slash");
     for method in ["HEAD", "POST", "OPTIONS"] {
-        for path in ["/app.js", "/style.css", "/app.js?v=2"] {
+        for path in ["/app.js", "/style.css", "/noble.js", "/app.js?v=2"] {
             assert!(ask(method, path).starts_with("HTTP/1.1 405 "), "{method} {path}");
         }
     }
@@ -476,19 +539,19 @@ fn lan_mode_refuses_the_addresses_just_outside_the_private_ranges() {
 fn before_auth_only_ping_pair_and_auth_are_heard() {
     let f = fixture(Vec::new());
     for name in ["snapshot", "command", "hello", "paired", ""] {
-        let mut conn = Conn::default();
+        let mut conn = phone();
         let step = f.say(&mut conn, name, json!({"cmd": "list"}), T);
         assert_eq!((names(&step), step.close), (vec!["error"], true), "{name:?}");
         assert_eq!(step.out[0]["data"]["message"], "pair or auth first", "{name:?}");
         assert!(conn.device.is_none(), "{name:?}");
     }
     for raw in ["", "[]", "\"pair\"", "null", "{\"name\": 5}", "{\"data\": {}}", "{\"name\": \"auth\"", "\u{0}"] {
-        let step = f.web.incoming(&mut Conn::default(), raw, T);
+        let step = f.web.incoming(&mut phone(), raw, T);
         assert!(step.close && names(&step) == ["error"], "{raw:?}: {step:?}");
     }
-    let pong = f.web.incoming(&mut Conn::default(), r#"{"name": "ping"}"#, T);
+    let pong = f.web.incoming(&mut phone(), r#"{"name": "ping"}"#, T);
     assert_eq!((names(&pong), pong.close), (vec!["pong"], false), "no data needed");
-    assert!(f.say(&mut Conn::default(), "pair", Value::Null, T).close, "a pair without a code");
+    assert!(f.say(&mut phone(), "pair", Value::Null, T).close, "a pair without a code");
 }
 
 #[test]
@@ -496,7 +559,7 @@ fn an_authenticated_socket_keeps_its_device() {
     let f = fixture(Vec::new());
     let (_, first) = f.paired();
     let (_, second) = f.paired();
-    let mut conn = Conn::default();
+    let mut conn = phone();
     assert!(!f.say(&mut conn, "auth", json!({"session": first}), T).close);
     let me = conn.device.clone().unwrap().user_id;
     let again = f.say(&mut conn, "auth", json!({"session": second}), T);
@@ -505,7 +568,7 @@ fn an_authenticated_socket_keeps_its_device() {
     let pair = f.say(&mut conn, "pair", json!({"token": code}), T);
     assert_eq!((names(&pair), pair.close), (vec!["error"], false), "a pair after auth");
     assert_eq!(conn.device.map(|d| d.user_id), Some(me), "still the first device");
-    let other = f.say(&mut Conn::default(), "pair", json!({"token": code}), T);
+    let other = f.say(&mut phone(), "pair", json!({"token": code}), T);
     assert_eq!(other.out[0]["name"], "paired", "the code was not spent");
 }
 
@@ -524,10 +587,10 @@ fn a_session_token_matches_only_exactly() {
         json!([session.clone()]),
         json!({"session": session.clone()}),
     ] {
-        let step = f.say(&mut Conn::default(), "auth", json!({"session": bad}), T);
+        let step = f.say(&mut phone(), "auth", json!({"session": bad}), T);
         assert_eq!((names(&step), step.close), (vec!["error"], true), "{bad}");
     }
-    assert!(!f.say(&mut Conn::default(), "auth", json!({"session": session}), T).close, "the exact token works");
+    assert!(!f.say(&mut phone(), "auth", json!({"session": session}), T).close, "the exact token works");
 }
 
 #[test]
@@ -567,7 +630,7 @@ fn command_ids_echo_as_given_and_odd_data_is_a_failed_reply() {
 fn a_device_label_is_trimmed_to_40_characters_or_defaulted() {
     let f = fixture(Vec::new());
     let label = |given: Value| {
-        let step = f.say(&mut Conn::default(), "pair", json!({"token": f.code(T), "label": given}), T);
+        let step = f.say(&mut phone(), "pair", json!({"token": f.code(T), "label": given}), T);
         step.out[0]["data"]["device"].as_str().unwrap().to_string()
     };
     assert_eq!(label(json!("é".repeat(50))), "é".repeat(40), "characters, not bytes");
@@ -593,12 +656,12 @@ fn a_request_head_may_be_8_kib_and_not_a_byte_more() {
 
 #[test]
 fn binary_continuation_huge_bad_and_close_frames_end_the_socket() {
-    let (_f, addr) = start();
+    let (f, addr) = start();
     let origin = format!("http://{addr}");
     let huge = vec![0x81, 0xff, 0x80, 0, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4];
     let bye = [&1000u16.to_be_bytes()[..], b"bye"].concat();
     for (what, frame) in [
-        ("binary", http::client_frame(2, b"hi")),
+        ("binary before the hello", http::client_frame(2, b"hi")),
         ("continuation", http::client_frame(0, b"hi")),
         ("64-bit length", huge),
         ("bad UTF-8", http::client_frame(1, &[0xff])),
@@ -610,7 +673,7 @@ fn binary_continuation_huge_bad_and_close_frames_end_the_socket() {
         assert_eq!(last.map(|(op, _)| op), Some(8), "{what}");
         assert!(client.frame().is_none(), "{what}: then the connection ends");
     }
-    let mut early = ws(addr, &origin);
+    let mut early = ws_secure(&f, addr, &PHONE);
     early.send("command", json!({"cmd": "list"}));
     assert_eq!(early.recv().unwrap()["data"]["message"], "pair or auth first");
     assert_eq!(early.frame(), Some((8, 1008u16.to_be_bytes().to_vec())), "a policy violation");
@@ -666,7 +729,11 @@ fn on_a_paused_clock(f: &Fixture, listener: std::net::TcpListener, sent: &[u8], 
 /// The server frames after its 101 answer: opcode and payload.
 fn server_frames(heard: &[u8]) -> Vec<(u8, Vec<u8>)> {
     assert!(heard.starts_with(b"HTTP/1.1 101 "), "{}", String::from_utf8_lossy(heard));
-    let mut at = heard.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    frames_from(&heard[heard.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4..])
+}
+
+fn frames_from(heard: &[u8]) -> Vec<(u8, Vec<u8>)> {
+    let mut at = 0;
     let mut frames = Vec::new();
     while at < heard.len() {
         let (len, head) = match heard[at + 1] {
@@ -677,6 +744,60 @@ fn server_frames(heard: &[u8]) -> Vec<(u8, Vec<u8>)> {
         at += head + len;
     }
     frames
+}
+
+async fn read_frame(rd: &mut tokio::net::tcp::OwnedReadHalf) -> (u8, Vec<u8>) {
+    let (b0, b1) = (rd.read_u8().await.unwrap(), rd.read_u8().await.unwrap());
+    let len = match b1 {
+        126 => usize::from(rd.read_u16().await.unwrap()),
+        n => usize::from(n),
+    };
+    let mut payload = vec![0; len];
+    rd.read_exact(&mut payload).await.unwrap();
+    (b0 & 0x0f, payload)
+}
+
+/// Like [`on_a_paused_clock`], with a device that says hello and then `first`
+/// sealed, as the page does. What the server said after its hello, each sealed
+/// message opened, and how much (virtual) time that took.
+fn on_a_paused_clock_secure(
+    f: &Fixture,
+    listener: std::net::TcpListener,
+    device: &[u8; 32],
+    first: &Value,
+) -> (Vec<(u8, Vec<u8>)>, Duration) {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
+    runtime.block_on(async {
+        let addr = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (mut rd, mut wr) = client.into_split();
+        let pending = e2e::client_start(device).unwrap();
+        wr.write_all(&[upgrade_head(addr), http::client_frame(1, pending.hello())].concat()).await.unwrap();
+        server.readable().await.unwrap();
+        let start = tokio::time::Instant::now();
+        let served = tokio::spawn(connection(server, f.web.clone()));
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(rd.read_u8().await.unwrap());
+        }
+        let (opcode, hello) = read_frame(&mut rd).await;
+        assert_eq!(opcode, 1);
+        let mut chan = pending.finish(&hello, &f.web.key.fp()).unwrap();
+        let sealed = chan.seal(first.to_string().as_bytes()).unwrap();
+        wr.write_all(&http::client_frame(2, &sealed)).await.unwrap();
+        let mut heard = Vec::new();
+        rd.read_to_end(&mut heard).await.unwrap();
+        let took = start.elapsed();
+        served.await.unwrap();
+        drop(wr);
+        let frames = frames_from(&heard)
+            .into_iter()
+            .map(|(op, payload)| if op == 2 { (op, chan.open(&payload).unwrap()) } else { (op, payload) })
+            .collect();
+        (frames, took)
+    })
 }
 
 #[test]
@@ -694,7 +815,7 @@ fn a_socket_that_never_authenticates_is_closed_after_the_auth_deadline() {
     let (heard, took) = on_a_paused_clock(&f, listener, &head, b"");
     let frames = server_frames(&heard);
     assert_eq!(frames.last(), Some(&(8, 1001u16.to_be_bytes().to_vec())), "going away");
-    assert!(frames[..frames.len() - 1].iter().all(|(op, _)| *op == 1), "only heartbeats before: {frames:?}");
+    assert_eq!(frames.len(), 1, "no heartbeat and nothing else is sent in the clear before the hello: {frames:?}");
     assert!(took >= AUTH && took <= AUTH + HEARTBEAT, "{took:?}");
 }
 
@@ -702,16 +823,16 @@ fn a_socket_that_never_authenticates_is_closed_after_the_auth_deadline() {
 fn an_authenticated_socket_hears_heartbeats_and_closes_when_idle() {
     let (f, listener) = unserved();
     let (_, session) = f.paired();
-    let auth = json!({"name": "auth", "data": {"session": session}}).to_string();
-    let sent = [upgrade_head(listener.local_addr().unwrap()), http::client_frame(1, auth.as_bytes())].concat();
-    let (heard, took) = on_a_paused_clock(&f, listener, &sent, b"");
-    let frames = server_frames(&heard);
+    let auth = json!({"name": "auth", "data": {"session": session}});
+    let (frames, took) = on_a_paused_clock_secure(&f, listener, &PHONE, &auth);
     let said: Vec<String> = frames
         .iter()
-        .filter(|(op, _)| *op == 1)
+        .filter(|(op, _)| *op == 2)
         .map(|(_, text)| serde_json::from_slice::<Value>(text).unwrap()["name"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(said[..2], ["hello", "snapshot"].map(String::from)[..], "{said:?}");
+    assert!(frames.iter().all(|(op, _)| matches!(op, 2 | 8)), "nothing in the clear: {frames:?}");
+    let replies: Vec<&str> = said.iter().map(String::as_str).filter(|name| *name != "heartbeat").collect();
+    assert_eq!(replies, ["hello", "snapshot"], "{said:?}");
     let beats = said.iter().filter(|name| *name == "heartbeat").count() as u32;
     assert!(beats >= IDLE.as_secs() as u32 / HEARTBEAT.as_secs() as u32, "every 20 s: {said:?}");
     assert_eq!(frames.last(), Some(&(8, 1001u16.to_be_bytes().to_vec())), "going away");
@@ -720,7 +841,7 @@ fn an_authenticated_socket_hears_heartbeats_and_closes_when_idle() {
 
 #[test]
 fn every_refusal_closes_with_its_own_code() {
-    let (_f, addr) = start();
+    let (f, addr) = start();
     let origin = format!("http://{addr}");
     let masked = |first: u8| vec![first, 0x80, 0, 0, 0, 0];
     for (what, frame, code) in [
@@ -729,7 +850,7 @@ fn every_refusal_closes_with_its_own_code() {
         ("fragmented", masked(0x01), 1002),
         ("continuation without a start", http::client_frame(0, b"hi"), 1002),
         ("unknown opcode", http::client_frame(3, b"hi"), 1002),
-        ("binary", http::client_frame(2, b"hi"), 1003),
+        ("binary before the hello", http::client_frame(2, b"hi"), 1008),
         ("invalid UTF-8", http::client_frame(1, &[0xff]), 1007),
         ("too big", http::client_frame(1, &vec![b'x'; http::MAX_FRAME + 1]), 1009),
     ] {
@@ -738,7 +859,7 @@ fn every_refusal_closes_with_its_own_code() {
         let close = std::iter::from_fn(|| client.frame()).find(|(op, _)| *op != 1);
         assert_eq!(close, Some((8, code.to_be_bytes().to_vec())), "{what}");
     }
-    let mut early = ws(addr, &origin);
+    let mut early = ws_secure(&f, addr, &PHONE);
     early.send("command", json!({"cmd": "list"}));
     assert_eq!(early.recv().unwrap()["data"]["message"], "pair or auth first");
     assert_eq!(early.frame(), Some((8, 1008u16.to_be_bytes().to_vec())), "policy");
@@ -767,10 +888,9 @@ fn deadlines_are_exact_not_the_next_heartbeat() {
 
     let (f, listener) = unserved();
     let (_, session) = f.paired();
-    let auth = json!({"name": "auth", "data": {"session": session}}).to_string();
-    let sent = [upgrade_head(listener.local_addr().unwrap()), http::client_frame(1, auth.as_bytes())].concat();
-    let (heard, took) = on_a_paused_clock(&f, listener, &sent, b"");
-    assert_eq!(server_frames(&heard).last(), Some(&(8, 1001u16.to_be_bytes().to_vec())));
+    let auth = json!({"name": "auth", "data": {"session": session}});
+    let (frames, took) = on_a_paused_clock_secure(&f, listener, &PHONE, &auth);
+    assert_eq!(frames.last(), Some(&(8, 1001u16.to_be_bytes().to_vec())));
     assert!(took >= IDLE && took <= Duration::from_secs(61), "{took:?}");
 }
 
@@ -779,14 +899,14 @@ fn five_failed_auths_from_one_address_block_it_and_are_logged_without_the_token(
     let f = fixture(Vec::new());
     let (_, good) = f.paired();
     let ip: IpAddr = "192.168.1.7".parse().unwrap();
-    let peer = || Conn { peer: Some(ip), ..Conn::default() };
+    let peer = || Conn { peer: Some(ip), ..phone() };
     for n in 0..5 {
         let step = f.say(&mut peer(), "auth", json!({"session": "secret-guess"}), T + n);
         assert!(step.close, "a failed auth closes");
     }
     let blocked = f.say(&mut peer(), "auth", json!({"session": good}), T + 10);
     assert!(blocked.close && blocked.out[0]["data"]["message"].as_str().unwrap().contains("too many"), "{blocked:?}");
-    let mut other = Conn { peer: Some("192.168.1.8".parse().unwrap()), ..Conn::default() };
+    let mut other = Conn { peer: Some("192.168.1.8".parse().unwrap()), ..phone() };
     assert_eq!(names(&f.say(&mut other, "auth", json!({"session": good}), T + 10)), ["hello", "snapshot"]);
     let after = f.say(&mut peer(), "auth", json!({"session": good}), T + 60_000 + 5);
     assert_eq!(names(&after), ["hello", "snapshot"], "refused for 60 s only");
@@ -799,7 +919,7 @@ fn five_failed_auths_from_one_address_block_it_and_are_logged_without_the_token(
 fn control_characters_never_reach_a_device_label() {
     let f = fixture(Vec::new());
     let label = |given: &str| {
-        let step = f.say(&mut Conn::default(), "pair", json!({"token": f.code(T), "label": given}), T);
+        let step = f.say(&mut phone(), "pair", json!({"token": f.code(T), "label": given}), T);
         step.out[0]["data"]["device"].as_str().unwrap().to_string()
     };
     assert_eq!(label("\u{1b}]0;x\u{7}ph\u{1b}[31mone\u{9b}\u{7f}\n"), "]0;xph[31mone");
@@ -812,14 +932,14 @@ fn an_empty_pair_code_is_usage_and_not_a_wrong_guess() {
     let f = fixture(Vec::new());
     let code = f.code(T);
     for blank in [json!(""), json!(null), json!(" - "), json!(7)] {
-        let step = f.say(&mut Conn::default(), "pair", json!({"token": blank}), T);
+        let step = f.say(&mut phone(), "pair", json!({"token": blank}), T);
         assert!(step.close && step.out[0]["data"]["message"].as_str().unwrap().contains("usage"), "{step:?}");
     }
-    assert!(f.say(&mut Conn::default(), "pair", json!({}), T).close);
+    assert!(f.say(&mut phone(), "pair", json!({}), T).close);
     for n in 0..4 {
-        assert!(f.say(&mut Conn::default(), "pair", json!({"token": "AAAAAAAA"}), T + n).close);
+        assert!(f.say(&mut phone(), "pair", json!({"token": "AAAAAAAA"}), T + n).close);
     }
-    let paired = f.say(&mut Conn::default(), "pair", json!({"token": code}), T + 5);
+    let paired = f.say(&mut phone(), "pair", json!({"token": code}), T + 5);
     assert_eq!(paired.out[0]["name"], "paired", "four real guesses, not five");
 }
 
@@ -910,4 +1030,339 @@ fn the_ready_line_keeps_null_pair_and_tunnel_when_locked_or_the_tunnel_failed() 
         assert_eq!(parsed["via"], via);
         assert!(!text.contains('\n'), "one line");
     }
+}
+
+#[test]
+fn a_session_is_good_only_from_the_device_key_it_paired_with() {
+    let f = fixture(Vec::new());
+    let (_, session) = f.paired();
+    let state = std::fs::read_to_string(f.dir.join("state.json")).unwrap();
+    assert!(state.contains(&e2e::b64(&phone().device_key.unwrap())), "the device key is kept: {state}");
+
+    let ip: IpAddr = "192.168.1.7".parse().unwrap();
+    for n in 0..5 {
+        let mut thief = Conn { peer: Some(ip), ..with_device(&STRANGER) };
+        let step = f.say(&mut thief, "auth", json!({"session": session}), T + n);
+        assert!(step.close && thief.device.is_none(), "{step:?}");
+        assert!(step.out[0]["data"]["message"].as_str().unwrap().contains("pair again"), "{step:?}");
+    }
+    let mut right_key_same_address = Conn { peer: Some(ip), ..phone() };
+    let blocked = f.say(&mut right_key_same_address, "auth", json!({"session": session}), T + 10);
+    assert!(blocked.out[0]["data"]["message"].as_str().unwrap().contains("too many"), "counted: {blocked:?}");
+    let log = std::fs::read_to_string(f.dir.join("audit.jsonl")).unwrap();
+    assert_eq!(log.matches("\"command\":\"auth\"").count(), 5, "{log}");
+    assert!(!log.contains(&session), "{log}");
+    assert_eq!(names(&f.say(&mut phone(), "auth", json!({"session": session}), T + 10)), ["hello", "snapshot"]);
+}
+
+#[test]
+fn a_session_from_before_device_keys_is_refused_and_the_old_state_still_loads() {
+    let f = fixture(Vec::new());
+    let (_, session) = f.paired();
+    let path = f.dir.join("state.json");
+    let mut state: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(state.as_object_mut().unwrap().remove("devices").is_some());
+    std::fs::write(&path, state.to_string()).unwrap();
+    assert_eq!(f.web.bridge.lock().unwrap().identities().unwrap().len(), 1, "an old state.json still loads");
+
+    let old = f.say(&mut phone(), "auth", json!({"session": session}), T);
+    assert!(old.close && old.out[0]["data"]["message"].as_str().unwrap().contains("pair again"), "{old:?}");
+    let code = f.code(T);
+    let again = f.say(&mut phone(), "pair", json!({"token": code}), T);
+    assert_eq!(names(&again), ["paired", "snapshot"], "pairing again works");
+    let fresh = again.out[0]["data"]["session"].as_str().unwrap();
+    assert_eq!(names(&f.say(&mut phone(), "auth", json!({"session": fresh}), T)), ["hello", "snapshot"]);
+}
+
+#[test]
+fn a_connection_without_a_device_key_cannot_pair_or_auth_and_keeps_its_code() {
+    let f = fixture(Vec::new());
+    let code = f.code(T);
+    let mut bare = Conn::default();
+    let step = f.say(&mut bare, "pair", json!({"token": code}), T);
+    assert!(step.close && step.out[0]["data"]["message"] == "no device key", "{step:?}");
+    assert!(f.say(&mut bare, "auth", json!({"session": "0".repeat(64)}), T).close);
+    assert_eq!(names(&f.say(&mut phone(), "pair", json!({"token": code}), T)), ["paired", "snapshot"]);
+}
+
+#[test]
+fn links_carry_the_servers_fingerprint_and_it_survives_a_restart() {
+    let bridge = crate::bridge::scratch();
+    let key = server_key(&bridge).unwrap();
+    assert_eq!(key.fp().len(), 43, "base64url of a SHA-256");
+    assert_eq!(
+        pair_link("http://192.168.1.20:8377", "ABCD2345", &key),
+        format!("http://192.168.1.20:8377/#pair=ABCD2345&fp={}", key.fp())
+    );
+    let restarted = Bridge::at(bridge.dir.clone(), Default::default());
+    assert_eq!(server_key(&restarted).unwrap().fp(), key.fp(), "stable across restarts");
+
+    // A damaged entry is replaced (and stays replaced), never used.
+    bridge.secret_put("web.key", b"short").unwrap();
+    let fresh = server_key(&bridge).unwrap();
+    assert_ne!(fresh.fp(), key.fp());
+    assert_eq!(server_key(&bridge).unwrap().fp(), fresh.fp());
+    bridge.secret_put("web.key", &[0; 32]).unwrap();
+    assert_ne!(server_key(&bridge).unwrap().fp(), fresh.fp(), "zero is no key");
+    let _ = bridge.secret_del("web.key");
+    let _ = std::fs::remove_dir_all(&bridge.dir);
+}
+
+#[test]
+fn a_plaintext_legacy_client_is_closed_and_its_code_is_not_spent() {
+    let (f, addr) = start();
+    let code = f.code(crate::runtime::now_ms());
+    let mut old = ws(addr, &format!("http://{addr}"));
+    old.send("pair", json!({"token": code, "label": "old"}));
+    assert_eq!(old.frame(), Some((8, 1008u16.to_be_bytes().to_vec())), "closed, with not one byte in the clear");
+    assert!(old.frame().is_none());
+
+    let mut phone = ws_secure(&f, addr, &PHONE);
+    phone.send("pair", json!({"token": code}));
+    assert_eq!(phone.recv().unwrap()["name"], "paired", "the code was not consumed");
+}
+
+#[test]
+fn after_the_handshake_only_sealed_binary_frames_are_heard() {
+    let (f, addr) = start();
+    let text = http::client_frame(1, br#"{"name":"ping"}"#);
+    let second_hello = e2e::client_start(&PHONE).unwrap().hello().to_vec();
+    let mut other_channel = ws_secure(&f, addr, &STRANGER).chan.take().unwrap();
+    let junk = other_channel.seal(br#"{"name":"ping"}"#).unwrap();
+    for (what, frame) in [
+        ("a text frame", text),
+        ("a second hello", http::client_frame(1, &second_hello)),
+        ("a frame sealed under another key", http::client_frame(2, &junk)),
+    ] {
+        let mut client = ws_secure(&f, addr, &PHONE);
+        client.stream.write_all(&frame).unwrap();
+        assert!(client.hung_up(), "{what}");
+    }
+
+    let mut client = ws_secure(&f, addr, &PHONE);
+    let mut sealed = client.chan.as_mut().unwrap().seal(br#"{"name":"ping"}"#).unwrap();
+    let last = sealed.len() - 1;
+    sealed[last] ^= 1;
+    client.stream.write_all(&http::client_frame(2, &sealed)).unwrap();
+    assert!(client.hung_up(), "a tampered frame");
+
+    let mut client = ws_secure(&f, addr, &PHONE);
+    let ping = client.chan.as_mut().unwrap().seal(br#"{"name":"ping"}"#).unwrap();
+    client.stream.write_all(&http::client_frame(2, &ping)).unwrap();
+    assert_eq!(client.recv().unwrap()["name"], "pong");
+    client.stream.write_all(&http::client_frame(2, &ping)).unwrap();
+    assert!(client.hung_up(), "a replayed frame");
+
+    let mut client = ws_secure(&f, addr, &PHONE);
+    client.send_sealed(&[0xff, 0xfe]);
+    assert!(client.hung_up(), "sealed bytes that are not UTF-8");
+    let mut client = ws_secure(&f, addr, &PHONE);
+    client.send_sealed(b"not json");
+    assert_eq!(client.recv().unwrap()["data"]["message"], "not JSON", "a sealed refusal is itself sealed");
+    assert!(client.hung_up());
+}
+
+#[test]
+fn a_first_frame_that_is_not_a_small_good_hello_closes_the_socket() {
+    let (_f, addr) = start();
+    let hello = String::from_utf8(e2e::client_start(&PHONE).unwrap().hello().to_vec()).unwrap();
+    let padded = format!("{},\"x\":\"{}\"}}", hello.trim_end_matches('}'), "a".repeat(MAX_HELLO));
+    let swapped = hello.replace("\"v\":1", "\"v\":2");
+    for (what, frame) in [
+        ("an empty text", http::client_frame(1, b"")),
+        ("not JSON", http::client_frame(1, b"hello")),
+        ("an old-style message", http::client_frame(1, br#"{"name":"auth","data":{"session":"x"}}"#)),
+        ("a hello over the cap", http::client_frame(1, padded.as_bytes())),
+        ("another version", http::client_frame(1, swapped.as_bytes())),
+        ("binary", http::client_frame(2, hello.as_bytes())),
+    ] {
+        let mut client = ws(addr, &format!("http://{addr}"));
+        client.stream.write_all(&frame).unwrap();
+        assert_eq!(client.frame(), Some((8, 1008u16.to_be_bytes().to_vec())), "{what}");
+    }
+}
+
+#[test]
+fn auth_from_another_device_key_is_refused_and_counted_over_the_socket() {
+    let (f, addr) = start();
+    let mut phone = ws_secure(&f, addr, &PHONE);
+    phone.send("pair", json!({"token": f.code(crate::runtime::now_ms()), "label": "phone"}));
+    let session = phone.recv().unwrap()["data"]["session"].as_str().unwrap().to_string();
+
+    let mut thief = ws_secure(&f, addr, &STRANGER);
+    thief.send("auth", json!({"session": session}));
+    let refused = thief.recv().unwrap();
+    assert_eq!(refused["name"], "error");
+    assert!(refused["data"]["message"].as_str().unwrap().contains("pair again"), "{refused}");
+    assert!(thief.hung_up());
+    let log = std::fs::read_to_string(f.dir.join("audit.jsonl")).unwrap();
+    assert_eq!(log.matches("\"command\":\"auth\"").count(), 1, "counted: {log}");
+
+    let mut again = ws_secure(&f, addr, &PHONE);
+    again.send("auth", json!({"session": session}));
+    assert_eq!(again.recv().unwrap()["name"], "hello", "the paired device still gets in");
+}
+
+#[test]
+fn a_hello_of_exactly_the_cap_is_answered_and_one_byte_more_closes() {
+    let (f, addr) = start();
+    let hello = String::from_utf8(e2e::client_start(&PHONE).unwrap().hello().to_vec()).unwrap();
+    let base = hello.trim_end_matches('}');
+    let padded = |len: usize| format!(r#"{base},"x":"{}"}}"#, "a".repeat(len - base.len() - 8));
+    let (at_cap, over) = (padded(MAX_HELLO), padded(MAX_HELLO + 1));
+    assert_eq!((at_cap.len(), over.len()), (MAX_HELLO, MAX_HELLO + 1));
+
+    let mut client = ws(addr, &format!("http://{addr}"));
+    client.stream.write_all(&http::client_frame(1, at_cap.as_bytes())).unwrap();
+    let (opcode, answer) = client.frame().unwrap();
+    assert_eq!(opcode, 1, "the server hello: {answer:?}");
+    let answer: Value = serde_json::from_slice(&answer).unwrap();
+    assert_eq!(answer["s"], e2e::b64(&f.web.key.public()), "{answer}");
+
+    let mut client = ws(addr, &format!("http://{addr}"));
+    client.stream.write_all(&http::client_frame(1, over.as_bytes())).unwrap();
+    assert_eq!(client.frame(), Some((8, 1008u16.to_be_bytes().to_vec())), "one byte over the cap");
+    assert!(client.frame().is_none());
+}
+
+#[test]
+fn many_small_sealed_frames_keep_both_counters_in_step() {
+    let (f, addr) = start();
+    let mut client = ws_secure(&f, addr, &PHONE);
+    for _ in 0..300 {
+        client.send("ping", Value::Null);
+    }
+    for n in 0..300 {
+        assert_eq!(client.recv().unwrap()["name"], "pong", "reply {n}");
+    }
+    client.send("command", json!({"cmd": "list"}));
+    assert_eq!(client.recv().unwrap()["data"]["message"], "pair or auth first", "the channel still works");
+}
+
+#[test]
+fn a_sealed_frame_may_fill_the_frame_cap_and_one_byte_more_closes_with_1009() {
+    let (f, addr) = start();
+    // The wire payload is the ciphertext then a 16-byte tag.
+    let ping = |sealed_len: usize| {
+        let pad = sealed_len - 16 - r#"{"name":"ping","data":""}"#.len();
+        json!({"name": "ping", "data": "x".repeat(pad)}).to_string()
+    };
+    let mut client = ws_secure(&f, addr, &PHONE);
+    let sealed = client.chan.as_mut().unwrap().seal(ping(http::MAX_FRAME).as_bytes()).unwrap();
+    assert_eq!(sealed.len(), http::MAX_FRAME);
+    client.stream.write_all(&http::client_frame(2, &sealed)).unwrap();
+    assert_eq!(client.recv().unwrap()["name"], "pong", "exactly the cap is fine");
+
+    let mut client = ws_secure(&f, addr, &PHONE);
+    let sealed = client.chan.as_mut().unwrap().seal(ping(http::MAX_FRAME + 1).as_bytes()).unwrap();
+    assert_eq!(sealed.len(), http::MAX_FRAME + 1);
+    client.stream.write_all(&http::client_frame(2, &sealed)).unwrap();
+    let close = std::iter::from_fn(|| client.frame()).find(|(op, _)| *op != 2);
+    assert_eq!(close, Some((8, 1009u16.to_be_bytes().to_vec())), "too big");
+    assert!(client.frame().is_none());
+}
+
+#[test]
+fn a_hello_alone_does_not_extend_the_auth_deadline_and_nothing_is_said_in_the_clear() {
+    let (f, listener) = unserved();
+    let (frames, took) = on_a_paused_clock_secure(&f, listener, &PHONE, &json!({"name": "ping"}));
+    assert_eq!(frames.last(), Some(&(8, 1001u16.to_be_bytes().to_vec())), "going away");
+    let before = &frames[..frames.len() - 1];
+    assert!(before.iter().all(|(op, _)| *op == 2), "only sealed frames after the hello: {frames:?}");
+    let said: Vec<String> = before
+        .iter()
+        .map(|(_, plain)| serde_json::from_slice::<Value>(plain).unwrap()["name"].as_str().unwrap().to_string())
+        .collect();
+    let replies: Vec<&str> = said.iter().map(String::as_str).filter(|name| *name != "heartbeat").collect();
+    assert_eq!(replies, ["pong"], "only the reply and sealed heartbeats: {said:?}");
+    assert!(took >= AUTH && took < AUTH + Duration::from_secs(1), "the auth deadline, exactly: {took:?}");
+}
+
+#[test]
+fn two_users_get_in_only_with_their_own_device_keys_and_unpairing_one_keeps_the_other() {
+    let f = fixture(Vec::new());
+    let pair = |conn: &mut Conn| {
+        let step = f.say(conn, "pair", json!({"token": f.code(T), "label": "device"}), T);
+        let data = &step.out[0]["data"];
+        (data["session"].as_str().unwrap().to_string(), u32::try_from(data["id"].as_u64().unwrap()).unwrap())
+    };
+    let (mine, my_id) = pair(&mut phone());
+    let (theirs, _) = pair(&mut with_device(&STRANGER));
+
+    for (session, device) in [(&mine, &STRANGER), (&theirs, &PHONE)] {
+        let step = f.say(&mut with_device(device), "auth", json!({"session": session}), T);
+        assert!(step.close && step.out[0]["data"]["message"].as_str().unwrap().contains("pair again"), "{step:?}");
+    }
+    assert_eq!(names(&f.say(&mut phone(), "auth", json!({"session": mine}), T)), ["hello", "snapshot"]);
+    let other = f.say(&mut with_device(&STRANGER), "auth", json!({"session": theirs}), T);
+    assert_eq!(names(&other), ["hello", "snapshot"]);
+
+    f.web.bridge.lock().unwrap().unpair(Some(my_id)).unwrap();
+    let gone = f.say(&mut phone(), "auth", json!({"session": mine}), T);
+    assert!(gone.close, "the unpaired device's old session, from its own key: {gone:?}");
+    let other = f.say(&mut with_device(&STRANGER), "auth", json!({"session": theirs}), T);
+    assert_eq!(names(&other), ["hello", "snapshot"], "the other binding stays");
+    let state: Value = serde_json::from_slice(&std::fs::read(f.dir.join("state.json")).unwrap()).unwrap();
+    let devices = state["devices"].as_object().unwrap();
+    assert_eq!(devices.len(), 1, "{state}");
+    let stranger = e2e::b64(&with_device(&STRANGER).device_key.unwrap());
+    assert!(devices.values().all(|d| *d == stranger), "{state}");
+}
+
+#[test]
+fn a_damaged_stored_device_key_refuses_only_its_own_session() {
+    let f = fixture(Vec::new());
+    let (_, first) = f.paired();
+    let path = f.dir.join("state.json");
+    let state: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let first_user = state["devices"].as_object().unwrap().keys().next().unwrap().clone();
+    let (_, second) = f.paired();
+
+    for garbage in [json!("!!not base64!!"), json!(""), json!("AAAA")] {
+        let mut state: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        state["devices"][&first_user] = garbage.clone();
+        std::fs::write(&path, state.to_string()).unwrap();
+        assert_eq!(f.web.bridge.lock().unwrap().identities().unwrap().len(), 2, "it still loads: {garbage}");
+        let refused = f.say(&mut phone(), "auth", json!({"session": first}), T);
+        let message = refused.out[0]["data"]["message"].as_str().unwrap();
+        assert!(refused.close && message.contains("pair again"), "{garbage}: {refused:?}");
+        let fine = f.say(&mut phone(), "auth", json!({"session": second}), T);
+        assert_eq!(names(&fine), ["hello", "snapshot"], "the other session is untouched: {garbage}");
+    }
+}
+
+#[test]
+fn a_missing_or_wrong_length_or_out_of_range_server_key_is_replaced_and_old_pins_fail() {
+    let bridge = crate::bridge::scratch();
+    let mut old = server_key(&bridge).unwrap();
+    for damage in [None, Some(vec![1u8; 31]), Some(vec![1u8; 33]), Some(vec![1u8; 64]), Some(vec![0xff; 32])] {
+        match &damage {
+            None => assert!(bridge.secret_del("web.key").unwrap(), "there was one"),
+            Some(bytes) => bridge.secret_put("web.key", bytes).unwrap(),
+        }
+        let fresh = server_key(&bridge).unwrap();
+        assert_ne!(fresh.fp(), old.fp(), "{damage:?}");
+        assert_eq!(server_key(&bridge).unwrap().fp(), fresh.fp(), "the new key is kept: {damage:?}");
+        let pending = e2e::client_start(&PHONE).unwrap();
+        let accepted = e2e::server_accept(pending.hello(), &fresh).unwrap();
+        assert!(pending.finish(&accepted.server_hello, &old.fp()).is_err(), "pinned to the old key: {damage:?}");
+        old = fresh;
+    }
+    let _ = bridge.secret_del("web.key");
+    let _ = std::fs::remove_dir_all(&bridge.dir);
+}
+
+#[test]
+fn a_bridge_folder_with_spaces_keeps_its_own_stable_fingerprint() {
+    let root = std::env::temp_dir().join(format!("h0x core bridge {}", crate::platform::random_hex()));
+    let (spaced, other) = (root.join("Program Files (x86)").join("my bridge"), root.join("my bridge 2"));
+    let key = server_key(&Bridge::at(spaced.clone(), Default::default())).unwrap();
+    let again = server_key(&Bridge::at(spaced.clone(), Default::default())).unwrap();
+    assert_eq!(again.fp(), key.fp(), "stable across restarts");
+    let neighbour = server_key(&Bridge::at(other.clone(), Default::default())).unwrap();
+    assert_ne!(neighbour.fp(), key.fp(), "each bridge folder has its own key");
+    for dir in [spaced, other] {
+        let _ = Bridge::at(dir, Default::default()).secret_del("web.key");
+    }
+    let _ = std::fs::remove_dir_all(&root);
 }

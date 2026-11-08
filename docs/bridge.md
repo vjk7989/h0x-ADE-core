@@ -80,13 +80,13 @@ When it starts, it prints the panel's address and a one-time pairing link, as te
 The link is valid for 5 minutes and works once. `h0x-core bridge pair --transport web` prints a new code you can type on the panel instead.
 Opening the link pairs the device: it becomes a paired account in `h0x-core bridge ls`, with transport `web` and the device's label, and it receives a session token.
 The token stays on the device. This machine keeps only its SHA-256 and compares it in constant time.
-Each later connection must give that token as its first message.
+Each later connection must give that token as its first message, from the same device (see "Encryption").
 `h0x-core bridge unpair <id>` revokes a device at once, and so does a reset.
 Everything else is as for Telegram: confirmations, the lock (no notices go out while locked), rate limits, redaction and the audit log.
 
 `--lan` only binds a private address: 10.x, 172.16–31.x, 192.168.x, or 100.64.0.0/10 (Tailscale and other private overlays).
 It refuses public, loopback and link-local addresses.
-It is plain http: anyone on that network can watch the traffic, the pairing link included. Use it only on a network you trust.
+The page comes over plain http, but everything the page and the panel say to each other is encrypted (see "Encryption"). Anyone on that network can still change the page you load, so use it only on a network you trust.
 
 ### Ways to reach it
 
@@ -94,7 +94,7 @@ It is plain http: anyone on that network can watch the traffic, the pairing link
 | --- | --- | --- |
 | Local | `h0x-core bridge web` | This machine only |
 | LAN (plain http) | `h0x-core bridge web --lan` | Devices on your private network |
-| Tunnel (Cloudflare) | `h0x-core bridge web --tunnel`, or `h0x-core bridge tunnel on` for a running panel; `bridge tunnel off` closes it | Anyone with the link, through Cloudflare (https, not end-to-end); see "Access from anywhere" |
+| Tunnel (Cloudflare) | `h0x-core bridge web --tunnel`, or `h0x-core bridge tunnel on` for a running panel; `bridge tunnel off` closes it | Anyone with the link, through Cloudflare (messages stay end-to-end encrypted; it delivers the page); see "Access from anywhere" |
 | Your VPS | `h0x-core bridge web --via vps --public-host h0x.example.com` | Anyone who can reach your VPS's HTTPS name |
 | SSH only | `ssh -L 8377:127.0.0.1:8377 you@your-pc`, then open `http://127.0.0.1:8377/` | Only you, with no public exposure at all |
 
@@ -125,10 +125,10 @@ h0x.example.com {
 }
 ```
 
-The pairing link and QR code then use `https://h0x.example.com/#pair=...`, and that name is added to the accepted `Host` and `Origin` values.
+The pairing link and QR code then use `https://h0x.example.com/#pair=...&fp=...`, and that name is added to the accepted `Host` and `Origin` values.
 Keep the proxy's `Host` header as it received it (Caddy and nginx's `proxy_set_header Host $host` do), and let it pass WebSocket upgrades.
 
-Security: the proxy on your VPS ends TLS, so it can see the traffic, pairing link included; run it only on a server you control.
+Security: the proxy on your VPS ends TLS and delivers the page, so it sees only ciphertext but could alter the page; run it only on a server you control.
 Pairing and session authentication still apply to every device, and so do the lock, the allow-list, rate limits and the audit log.
 Anyone who can reach the name can load the page, so treat a pairing link like a password: it works once, for 5 minutes.
 
@@ -137,7 +137,7 @@ What the server accepts:
 - Only its own address (and, with `--via`, your public name) in `Host`, so a hostile web page can't reach it through DNS rebinding.
   A browser's `Origin`, when sent, must be the panel itself. Apps that send no `Origin` still have to authenticate.
 - No CORS headers, no request bodies (`GET` only), request heads up to 8 KB that arrive within 10 seconds, and WebSocket messages up to 64 KB.
-  Messages must be masked and unfragmented text; anything else closes the connection.
+  Frames must be masked and unfragmented; the first is the client hello (text, at most 1 KB) and every later one a sealed binary frame. Anything else closes the connection.
 - A connection must pair or authenticate within 30 seconds and say something at least every 60.
   The server sends a heartbeat every 20 seconds.
 - Every answer carries `Content-Security-Policy: default-src 'self'; frame-ancestors 'none'`, `Referrer-Policy: no-referrer` and `X-Content-Type-Options: nosniff`.
@@ -167,7 +167,7 @@ From the server:
 - `paired` `{session, device, id}`
 - `hello` `{tunnel}`
 - `snapshot` `{lines, tunnel}`: the terminals, as `/agents` lists them.
-  `tunnel` is true on a connection that came through the Cloudflare tunnel, so the page can say it is not end-to-end.
+  `tunnel` is true on a connection that came through the Cloudflare tunnel, so the page can say Cloudflare delivers it.
 - `reply` `{id, kind, ...}`, where `kind` is one of:
   - `done` `{text}`
   - `needs_confirm` `{token, what}`
@@ -180,6 +180,22 @@ From the server:
 - `error` `{message}`, after which the connection usually closes.
 
 Reconnecting is the device's job: authenticate again with the session token.
+
+### Encryption
+
+Nothing goes over the WebSocket in the clear. The messages above are the plain content; on the wire each one is sealed.
+
+- The pairing link is `https://host/#pair=CODE&fp=FP`. `FP` is the fingerprint (SHA-256, base64url) of the panel's long-term key. The page pins it the first time and refuses any other.
+  The key is made when the panel first starts and kept in the OS secret store as `web.key`, so the fingerprint stays the same across restarts. It is never printed or logged.
+  If it is ever damaged, a new one is made and phones must pair again.
+- The first frame from the page is a hello (text) with a device key the phone made for itself. The panel answers with its hello. Both keys are mixed with fresh one-time keys, so each connection has its own session keys.
+  From then on every frame, both ways, is one binary frame: the JSON message sealed with AES-256-GCM, with a counter that never repeats.
+  A text frame after the hello, a frame that does not open, or a binary frame before the hello closes the connection. A plain-text client (before this change) is closed at once and its pairing code is not used up.
+- Pairing records the device's key with its session. `auth` only works from that same device key; from any other it fails like a wrong token and counts toward the block.
+  Sessions made before this change have no device key and are refused: pair the device again.
+
+The honest limit: this stops anyone who only watches the connection (other devices on the Wi-Fi, the network between, Cloudflare or your VPS proxy as far as the messages go). They see ciphertext.
+It does not protect against whoever delivers the page: a Wi-Fi attacker on a plain-http `--lan` page, Cloudflare, or your VPS could hand your phone an altered page that leaks what you type. Use a network you trust for `--lan` and a server you control. The native app will remove this limit, because it carries the code itself.
 
 ## Access from anywhere
 
@@ -201,9 +217,9 @@ Only one tunnel runs at a time; `tunnel on` while one is up keeps its address an
 While the tunnel is up, the panel also answers the tunnel's `Host`, and a browser's `Origin` must then be the tunnel's own https page.
 Everything else stays the same: pairing, session tokens, the lock, rate limits, redaction and the audit log.
 
-What passes through Cloudflare: the connection is https from the phone to Cloudflare, and Cloudflare hands it on to cloudflared here.
-Cloudflare can read all of it: the pairing link, session tokens, terminal text and every command.
-It is not end-to-end. The panel tells the device so (`tunnel: true` in `hello` and `snapshot`).
+What passes through Cloudflare: the connection is https from the phone to Cloudflare, and Cloudflare hands it on to cloudflared here. The messages inside are end-to-end encrypted (see "Encryption"): Cloudflare reads only ciphertext.
+It sees the address, the page it delivers, and the size and timing of the messages. The pairing code and the key fingerprint sit after the `#` of the link, which a browser never sends.
+Cloudflare also delivers the page, so it could alter it to read your session; the panel tells the device it is behind the tunnel (`tunnel: true` in `hello` and `snapshot`).
 Anyone who learns the address can reach the page, but not control anything without pairing.
 
 The tunnel stops, and cloudflared is killed:
@@ -370,8 +386,8 @@ It does not defend against:
 - **The chat service itself.** It sees everything sent through it.
 - **Other programs running as your account.** They can already reach core and its files.
 - **Secrets the redaction patterns don't recognize.**
-- **Someone watching a `--lan` network.** The panel is plain http there; they can see the traffic and a pairing link.
-- **Cloudflare, with the tunnel on.** It sees everything that passes through the tunnel, the pairing link and session tokens included.
+- **Someone on a `--lan` network who alters the page.** The page is plain http there; the messages are encrypted, but whoever changes the page could read them (see "Encryption").
+- **Cloudflare or your VPS proxy altering the page.** They deliver the page, so a changed page could read the messages; they cannot read them without doing that.
 
 The Telegram bot only makes outbound connections.
 The web panel listens on 127.0.0.1, or on a private LAN address with `--lan`, never on a public one.
