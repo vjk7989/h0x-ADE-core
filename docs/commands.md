@@ -764,7 +764,7 @@ Options:
 ## h0x-core send
 
 ```text
-Paste text into a terminal and press Enter (waits for a person to pause)
+Paste text into a terminal and press Enter (waits for a person's unfinished draft)
 
 Usage: h0x-core send [OPTIONS] <TERMINAL> <TEXT>
 

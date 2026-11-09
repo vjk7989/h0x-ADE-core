@@ -13,6 +13,30 @@ use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+tokio::task_local! {
+    pub(crate) static SEND_CANCELLED: Arc<std::sync::atomic::AtomicBool>;
+}
+
+pub(crate) fn check_cancelled() -> Result<(), RpcError> {
+    if SEND_CANCELLED.try_with(|c| c.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(false) {
+        Err(RpcError::new("cancelled", "send cancelled before typing", "send again if still needed"))
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) async fn send_cancelled() -> RpcError {
+    if SEND_CANCELLED.try_with(|_| ()).is_err() {
+        return std::future::pending().await;
+    }
+    loop {
+        if let Err(err) = check_cancelled() {
+            return err;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 type Reader = BufReader<platform::AsyncRead>;
 type Writer = platform::AsyncWrite;
 
@@ -164,12 +188,29 @@ async fn connection(core: Arc<Core>, read: platform::AsyncRead, mut write: Write
         }
         let handling = handle(&core, None, Some(&plain), line.as_bytes());
         // An exec ends when its caller goes away.
-        let handled = match is_exec(line.as_bytes()) {
-            true => tokio::select! {
+        let method = serde_json::from_str::<Value>(&line).ok().and_then(|r| r["method"].as_str().map(String::from));
+        let handled = match method.as_deref() {
+            Some("machine.exec") => tokio::select! {
                 handled = handling => handled,
                 () = closed(&mut read, &mut ahead) => return Ok(()),
             },
-            false => handling.await,
+            Some("terminal.send") => {
+                let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let handling = SEND_CANCELLED.scope(cancelled.clone(), handling);
+                tokio::pin!(handling);
+                tokio::select! {
+                    handled = &mut handling => handled,
+                    () = async {
+                        closed(&mut read, &mut ahead).await;
+                        platform::reply_closed(read.get_ref()).await;
+                    } => {
+                        cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                        handling.await;
+                        return Ok(());
+                    }
+                }
+            }
+            _ => handling.await,
         };
         let wrote = match &handled.reply {
             Some(reply) => write.write_all(format!("{reply}\n").as_bytes()).await,
@@ -207,10 +248,6 @@ async fn connection(core: Arc<Core>, read: platform::AsyncRead, mut write: Write
     crate::remote::peer_left(&core, &conn);
     writer.abort();
     result
-}
-
-fn is_exec(message: &[u8]) -> bool {
-    serde_json::from_slice::<Value>(message).is_ok_and(|m| m["method"] == "machine.exec")
 }
 
 /// Returns once a plain connection is closed; what it sends meanwhile is
@@ -310,6 +347,7 @@ async fn read_frames(core: &Arc<Core>, conn: &Arc<Conn>, read: &mut Reader) -> i
     // Execs running for this connection by request id: they end when it
     // closes, or when it gives up on one (`$/cancelRequest`).
     let mut execs = Execs::default();
+    let mut sends = Sends::default();
     while let Some((channel, kind, payload)) = wire::read_frame(read).await? {
         if channel != 0 && crate::remote::relay_in(core, conn, channel, kind, &payload) {
             continue;
@@ -328,11 +366,13 @@ async fn read_frames(core: &Arc<Core>, conn: &Arc<Conn>, read: &mut Reader) -> i
                 if request["method"] == "$/cancelRequest" {
                     let id = request["params"]["id"].to_string();
                     execs.0.iter().filter(|(of, _)| *of == id).for_each(|(_, exec)| exec.abort());
+                    sends.cancel(Some(&id));
                     continue;
                 }
+                let cancelled = sends.track(&request);
                 let (core, conn) = (core.clone(), conn.clone());
                 let task = tokio::spawn(async move {
-                    let handled = handle(&core, Some(&conn), None, &payload).await;
+                    let handled = SEND_CANCELLED.scope(cancelled, handle(&core, Some(&conn), None, &payload)).await;
                     if let Some(reply) = &handled.reply {
                         conn.with(|out| {
                             out.control(wire::encode(0, wire::DATA, reply.to_string().as_bytes()));
@@ -376,6 +416,37 @@ async fn read_frames(core: &Arc<Core>, conn: &Arc<Conn>, read: &mut Reader) -> i
         }
     }
     Ok(())
+}
+
+/// Only the draft hold observes cancellation; input already being typed must finish.
+#[derive(Default)]
+pub(crate) struct Sends(Vec<(String, std::sync::Weak<std::sync::atomic::AtomicBool>)>);
+
+impl Sends {
+    pub(crate) fn track(&mut self, request: &Value) -> Arc<std::sync::atomic::AtomicBool> {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if request["method"] == "terminal.send" {
+            self.0.retain(|(_, flag)| flag.strong_count() > 0);
+            self.0.push((request["id"].to_string(), Arc::downgrade(&cancelled)));
+        }
+        cancelled
+    }
+
+    pub(crate) fn cancel(&self, id: Option<&str>) {
+        for (of, flag) in &self.0 {
+            if id.is_none_or(|id| id == of)
+                && let Some(flag) = flag.upgrade()
+            {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+impl Drop for Sends {
+    fn drop(&mut self) {
+        self.cancel(None);
+    }
 }
 
 /// A connection's running execs by request id, ended with it.
@@ -471,5 +542,52 @@ mod tests {
         assert_eq!(id(Some("c")), "old");
         assert_ne!(id(Some("d")), "old", "and from then on a copy is told apart");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_sends_are_cancelled_by_their_own_id_and_all_when_the_connection_goes() {
+        use serde_json::json;
+        use std::sync::atomic::Ordering::Relaxed;
+        let send = |id: Value| json!({"jsonrpc": "2.0", "id": id, "method": "terminal.send", "params": {}});
+        let mut sends = Sends::default();
+        let number = sends.track(&send(json!(1)));
+        let string = sends.track(&send(json!("1")));
+        let exec = sends.track(&json!({"jsonrpc": "2.0", "id": 2, "method": "machine.exec"}));
+        sends.cancel(Some("2"));
+        assert!(!exec.load(Relaxed), "only sends watch for cancellation");
+        sends.cancel(Some("99"));
+        assert!(!number.load(Relaxed) && !string.load(Relaxed), "an unknown id cancels nothing");
+        sends.cancel(Some("1"));
+        assert!(number.load(Relaxed));
+        assert!(!string.load(Relaxed), "the string id \"1\" is another request than the number 1");
+        sends.cancel(Some(&json!("1").to_string()));
+        assert!(string.load(Relaxed));
+        // A finished send is forgotten at the next one.
+        drop(number);
+        let later = sends.track(&send(json!(3)));
+        assert_eq!(sends.0.len(), 2);
+        drop(sends);
+        assert!(later.load(Relaxed), "a closed connection cancels its held sends");
+        assert!(!exec.load(Relaxed));
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_seen_only_inside_a_send() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        use std::time::Duration;
+        assert!(check_cancelled().is_ok(), "no send in scope");
+        let outside = tokio::time::timeout(Duration::from_millis(100), send_cancelled()).await;
+        assert!(outside.is_err(), "outside a send it never fires");
+        let flag = Arc::new(AtomicBool::new(false));
+        SEND_CANCELLED
+            .scope(flag.clone(), async {
+                assert!(check_cancelled().is_ok());
+                assert!(tokio::time::timeout(Duration::from_millis(100), send_cancelled()).await.is_err());
+                flag.store(true, Relaxed);
+                assert_eq!(check_cancelled().unwrap_err().kind, "cancelled");
+                let err = tokio::time::timeout(Duration::from_secs(1), send_cancelled()).await.expect("fires");
+                assert_eq!(err.kind, "cancelled");
+            })
+            .await;
     }
 }
