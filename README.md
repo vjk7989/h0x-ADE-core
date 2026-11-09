@@ -53,6 +53,16 @@ minisign -Vm h0x-core-linux-x86_64.tar.gz -P RWTEdqtOBn6VKQ/x9x3qWk/gIWUb/I1OlZX
 ```
 
 `h0x-core update` checks these signatures itself. Run it to update; running terminals keep running.
+
+Updates and `h0x-core server restart` keep the environment the core started with;
+stopping and starting takes a fresh one. The first update from 0.1.10 to the next
+release uses the updater's environment once, because 0.1.10 cannot save it for the next core.
+If saving fails, the restart still goes ahead with the launcher's environment.
+Saved settings expire after three minutes and cannot carry over to another boot
+on Linux or macOS. On Windows, a restart cut short by a fast reboot can reuse them
+once. A plain SIGTERM keeps terminals and screens, but does not save settings.
+The new launcher still chooses the session's location and, on macOS, whether it
+starts from SSH or launchd.
 See [security](docs/security.md) for the trust and signing details.
 
 ## Quick start
