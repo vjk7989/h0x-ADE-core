@@ -91,7 +91,7 @@ In every mode but localhost the panel prints (and `--json` carries in `warning`)
 
 A web session lasts 30 days from pairing; after that the device pairs again. A session saved before this limit existed counts from the first time it is used.
 Wrong pairing codes sent over the web are counted per connection source (behind the tunnel, the visitor's address from Cloudflare's `CF-Connecting-IP`, which is believed only on requests that came through the tunnel from this machine): five in a row refuse that source for 10 minutes, before the code is even checked. They never count against Telegram pairing, and Telegram's wrong codes never block web pairing. Failed `auth`s are counted per source the same way and refuse it for a minute.
-The panel serves at most 64 connections at once and answers the next with `503`; the log of what happened is capped (see "Audit log").
+The panel serves at most 64 connections at once and answers the next with `503`. One source may hold at most 8 connections that have not authenticated yet (behind a proxy, by the visitor's address as above); its ninth gets `503` while other sources are still served, and a connection stops counting toward that share once it pairs or authenticates. A connection that has not paired or authenticated within 30 seconds is closed. An open connection whose session turns 30 days old is closed at the next heartbeat (every 20 seconds). The log of what happened is capped (see "Audit log").
 
 ### Ways to reach it
 
@@ -132,6 +132,7 @@ h0x.example.com {
 
 The pairing link and QR code then use `https://h0x.example.com/#pair=...&fp=...`, and that name is added to the accepted `Host` and `Origin` values.
 Keep the proxy's `Host` header as it received it (Caddy and nginx's `proxy_set_header Host $host` do), and let it pass WebSocket upgrades.
+The panel only sees your proxy (the ssh forward connects from 127.0.0.1), so it takes each visitor's address, for the failure counts and the per-source limit below, from the last hop of `X-Forwarded-For`, or else `X-Real-IP`, on requests for your public host that arrive from loopback. Caddy's `reverse_proxy` sets `X-Forwarded-For`; with nginx add `proxy_set_header X-Forwarded-For $remote_addr;` (or `X-Real-IP`). Without either header every visitor counts as 127.0.0.1, so one visitor's failures would refuse everyone. The headers are ignored in every other mode (LAN, localhost, Cloudflare tunnel).
 
 Security: the proxy on your VPS ends TLS and delivers the page, so it sees only ciphertext but could alter the page; run it only on a server you control.
 Pairing and session authentication still apply to every device, and so do the lock, the allow-list, rate limits and the audit log.
@@ -351,6 +352,7 @@ Each entry has the time, the account, the command, the terminal and the result.
 Typed text, commands, folders and terminal names are stored redacted and cut to 24 characters; text keeps its length.
 Pairing codes and confirmation tokens are never stored: a confirmation is logged as `confirm` with the action it ran.
 If the log can't be written, the command doesn't run.
+Failed or unauthenticated attempts (wrong pairing codes, failed `auth`) are written verbatim only for the first five of each minute; the rest of that minute becomes one line, such as `245 more failed attempts from 245 sources in the last minute`, so an attacker rotating sources cannot push real entries out of the log. Authenticated commands are always written verbatim.
 When `audit.jsonl` reaches 1 MiB it is moved to `audit.jsonl.1`, replacing the older one, so the log keeps between 1 and 2 MiB of the latest entries.
 
 ```sh

@@ -33,6 +33,11 @@ impl Drop for Fixture {
 }
 
 fn fixture(hosts: Vec<String>) -> Fixture {
+    fixture_via(hosts, None)
+}
+
+/// The same, answering as a vps reverse forward for `public` when there is one.
+fn fixture_via(hosts: Vec<String>, public: Option<&str>) -> Fixture {
     let bridge = crate::bridge::scratch();
     let dir = bridge.dir.clone();
     let (notices, _) = tokio::sync::broadcast::channel(16);
@@ -42,6 +47,8 @@ fn fixture(hosts: Vec<String>) -> Fixture {
         hosts,
         key: e2e::ServerKey::generate(),
         notices,
+        public: public.map(String::from),
+        unauthenticated: Default::default(),
         strikes: Default::default(),
         pair_strikes: Default::default(),
     };
@@ -1657,4 +1664,268 @@ fn a_new_pairing_gets_a_new_thirty_days_and_unpairing_forgets_the_date() {
     let state: Value = serde_json::from_slice(&std::fs::read(f.dir.join("state.json")).unwrap()).unwrap();
     assert_eq!(state["session_times"], json!({}), "{state}");
     assert!(auth(&session, later).close, "an unpaired device's session is gone");
+}
+
+const PANEL: &str = "panel.example.org";
+
+/// The server on a loopback port, as the vps forward: `PANEL` is its public host.
+fn start_via() -> (Fixture, SocketAddr) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let f = fixture_via(vps::with_public(hosts(Ipv4Addr::LOCALHOST, addr.port()), Some(PANEL)), Some(PANEL));
+    let web = f.web.clone();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async move { serve(tokio::net::TcpListener::from_std(listener).unwrap(), web).await });
+    });
+    (f, addr)
+}
+
+/// A WebSocket upgrade as the vps proxy sends it for `visitor`: the head of the answer, and the open stream.
+fn ws_via(addr: SocketAddr, visitor: &str) -> (String, TcpStream) {
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let head = format!(
+        "GET /ws HTTP/1.1\r\nHost: {PANEL}\r\nOrigin: https://{PANEL}\r\nX-Forwarded-For: 6.6.6.6, {visitor}\r\n\
+         Upgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).unwrap();
+    let mut answer = Vec::new();
+    let mut byte = [0u8];
+    while !answer.ends_with(b"\r\n\r\n") && stream.read_exact(&mut byte).is_ok() {
+        answer.push(byte[0]);
+    }
+    (String::from_utf8_lossy(&answer).into_owned(), stream)
+}
+
+#[test]
+fn one_source_cannot_hold_every_slot_before_it_authenticates() {
+    let (_f, addr) = start_via();
+    let (a, b) = ("198.51.100.7", "198.51.100.8");
+    let mut open: Vec<_> = (0..MAX_UNAUTHENTICATED_PER_SOURCE).map(|_| ws_via(addr, a)).collect();
+    assert!(open.iter().all(|(head, _)| head.starts_with("HTTP/1.1 101 ")), "up to the share is served");
+    let (refused, _) = ws_via(addr, a);
+    assert!(refused.starts_with("HTTP/1.1 503 "), "that source is full: {refused}");
+    let (other, _keep) = ws_via(addr, b);
+    assert!(other.starts_with("HTTP/1.1 101 "), "another source is still served: {other}");
+    // Hanging up frees its place.
+    open.truncate(MAX_UNAUTHENTICATED_PER_SOURCE - 1);
+    let mut served = false;
+    for _ in 0..100 {
+        served = ws_via(addr, a).0.starts_with("HTTP/1.1 101 ");
+        if served {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(served, "a closed connection gives its place back");
+}
+
+#[test]
+fn a_sources_places_are_counted_per_address_and_freed_on_drop() {
+    let sources = Arc::new(Sources::default());
+    let (a, b): (IpAddr, IpAddr) = ("203.0.113.5".parse().unwrap(), "2001:db8::5".parse().unwrap());
+    let mut held: Vec<_> = (0..MAX_UNAUTHENTICATED_PER_SOURCE).map(|_| sources.take(a).unwrap()).collect();
+    assert!(sources.take(a).is_none(), "the share is spent");
+    assert!(sources.take(b).is_some(), "another address has its own");
+    drop(held.pop());
+    assert!(sources.take(a).is_some(), "one freed, one taken");
+    drop(held);
+    assert!(sources.0.lock().unwrap().is_empty(), "nothing is remembered for sources with no connection");
+}
+
+#[test]
+fn a_flood_of_failures_cannot_push_real_entries_out_of_the_audit_log() {
+    let f = fixture(Vec::new());
+    let real = json!({"time_ms": T, "identity": "web:me", "command": "list", "result": "ok"});
+    f.web.bridge.lock().unwrap().audit(real.clone()).unwrap();
+    for n in 0..200u32 {
+        let source = format!("203.0.{}.{}", n / 250, n % 250 + 1);
+        assert!(f.say(&mut from(&source), "auth", json!({"session": "wrong"}), T + 10).close);
+    }
+    for n in 0..50u32 {
+        let result = f.web.bridge.lock().unwrap().pair_verify("telegram", &n.to_string(), "", "AAAAAAAA", T + 20);
+        assert!(result.is_err());
+    }
+    let read = || std::fs::read_to_string(f.dir.join("audit.jsonl")).unwrap();
+    let log = read();
+    assert_eq!(log.matches("\"command\":\"list\"").count(), 1, "the real entry is still there, verbatim: {log}");
+    assert!(log.contains(&real.to_string()));
+    let attempts =
+        log.lines().filter(|l| l.contains("\"command\":\"auth\"") || l.contains("\"command\":\"pair\"")).count();
+    assert_eq!(attempts, 5, "only the first few failures of the minute are lines: {log}");
+    assert!(log.len() < 2_000, "the log did not grow with the flood: {} bytes", log.len());
+    // The next minute: an authenticated entry brings the summary first, then itself, verbatim.
+    let later = json!({"time_ms": T + 70_000, "identity": "web:me", "command": "status", "result": "ok"});
+    f.web.bridge.lock().unwrap().audit(later.clone()).unwrap();
+    let log = read();
+    let lines: Vec<&str> = log.lines().collect();
+    assert!(
+        lines[lines.len() - 2].contains("245 more failed attempts from 245 sources in the last minute"),
+        "one aggregate line: {log}"
+    );
+    assert_eq!(lines[lines.len() - 1], later.to_string());
+    // And a new minute writes its first failures verbatim again.
+    assert!(f.say(&mut from("198.51.100.1"), "auth", json!({"session": "wrong"}), T + 71_000).close);
+    assert_eq!(read().matches("\"command\":\"auth\"").count(), 6);
+}
+
+#[test]
+fn an_open_socket_closes_at_the_next_heartbeat_once_its_session_turns_thirty_days_old() {
+    let (f, listener) = unserved();
+    let (_, session) = f.paired_at(crate::runtime::now_ms());
+    let auth = json!({"name": "auth", "data": {"session": session}});
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().start_paused(true).build().unwrap();
+    let (frames, took) = runtime.block_on(async {
+        let addr = listener.local_addr().unwrap();
+        let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (mut rd, mut wr) = client.into_split();
+        let pending = e2e::client_start(&PHONE).unwrap();
+        wr.write_all(&[upgrade_head(addr), http::client_frame(1, pending.hello())].concat()).await.unwrap();
+        server.readable().await.unwrap();
+        let start = tokio::time::Instant::now();
+        let served = tokio::spawn(connection(server, f.web.clone()));
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(rd.read_u8().await.unwrap());
+        }
+        let (_, hello) = read_frame(&mut rd).await;
+        let mut chan = pending.finish(&hello, &f.web.key.fp()).unwrap();
+        wr.write_all(&http::client_frame(2, &chan.seal(auth.to_string().as_bytes()).unwrap())).await.unwrap();
+        // Authenticated: the snapshot has arrived. The wait spins instead of idling: an idle
+        // paused runtime jumps the clock ahead, and the server would run its heartbeats before
+        // the session below is aged.
+        loop {
+            let mut next = Box::pin(read_frame(&mut rd));
+            let (op, payload) = loop {
+                tokio::select! {
+                    biased;
+                    frame = &mut next => break frame,
+                    () = tokio::task::yield_now() => {}
+                }
+            };
+            assert_eq!(op, 2);
+            let msg: Value = serde_json::from_slice(&chan.open(&payload).unwrap()).unwrap();
+            if msg["name"] == "snapshot" {
+                break;
+            }
+        }
+        // The session now dates from the epoch: far more than 30 days old.
+        let path = f.dir.join("state.json");
+        let mut state: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for made in state["session_times"].as_object_mut().unwrap().values_mut() {
+            *made = json!(0);
+        }
+        std::fs::write(&path, state.to_string()).unwrap();
+        let mut heard = Vec::new();
+        rd.read_to_end(&mut heard).await.unwrap();
+        let took = start.elapsed();
+        served.await.unwrap();
+        drop(wr);
+        (frames_from(&heard), took)
+    });
+    assert_eq!(frames.last(), Some(&(8, 1008u16.to_be_bytes().to_vec())), "closed by policy: {frames:?}");
+    assert!(frames.iter().all(|(op, _)| *op == 8), "not even a heartbeat after it expired: {frames:?}");
+    assert!(took <= HEARTBEAT + Duration::from_secs(1) && took < IDLE, "at the next heartbeat, not at idle: {took:?}");
+}
+
+#[test]
+fn an_open_sessions_age_ends_exactly_at_thirty_days_and_what_cannot_be_aged_stays_open() {
+    let f = fixture(Vec::new());
+    let (conn, _) = f.paired_at(T);
+    assert!(f.web.session_alive(&conn, T + SESSION_MS - 1), "one millisecond under thirty days");
+    assert!(!f.web.session_alive(&conn, T + SESSION_MS), "exactly thirty days: closed at that heartbeat");
+    assert!(!f.web.session_alive(&conn, u64::MAX), "the far future");
+    assert!(f.web.session_alive(&conn, 0), "a clock gone back does not end it");
+    assert!(f.web.session_alive(&phone(), u64::MAX), "a socket that never authenticated has no session to age");
+    let nobody = Conn { device: Some(Sender { transport: "web".into(), user_id: "nobody".into() }), ..phone() };
+    assert!(!f.web.session_alive(&nobody, T), "a user the state does not know is closed at the heartbeat");
+    let path = f.dir.join("state.json");
+    let mut state: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    state.as_object_mut().unwrap().remove("session_times");
+    std::fs::write(&path, state.to_string()).unwrap();
+    assert!(f.web.session_alive(&conn, u64::MAX), "still paired, from before dates: the next auth dates it");
+    std::fs::write(f.dir.join("state.json"), "not json").unwrap();
+    assert!(f.web.session_alive(&conn, u64::MAX), "an unreadable state: the next auth decides");
+}
+
+#[test]
+fn authenticating_gives_one_place_back_to_its_source_and_closing_after_frees_nothing_more() {
+    let (f, addr) = start_via();
+    let (_, session) = f.paired_at(crate::runtime::now_ms());
+    let a = "198.51.100.7";
+    let mut open: Vec<_> = (0..MAX_UNAUTHENTICATED_PER_SOURCE).map(|_| ws_via(addr, a)).collect();
+    assert!(open.iter().all(|(head, _)| head.starts_with("HTTP/1.1 101 ")), "up to the share is served");
+    let (_, stream) = open.pop().unwrap();
+    let mut phone = Client { stream, chan: None };
+    phone.secure(&f, &PHONE);
+    phone.send("auth", json!({"session": session}));
+    assert_eq!(phone.recv().unwrap()["name"], "hello");
+    let (freed, _freed) = ws_via(addr, a);
+    assert!(freed.starts_with("HTTP/1.1 101 "), "the authenticated socket no longer holds a place: {freed}");
+    let (full, _) = ws_via(addr, a);
+    assert!(full.starts_with("HTTP/1.1 503 "), "one place came back, not more: {full}");
+    // The same visitor's header on a request for this machine's own host is not the forward: uncapped.
+    let mut local = TcpStream::connect(addr).unwrap();
+    local.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let head = format!(
+        "GET /ws HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nX-Forwarded-For: {a}\r\n\
+         Upgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    local.write_all(head.as_bytes()).unwrap();
+    let mut answer = Vec::new();
+    let mut byte = [0u8];
+    while !answer.ends_with(b"\r\n\r\n") && local.read_exact(&mut byte).is_ok() {
+        answer.push(byte[0]);
+    }
+    let answer = String::from_utf8_lossy(&answer);
+    assert!(answer.starts_with("HTTP/1.1 101 "), "localhost is counted by its socket, not the header: {answer}");
+    // Its place went at auth: the authenticated socket leaving gives nothing back twice.
+    drop(phone);
+    std::thread::sleep(Duration::from_millis(300));
+    let (still, _) = ws_via(addr, a);
+    assert!(still.starts_with("HTTP/1.1 503 "), "still full: {still}");
+}
+
+#[test]
+fn an_unpaired_or_revoked_devices_open_socket_is_closed_at_the_next_check() {
+    let f = fixture(Vec::new());
+    let (one, _) = f.paired_at(T);
+    let (two, _) = f.paired_at(T);
+    assert!(f.web.session_alive(&one, T + 1) && f.web.session_alive(&two, T + 1));
+    let id = f.web.bridge.lock().unwrap().identities().unwrap()[0].id;
+    f.web.bridge.lock().unwrap().unpair(Some(id)).unwrap();
+    let alive = [&one, &two].map(|c| f.web.session_alive(c, T + 2));
+    assert_eq!(alive.iter().filter(|a| **a).count(), 1, "exactly the unpaired device is closed: {alive:?}");
+    f.web.bridge.lock().unwrap().unpair(None).unwrap();
+    assert!(!f.web.session_alive(&one, T + 3) && !f.web.session_alive(&two, T + 3), "unpair all closes all");
+}
+
+#[test]
+fn the_vps_host_is_the_public_host_with_or_without_its_default_port_only() {
+    let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+    for (host, via) in [
+        (PANEL, true),
+        ("panel.example.org:443", true),
+        ("panel.example.org:80", true),
+        ("PANEL.Example.ORG:443", true),
+        ("panel.example.org:8377", false),
+        ("panel.example.org:4430", false),
+        ("panel.example.org:", false),
+        ("panel.example.org.evil.test", false),
+        ("127.0.0.1:443", false),
+    ] {
+        let req = http::Request {
+            method: "GET".into(),
+            path: "/ws".into(),
+            headers: vec![("host".into(), host.into()), ("x-forwarded-for".into(), "198.51.100.7".into())],
+        };
+        let seen = tunnel::client(&req, ip("127.0.0.1"), false, Some(PANEL));
+        assert_eq!(seen, if via { ip("198.51.100.7") } else { ip("127.0.0.1") }, "{host}");
+    }
 }
