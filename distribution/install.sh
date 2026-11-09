@@ -5,7 +5,8 @@
 #
 # Into ~/.local/bin/h0x-core. An h0x-core that is already there is swapped
 # the planned way (h0x-core update --from): running terminals keep running.
-# The download must carry the release key's signature (its .minisig).
+# The download must carry the release key's signature (its .minisig); an
+# installed h0x-core checks it before anything downloaded runs.
 # H0X_CORE_VERSION=0.2.0 picks a version; H0X_CORE_RELEASES_URL points
 # elsewhere (tests); H0X_CORE_INSTALL_DIR installs elsewhere.
 set -eu
@@ -68,15 +69,34 @@ asset=${asset##*/}
 archive="$tmp/$asset"
 curl -fsSL --proto "$proto" --proto-redir "$proto" "$url" -o "$archive" || fail "download failed: $url"
 [ "$(sha256 "$archive")" = "$want" ] || fail "the download is damaged (checksum mismatch); try again"
+# The checksum comes from the same place as the file: the signature is what
+# proves the release key made it. Nothing from the download runs before that
+# is checked. An h0x-core already installed (0.1.9 or newer, which has
+# `update --from --check`) does the checking; only a first install, with
+# nothing trusted on this machine yet, lets the downloaded h0x-core check
+# itself (trust on first use: TLS to GitHub and the manifest's checksum).
+# A site set by H0X_CORE_RELEASES_URL (tests) is not signed.
+checks_signatures() {
+  [ -x "$bin/h0x-core" ] || return 1
+  v=$("$bin/h0x-core" --version 2>/dev/null | sed -n 's/^h0x-core \([0-9][0-9]*\)\.\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2 \3/p')
+  [ -n "$v" ] || return 1
+  # shellcheck disable=SC2086
+  set -- $v
+  [ "$1" -gt 0 ] || [ "$2" -gt 1 ] || { [ "$2" -eq 1 ] && [ "$3" -ge 9 ]; }
+}
+signed=
+if [ -z "${H0X_CORE_RELEASES_URL:-}" ]; then
+  signed=1
+  curl -fsSL --proto "$proto" --proto-redir "$proto" "${url%%[?#]*}.minisig" -o "$archive.minisig" || fail "no signature for $asset: ${url%%[?#]*}.minisig"
+  if checks_signatures; then
+    "$bin/h0x-core" update --from "$archive" --check >/dev/null || fail "$asset is not signed by the h0x-core release key (see above)"
+    signed=installed
+  fi
+fi
 tar -xzf "$archive" -C "$tmp"
 "$tmp/h0x-core" --version >/dev/null 2>&1 || fail "the downloaded h0x-core does not run on this machine"
-# The checksum comes from the same place as the file: the signature is what
-# proves the release key made it. The downloaded h0x-core checks it with its
-# embedded key before anything is installed (it has to be trusted to say so:
-# that first step rests on TLS to GitHub; every later update is checked by the
-# h0x-core already installed). A site set by H0X_CORE_RELEASES_URL (tests) is not signed.
-if [ -z "${H0X_CORE_RELEASES_URL:-}" ]; then
-  curl -fsSL --proto "$proto" --proto-redir "$proto" "${url%%[?#]*}.minisig" -o "$archive.minisig" || fail "no signature for $asset: ${url%%[?#]*}.minisig"
+if [ "$signed" = 1 ]; then
+  say "h0x-core: no installed h0x-core can check the signature: the downloaded one does (trusted on first use: TLS to GitHub and the checksum)."
   "$tmp/h0x-core" update --from "$archive" --check >/dev/null || fail "$asset is not signed by the h0x-core release key (see above)"
 fi
 mkdir -p "$bin"

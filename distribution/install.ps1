@@ -5,7 +5,8 @@
 # Into %LOCALAPPDATA%\Programs\h0x-core (h0x-core.exe, Microsoft's ConPTY
 # beside it), added to your PATH. An h0x-core that is already there is
 # swapped the planned way (h0x-core update --from): running terminals keep
-# running. The download must carry the release key's signature (its .minisig).
+# running. The download must carry the release key's signature (its .minisig);
+# an installed h0x-core checks it before anything downloaded runs.
 # No admin needed. H0X_CORE_VERSION=0.2.0 picks a version;
 # H0X_CORE_RELEASES_URL points elsewhere (tests); H0X_CORE_INSTALL_DIR
 # installs elsewhere.
@@ -88,17 +89,29 @@ try {
         if ($LASTEXITCODE) { Fail "no signature for ${asset}: $sigUrl" }
     }
   }
+    # The checksum comes from the same place as the file: the signature proves the
+    # release key made it. Nothing from the download runs before that is checked. An
+    # installed h0x-core (0.1.9 or newer, which has `update --from --check`) does the
+    # checking; only a first install lets the downloaded h0x-core check itself (trust
+    # on first use: TLS to GitHub and the manifest's checksum).
+    $installed = Join-Path $dir "h0x-core.exe"
+    $checkedByInstalled = $false
+    if ($signed -and (Test-Path $installed)) {
+        $have = ((& $installed --version 2>$null) -join "") -replace "^h0x-core ", ""
+        if ($have -match "^(\d+)\.(\d+)\.(\d+)" -and [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])" -ge [version]"0.1.9") {
+            & $installed update --from $archive --check | Out-Null
+            if ($LASTEXITCODE) { Fail "$asset is not signed by the h0x-core release key (see above)" }
+            $checkedByInstalled = $true
+        }
+    }
     New-Item -ItemType Directory -Force "$tmp\h0x-core" | Out-Null
     & $tar -xf $archive -C "$tmp\h0x-core"
     $new = "$tmp\h0x-core\h0x-core.exe"
     if ($LASTEXITCODE -or -not (Test-Path "$tmp\h0x-core\conpty\conpty.dll")) { Fail "the download holds no complete h0x-core" }
     $version = (& $new --version) -replace "^h0x-core ", ""
     if ($LASTEXITCODE) { Fail "the downloaded h0x-core does not run on this machine" }
-    if ($signed) {
-        # The checksum comes from the same place as the file: the signature proves the
-        # release key made it. The downloaded h0x-core checks it with its embedded key
-        # before anything is installed (it has to be trusted to say so: that first step
-        # rests on TLS to GitHub; later updates are checked by the installed h0x-core).
+    if ($signed -and -not $checkedByInstalled) {
+        Write-Host "h0x-core: no installed h0x-core can check the signature: the downloaded one does (trusted on first use: TLS to GitHub and the checksum)."
         & $new update --from $archive --check | Out-Null
         if ($LASTEXITCODE) { Fail "$asset is not signed by the h0x-core release key (see above)" }
     }

@@ -600,3 +600,54 @@ fn the_install_script_names_the_archive_after_the_path_even_when_the_query_has_a
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// An h0x-core already installed (0.1.9 or newer) is the one that checks the
+/// signature: a downloaded h0x-core that would lie ("signed") or refuse never
+/// gets to say, and it is not even asked.
+#[test]
+fn the_install_script_lets_the_installed_core_verify_not_the_downloaded_one() {
+    for installed_accepts in [false, true] {
+        let s = Session::new();
+        let asked = s.root.join("asked.log");
+        let downloaded_exit = i32::from(installed_accepts);
+        let downloaded = format!(
+            "#!/bin/sh\ncase \"$*\" in\n  --version) echo 'h0x-core 9.9.9' ;;\n  *--check*) echo downloaded >> '{}'; exit {downloaded_exit} ;;\nesac\nexit 0\n",
+            asked.display()
+        );
+        let (stub, _name, new_bytes) = stubbed_release(&s, "", &downloaded);
+        let bin = s.root.join("installed");
+        std::fs::create_dir_all(&bin).unwrap();
+        let installed = format!(
+            "#!/bin/sh\ncase \"$*\" in\n  --version) echo 'h0x-core 0.1.9' ;;\n  *--check*) echo installed >> '{}'; exit {} ;;\n  update*) case \"$3\" in *.tar.gz) exit 1 ;; esac; cp \"$3\" \"$0\" ;;\nesac\n",
+            asked.display(),
+            i32::from(!installed_accepts)
+        );
+        std::fs::write(bin.join("h0x-core"), &installed).unwrap();
+        std::fs::set_permissions(bin.join("h0x-core"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let out = install_signed(&stub, &bin);
+        let err = String::from_utf8_lossy(&out.stderr);
+        let log = std::fs::read_to_string(&asked).unwrap_or_default();
+        assert_eq!(log.trim(), "installed", "only the installed core is asked: {log:?} {err}");
+        let now = std::fs::read(bin.join("h0x-core")).unwrap();
+        if installed_accepts {
+            assert!(out.status.success(), "{err}");
+            assert_eq!(now, new_bytes, "the verified download is swapped in");
+        } else {
+            assert!(!out.status.success());
+            assert!(err.contains("is not signed by the h0x-core release key"), "{err}");
+            assert_eq!(now, installed.as_bytes(), "a refusal swaps nothing");
+        }
+    }
+}
+
+/// A first install has no h0x-core to ask: the downloaded one checks (trust on
+/// first use), and the script says so.
+#[test]
+fn a_first_install_says_the_downloaded_core_checked_its_own_signature() {
+    let s = Session::new();
+    let (stub, _name, _) = stubbed_release(&s, "", &checking_core(&s));
+    let out = install_signed(&stub, &s.root.join("fresh"));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(said.contains("trusted on first use"), "{said}");
+}

@@ -111,6 +111,11 @@ fn minisig(file: &Path) -> PathBuf {
 /// Why `file` is not the release asset `name` signed by `key` (its trusted
 /// comment's `file:`, so one signed file cannot stand in for another).
 fn check(file: &Path, sig: &Path, key: &str, name: &str) -> Result<(), String> {
+    checked_bytes(file, sig, key, name).map(|_| ())
+}
+
+/// `check`, giving the very bytes that were verified.
+fn checked_bytes(file: &Path, sig: &Path, key: &str, name: &str) -> Result<Vec<u8>, String> {
     let key = minisign_verify::PublicKey::from_base64(key).map_err(|e| e.to_string())?;
     let text = std::fs::read_to_string(sig).map_err(|_| "it has no signature".to_string())?;
     let signature =
@@ -119,7 +124,7 @@ fn check(file: &Path, sig: &Path, key: &str, name: &str) -> Result<(), String> {
     key.verify(&bytes, &signature, false).map_err(|e| format!("its signature does not match: {e}"))?;
     let file_field = format!("file:{name}");
     if signature.trusted_comment().split('\t').any(|f| f == file_field) {
-        Ok(())
+        Ok(bytes)
     } else {
         Err(format!("its signature is for another file, not {name}"))
     }
@@ -164,13 +169,29 @@ fn verify_archive_by(archive: &Path, sig: Option<&Path>, key: &str) -> Result<()
     check(archive, &sig, key, &name).map_err(|why| not_signed(archive, why))
 }
 
+/// Verifies the archive and keeps the verified bytes in a new private file in
+/// `scratch` (so what is unpacked cannot differ from what was checked, even
+/// if the person's file is swapped meanwhile).
+fn sealed(archive: &Path, sig: Option<&Path>, key: &str, scratch: &Path) -> Result<PathBuf, RpcError> {
+    let sig = sig.map(Path::to_path_buf).unwrap_or_else(|| minisig(archive));
+    let name = archive.file_name().unwrap_or_default().to_string_lossy();
+    let bytes = checked_bytes(archive, &sig, key, &name).map_err(|why| not_signed(archive, why))?;
+    let copy = scratch.join(&*name);
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&copy)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, &bytes));
+    written.map_err(|e| unavailable(format!("cannot keep {} for unpacking: {e}", archive.display())))?;
+    Ok(copy)
+}
+
 /// The h0x-core inside what `update --from` was given: a signed release
 /// archive, unpacked into `scratch` once its signature checked out. Debug and
 /// test builds also take a bare binary as it is (the tests' own builds).
 pub fn from_file(from: &Path, sig: Option<&Path>, scratch: &Path) -> Result<PathBuf, RpcError> {
     if is_archive(from) {
-        verify_archive(from, sig)?;
-        return unpack(from, scratch);
+        return unpack(&sealed(from, sig, PUBLIC_KEY, scratch)?, scratch);
     }
     if cfg!(any(debug_assertions, test)) && sig.is_none() {
         return Ok(from.to_path_buf());
@@ -492,6 +513,20 @@ ZJhj3MtbsDPyt278bwB0BcVRB5ZoKqA6VCCZ5s51lq49BobYTBUuzlJqofyqGhaBwWB6iLyCd1cVXXQh
         std::fs::rename(super::minisig(&file), super::minisig(&renamed)).unwrap();
         let err = super::verify_archive_by(&renamed, None, TEST_KEY).unwrap_err();
         assert!(err.message.contains("its signature is for another file, not h0x-core-linux-aarch64.tar.gz"));
+    }
+
+    #[test]
+    fn what_is_unpacked_is_the_archive_that_was_verified_even_if_the_file_is_swapped() {
+        let (_scratch, file, _) = signed(PAYLOAD, Some(SIG));
+        let keep = super::Scratch::new().unwrap();
+        let copy = super::sealed(&file, None, TEST_KEY, &keep.0).unwrap();
+        std::fs::write(&file, b"swapped after the check").unwrap();
+        assert_eq!(std::fs::read(&copy).unwrap(), PAYLOAD.as_bytes());
+        assert_ne!(copy, file);
+        // Unverified archives leave nothing behind.
+        let other = super::Scratch::new().unwrap();
+        assert!(super::sealed(&file, None, TEST_KEY, &other.0).is_err());
+        assert_eq!(std::fs::read_dir(&other.0).unwrap().count(), 0);
     }
 
     #[test]

@@ -148,10 +148,14 @@ impl Write for &Stream {
 
 /// A core of this version listens on a salted name; one still running from
 /// before the salt (an update in progress) on the older. Both are checked to
-/// be served by this account.
+/// be served by this account. The older name is only ever a bonus: anyone can
+/// squat it, so any failure there (another account, busy) means "no older core"
+/// and the salted name's own NotFound stands (a new core is started on it).
 pub fn connect(path: &Path) -> io::Result<Stream> {
     match connect_one(path) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => unsalted(path).map_or(Err(e), |older| connect_one(&older)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            unsalted(path).and_then(|older| connect_one(&older).ok()).ok_or(e)
+        }
         found => found,
     }
 }
@@ -1483,6 +1487,42 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_older_name_that_cannot_be_used_is_ignored_so_the_salted_core_can_start() {
+        use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+        use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, PIPE_TYPE_BYTE, PIPE_WAIT};
+        let tag = crate::platform::random_hex();
+        let salt = "ef".repeat(16);
+        let older = PathBuf::from(format!(r"\\.\pipe\h0x-core-squat-{tag}.sock"));
+        let wanted = PathBuf::from(format!(r"\\.\pipe\h0x-core-squat-{salt}-{tag}.sock"));
+        // Someone holds the older name with its only instance taken: unusable.
+        let name = super::wide(older.as_os_str());
+        let h = unsafe {
+            CreateNamedPipeW(
+                name.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_WAIT,
+                1,
+                512,
+                512,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(h, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
+        let _squatter = unsafe {
+            <std::os::windows::io::OwnedHandle as std::os::windows::io::FromRawHandle>::from_raw_handle(h as _)
+        };
+        let _taken = super::connect(&older).unwrap();
+        let err = super::connect(&wanted).map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+        // A working older core is still found while an update is in progress.
+        let other = PathBuf::from(format!(r"\\.\pipe\h0x-core-update-{tag}.sock"));
+        let wanted = PathBuf::from(format!(r"\\.\pipe\h0x-core-update-{salt}-{tag}.sock"));
+        let _listener = super::listen(&other).unwrap();
+        super::connect(&wanted).unwrap();
     }
 
     #[test]
