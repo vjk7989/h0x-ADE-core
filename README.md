@@ -135,6 +135,7 @@ files stay on that machine; your local core lists its terminals beside yours.
 A program can say it is working, done, blocked, or in error through OSC 7501,
 the Program Status Protocol. Core stores what it reports and never guesses from
 screen text. A program that does not report status has none.
+Send `kind=permission` with `state=blocked` if a phone or chat may answer it; question and auth are answered only in the terminal.
 Use `h0x-core get review` for a snapshot or `h0x-core events` to follow changes.
 
 ## Remote control

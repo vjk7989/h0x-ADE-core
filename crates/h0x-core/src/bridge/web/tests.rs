@@ -9,13 +9,13 @@ fn fake_core(method: &str, params: Value) -> Result<Value, RpcError> {
     let t = params["terminal"].as_str().unwrap_or_default();
     Ok(match method {
         "terminal.get" if t == "t2" => {
-            json!({"address": "t2", "state": "live", "argv": ["claude"], "cwd": "/w", "reported": true, "status": {"state": "blocked"}})
+            json!({"address": "t2", "state": "live", "argv": ["claude"], "cwd": "/w", "reported": true, "status": {"state": "blocked", "kind": "permission"}})
         }
         "terminal.get" => {
             json!({"address": t, "state": "live", "argv": ["/bin/sh"], "cwd": r"C:\work", "reported": false})
         }
         "terminal.list" => {
-            json!({"terminals": [{"address": "t2", "argv": ["claude"], "cwd": "/w", "state": "live", "status": {"state": "blocked"}}]})
+            json!({"terminals": [{"address": "t2", "argv": ["claude"], "cwd": "/w", "state": "live", "status": {"state": "blocked", "kind": "permission"}}]})
         }
         _ => json!({}),
     })

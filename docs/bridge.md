@@ -304,6 +304,10 @@ A waiting confirmation is void once the account is unpaired or paired again, and
 Approve and deny press keys for you. For a program that reports its status and is `blocked`, approve presses enter and deny presses esc.
 In agents' permission dialogs, enter takes the highlighted first choice ("yes") and esc cancels.
 A reporting program that isn't blocked gets nothing, and the reply says what it is doing.
+Only a `permission` request is answered from a chat, the web panel or a phone.
+A program blocked on a `question` or `auth` (a sign-in) is never answered from here, with or without a confirmation: the reply says to answer it in the terminal.
+A blocked report with no kind, or a kind the bridge doesn't know, counts the same as a question.
+The kind is read again when the command runs, and again when a confirmation is used, so an answer never lands on a prompt that changed in between.
 For any other program, approve types `y` and enter, and deny types `n` and enter, after a confirmation.
 The bridge has no list of agents and reads no screens. It goes only by what the program reports, like the rest of core.
 

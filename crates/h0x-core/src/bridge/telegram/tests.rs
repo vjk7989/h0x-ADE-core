@@ -37,7 +37,7 @@ fn fixture() -> Fixture {
 fn fake_core(method: &str, params: &Value) -> Result<Value, RpcError> {
     let t = params["terminal"].as_str().unwrap_or_default();
     let record = |state: Option<&str>| {
-        let status = state.map_or(Value::Null, |s| json!({"state": s, "app": "claude-code"}));
+        let status = state.map_or(Value::Null, |s| json!({"state": s, "kind": "permission", "app": "claude-code"}));
         // Started as a shell; a reporting terminal runs an agent now.
         let front = if state.is_some() { "claude" } else { "bash" };
         json!({"address": t, "state": "live", "argv": ["/bin/sh"], "cwd": "/work", "foreground": {"name": front},
@@ -48,7 +48,7 @@ fn fake_core(method: &str, params: &Value) -> Result<Value, RpcError> {
         ("terminal.get", "t2") => record(Some("blocked")),
         ("terminal.get", _) => record(Some("working")),
         ("terminal.list", _) => {
-            json!({"terminals": [{"address": "t2", "argv": ["claude"], "cwd": "/w", "state": "live", "status": {"state": "blocked"}}]})
+            json!({"terminals": [{"address": "t2", "argv": ["claude"], "cwd": "/w", "state": "live", "status": {"state": "blocked", "kind": "permission"}}]})
         }
         ("terminal.read", _) => json!({"text": "a < b && c > d\nAPI_KEY=abcdef0123456789\n"}),
         _ => json!({}),
