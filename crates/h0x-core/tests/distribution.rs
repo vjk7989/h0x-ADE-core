@@ -731,7 +731,10 @@ fn the_install_script_does_not_hang_on_an_installed_core_that_hangs() {
     let (stub, _name, new_bytes) = stubbed_release(&s, "", &downloaded);
     // --version hangs (in a child, as a real stuck process might).
     let bin = s.root.join("hangs-version");
-    put_installed(&bin, "#!/bin/sh\ncase \"$1\" in\n  --version) sleep 600 ;;\n  update*) case \"$3\" in *.tar.gz) exit 1 ;; esac; cp \"$3\" \"$0\" ;;\nesac\n");
+    put_installed(
+        &bin,
+        "#!/bin/sh\ncase \"$1\" in\n  --version) sleep 600 ;;\n  update*) case \"$3\" in *.tar.gz) exit 1 ;; esac; cp \"$3\" \"$0\" ;;\nesac\n",
+    );
     let started = Instant::now();
     let out = install_signed_within(&stub, &bin, "1");
     assert!(started.elapsed() < Duration::from_secs(60), "bounded");
