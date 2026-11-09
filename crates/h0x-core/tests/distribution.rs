@@ -600,3 +600,180 @@ fn the_install_script_names_the_archive_after_the_path_even_when_the_query_has_a
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// An h0x-core already installed (0.1.9 or newer) is the one that checks the
+/// signature: a downloaded h0x-core that would lie ("signed") or refuse never
+/// gets to say, and it is not even asked.
+#[test]
+fn the_install_script_lets_the_installed_core_verify_not_the_downloaded_one() {
+    for installed_accepts in [false, true] {
+        let s = Session::new();
+        let asked = s.root.join("asked.log");
+        let downloaded_exit = i32::from(installed_accepts);
+        let downloaded = format!(
+            "#!/bin/sh\ncase \"$*\" in\n  --version) echo 'h0x-core 9.9.9' ;;\n  *--check*) echo downloaded >> '{}'; exit {downloaded_exit} ;;\nesac\nexit 0\n",
+            asked.display()
+        );
+        let (stub, _name, new_bytes) = stubbed_release(&s, "", &downloaded);
+        let bin = s.root.join("installed");
+        std::fs::create_dir_all(&bin).unwrap();
+        let installed = format!(
+            "#!/bin/sh\ncase \"$*\" in\n  --version) echo 'h0x-core 0.1.9' ;;\n  *--check*) echo installed >> '{}'; exit {} ;;\n  update*) case \"$3\" in *.tar.gz) exit 1 ;; esac; cp \"$3\" \"$0\" ;;\nesac\n",
+            asked.display(),
+            i32::from(!installed_accepts)
+        );
+        std::fs::write(bin.join("h0x-core"), &installed).unwrap();
+        std::fs::set_permissions(bin.join("h0x-core"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let out = install_signed(&stub, &bin);
+        let err = String::from_utf8_lossy(&out.stderr);
+        let log = std::fs::read_to_string(&asked).unwrap_or_default();
+        assert_eq!(log.trim(), "installed", "only the installed core is asked: {log:?} {err}");
+        let now = std::fs::read(bin.join("h0x-core")).unwrap();
+        if installed_accepts {
+            assert!(out.status.success(), "{err}");
+            assert_eq!(now, new_bytes, "the verified download is swapped in");
+        } else {
+            assert!(!out.status.success());
+            assert!(err.contains("is not signed by the h0x-core release key"), "{err}");
+            assert_eq!(now, installed.as_bytes(), "a refusal swaps nothing");
+        }
+    }
+}
+
+/// A first install has no h0x-core to ask: the downloaded one checks (trust on
+/// first use), and the script says so.
+#[test]
+fn a_first_install_says_the_downloaded_core_checked_its_own_signature() {
+    let s = Session::new();
+    let (stub, _name, _) = stubbed_release(&s, "", &checking_core(&s));
+    let out = install_signed(&stub, &s.root.join("fresh"));
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(said.contains("trusted on first use"), "{said}");
+}
+
+/// Which h0x-core checks the download depends on the installed one's `--version`,
+/// compared as numbers (0.1.10 is newer than 0.1.9): 0.1.9 or newer checks it
+/// itself; older, unreadable or silent ones leave it to the downloaded core,
+/// which says so. Installed into a folder with spaces.
+#[test]
+fn the_install_script_reads_the_installed_version_as_numbers_to_pick_the_verifier() {
+    let cases = [
+        ("echo 'h0x-core 0.1.10'", "installed"),
+        ("echo 'h0x-core 0.2.0'", "installed"),
+        ("echo 'h0x-core 1.0.0'", "installed"),
+        ("echo 'h0x-core 0.1.10-rc.1'", "installed"),
+        ("echo 'h0x-core 0.1.9 (abc123)'", "installed"),
+        ("echo 'h0x-core 0.1.8'", "downloaded"),
+        ("echo 'h0x-core 0.0.99'", "downloaded"),
+        ("echo 'h0x-core 0.1'", "downloaded"),
+        ("echo 'hc 0.1.9'", "downloaded"),
+        ("echo 'h0x-core'", "downloaded"),
+        ("exit 1", "downloaded"),
+    ];
+    for (says, verifier) in cases {
+        let s = Session::new();
+        let asked = s.root.join("asked.log");
+        let downloaded = format!(
+            "#!/bin/sh\ncase \"$*\" in\n  --version) echo 'h0x-core 9.9.9' ;;\n  *--check*) echo downloaded >> '{}' ;;\nesac\nexit 0\n",
+            asked.display()
+        );
+        let (stub, _name, new_bytes) = stubbed_release(&s, "", &downloaded);
+        let bin = s.root.join("installed core ü");
+        std::fs::create_dir_all(&bin).unwrap();
+        let installed = format!(
+            "#!/bin/sh\ncase \"$*\" in\n  --version) {says} ;;\n  *--check*) echo installed >> '{}' ;;\n  update*) case \"$3\" in *.tar.gz) exit 1 ;; esac; cp \"$3\" \"$0\" ;;\nesac\n",
+            asked.display()
+        );
+        std::fs::write(bin.join("h0x-core"), &installed).unwrap();
+        std::fs::set_permissions(bin.join("h0x-core"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let out = install_signed(&stub, &bin);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{says}: {err}");
+        let log = std::fs::read_to_string(&asked).unwrap_or_default();
+        assert_eq!(log.trim(), verifier, "{says}: exactly one verifier is asked: {log:?} {err}");
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(said.contains("trusted on first use"), verifier == "downloaded", "{says}: {said}");
+        assert_eq!(std::fs::read(bin.join("h0x-core")).unwrap(), new_bytes, "{says}: swapped once verified");
+    }
+}
+
+/// install.sh with the installed core's runs bounded to `secs` seconds.
+fn install_signed_within(stub: &Path, bin: &Path, secs: &str) -> std::process::Output {
+    Command::new("sh")
+        .arg(format!("{ROOT}/../../distribution/install.sh"))
+        .env("PATH", format!("{}:/usr/bin:/bin", stub.display()))
+        .env_remove("H0X_CORE_RELEASES_URL")
+        .env_remove("H0X_CORE_VERSION")
+        .env("H0X_CORE_INSTALL_SECS", secs)
+        .env("H0X_CORE_INSTALL_DIR", bin)
+        .output()
+        .unwrap()
+}
+
+fn put_installed(bin: &Path, script: &str) {
+    std::fs::create_dir_all(bin).unwrap();
+    std::fs::write(bin.join("h0x-core"), script).unwrap();
+    std::fs::set_permissions(bin.join("h0x-core"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+}
+
+/// An installed core that hangs on --version cannot say what it is: the
+/// downloaded one checks instead. One that hangs on --check fails the install
+/// (verification is never skipped).
+#[test]
+fn the_install_script_does_not_hang_on_an_installed_core_that_hangs() {
+    let s = Session::new();
+    let asked = s.root.join("asked.log");
+    let downloaded = format!(
+        "#!/bin/sh\ncase \"$*\" in\n  --version) echo 'h0x-core 9.9.9' ;;\n  *--check*) echo downloaded >> '{}' ;;\nesac\nexit 0\n",
+        asked.display()
+    );
+    let (stub, _name, new_bytes) = stubbed_release(&s, "", &downloaded);
+    // --version hangs (in a child, as a real stuck process might).
+    let bin = s.root.join("hangs-version");
+    put_installed(
+        &bin,
+        "#!/bin/sh\ncase \"$1\" in\n  --version) sleep 600 ;;\n  update*) case \"$3\" in *.tar.gz) exit 1 ;; esac; cp \"$3\" \"$0.new\" && mv \"$0.new\" \"$0\" ;;\nesac\n",
+    );
+    let started = std::time::Instant::now();
+    let out = install_signed_within(&stub, &bin, "1");
+    assert!(started.elapsed() < std::time::Duration::from_secs(60), "bounded");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(std::fs::read_to_string(&asked).unwrap().trim(), "downloaded", "the downloaded core checked");
+    assert_eq!(std::fs::read(bin.join("h0x-core")).unwrap(), new_bytes);
+    // --check hangs: the install fails and nothing is swapped.
+    let bin = s.root.join("hangs-check");
+    let hangs = "#!/bin/sh\ncase \"$*\" in\n  --version) echo 'h0x-core 0.1.9' ;;\n  *--check*) sleep 600 ;;\nesac\n";
+    put_installed(&bin, hangs);
+    let started = std::time::Instant::now();
+    let out = install_signed_within(&stub, &bin, "1");
+    assert!(started.elapsed() < std::time::Duration::from_secs(60), "bounded");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("is not signed by the h0x-core release key"));
+    assert_eq!(std::fs::read(bin.join("h0x-core")).unwrap(), hangs.as_bytes());
+}
+
+/// A prerelease of 0.1.9 is older than 0.1.9: it is not trusted to verify.
+#[test]
+fn a_prerelease_installed_core_is_older_and_the_downloaded_core_verifies() {
+    for version in ["0.1.9-rc.1", "99999999999.0.0", "0.1", "junk"] {
+        let s = Session::new();
+        let asked = s.root.join("asked.log");
+        let downloaded = format!(
+            "#!/bin/sh\ncase \"$*\" in\n  --version) echo 'h0x-core 9.9.9' ;;\n  *--check*) echo downloaded >> '{}' ;;\nesac\nexit 0\n",
+            asked.display()
+        );
+        let (stub, _name, _) = stubbed_release(&s, "", &downloaded);
+        let bin = s.root.join("installed");
+        put_installed(
+            &bin,
+            &format!(
+                "#!/bin/sh\ncase \"$*\" in\n  --version) echo 'h0x-core {version}' ;;\n  *--check*) echo installed >> '{}'; exit 1 ;;\n  update*) case \"$3\" in *.tar.gz) exit 1 ;; esac; cp \"$3\" \"$0\" ;;\nesac\n",
+                asked.display()
+            ),
+        );
+        let out = install_signed_within(&stub, &bin, "5");
+        let log = std::fs::read_to_string(&asked).unwrap_or_default();
+        assert_eq!(log.trim(), "downloaded", "{version}: {log:?} {}", String::from_utf8_lossy(&out.stderr));
+    }
+}
