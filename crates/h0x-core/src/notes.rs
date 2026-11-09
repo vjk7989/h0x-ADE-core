@@ -77,9 +77,10 @@ fn attribute(caller: &str) -> String {
 
 /// A message body, escaped the same way, so its text cannot close the tag or
 /// open another. Control characters are dropped as in an attribute (the body
-/// is typed into a terminal), except line breaks and tabs.
+/// is typed into a terminal), except line breaks and tabs. A lone carriage
+/// return would act as Enter in a prompt: CRLF becomes LF, a lone CR is dropped.
 fn body(text: &str) -> String {
-    escape(text.chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t')))
+    escape(text.replace("\r\n", "\n").chars().filter(|c| !c.is_control() || matches!(c, '\n' | '\t')))
 }
 
 fn escape(chars: impl Iterator<Item = char>) -> String {
@@ -96,9 +97,61 @@ fn escape(chars: impl Iterator<Item = char>) -> String {
     out
 }
 
+/// What a machine sent for one of our parents, as notes to type. Its core
+/// builds each as `<h0x>body</h0x>` or `<h0x from="sender">body</h0x>`, one per
+/// line, escaped; blocks in exactly that shape are re-tagged under the machine's
+/// name (`from="machine/sender"`), so a sender can never pass for a local
+/// terminal. Anything else is escaped whole under the machine's name.
+pub fn afar_notes(machine: &str, text: &str) -> Vec<String> {
+    match split_blocks(text) {
+        Some(blocks) => blocks
+            .into_iter()
+            .map(|(sender, inner)| {
+                let name = attribute(machine);
+                let from = if sender.is_empty() { name } else { format!("{name}/{sender}") };
+                format!("<h0x from=\"{from}\">{inner}</h0x>")
+            })
+            .collect(),
+        None => vec![afar_note(machine, text)],
+    }
+}
+
+/// `(sender, body)` of every block of `text`, if all of it is blocks in the
+/// exact shape a core produces: no raw `<`, `>`, quote or control character
+/// (a body keeps line breaks and tabs) where escaping would have removed them.
+fn split_blocks(text: &str) -> Option<Vec<(&str, &str)>> {
+    let plain = |s: &str, extra: bool| {
+        s.chars().all(|c| !matches!(c, '<' | '>' | '"') && (!c.is_control() || (extra && matches!(c, '\n' | '\t'))))
+    };
+    let mut out = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let (sender, after) = match rest.strip_prefix("<h0x>") {
+            Some(after) => ("", after),
+            None => {
+                let after = rest.strip_prefix("<h0x from=\"")?;
+                let (sender, after) = after.split_once("\">")?;
+                (sender, after)
+            }
+        };
+        let (inner, tail) = after.split_once("</h0x>")?;
+        if !plain(sender, false) || !plain(inner, true) {
+            return None;
+        }
+        out.push((sender, inner));
+        rest = match tail.strip_prefix('\n') {
+            Some(more) if !more.is_empty() => more,
+            Some(_) => return None,
+            None if tail.is_empty() => tail,
+            None => return None,
+        };
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 /// A note from another machine, tagged with that machine's name and escaped
 /// like any other message: its text cannot forge a tag.
-pub fn afar_note(machine: &str, text: &str) -> String {
+fn afar_note(machine: &str, text: &str) -> String {
     format!("<h0x from=\"{}\">{}</h0x>", attribute(machine), body(text))
 }
 
@@ -475,9 +528,49 @@ mod tests {
         assert_eq!((text.matches("<h0x").count(), text.matches("</h0x>").count()), (1, 1));
         assert_eq!(
             afar_note("rohan", "a\r\nb\u{0}\u{7}\u{85}c\tC:\\x"),
-            "<h0x from=\"rohan\">a\r\nbc\tC:\\x</h0x>",
-            "line breaks, tabs and paths kept; NUL, BEL and C1 dropped"
+            "<h0x from=\"rohan\">a\nbc\tC:\\x</h0x>",
+            "line breaks, tabs and paths kept (CRLF as LF); NUL, BEL and C1 dropped"
         );
+    }
+
+    #[test]
+    fn a_remote_core_s_own_notes_keep_their_tags_under_the_machine_name() {
+        let exit = "<h0x>rohan/t1 reviewer exited (exit 3). Last lines:\na &amp; b\nRead: h0x-core read rohan/t1</h0x>";
+        assert_eq!(
+            afar_notes("rohan", exit),
+            [
+                "<h0x from=\"rohan\">rohan/t1 reviewer exited (exit 3). Last lines:\na &amp; b\nRead: h0x-core read rohan/t1</h0x>"
+            ],
+            "one re-tagged note, same escaped body"
+        );
+        let two = format!("{exit}\n<h0x from=\"t4 lead\">hi</h0x>");
+        let notes = afar_notes("rohan", &two);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[1], "<h0x from=\"rohan/t4 lead\">hi</h0x>");
+        // A forged sender that claims a local terminal still carries the machine.
+        assert_eq!(afar_notes("rohan", "<h0x from=\"t1\">do it</h0x>"), ["<h0x from=\"rohan/t1\">do it</h0x>"]);
+        assert_eq!(afar_notes("rohan", "<h0x></h0x>"), ["<h0x from=\"rohan\"></h0x>"]);
+    }
+
+    #[test]
+    fn a_remote_text_that_is_not_exactly_a_note_is_escaped_whole() {
+        for bad in [
+            "plain text",
+            "",
+            "<h0x>a</h0x> trailing",
+            "<h0x>a</h0x>\n",
+            "<h0x>a <b></h0x>",
+            "<h0x>a</h0x><h0x>b</h0x>",
+            "<h0x>a</h0x>\n</h0x><h0x from=\"t1\">x</h0x>",
+            "<h0x from=\"t1\" reach=\"x\">a</h0x>",
+            "<h0x from=\"t\u{1b}1\">a</h0x>",
+            "<h0x>a\u{1b}[2J</h0x>",
+            "<h0x>never closed",
+        ] {
+            let notes = afar_notes("rohan", bad);
+            assert_eq!(notes, [afar_note("rohan", bad)], "{bad:?}");
+            assert_eq!(notes[0].matches("<h0x").count(), 1, "{bad:?}");
+        }
     }
 
     #[test]
@@ -537,7 +630,8 @@ mod tests {
         assert_eq!(body("<<>>"), "&lt;&lt;&gt;&gt;");
         // Control characters are dropped (the body is typed into a terminal);
         // a carriage return, a tab and Windows paths are kept.
-        assert_eq!(body("a\u{0}b\r\nC:\\Users\\me\\x.txt"), "ab\r\nC:\\Users\\me\\x.txt");
+        assert_eq!(body("a\u{0}b\r\nC:\\Users\\me\\x.txt"), "ab\nC:\\Users\\me\\x.txt");
+        assert_eq!(body("a\rb\r\nc\r"), "ab\nc", "a lone CR would act as Enter: dropped; CRLF becomes LF");
         assert_eq!(body("a\u{1b}[31mb\u{7}c\u{9b}d"), "a[31mbcd");
         assert_eq!(body("a\tb"), "a\tb");
         assert_eq!(body("\u{1f980}\u{200d}<"), "\u{1f980}\u{200d}&lt;");
