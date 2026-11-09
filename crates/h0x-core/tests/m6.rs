@@ -50,9 +50,9 @@ fn a_parent_note_waits_for_a_draft_and_survives_a_dialog_while_waiting() {
     wait_until("parent dialog", || get(&s, &p)["status"]["state"] == "blocked");
     person.typed(b"\r");
     std::thread::sleep(Duration::from_millis(400));
-    assert!(!text(&s, &p).contains("<h0x-core>"), "note answered the dialog");
+    assert!(!text(&s, &p).contains("<h0x>"), "note answered the dialog");
     touch(&s, "free");
-    wait_until("note after the dialog", || text(&s, &p).contains(&format!("parent-got:<h0x-core>{kid} is blocked")));
+    wait_until("note after the dialog", || text(&s, &p).contains(&format!("parent-got:<h0x>{kid} is blocked")));
     let got = text(&s, &p);
     assert!(got.contains("parent-got:my draft"), "{got}");
     assert_eq!(got.matches("is blocked").count(), 1, "{got}");
