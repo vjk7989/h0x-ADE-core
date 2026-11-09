@@ -5,7 +5,8 @@
 # Into %LOCALAPPDATA%\Programs\h0x-core (h0x-core.exe, Microsoft's ConPTY
 # beside it), added to your PATH. An h0x-core that is already there is
 # swapped the planned way (h0x-core update --from): running terminals keep
-# running. The download must carry the release key's signature (its .minisig).
+# running. The download must carry the release key's signature (its .minisig);
+# an installed h0x-core checks it before anything downloaded runs.
 # No admin needed. H0X_CORE_VERSION=0.2.0 picks a version;
 # H0X_CORE_RELEASES_URL points elsewhere (tests); H0X_CORE_INSTALL_DIR
 # installs elsewhere.
@@ -88,17 +89,48 @@ try {
         if ($LASTEXITCODE) { Fail "no signature for ${asset}: $sigUrl" }
     }
   }
+    # The checksum comes from the same place as the file: the signature proves the
+    # release key made it. Nothing from the download runs before that is checked. An
+    # installed h0x-core (0.1.9 or newer, which has `update --from --check`) does the
+    # checking; only a first install lets the downloaded h0x-core check itself (trust
+    # on first use: TLS to GitHub and the manifest's checksum).
+    $installed = Join-Path $dir "h0x-core.exe"
+    $checkedByInstalled = $false
+    # Bounded: an installed h0x-core that cannot run or hangs counts as unable to check
+    # (for --version: fall back to the downloaded one; for --check: the install fails).
+    function Invoke-Installed($argText, $ms, $out) {
+        try {
+            $p = Start-Process -FilePath $installed -ArgumentList $argText -NoNewWindow -PassThru -RedirectStandardOutput $out
+            $null = $p.Handle # keeps the exit code readable after a timed wait
+            if (-not $p.WaitForExit($ms)) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; return $null }
+            return $p.ExitCode
+        } catch { return $null }
+    }
+    if ($signed -and (Test-Path $installed)) {
+        $vout = "$tmp\installed.version"
+        $have = ""
+        if ((Invoke-Installed "--version" 30000 $vout) -eq 0) { $have = [string](Get-Content $vout | Select-Object -First 1) }
+        # X.Y.Z, then anything. A prerelease sorts below its release (semver): 0.1.9-rc.1
+        # is older than 0.1.9, 0.1.10-rc.1 is newer.
+        if ($have -match "^h0x-core (\d{1,9})\.(\d{1,9})\.(\d{1,9})(.*)$") {
+            $n = [int64[]]($Matches[1], $Matches[2], $Matches[3])
+            $pre = $Matches[4].StartsWith("-")
+            if ($n[0] -gt 0 -or $n[1] -gt 1 -or ($n[1] -eq 1 -and ($n[2] -gt 9 -or ($n[2] -eq 9 -and -not $pre)))) {
+                if ((Invoke-Installed "update --from `"$archive`" --check" 120000 "$tmp\check.out") -ne 0) {
+                    Fail "$asset is not signed by the h0x-core release key, or the installed h0x-core could not check it (see above)"
+                }
+                $checkedByInstalled = $true
+            }
+        }
+    }
     New-Item -ItemType Directory -Force "$tmp\h0x-core" | Out-Null
     & $tar -xf $archive -C "$tmp\h0x-core"
     $new = "$tmp\h0x-core\h0x-core.exe"
     if ($LASTEXITCODE -or -not (Test-Path "$tmp\h0x-core\conpty\conpty.dll")) { Fail "the download holds no complete h0x-core" }
     $version = (& $new --version) -replace "^h0x-core ", ""
     if ($LASTEXITCODE) { Fail "the downloaded h0x-core does not run on this machine" }
-    if ($signed) {
-        # The checksum comes from the same place as the file: the signature proves the
-        # release key made it. The downloaded h0x-core checks it with its embedded key
-        # before anything is installed (it has to be trusted to say so: that first step
-        # rests on TLS to GitHub; later updates are checked by the installed h0x-core).
+    if ($signed -and -not $checkedByInstalled) {
+        Write-Host "h0x-core: no installed h0x-core can check the signature: the downloaded one does (trusted on first use: TLS to GitHub and the checksum)."
         & $new update --from $archive --check | Out-Null
         if ($LASTEXITCODE) { Fail "$asset is not signed by the h0x-core release key (see above)" }
     }

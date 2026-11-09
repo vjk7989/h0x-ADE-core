@@ -5,7 +5,8 @@
 #
 # Into ~/.local/bin/h0x-core. An h0x-core that is already there is swapped
 # the planned way (h0x-core update --from): running terminals keep running.
-# The download must carry the release key's signature (its .minisig).
+# The download must carry the release key's signature (its .minisig); an
+# installed h0x-core checks it before anything downloaded runs.
 # H0X_CORE_VERSION=0.2.0 picks a version; H0X_CORE_RELEASES_URL points
 # elsewhere (tests); H0X_CORE_INSTALL_DIR installs elsewhere.
 set -eu
@@ -68,15 +69,52 @@ asset=${asset##*/}
 archive="$tmp/$asset"
 curl -fsSL --proto "$proto" --proto-redir "$proto" "$url" -o "$archive" || fail "download failed: $url"
 [ "$(sha256 "$archive")" = "$want" ] || fail "the download is damaged (checksum mismatch); try again"
+# The checksum comes from the same place as the file: the signature is what
+# proves the release key made it. Nothing from the download runs before that
+# is checked. An h0x-core already installed (0.1.9 or newer, which has
+# `update --from --check`) does the checking; only a first install, with
+# nothing trusted on this machine yet, lets the downloaded h0x-core check
+# itself (trust on first use: TLS to GitHub and the manifest's checksum).
+# A site set by H0X_CORE_RELEASES_URL (tests) is not signed.
+# An installed h0x-core that hangs counts as unable: runs are bounded (seconds in
+# H0X_CORE_INSTALL_SECS, for tests; else 30 for --version, 120 for --check).
+bounded() {
+  secs=$1; shift
+  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"; return; fi
+  "$@" & pid=$!
+  ( sleep "$secs"; pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 & killer=$!
+  rc=0; wait "$pid" || rc=$?
+  kill "$killer" 2>/dev/null || true
+  return "$rc"
+}
+checks_signatures() {
+  [ -x "$bin/h0x-core" ] || return 1
+  bounded "${H0X_CORE_INSTALL_SECS:-30}" "$bin/h0x-core" --version >"$tmp/installed.version" 2>/dev/null || return 1
+  # X.Y.Z, then anything (a build note, a prerelease). A prerelease sorts below its
+  # release (semver): 0.1.9-rc.1 is older than 0.1.9, 0.1.10-rc.1 is newer.
+  v=$(sed -n 's/^h0x-core \([0-9][0-9]*\)\.\([0-9][0-9]*\)\.\([0-9][0-9]*\)\(.*\)$/\1 \2 \3 \4/p' "$tmp/installed.version" | head -n 1)
+  [ -n "$v" ] || return 1
+  # shellcheck disable=SC2086
+  set -f; set -- $v; set +f
+  [ "${#1}" -le 9 ] && [ "${#2}" -le 9 ] && [ "${#3}" -le 9 ] || return 1
+  [ "$1" -gt 0 ] || [ "$2" -gt 1 ] || { [ "$2" -eq 1 ] && [ "$3" -gt 9 ]; } && return 0
+  [ "$1" -eq 0 ] && [ "$2" -eq 1 ] && [ "$3" -eq 9 ] || return 1
+  case ${4:-} in -*) return 1 ;; esac
+  return 0
+}
+signed=
+if [ -z "${H0X_CORE_RELEASES_URL:-}" ]; then
+  signed=1
+  curl -fsSL --proto "$proto" --proto-redir "$proto" "${url%%[?#]*}.minisig" -o "$archive.minisig" || fail "no signature for $asset: ${url%%[?#]*}.minisig"
+  if checks_signatures; then
+    bounded "${H0X_CORE_INSTALL_SECS:-120}" "$bin/h0x-core" update --from "$archive" --check >/dev/null || fail "$asset is not signed by the h0x-core release key (see above)"
+    signed=installed
+  fi
+fi
 tar -xzf "$archive" -C "$tmp"
 "$tmp/h0x-core" --version >/dev/null 2>&1 || fail "the downloaded h0x-core does not run on this machine"
-# The checksum comes from the same place as the file: the signature is what
-# proves the release key made it. The downloaded h0x-core checks it with its
-# embedded key before anything is installed (it has to be trusted to say so:
-# that first step rests on TLS to GitHub; every later update is checked by the
-# h0x-core already installed). A site set by H0X_CORE_RELEASES_URL (tests) is not signed.
-if [ -z "${H0X_CORE_RELEASES_URL:-}" ]; then
-  curl -fsSL --proto "$proto" --proto-redir "$proto" "${url%%[?#]*}.minisig" -o "$archive.minisig" || fail "no signature for $asset: ${url%%[?#]*}.minisig"
+if [ "$signed" = 1 ]; then
+  say "h0x-core: no installed h0x-core can check the signature: the downloaded one does (trusted on first use: TLS to GitHub and the checksum)."
   "$tmp/h0x-core" update --from "$archive" --check >/dev/null || fail "$asset is not signed by the h0x-core release key (see above)"
 fi
 mkdir -p "$bin"
