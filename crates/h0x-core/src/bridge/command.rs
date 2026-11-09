@@ -205,6 +205,8 @@ pub(super) struct Planned {
     what: String,
     /// An approve or deny: its terminal's status is checked again when it runs.
     answer: bool,
+    /// The terminal was blocked when this was planned: it must still be when it runs.
+    was_blocked: bool,
 }
 
 /// A destructive command waiting for its confirmation. It is void once the
@@ -233,18 +235,23 @@ fn at_shell(t: &Value) -> bool {
 
 /// A remote yes or no answers a blocked terminal only when it asks for a permission. A
 /// question or a sign-in is the person's to answer in the terminal; a missing or unknown
-/// kind counts as one of those. (Not blocked: nothing here to refuse.)
+/// kind counts as one of those. The key goes to the whole terminal, so a pending question
+/// in any record, root or child, refuses it. (Not blocked: nothing here to refuse.)
 fn answerable(t: &Value, address: &str) -> Result<(), RpcError> {
-    if t["status"]["state"] != "blocked" {
-        return Ok(());
+    let children = t["records"].as_object().into_iter().flat_map(|r| r.values());
+    for status in std::iter::once(&t["status"]).chain(children) {
+        if status["state"] != "blocked" {
+            continue;
+        }
+        let asks = match status["kind"].as_str() {
+            Some("permission") => continue,
+            Some("question") => "a question",
+            Some("auth") => "a sign-in",
+            _ => "a request of unknown kind",
+        };
+        return Err(failed(format!("{address} is blocked on {asks}: answer it in the terminal, not from here")));
     }
-    let asks = match t["status"]["kind"].as_str() {
-        Some("permission") => return Ok(()),
-        Some("question") => "a question",
-        Some("auth") => "a sign-in",
-        _ => "a request of unknown kind",
-    };
-    Err(failed(format!("{address} is blocked on {asks}: answer it in the terminal, not from here")))
+    Ok(())
 }
 
 /// A text for the log: redacted, then cut short.
@@ -347,7 +354,12 @@ impl Bridge {
                     let still = match planned.answer {
                         true => {
                             let address = planned.params["terminal"].as_str().unwrap_or_default();
-                            call("terminal.get", json!({"terminal": address})).and_then(|t| answerable(&t, address))
+                            call("terminal.get", json!({"terminal": address})).and_then(|t| {
+                                if planned.was_blocked && t["status"]["state"] != "blocked" {
+                                    return Err(failed(format!("{address} is no longer waiting on you")));
+                                }
+                                answerable(&t, address)
+                            })
                         }
                         false => Ok(()),
                     };
@@ -417,7 +429,7 @@ fn plan(
     call: &impl Fn(&str, Value) -> Result<Value, RpcError>,
     command: &Command,
 ) -> Result<(Planned, bool), RpcError> {
-    let planned = |method, params, what: String| Planned { method, params, what, answer: false };
+    let planned = |method, params, what: String| Planned { method, params, what, answer: false, was_blocked: false };
     if let Command::Run { folder, command } = command {
         if command.trim().is_empty() {
             return Err(failed("nothing to run"));
@@ -471,7 +483,14 @@ fn plan(
             };
             answerable(&t, &address)?;
             let what = format!("{} in {address}: press {}", if yes { "approve" } else { "deny" }, names.join(" "));
-            (Planned { answer: true, ..planned("terminal.keys", press(names), what) }, !reports)
+            (
+                Planned {
+                    answer: true,
+                    was_blocked: state == "blocked",
+                    ..planned("terminal.keys", press(names), what)
+                },
+                !reports,
+            )
         }
         Command::Interrupt { .. } => {
             (planned("terminal.interrupt", json!({"terminal": address}), format!("interrupt {address}")), false)
@@ -936,6 +955,42 @@ mod tests {
         let reply = f.send(Command::Approve { terminal: "k3".into() }, T);
         assert!(matches!(&reply, Reply::Failed(m) if m.contains("a question")), "{reply:?}");
         assert!(f.acted().is_empty());
+    }
+
+    #[test]
+    fn a_blocked_child_question_refuses_the_key_even_under_a_root_permission() {
+        let mut f = fixture(BridgeConfig::default());
+        let mut t = k3("claude", json!({"state": "blocked", "kind": "permission"}));
+        t["records"] = json!({"sub": {"state": "blocked", "kind": "question"}});
+        *f.k3.borrow_mut() = t.clone();
+        for command in [Command::Approve { terminal: "k3".into() }, Command::Deny { terminal: "k3".into() }] {
+            let reply = f.send(command, T);
+            assert!(matches!(&reply, Reply::Failed(m) if m.contains("a question")), "{reply:?}");
+        }
+        // A child permission, or a child at work, does not.
+        t["records"] = json!({"a": {"state": "blocked", "kind": "permission"}, "b": {"state": "working"}});
+        *f.k3.borrow_mut() = t;
+        assert!(matches!(f.send(Command::Approve { terminal: "k3".into() }, T), Reply::Done(_)));
+        assert_eq!(f.acted().len(), 1, "only the allowed one pressed a key");
+    }
+
+    #[test]
+    fn a_terminal_that_stopped_being_blocked_gets_nothing_at_the_confirmation() {
+        let mut f = fixture(BridgeConfig::default());
+        let blocked = json!({"state": "blocked", "kind": "permission"});
+        let shell = "pwsh.exe";
+        for (later, what) in [(json!({"state": "working"}), "working"), (Value::Null, "no status")] {
+            *f.k3.borrow_mut() = k3(shell, blocked.clone());
+            let ask = f.send(Command::Approve { terminal: "k3".into() }, T);
+            *f.k3.borrow_mut() = k3(shell, later);
+            let reply = f.send(Command::Confirm { token: token(&ask) }, T);
+            assert!(matches!(&reply, Reply::Failed(m) if m.contains("no longer waiting")), "{what}: {reply:?}");
+            assert!(f.acted().is_empty(), "{what}: nothing typed");
+            assert_eq!(f.bridge.log(1).unwrap()[0]["result"], "failed", "the refusal is audited");
+        }
+        // A terminal that never reported keeps the old rule: ask, then type.
+        let ask = f.send(Command::Approve { terminal: "t1".into() }, T);
+        assert!(matches!(f.send(Command::Confirm { token: token(&ask) }, T), Reply::Done(_)));
     }
 
     #[test]
