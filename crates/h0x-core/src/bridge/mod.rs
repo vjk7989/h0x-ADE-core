@@ -359,15 +359,16 @@ impl Bridge {
             return Ok(());
         }
         let (held_back, sources) = (failures.held_back, failures.sources.len());
-        *failures = Failures { since: now, ..Failures::default() };
-        if held_back == 0 {
-            return Ok(());
+        if held_back > 0 {
+            let more = if sources >= FAILURE_SOURCES { "+" } else { "" };
+            let result = format!("{held_back} more failed attempts from {sources}{more} sources in the last minute");
+            // A summary that can't be written stays counted, for the next write to try again.
+            self.append(
+                json!({"time_ms": now, "identity": "unauthenticated", "command": "failed-attempts", "result": result}),
+            )?;
         }
-        let more = if sources >= FAILURE_SOURCES { "+" } else { "" };
-        let result = format!("{held_back} more failed attempts from {sources}{more} sources in the last minute");
-        self.append(
-            json!({"time_ms": now, "identity": "unauthenticated", "command": "failed-attempts", "result": result}),
-        )
+        *failures = Failures { since: now, ..Failures::default() };
+        Ok(())
     }
 
     fn append(&self, entry: Value) -> Result<(), RpcError> {
