@@ -1,5 +1,5 @@
 //! Status facts from OSC 7501, kept per terminal exactly as reported.
-//! A report replaces its record; `clear` removes a record and its children.
+//! A report replaces its record; a child record without `app` takes its nearest ancestor's; `clear` removes a record and its children.
 //! The turn goes up each time the root record leaves `working`, for any reason.
 //! When the program exits only `done` and `error` records stay; a new shell prompt
 //! (OSC 133 A) drops `working` and `blocked` ones, and a full reset (RIS) all of them.
@@ -125,7 +125,11 @@ pub fn apply(t: &mut Terminal, r: &StatusReport) -> Change {
             t.records.remove(&oldest);
             forget_order(t);
         }
-        t.records.insert(r.id.clone(), Status::from(r));
+        let mut status = Status::from(r);
+        if status.app.is_empty() {
+            status.app = inherited_app(t, &r.id);
+        }
+        t.records.insert(r.id.clone(), status);
         t.record_order.retain(|k| *k != r.id);
         t.record_order.push(r.id.clone());
     }
@@ -136,6 +140,18 @@ pub fn apply(t: &mut Terminal, r: &StatusReport) -> Change {
         turn_ended: end_turn(t, was_working),
         stuck: stuck(t).is_some() && stuck(t) != was.as_deref(),
     }
+}
+
+/// The `app` of the nearest ancestor of `id` (a/b/c: a/b, a, then the root) that has one.
+fn inherited_app(t: &Terminal, id: &str) -> String {
+    let mut parent = id;
+    while let Some((up, _)) = parent.rsplit_once('/') {
+        parent = up;
+        if let Some(app) = t.records.get(parent).map(|s| &s.app).filter(|a| !a.is_empty()) {
+            return app.clone();
+        }
+    }
+    t.status.as_ref().map(|s| s.app.clone()).unwrap_or_default()
 }
 
 fn forget_order(t: &mut Terminal) {
@@ -321,6 +337,48 @@ mod tests {
         }
         assert!(t.status.is_none() && t.records.is_empty());
         assert_eq!(t.turn, 1);
+    }
+
+    fn report_app(state: &'static str, id: &str, app: &str) -> StatusReport {
+        StatusReport { app: app.into(), ..report(state, id) }
+    }
+
+    fn app_of(t: &Terminal, id: &str) -> String {
+        t.records[id].app.clone()
+    }
+
+    #[test]
+    fn a_child_takes_the_app_of_its_nearest_ancestor_that_has_one() {
+        let mut t = terminal();
+        apply(&mut t, &report_app("working", "a", "cargo"));
+        apply(&mut t, &report("working", "a/b"));
+        apply(&mut t, &report_app("working", "a/b/c", "own"));
+        apply(&mut t, &report("working", "a/b/c/d/e"));
+        apply(&mut t, &report("working", "a/b/c/d"));
+        assert_eq!(app_of(&t, "a/b"), "cargo", "from its parent");
+        assert_eq!(app_of(&t, "a/b/c"), "own", "its own app wins");
+        assert_eq!(app_of(&t, "a/b/c/d/e"), "own", "the nearest, though a parent in between is missing");
+        assert_eq!(app_of(&t, "a/b/c/d"), "own", "the same one once that parent exists");
+    }
+
+    #[test]
+    fn inheriting_stops_at_missing_or_app_less_ancestors_and_never_matches_a_prefix() {
+        let mut t = terminal();
+        apply(&mut t, &report_app("working", "ab", "other"));
+        apply(&mut t, &report("working", "a"));
+        apply(&mut t, &report("working", "a/b"));
+        apply(&mut t, &report("working", "x/y/z"));
+        assert_eq!(app_of(&t, "a/b"), "", "the parent has none, there is no root");
+        assert_eq!(app_of(&t, "x/y/z"), "", "no ancestor exists");
+        apply(&mut t, &report_app("idle", "", "root-app"));
+        apply(&mut t, &report("working", "a/b"));
+        assert_eq!(app_of(&t, "a/b"), "root-app", "the root record is the last ancestor");
+        apply(&mut t, &report("working", "a"));
+        assert_eq!(app_of(&t, "a"), "root-app");
+        assert_eq!(app_of(&t, "ab"), "other", "stored apps are untouched");
+        let mut screen = ghostty_vt::Terminal::new(80, 24, 1 << 20);
+        screen.write(t.records["a/b"].encode("a/b").as_bytes());
+        assert_eq!(screen.take_status_reports()[0].app, "root-app");
     }
 
     fn fill(t: &mut Terminal, n: usize) {
