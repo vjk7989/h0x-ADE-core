@@ -23,6 +23,8 @@ pub struct Config {
     pub history_mb: Option<f64>,
     /// Keep the machine from sleeping while a terminal's status is `working` (default off).
     /// The display and the screen lock are not affected.
+    /// A stuck `working` agent keeps the machine awake until it reports `done` or this is
+    /// turned off: there is no time limit.
     pub keep_awake: Option<bool>,
     /// Where the core listens (default under $XDG_RUNTIME_DIR). `H0X_CORE_SOCKET` wins.
     pub socket: Option<String>,

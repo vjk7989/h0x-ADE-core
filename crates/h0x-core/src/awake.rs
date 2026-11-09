@@ -15,31 +15,46 @@ pub fn held() -> bool {
 
 /// What the operating system gives us: a block on system sleep that is given back on `release`.
 pub trait Inhibitor {
-    fn hold(&mut self);
+    /// Takes the block; false when the system would not give it (the reason is logged).
+    fn hold(&mut self) -> bool;
+    /// The block is still in force (a helper process may have exited).
+    fn alive(&mut self) -> bool;
     fn release(&mut self);
 }
 
 /// Decides when the block is held; the OS part is the `Inhibitor`.
 pub struct KeepAwake<I: Inhibitor> {
     inhibitor: I,
+    /// The block is wanted now. Kept even when it could not be taken: no retry until the next turn.
     held: bool,
+    /// The block is really in force.
+    took: bool,
 }
 
 impl<I: Inhibitor> KeepAwake<I> {
     pub fn new(inhibitor: I) -> Self {
-        Self { inhibitor, held: false }
+        Self { inhibitor, held: false, took: false }
     }
 
     /// `enabled`: the setting. `working`: some live terminal's root status is `working`.
     pub fn update(&mut self, enabled: bool, working: bool) {
         let want = enabled && working;
         if want && !self.held {
-            self.inhibitor.hold();
+            self.took = self.inhibitor.hold();
+        } else if want && self.took && !self.inhibitor.alive() {
+            eprintln!("core: keep_awake: the sleep block ended on its own; nothing keeps the machine awake now");
+            self.took = false;
         } else if !want && self.held {
             self.inhibitor.release();
+            self.took = false;
         }
         self.held = want;
-        HELD.store(want, Ordering::SeqCst);
+        HELD.store(self.holding(), Ordering::SeqCst);
+    }
+
+    /// The block is in force.
+    pub fn holding(&self) -> bool {
+        self.held && self.took
     }
 }
 
@@ -59,7 +74,7 @@ pub struct Os(Option<std::sync::mpsc::Sender<()>>);
 
 #[cfg(windows)]
 impl Inhibitor for Os {
-    fn hold(&mut self) {
+    fn hold(&mut self) -> bool {
         use windows_sys::Win32::System::Power::{ES_CONTINUOUS, ES_SYSTEM_REQUIRED, SetThreadExecutionState};
         let (release, wait) = std::sync::mpsc::channel::<()>();
         let spawned = std::thread::Builder::new().name("keep-awake".into()).spawn(move || {
@@ -71,6 +86,11 @@ impl Inhibitor for Os {
             Ok(_) => self.0 = Some(release),
             Err(e) => eprintln!("core: keep_awake: cannot start a thread: {e}"),
         }
+        self.0.is_some()
+    }
+
+    fn alive(&mut self) -> bool {
+        true
     }
 
     fn release(&mut self) {
@@ -86,7 +106,8 @@ pub struct Os(Option<std::process::Child>);
 
 #[cfg(unix)]
 impl Inhibitor for Os {
-    fn hold(&mut self) {
+    fn hold(&mut self) -> bool {
+        use std::os::unix::process::CommandExt;
         let pid = std::process::id().to_string();
         let mut helper = if cfg!(target_os = "macos") {
             let mut c = std::process::Command::new("caffeinate");
@@ -98,7 +119,9 @@ impl Inhibitor for Os {
             c.args(["tail", "--pid", &pid, "-f", "/dev/null"]);
             c
         };
+        // Its own group: release ends the helper and whatever it started (`tail` under systemd-inhibit).
         helper
+            .process_group(0)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -106,10 +129,17 @@ impl Inhibitor for Os {
             Ok(child) => self.0 = Some(child),
             Err(e) => eprintln!("core: keep_awake: cannot start {}: {e}", helper.get_program().to_string_lossy()),
         }
+        self.0.is_some()
+    }
+
+    fn alive(&mut self) -> bool {
+        self.0.as_mut().is_some_and(|child| child.try_wait().is_ok_and(|exited| exited.is_none()))
     }
 
     fn release(&mut self) {
         if let Some(mut child) = self.0.take() {
+            // The group id is the helper's pid.
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -120,8 +150,22 @@ impl Core {
     /// Follows the setting and the terminals: on each tick, hold or release.
     pub async fn watch_awake(self: Arc<Self>) {
         let mut awake = KeepAwake::new(Os::default());
+        let mut complained: Option<String> = None;
         loop {
-            let enabled = crate::config::load(&self.paths.config).is_ok_and(|c| c.keep_awake.unwrap_or(false));
+            // A config that cannot be read means off; say so once per distinct error.
+            let enabled = match crate::config::load(&self.paths.config) {
+                Ok(c) => {
+                    complained = None;
+                    c.keep_awake.unwrap_or(false)
+                }
+                Err(e) => {
+                    if complained.as_deref() != Some(e.message.as_str()) {
+                        eprintln!("core: keep_awake is off until the config is fixed: {}", e.message);
+                        complained = Some(e.message);
+                    }
+                    false
+                }
+            };
             let working = self
                 .lock()
                 .reg
@@ -139,12 +183,29 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    #[derive(Clone, Default)]
-    struct Fake(Arc<Mutex<Vec<&'static str>>>);
+    #[derive(Clone)]
+    struct Fake(Arc<Mutex<Vec<&'static str>>>, Arc<Mutex<(bool, bool)>>);
+
+    impl Fake {
+        /// `(takes the block, stays in force)`; the default is both.
+        fn behaving(takes: bool, stays: bool) -> Self {
+            Fake(Arc::default(), Arc::new(Mutex::new((takes, stays))))
+        }
+    }
+
+    impl Default for Fake {
+        fn default() -> Self {
+            Fake::behaving(true, true)
+        }
+    }
 
     impl Inhibitor for Fake {
-        fn hold(&mut self) {
+        fn hold(&mut self) -> bool {
             self.0.lock().unwrap().push("hold");
+            self.1.lock().unwrap().0
+        }
+        fn alive(&mut self) -> bool {
+            self.1.lock().unwrap().1
         }
         fn release(&mut self) {
             self.0.lock().unwrap().push("release");
@@ -236,5 +297,37 @@ mod tests {
         awake.update(false, false);
         drop(awake);
         assert_eq!(log(&fake), ["hold", "release"]);
+    }
+
+    #[test]
+    fn a_block_the_system_would_not_give_is_not_claimed_nor_retried() {
+        let fake = Fake::behaving(false, true);
+        let mut awake = KeepAwake::new(fake.clone());
+        for _ in 0..3 {
+            awake.update(true, true);
+            assert!(!awake.holding(), "nothing was taken");
+        }
+        assert_eq!(log(&fake), ["hold"], "one try per working turn");
+        awake.update(true, false);
+        awake.update(true, true);
+        assert_eq!(log(&fake), ["release", "hold"], "the next turn tries again");
+    }
+
+    #[test]
+    fn a_helper_that_starts_and_then_dies_stops_being_claimed_until_the_next_turn() {
+        let fake = Fake::default();
+        let mut awake = KeepAwake::new(fake.clone());
+        awake.update(true, true);
+        assert!(awake.holding());
+        *fake.1.lock().unwrap() = (true, false);
+        awake.update(true, true);
+        assert!(!awake.holding(), "the block ended on its own");
+        awake.update(true, true);
+        assert_eq!(log(&fake), ["hold"], "no respawn while the same turn goes on");
+        awake.update(true, false);
+        *fake.1.lock().unwrap() = (true, true);
+        awake.update(true, true);
+        assert!(awake.holding());
+        assert_eq!(log(&fake), ["release", "hold"]);
     }
 }

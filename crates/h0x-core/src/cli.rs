@@ -172,8 +172,9 @@ fn quiet_on_broken_pipe() {
             .map(String::as_str)
             .or_else(|| info.payload().downcast_ref::<&str>().copied())
             .unwrap_or_default();
-        let closed = message.starts_with("failed printing to std")
-            && ["(os error 32)", "(os error 109)", "(os error 232)"].iter().any(|code| message.ends_with(code));
+        // EPIPE; on Windows 32 is a sharing violation, so there it is ERROR_BROKEN_PIPE and ERROR_NO_DATA.
+        let codes: &[&str] = if cfg!(windows) { &["(os error 109)", "(os error 232)"] } else { &["(os error 32)"] };
+        let closed = message.starts_with("failed printing to std") && codes.iter().any(|code| message.ends_with(code));
         if closed && std::thread::current().name() == Some("main") {
             std::process::exit(BROKEN_PIPE_EXIT);
         }
@@ -183,9 +184,12 @@ fn quiet_on_broken_pipe() {
 
 pub fn main() -> i32 {
     let daemon = crate::platform::daemon_startup();
-    quiet_on_broken_pipe();
     client::remember_exe();
     let args: Vec<_> = if daemon { vec!["serve".into()] } else { std::env::args_os().skip(1).collect() };
+    // Only commands a person runs: the core and the holder run on "main" too, and must panic as before.
+    if !matches!(args.first().and_then(|a| a.to_str()), Some("serve" | "hold")) {
+        quiet_on_broken_pipe();
+    }
     match args.iter().map(|a| a.to_str()).collect::<Vec<_>>().as_slice() {
         [Some("--help" | "-h" | "help")] => {
             print!("{HELP}");
