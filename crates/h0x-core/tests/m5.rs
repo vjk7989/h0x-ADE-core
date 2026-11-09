@@ -127,6 +127,20 @@ fn exits_and_output_end_waits() {
 }
 
 #[test]
+fn a_wait_that_ends_at_exit_says_the_kept_done_like_a_wait_after_it() {
+    let s = session();
+    let t = agent(&s, "r state=done; w a; exit 0");
+    wait_until("done", || state(&s, &t) == "done");
+    let waiting = wait_bg(&s, &[&t, "--output", "never printed"]);
+    touch(&s, "a");
+    let live = waiting.join().unwrap();
+    let later = s.json(&["wait", &t]);
+    assert_eq!((live["reason"].as_str(), later["reason"].as_str()), (Some("exit"), Some("exit")));
+    assert_eq!(state(&s, &t), "done", "exit keeps done");
+    assert_eq!(live["status"], later["status"], "one finished terminal, one word");
+}
+
+#[test]
 fn a_wait_after_send_catches_the_turn_even_if_it_already_ended() {
     let s = session();
     let t = agent(&s, "stty -echo; r state=idle; while read -r l; do r state=working; r state=done; done");
