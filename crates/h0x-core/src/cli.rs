@@ -157,10 +157,39 @@ pub fn command_names() -> Vec<String> {
         .collect()
 }
 
+/// Exit status when output goes to a closed pipe (`h0x-core --skill | head -c 0`): the unix
+/// convention for death by SIGPIPE, 128 + 13, on every platform.
+const BROKEN_PIPE_EXIT: i32 = 141;
+
+/// `print!` panics when stdout is closed. On the main thread that is a person's `| head`, not a
+/// bug: leave quietly. The OS error number is matched because the text is localized.
+fn quiet_on_broken_pipe() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        // EPIPE; on Windows 32 is a sharing violation, so there it is ERROR_BROKEN_PIPE and ERROR_NO_DATA.
+        let codes: &[&str] = if cfg!(windows) { &["(os error 109)", "(os error 232)"] } else { &["(os error 32)"] };
+        let closed = message.starts_with("failed printing to std") && codes.iter().any(|code| message.ends_with(code));
+        if closed && std::thread::current().name() == Some("main") {
+            std::process::exit(BROKEN_PIPE_EXIT);
+        }
+        default(info);
+    }));
+}
+
 pub fn main() -> i32 {
     let daemon = crate::platform::daemon_startup();
     client::remember_exe();
     let args: Vec<_> = if daemon { vec!["serve".into()] } else { std::env::args_os().skip(1).collect() };
+    // Only commands a person runs: the core and the holder run on "main" too, and must panic as before.
+    if !matches!(args.first().and_then(|a| a.to_str()), Some("serve" | "hold")) {
+        quiet_on_broken_pipe();
+    }
     match args.iter().map(|a| a.to_str()).collect::<Vec<_>>().as_slice() {
         [Some("--help" | "-h" | "help")] => {
             print!("{HELP}");
@@ -599,7 +628,7 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
                 id.get(..8).unwrap_or(id),
                 r["pid"],
                 r["uptime_ms"].as_u64().unwrap_or(0) / 1000
-            );
+            ) + if r["keep_awake"] == true { ", keeping the machine awake" } else { "" };
             Out { json: r, human }
         }
         Cmd::Server { action: ServerCmd::Stop } => stop(&paths)?,
@@ -921,6 +950,25 @@ mod tests {
 
     fn parsed(args: &[&str]) -> Cmd {
         Cli::try_parse_from([&["h0x-core"], args].concat()).unwrap().cmd.unwrap()
+    }
+
+    #[test]
+    fn a_broken_pipe_panic_off_the_main_thread_still_panics() {
+        // Installed for the rest of this test process; it hands every other panic on.
+        quiet_on_broken_pipe();
+        for message in [
+            "failed printing to stdout: Broken pipe (os error 32)",
+            "failed printing to stderr: The pipe is being closed. (os error 232)",
+            "failed printing to stdout: The pipe has been ended. (os error 109)",
+        ] {
+            let worker = std::thread::Builder::new()
+                .name("worker".into())
+                .spawn(move || std::panic::panic_any(message.to_string()))
+                .unwrap();
+            // Had the hook exited, this test process would have ended with 141 here.
+            let payload = worker.join().expect_err("the worker panics");
+            assert_eq!(payload.downcast_ref::<String>().map(String::as_str), Some(message));
+        }
     }
 
     #[test]

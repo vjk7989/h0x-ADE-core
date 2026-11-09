@@ -144,6 +144,8 @@ pub struct StatusResult {
     pub holders: Vec<HolderInfo>,
     pub live: usize,
     pub finished: usize,
+    /// A sleep block is held now: `keep_awake` is on and a terminal is working.
+    pub keep_awake: bool,
     /// The package manager this h0x-core came from (homebrew, nix, mise, or
     /// system package manager): it updates h0x-core, `h0x-core update` won't.
     /// Null for a replaceable plain install.

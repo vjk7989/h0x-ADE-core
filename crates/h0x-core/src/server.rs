@@ -82,6 +82,7 @@ pub fn serve() -> io::Result<()> {
         }
         crate::remote::start_all(&core);
         tokio::spawn(core.clone().watch_foreground());
+        tokio::spawn(core.clone().watch_awake());
         tokio::spawn(core.clone().save_when_due());
         let term = platform::termination();
         tokio::pin!(term);
