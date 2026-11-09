@@ -735,9 +735,9 @@ fn the_install_script_does_not_hang_on_an_installed_core_that_hangs() {
         &bin,
         "#!/bin/sh\ncase \"$1\" in\n  --version) sleep 600 ;;\n  update*) case \"$3\" in *.tar.gz) exit 1 ;; esac; cp \"$3\" \"$0\" ;;\nesac\n",
     );
-    let started = Instant::now();
+    let started = std::time::Instant::now();
     let out = install_signed_within(&stub, &bin, "1");
-    assert!(started.elapsed() < Duration::from_secs(60), "bounded");
+    assert!(started.elapsed() < std::time::Duration::from_secs(60), "bounded");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(std::fs::read_to_string(&asked).unwrap().trim(), "downloaded", "the downloaded core checked");
     assert_eq!(std::fs::read(bin.join("h0x-core")).unwrap(), new_bytes);
@@ -745,9 +745,9 @@ fn the_install_script_does_not_hang_on_an_installed_core_that_hangs() {
     let bin = s.root.join("hangs-check");
     let hangs = "#!/bin/sh\ncase \"$*\" in\n  --version) echo 'h0x-core 0.1.9' ;;\n  *--check*) sleep 600 ;;\nesac\n";
     put_installed(&bin, hangs);
-    let started = Instant::now();
+    let started = std::time::Instant::now();
     let out = install_signed_within(&stub, &bin, "1");
-    assert!(started.elapsed() < Duration::from_secs(60), "bounded");
+    assert!(started.elapsed() < std::time::Duration::from_secs(60), "bounded");
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("is not signed by the h0x-core release key"));
     assert_eq!(std::fs::read(bin.join("h0x-core")).unwrap(), hangs.as_bytes());
