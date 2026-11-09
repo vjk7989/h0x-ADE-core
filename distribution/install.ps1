@@ -96,12 +96,29 @@ try {
     # on first use: TLS to GitHub and the manifest's checksum).
     $installed = Join-Path $dir "h0x-core.exe"
     $checkedByInstalled = $false
+    # Bounded: an installed h0x-core that cannot run or hangs counts as unable to check
+    # (for --version: fall back to the downloaded one; for --check: the install fails).
+    function Invoke-Installed($argText, $ms, $out) {
+        try {
+            $p = Start-Process -FilePath $installed -ArgumentList $argText -NoNewWindow -PassThru -RedirectStandardOutput $out
+            $null = $p.Handle # keeps the exit code readable after a timed wait
+            if (-not $p.WaitForExit($ms)) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; return $null }
+            return $p.ExitCode
+        } catch { return $null }
+    }
     if ($signed -and (Test-Path $installed)) {
-        $have = ((& $installed --version 2>$null) -join "") -replace "^h0x-core ", ""
-        if ($have -match "^(\d+)\.(\d+)\.(\d+)" -and [version]"$($Matches[1]).$($Matches[2]).$($Matches[3])" -ge [version]"0.1.9") {
-            & $installed update --from $archive --check | Out-Null
-            if ($LASTEXITCODE) { Fail "$asset is not signed by the h0x-core release key (see above)" }
-            $checkedByInstalled = $true
+        $vout = "$tmp\installed.version"
+        $have = ""
+        if ((Invoke-Installed "--version" 30000 $vout) -eq 0) { $have = [string](Get-Content $vout | Select-Object -First 1) }
+        # Plain X.Y.Z only: a prerelease (0.1.9-rc.1) is older than 0.1.9.
+        if ($have -match "^h0x-core (\d{1,9})\.(\d{1,9})\.(\d{1,9})$") {
+            $n = [int64[]]($Matches[1], $Matches[2], $Matches[3])
+            if ($n[0] -gt 0 -or $n[1] -gt 1 -or ($n[1] -eq 1 -and $n[2] -ge 9)) {
+                if ((Invoke-Installed "update --from `"$archive`" --check" 120000 "$tmp\check.out") -ne 0) {
+                    Fail "$asset is not signed by the h0x-core release key, or the installed h0x-core could not check it (see above)"
+                }
+                $checkedByInstalled = $true
+            }
         }
     }
     New-Item -ItemType Directory -Force "$tmp\h0x-core" | Out-Null

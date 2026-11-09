@@ -76,12 +76,26 @@ curl -fsSL --proto "$proto" --proto-redir "$proto" "$url" -o "$archive" || fail 
 # nothing trusted on this machine yet, lets the downloaded h0x-core check
 # itself (trust on first use: TLS to GitHub and the manifest's checksum).
 # A site set by H0X_CORE_RELEASES_URL (tests) is not signed.
+# An installed h0x-core that hangs counts as unable: runs are bounded (seconds in
+# H0X_CORE_INSTALL_SECS, for tests; else 30 for --version, 120 for --check).
+bounded() {
+  secs=$1; shift
+  if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"; return; fi
+  "$@" & pid=$!
+  ( sleep "$secs"; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 & killer=$!
+  rc=0; wait "$pid" || rc=$?
+  kill "$killer" 2>/dev/null || true
+  return "$rc"
+}
 checks_signatures() {
   [ -x "$bin/h0x-core" ] || return 1
-  v=$("$bin/h0x-core" --version 2>/dev/null | sed -n 's/^h0x-core \([0-9][0-9]*\)\.\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2 \3/p')
+  bounded "${H0X_CORE_INSTALL_SECS:-30}" "$bin/h0x-core" --version >"$tmp/installed.version" 2>/dev/null || return 1
+  # Plain X.Y.Z only: a prerelease (0.1.9-rc.1) is older than 0.1.9.
+  v=$(sed -n 's/^h0x-core \([0-9][0-9]*\)\.\([0-9][0-9]*\)\.\([0-9][0-9]*\)$/\1 \2 \3/p' "$tmp/installed.version" | head -n 1)
   [ -n "$v" ] || return 1
   # shellcheck disable=SC2086
   set -- $v
+  [ "${#1}" -le 9 ] && [ "${#2}" -le 9 ] && [ "${#3}" -le 9 ] || return 1
   [ "$1" -gt 0 ] || [ "$2" -gt 1 ] || { [ "$2" -eq 1 ] && [ "$3" -ge 9 ]; }
 }
 signed=
@@ -89,7 +103,7 @@ if [ -z "${H0X_CORE_RELEASES_URL:-}" ]; then
   signed=1
   curl -fsSL --proto "$proto" --proto-redir "$proto" "${url%%[?#]*}.minisig" -o "$archive.minisig" || fail "no signature for $asset: ${url%%[?#]*}.minisig"
   if checks_signatures; then
-    "$bin/h0x-core" update --from "$archive" --check >/dev/null || fail "$asset is not signed by the h0x-core release key (see above)"
+    bounded "${H0X_CORE_INSTALL_SECS:-120}" "$bin/h0x-core" update --from "$archive" --check >/dev/null || fail "$asset is not signed by the h0x-core release key (see above)"
     signed=installed
   fi
 fi
