@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-11-09
+
+Security release from a full audit.
+
+### Changed
+
+- Phone panel: every way of reaching it (Wi-Fi, Cloudflare, your VPS) now says who delivers the page; `bridge web --json` has a `warning` field.
+- Phone sessions expire 30 days after pairing.
+- Wrong pairing codes are limited per sender, web and Telegram pairing no longer block each other, the panel accepts at most 64 connections, and the audit log rotates at 1 MiB.
+- `update --from` and the install scripts verify the release signature before installing; `install.ps1` locks an install folder outside your profile to you, SYSTEM and Administrators.
+- Telegram/web approvals for a plain shell always ask for confirmation, even if a program claims to be an agent.
+- Messages between agents can no longer forge a second message or carry terminal control codes.
+
+### Fixed
+
+- An install-folder `cloudflared` is checked against its known fingerprint before every start.
+- A temporary secret-store problem no longer replaces the panel's key.
+- Windows: the core's pipe name is unique per user, and a terminal that cannot join its clean-up job is not started.
+
 ## [0.1.8] - 2026-11-08
 
 ### New
