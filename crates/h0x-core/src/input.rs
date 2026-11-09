@@ -102,13 +102,16 @@ impl Gate {
                     self.draft = self.draft.saturating_add(1);
                 }
                 self.draft_ended = false;
-            } else if self.sequence == b"\x1b" && (b == 0x1b || (index == 0 && (b < 0x20 || b == 0x7f))) {
+            } else if self.sequence == b"\x1b" && (b == 0x1b || (index == 0 && !matches!(b, b'[' | b'O'))) {
                 self.sequence.clear();
                 if b == 0x1b {
                     self.sequence.push(b);
                     self.draft_ended = false;
-                } else {
+                } else if b < 0x80 {
                     self.key(b.into(), 1);
+                } else if b & 0xc0 != 0x80 {
+                    self.draft_ended = false;
+                    self.draft = self.draft.saturating_add(1);
                 }
             } else if b == 0x1b || !self.sequence.is_empty() {
                 self.sequence.push(b);
@@ -181,7 +184,12 @@ pub fn quiet() -> Duration {
 }
 
 pub(crate) fn draft_timeout() -> Duration {
-    env_ms("H0X_CORE_DRAFT_MS", 60_000)
+    clamp_draft(env_ms("H0X_CORE_DRAFT_MS", 60_000))
+}
+
+/// A draft never holds a message longer than ten minutes, whatever the setting.
+fn clamp_draft(timeout: Duration) -> Duration {
+    timeout.min(Duration::from_millis(600_000))
 }
 
 /// How long `send` watches for the program to start working.
@@ -780,6 +788,11 @@ mod tests {
             assert_eq!(parse(Some(bad)), default, "{bad:?}");
         }
         assert_eq!(parse(Some("18446744073709551615")), Duration::from_millis(u64::MAX), "the largest is taken as is");
+        let ten_minutes = Duration::from_millis(600_000);
+        assert_eq!(clamp_draft(parse(Some("18446744073709551615"))), ten_minutes, "clamped, not rejected");
+        assert_eq!(clamp_draft(parse(Some("600000"))), ten_minutes);
+        assert_eq!(clamp_draft(parse(Some("600001"))), ten_minutes);
+        assert_eq!(clamp_draft(parse(Some("1500"))), Duration::from_millis(1500), "smaller values are kept");
         parse(None);
     }
 

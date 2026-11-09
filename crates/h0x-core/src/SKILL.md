@@ -101,7 +101,7 @@ children finish:
   status, so it normally waits for exit. `h0x-core read <t>` gets output afterward.
 
 Sends and parent notes wait for an unfinished draft, up to 60 seconds since
-the person's last key. Sends to an added machine keep waiting while its line is alive.
+the person's last key (`H0X_CORE_DRAFT_MS`, in milliseconds, at most 10 minutes). Sends to an added machine keep waiting while its line is alive.
 
 Reports arrive tagged, for example:
 
