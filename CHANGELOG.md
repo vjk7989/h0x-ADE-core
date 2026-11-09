@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Agent messages and parent notes wait for you to send or clear an unfinished draft, instead of submitting it with their message. A draft left alone holds messages for at most a minute (`H0X_CORE_DRAFT_MS`). Sends to another machine wait too. Ported from herdrdev/herdr-core 3ba03e6.
+
 ## [0.1.10] - 2026-11-09
 
 Security release from the second audit (Cloudflare security-audit tool).

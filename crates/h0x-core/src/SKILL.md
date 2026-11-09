@@ -100,6 +100,9 @@ children finish:
 - `h0x-core wait <t>` waits for just that terminal. Plain programs have no agent
   status, so it normally waits for exit. `h0x-core read <t>` gets output afterward.
 
+Sends and parent notes wait for an unfinished draft, up to 60 seconds since
+the person's last key. Sends to an added machine keep waiting while its line is alive.
+
 Reports arrive tagged, for example:
 
 ```text
