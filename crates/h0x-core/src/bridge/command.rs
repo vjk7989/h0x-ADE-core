@@ -253,7 +253,7 @@ impl Bridge {
         if let Err(retry_secs) = self.admit(&key, now) {
             return Reply::RateLimited { retry_secs };
         }
-        let mut log = match self.audit_file() {
+        let mut log = match self.rotate_audit(super::AUDIT_MAX).and_then(|()| self.audit_file()) {
             Ok(file) => file,
             Err(e) => return Reply::Failed(format!("the audit log can't be written: {e}")),
         };
@@ -891,6 +891,19 @@ mod tests {
         f.bridge.pair_verify("telegram", "42", "me", &code, T).unwrap();
         assert!(matches!(f.send(Command::Confirm { token: kill }, T), Reply::Failed(_)));
         assert!(f.acted().is_empty(), "nothing was killed");
+    }
+
+    #[test]
+    fn the_command_path_rotates_the_audit_log_at_its_size_limit() {
+        let mut f = fixture(BridgeConfig::default());
+        let path = f.bridge.dir.join("audit.jsonl");
+        std::fs::write(&path, vec![b'x'; usize::try_from(super::super::AUDIT_MAX).unwrap()]).unwrap();
+        f.send(Command::List, T);
+        let old = std::fs::metadata(f.bridge.dir.join("audit.jsonl.1")).unwrap().len();
+        assert_eq!(old, super::super::AUDIT_MAX, "the full log moved aside");
+        assert_eq!(f.bridge.log(5).unwrap().len(), 1, "a fresh log with just the new entry");
+        f.send(Command::List, T);
+        assert!(std::fs::metadata(&path).unwrap().len() < super::super::AUDIT_MAX);
     }
 
     #[test]
