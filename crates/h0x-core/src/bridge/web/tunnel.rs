@@ -1299,6 +1299,64 @@ mod hardening_tests {
     }
 
     #[test]
+    fn behind_the_vps_only_a_clean_last_hop_counts_and_anything_odd_falls_back() {
+        let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+        let pub_host = Some("panel.example.org");
+        let real = "203.0.113.1";
+        // The last X-Forwarded-For hop when it is a bare address, else X-Real-IP.
+        let seen = |xff: &str| {
+            let req = request(&[("host", "panel.example.org"), ("x-forwarded-for", xff), ("x-real-ip", real)]);
+            client(&req, ip("127.0.0.1"), false, pub_host)
+        };
+        assert_eq!(seen("6.6.6.6, 2001:db8::9"), ip("2001:db8::9"), "an IPv6 last hop");
+        assert_eq!(seen("6.6.6.6,198.51.100.7"), ip("198.51.100.7"), "no space after the comma");
+        assert_eq!(seen(" \t198.51.100.7 \t"), ip("198.51.100.7"), "spaces and tabs around it");
+        let many = (0..500).map(|n| format!("10.0.{}.{}", n / 250, n % 250)).collect::<Vec<_>>().join(", ");
+        assert_eq!(seen(&format!("{many}, 198.51.100.9")), ip("198.51.100.9"), "hundreds of hops: still the last");
+        for odd in [
+            "",
+            "198.51.100.7, garbage",
+            "198.51.100.7,",
+            "198.51.100.7:4711",
+            "[2001:db8::9]:443",
+            "198.51.100.7 198.51.100.8",
+            "unknown",
+        ] {
+            assert_eq!(seen(odd), ip(real), "never an earlier hop the visitor wrote: {odd:?}");
+        }
+        // A later X-Forwarded-For line that is unusable does not revive an earlier one.
+        let lines = request(&[
+            ("host", "panel.example.org"),
+            ("x-forwarded-for", "198.51.100.7"),
+            ("x-forwarded-for", "garbage"),
+        ]);
+        assert_eq!(client(&lines, ip("127.0.0.1"), false, pub_host), ip("127.0.0.1"), "the last line or nothing");
+        // X-Real-IP alone: trimmed, IPv6, and refused when it is not an address.
+        let only_real =
+            |v: &str| client(&request(&[("host", "panel.example.org"), ("x-real-ip", v)]), ip("::1"), false, pub_host);
+        assert_eq!(only_real(" 198.51.100.7 "), ip("198.51.100.7"));
+        assert_eq!(only_real("2001:db8::7"), ip("2001:db8::7"));
+        for odd in ["", "198.51.100.7:80", "198.51.100.7, 6.6.6.6"] {
+            assert_eq!(only_real(odd), ip("::1"), "{odd:?}");
+        }
+        // The host is matched in any case, but exactly: a port or a lookalike is not the forward.
+        let host = |h: &str| {
+            let req = request(&[("host", h), ("x-forwarded-for", "198.51.100.7")]);
+            client(&req, ip("127.0.0.1"), false, pub_host)
+        };
+        assert_eq!(host("PANEL.Example.ORG"), ip("198.51.100.7"), "case does not matter");
+        for other in ["panel.example.org:443", "panel.example.org.", "evil.panel.example.org", "", "example.org"] {
+            assert_eq!(host(other), ip("127.0.0.1"), "{other:?}");
+        }
+        let no_host = request(&[("x-forwarded-for", "198.51.100.7")]);
+        assert_eq!(client(&no_host, ip("127.0.0.1"), false, pub_host), ip("127.0.0.1"), "no Host header");
+        // A mapped loopback peer is the forward too; no peer stays no answer.
+        let xff = request(&[("host", "panel.example.org"), ("x-forwarded-for", "198.51.100.7")]);
+        assert_eq!(client(&xff, ip("::ffff:127.0.0.1"), false, pub_host), ip("198.51.100.7"));
+        assert_eq!(client(&xff, None, false, pub_host), None);
+    }
+
+    #[test]
     fn a_mapped_loopback_peer_is_cloudflared_too() {
         let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
         let cf = request(&[("cf-connecting-ip", "198.51.100.7")]);

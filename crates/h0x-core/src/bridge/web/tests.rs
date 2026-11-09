@@ -1832,3 +1832,57 @@ fn an_open_socket_closes_at_the_next_heartbeat_once_its_session_turns_thirty_day
     assert!(frames.iter().all(|(op, _)| *op == 8), "not even a heartbeat after it expired: {frames:?}");
     assert!(took <= HEARTBEAT + Duration::from_secs(1) && took < IDLE, "at the next heartbeat, not at idle: {took:?}");
 }
+
+#[test]
+fn an_open_sessions_age_ends_exactly_at_thirty_days_and_what_cannot_be_aged_stays_open() {
+    let f = fixture(Vec::new());
+    let (conn, _) = f.paired_at(T);
+    assert!(f.web.session_alive(&conn, T + SESSION_MS - 1), "one millisecond under thirty days");
+    assert!(!f.web.session_alive(&conn, T + SESSION_MS), "exactly thirty days: closed at that heartbeat");
+    assert!(!f.web.session_alive(&conn, u64::MAX), "the far future");
+    assert!(f.web.session_alive(&conn, 0), "a clock gone back does not end it");
+    assert!(f.web.session_alive(&phone(), u64::MAX), "a socket that never authenticated has no session to age");
+    let undated = Conn { device: Some(Sender { transport: "web".into(), user_id: "nobody".into() }), ..phone() };
+    assert!(f.web.session_alive(&undated, u64::MAX), "no date: the next auth decides");
+    std::fs::write(f.dir.join("state.json"), "not json").unwrap();
+    assert!(f.web.session_alive(&conn, u64::MAX), "an unreadable state: the next auth decides");
+}
+
+#[test]
+fn authenticating_gives_one_place_back_to_its_source_and_closing_after_frees_nothing_more() {
+    let (f, addr) = start_via();
+    let (_, session) = f.paired_at(crate::runtime::now_ms());
+    let a = "198.51.100.7";
+    let mut open: Vec<_> = (0..MAX_UNAUTHENTICATED_PER_SOURCE).map(|_| ws_via(addr, a)).collect();
+    assert!(open.iter().all(|(head, _)| head.starts_with("HTTP/1.1 101 ")), "up to the share is served");
+    let (_, stream) = open.pop().unwrap();
+    let mut phone = Client { stream, chan: None };
+    phone.secure(&f, &PHONE);
+    phone.send("auth", json!({"session": session}));
+    assert_eq!(phone.recv().unwrap()["name"], "hello");
+    let (freed, _freed) = ws_via(addr, a);
+    assert!(freed.starts_with("HTTP/1.1 101 "), "the authenticated socket no longer holds a place: {freed}");
+    let (full, _) = ws_via(addr, a);
+    assert!(full.starts_with("HTTP/1.1 503 "), "one place came back, not more: {full}");
+    // The same visitor's header on a request for this machine's own host is not the forward: uncapped.
+    let mut local = TcpStream::connect(addr).unwrap();
+    local.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let head = format!(
+        "GET /ws HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\nX-Forwarded-For: {a}\r\n\
+         Upgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    );
+    local.write_all(head.as_bytes()).unwrap();
+    let mut answer = Vec::new();
+    let mut byte = [0u8];
+    while !answer.ends_with(b"\r\n\r\n") && local.read_exact(&mut byte).is_ok() {
+        answer.push(byte[0]);
+    }
+    let answer = String::from_utf8_lossy(&answer);
+    assert!(answer.starts_with("HTTP/1.1 101 "), "localhost is counted by its socket, not the header: {answer}");
+    // Its place went at auth: the authenticated socket leaving gives nothing back twice.
+    drop(phone);
+    std::thread::sleep(Duration::from_millis(300));
+    let (still, _) = ws_via(addr, a);
+    assert!(still.starts_with("HTTP/1.1 503 "), "still full: {still}");
+}

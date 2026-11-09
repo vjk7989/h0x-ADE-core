@@ -768,4 +768,89 @@ mod audit_and_pairing_tests {
         }
         std::fs::remove_dir_all(&b.dir).unwrap();
     }
+
+    fn failure(now: u64, who: &str) -> Value {
+        json!({"time_ms": now, "identity": who, "command": "auth", "result": "refused: wrong"})
+    }
+
+    #[test]
+    fn five_failures_a_minute_are_verbatim_and_the_minute_ends_exactly_sixty_seconds_after_it_began() {
+        let b = scratch();
+        for n in 0..FAILURE_LINES {
+            b.audit_failed(failure(T + u64::from(n), "web:203.0.113.1")).unwrap();
+        }
+        assert_eq!(b.log(100).unwrap().len(), 5, "the first five are lines");
+        b.audit_failed(failure(T + FAILURE_WINDOW_MS - 1, "web:203.0.113.2")).unwrap();
+        b.audit_failed(failure(T - 30_000, "web:203.0.113.2")).unwrap();
+        assert_eq!(b.log(100).unwrap().len(), 5, "the last millisecond, and a clock gone back, are the same minute");
+        b.audit_failed(failure(T + FAILURE_WINDOW_MS, "web:203.0.113.3")).unwrap();
+        let log = b.log(100).unwrap();
+        assert_eq!(log.len(), 7, "{log:?}");
+        assert_eq!(
+            log[5],
+            json!({"time_ms": T + FAILURE_WINDOW_MS, "identity": "unauthenticated", "command": "failed-attempts",
+                "result": "2 more failed attempts from 1 sources in the last minute"})
+        );
+        assert_eq!(log[6], failure(T + FAILURE_WINDOW_MS, "web:203.0.113.3"), "a new minute: verbatim again");
+        std::fs::remove_dir_all(&b.dir).unwrap();
+    }
+
+    #[test]
+    fn exactly_five_failures_leave_no_summary_line() {
+        let b = scratch();
+        for n in 0..FAILURE_LINES {
+            b.audit_failed(failure(T, &format!("web:203.0.113.{n}"))).unwrap();
+        }
+        b.audit(json!({"time_ms": T + 10 * FAILURE_WINDOW_MS, "identity": "web:me", "result": "ok"})).unwrap();
+        let log = b.log(100).unwrap();
+        assert_eq!(log.len(), 6, "{log:?}");
+        assert!(log.iter().all(|e| e["command"] != "failed-attempts"), "nothing was held back: {log:?}");
+        std::fs::remove_dir_all(&b.dir).unwrap();
+    }
+
+    #[test]
+    fn a_held_back_flood_is_summarised_at_the_next_write_however_late_and_successes_stay_verbatim() {
+        let b = scratch();
+        let (code, _) = b.pair("web", T).unwrap();
+        for n in 0..40 {
+            assert!(b.pair_verify("web", &format!("u{}", n % 3), "", "WRONGWRONG", T + n).is_err());
+        }
+        // A good code in the middle of the flood: its line is written, and the summary is not due yet.
+        assert!(b.pair_verify("web", "me", "", &code, T + 100).is_ok());
+        let log = b.log(100).unwrap();
+        assert_eq!(log.len(), 6, "{log:?}");
+        assert_eq!(log[5]["result"], "paired");
+        assert_eq!(log[5]["identity"], "web:me");
+        // Ten quiet minutes later the next failure brings the summary first, dated then.
+        let late = T + 10 * FAILURE_WINDOW_MS;
+        assert!(b.pair_verify("web", "u9", "", "WRONGWRONG", late).is_err());
+        let log = b.log(100).unwrap();
+        assert_eq!(log.len(), 8, "{log:?}");
+        assert_eq!(log[6]["command"], "failed-attempts");
+        assert_eq!(log[6]["time_ms"], late);
+        assert_eq!(log[6]["result"], "35 more failed attempts from 3 sources in the last minute");
+        assert_eq!((log[7]["identity"].as_str(), log[7]["command"].as_str()), (Some("web:u9"), Some("pair")));
+        std::fs::remove_dir_all(&b.dir).unwrap();
+    }
+
+    #[test]
+    fn the_summary_counts_sources_up_to_its_cap_and_marks_more_with_a_plus() {
+        let summary = |distinct: usize, attempts: usize| {
+            let b = scratch();
+            for n in 0..FAILURE_LINES {
+                b.audit_failed(failure(T, &format!("first:{n}"))).unwrap();
+            }
+            for n in 0..attempts {
+                b.audit_failed(failure(T + 1, &format!("web:{}", n % distinct))).unwrap();
+            }
+            b.audit(json!({"time_ms": T + FAILURE_WINDOW_MS, "identity": "web:me", "result": "ok"})).unwrap();
+            let log = b.log(2).unwrap();
+            std::fs::remove_dir_all(&b.dir).unwrap();
+            assert_eq!(log[1]["identity"], "web:me", "the success comes after its summary");
+            log[0]["result"].as_str().unwrap().to_string()
+        };
+        assert_eq!(summary(1023, 1023), "1023 more failed attempts from 1023 sources in the last minute");
+        assert_eq!(summary(5000, 5000), "5000 more failed attempts from 1024+ sources in the last minute");
+        assert_eq!(summary(2, 3000), "3000 more failed attempts from 2 sources in the last minute");
+    }
 }
