@@ -203,6 +203,8 @@ pub(super) struct Planned {
     method: &'static str,
     params: Value,
     what: String,
+    /// An approve or deny: its terminal's status is checked again when it runs.
+    answer: bool,
 }
 
 /// A destructive command waiting for its confirmation. It is void once the
@@ -229,6 +231,22 @@ fn at_shell(t: &Value) -> bool {
         .contains(&name)
 }
 
+/// A remote yes or no answers a blocked terminal only when it asks for a permission. A
+/// question or a sign-in is the person's to answer in the terminal; a missing or unknown
+/// kind counts as one of those. (Not blocked: nothing here to refuse.)
+fn answerable(t: &Value, address: &str) -> Result<(), RpcError> {
+    if t["status"]["state"] != "blocked" {
+        return Ok(());
+    }
+    let asks = match t["status"]["kind"].as_str() {
+        Some("permission") => return Ok(()),
+        Some("question") => "a question",
+        Some("auth") => "a sign-in",
+        _ => "a request of unknown kind",
+    };
+    Err(failed(format!("{address} is blocked on {asks}: answer it in the terminal, not from here")))
+}
+
 /// A text for the log: redacted, then cut short.
 fn brief(text: &str) -> String {
     let text = redact(text);
@@ -252,6 +270,10 @@ impl Bridge {
         let key = from.key();
         if let Err(retry_secs) = self.admit(&key, now) {
             return Reply::RateLimited { retry_secs };
+        }
+        // A summary of held-back failures that is due goes before this command's line.
+        if let Err(e) = self.settle(&mut self.failures.lock().unwrap(), now) {
+            return Reply::Failed(format!("the audit log can't be written: {}", e.message));
         }
         let mut log = match self.rotate_audit(super::AUDIT_MAX).and_then(|()| self.audit_file()) {
             Ok(file) => file,
@@ -321,7 +343,15 @@ impl Bridge {
             Command::Confirm { token } => match self.take(me, locks, token, now) {
                 Some(planned) => {
                     let what = redact(&planned.what);
-                    (done(perform(call, planned)), Some(what))
+                    // The status may have changed since the person was asked.
+                    let still = match planned.answer {
+                        true => {
+                            let address = planned.params["terminal"].as_str().unwrap_or_default();
+                            call("terminal.get", json!({"terminal": address})).and_then(|t| answerable(&t, address))
+                        }
+                        false => Ok(()),
+                    };
+                    (done(still.and_then(|()| perform(call, planned))), Some(what))
                 }
                 None => {
                     (Reply::Failed("no such confirmation: used, expired (2 minutes), voided or not yours".into()), None)
@@ -387,7 +417,7 @@ fn plan(
     call: &impl Fn(&str, Value) -> Result<Value, RpcError>,
     command: &Command,
 ) -> Result<(Planned, bool), RpcError> {
-    let planned = |method, params, what: String| Planned { method, params, what };
+    let planned = |method, params, what: String| Planned { method, params, what, answer: false };
     if let Command::Run { folder, command } = command {
         if command.trim().is_empty() {
             return Err(failed("nothing to run"));
@@ -439,8 +469,9 @@ fn plan(
                 (false, true) => &["y", "enter"],
                 (false, false) => &["n", "enter"],
             };
+            answerable(&t, &address)?;
             let what = format!("{} in {address}: press {}", if yes { "approve" } else { "deny" }, names.join(" "));
-            (planned("terminal.keys", press(names), what), !reports)
+            (Planned { answer: true, ..planned("terminal.keys", press(names), what) }, !reports)
         }
         Command::Interrupt { .. } => {
             (planned("terminal.interrupt", json!({"terminal": address}), format!("interrupt {address}")), false)
@@ -477,6 +508,8 @@ mod tests {
     struct Fixture {
         bridge: Bridge,
         calls: RefCell<Vec<(String, Value)>>,
+        /// The `kind` of what k1 (an agent) and k2 (a shell printing a report) are blocked on.
+        kind: RefCell<Value>,
     }
 
     fn me() -> Sender {
@@ -488,7 +521,7 @@ mod tests {
         bridge.config = config;
         let (code, _) = bridge.pair("telegram", T).unwrap();
         bridge.pair_verify("telegram", "42", "me", &code, T).unwrap();
-        Fixture { bridge, calls: RefCell::new(Vec::new()) }
+        Fixture { bridge, calls: RefCell::new(Vec::new()), kind: RefCell::new(Value::Null) }
     }
 
     impl Fixture {
@@ -497,7 +530,7 @@ mod tests {
         }
 
         fn send_as(&mut self, from: &Sender, command: Command, now: u64) -> Reply {
-            let calls = &self.calls;
+            let (calls, kind) = (&self.calls, &self.kind);
             let core = |method: &str, params: Value| -> Result<Value, RpcError> {
                 calls.borrow_mut().push((method.into(), params.clone()));
                 let t = params["terminal"].as_str().unwrap_or_default();
@@ -511,17 +544,31 @@ mod tests {
                 };
                 Ok(match (method, t) {
                     ("terminal.get", "t1") => record(t, None),
-                    ("terminal.get", "t2") => record(t, Some("blocked")),
+                    ("terminal.get", "t2") => {
+                        let mut r = record(t, Some("blocked"));
+                        r["status"]["kind"] = "permission".into();
+                        r
+                    }
+                    ("terminal.get", "k1") => {
+                        let mut r = record(t, Some("blocked"));
+                        r["status"]["kind"] = kind.borrow().clone();
+                        r
+                    }
+                    ("terminal.get", "k2") => {
+                        json!({"address": t, "state": "live", "argv": ["pwsh.exe"], "cwd": "/work",
+                               "foreground": {"name": "pwsh.exe", "argv": ["pwsh.exe"], "cwd": "/work"},
+                               "reported": true, "status": {"state": "blocked", "kind": kind.borrow().clone()}})
+                    }
                     ("terminal.get", "t3") => record(t, Some("working")),
                     // A shell printing a status report of its own: forged.
                     ("terminal.get", "t4") => {
                         json!({"address": t, "state": "live", "argv": ["pwsh.exe"], "cwd": "/work",
                                "foreground": {"name": "pwsh.exe", "argv": ["pwsh.exe"], "cwd": "/work"},
-                               "reported": true, "status": {"state": "blocked", "app": "claude-code"}})
+                               "reported": true, "status": {"state": "blocked", "kind": "permission", "app": "claude-code"}})
                     }
                     ("terminal.get", "t6") => {
                         json!({"address": t, "state": "live", "argv": ["C:\\Windows\\System32\\cmd.exe"], "cwd": "/work",
-                               "reported": true, "status": {"state": "blocked"}})
+                               "reported": true, "status": {"state": "blocked", "kind": "permission"}})
                     }
                     ("terminal.get", _) => return Err(RpcError::new("not_found", format!("no terminal {t}"), "")),
                     ("terminal.list", _) => {
@@ -751,6 +798,70 @@ mod tests {
         }
     }
 
+    /// What a null kind (the report said none) or the given one makes of approve and deny.
+    fn answer_with(f: &mut Fixture, from: &Sender, terminal: &str, kind: Value, yes: bool) -> Reply {
+        *f.kind.borrow_mut() = kind;
+        let terminal = terminal.to_string();
+        f.send_as(from, if yes { Command::Approve { terminal } } else { Command::Deny { terminal } }, T)
+    }
+
+    #[test]
+    fn only_a_permission_is_answered_from_a_remote_chat() {
+        let mut f = fixture(BridgeConfig::default());
+        let (code, _) = f.bridge.pair("web", T).unwrap();
+        f.bridge.pair_verify("web", "7", "phone", &code, T).unwrap();
+        let web = Sender { transport: "web".into(), user_id: "7".into() };
+        for from in [me(), web] {
+            for yes in [true, false] {
+                let permission = answer_with(&mut f, &from, "k1", json!("permission"), yes);
+                assert!(matches!(permission, Reply::Done(_)), "{from:?} {yes}: {permission:?}");
+                assert_eq!(f.acted()[0].1["keys"], json!([if yes { "enter" } else { "esc" }]));
+                for (kind, said) in [
+                    (json!("question"), "a question"),
+                    (json!("auth"), "a sign-in"),
+                    (Value::Null, "a request of unknown kind"),
+                    (json!("banana"), "a request of unknown kind"),
+                    (json!("Permission"), "a request of unknown kind"),
+                    (json!(""), "a request of unknown kind"),
+                    (json!(7), "a request of unknown kind"),
+                ] {
+                    let reply = answer_with(&mut f, &from, "k1", kind.clone(), yes);
+                    let Reply::Failed(message) = &reply else { panic!("{from:?} {yes} {kind}: {reply:?}") };
+                    assert!(message.contains(said) && message.contains("in the terminal"), "{message}");
+                    assert!(f.acted().is_empty(), "{kind}: no key was pressed");
+                }
+            }
+        }
+        let last = f.bridge.log(1).unwrap();
+        assert_eq!(last[0]["result"], "failed", "a refusal is audited");
+    }
+
+    #[test]
+    fn a_shell_printing_a_blocked_report_follows_kind_too_and_is_checked_again_at_the_confirmation() {
+        let mut f = fixture(BridgeConfig::default());
+        for yes in [true, false] {
+            // A permission still needs the confirmation, then types y/n and enter.
+            let ask = answer_with(&mut f, &me(), "k2", json!("permission"), yes);
+            let confirm = Command::Confirm { token: token(&ask) };
+            assert!(f.acted().is_empty());
+            assert!(matches!(f.send(confirm, T), Reply::Done(_)));
+            assert_eq!(f.acted()[0].1["keys"], json!([if yes { "y" } else { "n" }, "enter"]));
+            // A question, an auth, no kind or an odd one: refused before any confirmation is offered.
+            for kind in [json!("question"), json!("auth"), Value::Null, json!("banana")] {
+                let reply = answer_with(&mut f, &me(), "k2", kind.clone(), yes);
+                assert!(matches!(reply, Reply::Failed(_)), "{kind}: {reply:?}");
+            }
+            // The status changes while the confirmation waits: nothing is typed.
+            let ask = answer_with(&mut f, &me(), "k2", json!("permission"), yes);
+            *f.kind.borrow_mut() = json!("question");
+            let reply = f.send(Command::Confirm { token: token(&ask) }, T);
+            assert!(matches!(&reply, Reply::Failed(m) if m.contains("a question")), "{reply:?}");
+            assert!(f.acted().is_empty(), "nothing typed after the kind changed");
+        }
+        // Not blocked at all (a shell with no report): unchanged, y/n after a confirmation.
+        assert!(matches!(f.send(Command::Approve { terminal: "t1".into() }, T), Reply::NeedsConfirm { .. }));
+    }
+
     #[test]
     fn shell_names_are_recognised_by_program_not_path_or_case() {
         for p in ["bash", "/usr/bin/zsh", "C:\\Windows\\System32\\cmd.exe", "PowerShell.EXE", "nu"] {
@@ -904,6 +1015,28 @@ mod tests {
         assert_eq!(f.bridge.log(5).unwrap().len(), 1, "a fresh log with just the new entry");
         f.send(Command::List, T);
         assert!(std::fs::metadata(&path).unwrap().len() < super::super::AUDIT_MAX);
+    }
+
+    #[test]
+    fn a_command_writes_the_pending_failure_summary_before_its_own_line() {
+        let mut f = fixture(BridgeConfig::default());
+        f.bridge.pair("web", T).unwrap();
+        for n in 0..8 {
+            assert!(f.bridge.pair_verify("web", "u1", "", "WRONGWRONG", T + n).is_err());
+        }
+        // Inside the minute the summary is not due: the command's line follows the failures.
+        f.send(Command::List, T + 100);
+        let log = f.bridge.log(100).unwrap();
+        assert!(log.iter().all(|e| e["command"] != "failed-attempts"), "{log:?}");
+        // A quiet ten minutes later the next command brings the summary first, dated then.
+        let late = T + 600_000;
+        f.send(Command::List, late);
+        let log = f.bridge.log(100).unwrap();
+        let [.., summary, own] = &log[..] else { panic!("{log:?}") };
+        assert_eq!(summary["command"], "failed-attempts");
+        assert_eq!(summary["time_ms"], late);
+        assert_eq!(summary["result"], "3 more failed attempts from 1 sources in the last minute");
+        assert_eq!((own["identity"].as_str(), own["command"].as_str()), (Some("telegram:42"), Some("list")));
     }
 
     #[test]
