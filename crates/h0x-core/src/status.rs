@@ -1,6 +1,7 @@
 //! Status facts from OSC 7501, kept per terminal exactly as reported.
 //! A report replaces its record; `clear` removes a record and its children.
 //! The turn goes up each time the root record leaves `working`, for any reason.
+//! When the program exits only `done` and `error` records stay.
 
 use crate::terminals::Terminal;
 use ghostty_vt::StatusReport;
@@ -126,14 +127,22 @@ pub fn apply(t: &mut Terminal, r: &StatusReport) -> Change {
     }
 }
 
-/// The program ended: its status facts reset.
-pub fn reset(t: &mut Terminal) -> Change {
+/// Drops the root and child records whose state is one of `gone`.
+fn drop_states(t: &mut Terminal, gone: &[&str]) -> Change {
     let (was_working, was_word) = (working(t), word(t));
-    let had = t.status.is_some() || !t.records.is_empty();
-    t.status = None;
-    t.records.clear();
+    let had = t.records.len() + t.status.is_some() as usize;
+    if t.status.as_ref().is_some_and(|s| gone.contains(&s.state.as_str())) {
+        t.status = None;
+    }
+    t.records.retain(|_, s| !gone.contains(&s.state.as_str()));
     stamp(t, was_word);
-    Change { status: had, turn_ended: end_turn(t, was_working), ..Default::default() }
+    let changed = t.records.len() + t.status.is_some() as usize != had;
+    Change { status: changed, turn_ended: end_turn(t, was_working), ..Default::default() }
+}
+
+/// The program ended: what it was doing is over, but its outcomes (done, error) stand.
+pub fn reset(t: &mut Terminal) -> Change {
+    drop_states(t, &["working", "blocked", "idle"])
 }
 
 pub(crate) fn base64(bytes: &[u8]) -> String {
@@ -205,7 +214,11 @@ mod tests {
         assert!(t.status_ms >= Some(since));
         t.status_ms = Some(1);
         reset(&mut t);
-        assert!(t.status_ms > Some(1), "exiting clears the word");
+        assert_eq!(t.status_ms, Some(1), "exiting keeps a done word, and so its time");
+        apply(&mut t, &report("working", ""));
+        t.status_ms = Some(1);
+        reset(&mut t);
+        assert!(t.status_ms > Some(1), "exiting clears a working word");
     }
 
     #[test]
@@ -226,6 +239,37 @@ mod tests {
         }
         apply(&mut t, &report("clear", "build"));
         assert_eq!(t.records.keys().collect::<Vec<_>>(), ["buildx", "deploy"]);
+    }
+
+    #[test]
+    fn exiting_keeps_outcomes_and_drops_what_was_in_progress() {
+        let mut t = terminal();
+        assert_eq!(reset(&mut t), Change::default(), "nothing to reset");
+        apply(&mut t, &report("done", ""));
+        for (id, state) in [("w", "working"), ("b", "blocked"), ("i", "idle"), ("d", "done"), ("e", "error")] {
+            apply(&mut t, &report(state, id));
+        }
+        t.status_ms = Some(1);
+        let change = reset(&mut t);
+        assert!(change.status && !change.turn_ended && !change.stuck && !change.root_report);
+        assert_eq!(t.records.keys().collect::<Vec<_>>(), ["d", "e"]);
+        assert_eq!(t.status.as_ref().map(|s| s.state.as_str()), Some("done"));
+        assert_eq!(t.status_ms, Some(1), "the root word did not change");
+        assert_eq!(reset(&mut t), Change::default(), "a second exit changes nothing");
+    }
+
+    #[test]
+    fn exiting_while_working_ends_the_turn_and_a_failed_root_stays() {
+        let mut t = terminal();
+        apply(&mut t, &report("working", ""));
+        let change = reset(&mut t);
+        assert!(change.status && change.turn_ended);
+        assert!(t.status.is_none() && t.reported);
+        assert_eq!((t.turn, t.status_ms.is_some()), (1, true));
+        apply(&mut t, &report("error", ""));
+        assert!(!reset(&mut t).status);
+        assert_eq!(t.status.as_ref().map(|s| s.state.as_str()), Some("error"));
+        assert_eq!(t.turn, 1);
     }
 
     #[test]

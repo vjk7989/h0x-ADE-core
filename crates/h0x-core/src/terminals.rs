@@ -55,7 +55,7 @@ pub struct Terminal {
     #[serde(default)]
     pub identity: String,
     /// The program's own word for what it's doing (OSC 7501 root record);
-    /// null if it never said, or after it exited.
+    /// null if it never said, or it exited while working, blocked or idle.
     #[serde(default)]
     pub status: Option<crate::status::Status>,
     /// When that word last changed, ms since the epoch; null if it never said.
