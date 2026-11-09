@@ -102,18 +102,22 @@ fn the_sleep_helper_starts_once_per_working_turn_with_fixed_arguments_and_goes_w
 }
 
 #[test]
-fn an_invalid_keep_awake_value_holds_nothing_until_it_is_fixed() {
+fn an_invalid_keep_awake_value_is_a_config_error_and_releases_until_it_is_fixed() {
     let s = Session::new();
-    config(&s, "keep_awake = \"yes\"");
+    config(&s, "keep_awake = true");
     let core = serve(&s, &fake_inhibit(&s));
-    let t = agent(&s, "go");
-    wait_until("working", || get(&s, &t)["status"]["state"] == "working");
-    std::thread::sleep(Duration::from_secs(5));
-    assert!(!held(&s));
-    assert!(inhibit_calls(&s).is_empty());
+    let pid = s.json(&["server", "status"])["pid"].as_u64().unwrap();
+    agent(&s, "go");
+    wait_until("held", || held(&s));
+    assert_eq!(helpers(pid), 1);
+    // Not a boolean: commands say so, and the running core stops holding.
+    config(&s, "keep_awake = \"yes\"");
+    let (_, err) = s.err(&["run", "--bg", "/bin/sh", "-c", "true"]);
+    assert_eq!(err["error"]["kind"], "config", "{err}");
+    wait_until("released while the value is invalid", || helpers(pid) == 0);
     config(&s, "keep_awake = true");
     wait_until("held once the value is a boolean", || held(&s));
-    assert_eq!(inhibit_calls(&s).len(), 1);
+    assert_eq!(inhibit_calls(&s).len(), 2);
     touch(&s, "go");
     wait_until("released", || !held(&s));
     stop(&s, core);
