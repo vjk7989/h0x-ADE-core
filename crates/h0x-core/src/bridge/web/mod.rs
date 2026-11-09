@@ -46,6 +46,8 @@ const MAX_SOURCES: usize = 4096;
 const SESSION_MS: u64 = 30 * 24 * 60 * 60_000;
 /// Connections served at once; more are refused with 503.
 const MAX_CONNECTIONS: usize = 64;
+/// Connections one source may hold before it has authenticated; more are refused with 503.
+const MAX_UNAUTHENTICATED_PER_SOURCE: usize = 8;
 /// How long to wait after a failed `accept`, so a persistent error cannot spin.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// After closing, how long to keep reading so unread data cannot turn the
@@ -199,6 +201,13 @@ impl Bridge {
         };
         Ok((now.saturating_sub(made) < SESSION_MS).then_some(user))
     }
+
+    /// Whether `user`'s session is still under [`SESSION_MS`] old at `now`, for a socket
+    /// that authenticated earlier. A state that cannot be read, or has no date, counts as alive.
+    fn session_live(&self, user: &str, now: u64) -> bool {
+        let Ok(st) = self.load() else { return true };
+        st.session_times.get(user).is_none_or(|made| now.saturating_sub(*made) < SESSION_MS)
+    }
 }
 
 /// The panel's long-term key S, kept in the secret store so the pairing
@@ -233,6 +242,10 @@ pub(crate) struct Web {
     hosts: Vec<String>,
     key: e2e::ServerKey,
     notices: tokio::sync::broadcast::Sender<Notice>,
+    /// The vps's public host while `--via` is on: requests for it come through the reverse forward.
+    public: Option<String>,
+    /// Connections each source holds before it authenticated.
+    unauthenticated: Arc<Sources>,
     /// Failed `auth`s per source address.
     strikes: Strikes,
     /// Wrong pairing codes per source address, counted before the code is checked.
@@ -271,6 +284,41 @@ impl Strikes {
     fn clear(&self, source: Option<IpAddr>) {
         if let Some(ip) = source {
             self.0.lock().unwrap().remove(&ip);
+        }
+    }
+}
+
+/// Connections not yet authenticated, per source address.
+#[derive(Default)]
+struct Sources(Mutex<std::collections::HashMap<IpAddr, usize>>);
+
+/// One source's place among its unauthenticated connections; freed on drop.
+struct Held {
+    sources: Arc<Sources>,
+    ip: IpAddr,
+}
+
+impl Sources {
+    /// A place for `ip`, or None when it already holds [`MAX_UNAUTHENTICATED_PER_SOURCE`].
+    fn take(self: &Arc<Self>, ip: IpAddr) -> Option<Held> {
+        let mut map = self.0.lock().unwrap();
+        let held = map.entry(ip).or_default();
+        if *held >= MAX_UNAUTHENTICATED_PER_SOURCE {
+            return None;
+        }
+        *held += 1;
+        Some(Held { sources: self.clone(), ip })
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let mut map = self.sources.0.lock().unwrap();
+        if let Some(held) = map.get_mut(&self.ip) {
+            *held -= 1;
+            if *held == 0 {
+                map.remove(&self.ip);
+            }
         }
     }
 }
@@ -464,9 +512,15 @@ impl Web {
     fn auth_failed(&self, peer: Option<IpAddr>, why: &str, now: u64) -> Step {
         let who = peer.map_or_else(|| "unknown".to_string(), |ip| ip.to_string());
         let entry = json!({"time_ms": now, "identity": format!("web:{who}"), "command": "auth", "result": format!("refused: {why}")});
-        let _ = self.bridge.lock().unwrap().audit(entry);
+        let _ = self.bridge.lock().unwrap().audit_failed(entry);
         self.strikes.add(peer, now, AUTH_BLOCK_MS);
         refuse(why)
+    }
+
+    /// Whether the session behind an open socket is still inside [`SESSION_MS`]; an
+    /// unreadable state counts as alive (the next `auth` decides).
+    fn session_alive(&self, conn: &Conn, now: u64) -> bool {
+        conn.device.as_ref().is_none_or(|from| self.bridge.lock().unwrap().session_live(&from.user_id, now))
     }
 
     /// A notice for this connection: only to a device that is still paired,
@@ -502,6 +556,15 @@ async fn read_head(stream: &mut tokio::net::TcpStream, buf: &mut Vec<u8>) -> Res
 
 async fn connection(mut stream: tokio::net::TcpStream, web: Arc<Web>) {
     let peer = stream.peer_addr().ok().map(|a| a.ip());
+    // A source's connections that have not authenticated yet are capped. A loopback peer
+    // is a proxy (the vps forward, cloudflared): its visitors are capped below, by address.
+    let mut held = Vec::new();
+    if let Some(ip) = peer.filter(|ip| !tunnel::loopback(*ip)) {
+        match web.unauthenticated.take(ip) {
+            Some(place) => held.push(place),
+            None => return drop(stream.write_all(&http::error(503)).await),
+        }
+    }
     let mut buf = Vec::new();
     let end = match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut stream, &mut buf)).await {
         Ok(Ok(end)) => end,
@@ -528,9 +591,15 @@ async fn connection(mut stream: tokio::net::TcpStream, web: Arc<Web>) {
         "/noble.js" => page(NOBLE, "text/javascript; charset=utf-8"),
         "/ws" => match http::upgrade(&req) {
             Ok(head) => {
+                let client = tunnel::client(&req, peer, via_tunnel, web.public.as_deref());
+                if let Some(ip) = client.filter(|ip| Some(*ip) != peer) {
+                    match web.unauthenticated.take(ip) {
+                        Some(place) => held.push(place),
+                        None => return drop(stream.write_all(&http::error(503)).await),
+                    }
+                }
                 if stream.write_all(&head).await.is_ok() {
-                    let client = tunnel::client(&req, peer, via_tunnel);
-                    websocket(stream, buf.split_off(end + 4), web, via_tunnel, client).await;
+                    websocket(stream, buf.split_off(end + 4), web, via_tunnel, client, held).await;
                 }
                 return;
             }
@@ -572,7 +641,14 @@ async fn hang_up(mut rd: tokio::net::tcp::OwnedReadHalf, mut wr: tokio::net::tcp
     let _ = tokio::time::timeout(LINGER, async { while matches!(rd.read(&mut sink).await, Ok(n) if n > 0) {} }).await;
 }
 
-async fn websocket(stream: tokio::net::TcpStream, mut buf: Vec<u8>, web: Arc<Web>, tunnel: bool, peer: Option<IpAddr>) {
+async fn websocket(
+    stream: tokio::net::TcpStream,
+    mut buf: Vec<u8>,
+    web: Arc<Web>,
+    tunnel: bool,
+    peer: Option<IpAddr>,
+    mut held: Vec<Held>,
+) {
     let (mut rd, mut wr) = stream.into_split();
     let mut conn = Conn { peer, tunnel, ..Conn::default() };
     let mut chan: Option<e2e::Channel> = None;
@@ -635,6 +711,10 @@ async fn websocket(stream: tokio::net::TcpStream, mut buf: Vec<u8>, web: Arc<Web
                 return;
             };
             conn = mine;
+            // Once authenticated, the connection no longer counts against its source's share.
+            if conn.device.is_some() {
+                held.clear();
+            }
             for msg in &step.out {
                 if !send(&mut wr, &mut chan, msg).await {
                     return;
@@ -664,6 +744,11 @@ async fn websocket(stream: tokio::net::TcpStream, mut buf: Vec<u8>, web: Arc<Web
             },
             _ = tokio::time::sleep_until(due) => return hang_up(rd, wr, &1001u16.to_be_bytes()).await,
             _ = beat.tick() => {
+                // A session that turned 30 days old since `auth` ends here, not at the next reconnect.
+                let (shared, mine, now) = (web.clone(), conn.clone(), crate::runtime::now_ms());
+                if !tokio::task::spawn_blocking(move || shared.session_alive(&mine, now)).await.unwrap_or(true) {
+                    return hang_up(rd, wr, &1008u16.to_be_bytes()).await;
+                }
                 if !send(&mut wr, &mut chan, &message("heartbeat", Value::Null)).await {
                     return;
                 }
@@ -781,6 +866,8 @@ pub fn run(
         hosts,
         key,
         notices,
+        public: public.map(String::from),
+        unauthenticated: Default::default(),
         strikes: Default::default(),
         pair_strikes: Default::default(),
     });

@@ -22,9 +22,10 @@ use crate::config::BridgeConfig;
 use crate::rpc::RpcError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 /// Who can pair today.
 pub const TRANSPORTS: &[&str] = &["telegram", "web"];
@@ -36,6 +37,12 @@ const WRONG_CODES: u32 = 5;
 const BLOCK_MS: u64 = 10 * 60_000;
 /// audit.jsonl moves to audit.jsonl.1 (replacing the older one) once it holds this many bytes.
 const AUDIT_MAX: u64 = 1 << 20;
+/// Failed or unauthenticated attempts get this many verbatim audit lines a minute; the
+/// rest become one summary line, so rotating sources cannot flush real entries out of the log.
+const FAILURE_LINES: u32 = 5;
+const FAILURE_WINDOW_MS: u64 = 60_000;
+/// Distinct sources remembered for the summary line.
+const FAILURE_SOURCES: usize = 1024;
 /// No 0/O or 1/I: read off a screen and typed on a phone. 32 letters: no modulo bias.
 const ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
@@ -96,6 +103,17 @@ pub struct Bridge {
     recent: HashMap<String, VecDeque<u64>>,
     /// Destructive commands waiting for `confirm`, by token.
     tokens: HashMap<String, command::Waiting>,
+    /// The failed attempts of the current minute, for [`Bridge::audit_failed`].
+    failures: Mutex<Failures>,
+}
+
+/// One minute of failed attempts: when it began, how many lines were written, and what was held back.
+#[derive(Default)]
+struct Failures {
+    since: u64,
+    written: u32,
+    held_back: u32,
+    sources: HashSet<String>,
 }
 
 fn failed(e: impl std::fmt::Display) -> RpcError {
@@ -110,7 +128,7 @@ impl Bridge {
     }
 
     pub fn at(dir: PathBuf, config: BridgeConfig) -> Bridge {
-        Bridge { dir, config, recent: HashMap::new(), tokens: HashMap::new() }
+        Bridge { dir, config, recent: HashMap::new(), tokens: HashMap::new(), failures: Mutex::default() }
     }
 
     /// The state, or empty when there is none. A file that isn't a JSON
@@ -225,9 +243,12 @@ impl Bridge {
             Err(e) => format!("refused: {}", e.message),
         };
         // Logged before it counts: an attempt the log can't keep pairs no one.
-        self.audit(
-            json!({"time_ms": now, "identity": format!("{transport}:{user_id}"), "command": "pair", "result": outcome}),
-        )?;
+        let entry =
+            json!({"time_ms": now, "identity": format!("{transport}:{user_id}"), "command": "pair", "result": outcome});
+        match &result {
+            Ok(_) => self.audit(entry)?,
+            Err(_) => self.audit_failed(entry)?,
+        }
         self.save(&st)?;
         result
     }
@@ -307,7 +328,49 @@ impl Bridge {
         Ok(())
     }
 
+    /// One audit line, verbatim. A summary of held-back failures that is due goes first.
     fn audit(&self, entry: Value) -> Result<(), RpcError> {
+        let now = entry["time_ms"].as_u64().unwrap_or_default();
+        self.settle(&mut self.failures.lock().unwrap(), now)?;
+        self.append(entry)
+    }
+
+    /// An unauthenticated or failed attempt: the first [`FAILURE_LINES`] of each minute are
+    /// written verbatim, the rest only counted, and one summary line follows the minute.
+    pub(crate) fn audit_failed(&self, entry: Value) -> Result<(), RpcError> {
+        let now = entry["time_ms"].as_u64().unwrap_or_default();
+        let mut failures = self.failures.lock().unwrap();
+        self.settle(&mut failures, now)?;
+        if failures.written < FAILURE_LINES {
+            failures.written += 1;
+            drop(failures);
+            return self.append(entry);
+        }
+        failures.held_back += 1;
+        if failures.sources.len() < FAILURE_SOURCES {
+            failures.sources.insert(entry["identity"].as_str().unwrap_or_default().to_string());
+        }
+        Ok(())
+    }
+
+    /// Once a minute is over: its summary line (if attempts were held back), then a fresh minute.
+    fn settle(&self, failures: &mut Failures, now: u64) -> Result<(), RpcError> {
+        if now.saturating_sub(failures.since) < FAILURE_WINDOW_MS {
+            return Ok(());
+        }
+        let (held_back, sources) = (failures.held_back, failures.sources.len());
+        *failures = Failures { since: now, ..Failures::default() };
+        if held_back == 0 {
+            return Ok(());
+        }
+        let more = if sources >= FAILURE_SOURCES { "+" } else { "" };
+        let result = format!("{held_back} more failed attempts from {sources}{more} sources in the last minute");
+        self.append(
+            json!({"time_ms": now, "identity": "unauthenticated", "command": "failed-attempts", "result": result}),
+        )
+    }
+
+    fn append(&self, entry: Value) -> Result<(), RpcError> {
         self.rotate_audit(AUDIT_MAX).map_err(failed)?;
         let mut file = self.audit_file().map_err(failed)?;
         file.write_all(format!("{entry}\n").as_bytes()).map_err(failed)
