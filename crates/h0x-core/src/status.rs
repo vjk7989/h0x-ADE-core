@@ -112,16 +112,22 @@ pub fn apply(t: &mut Terminal, r: &StatusReport) -> Change {
         } else {
             let child = format!("{}/", r.id);
             t.records.retain(|id, _| *id != r.id && !id.starts_with(&child));
+            forget_order(t);
         }
     } else if r.id.is_empty() {
         t.status = Some(Status::from(r));
     } else {
-        // Over the limit, the record updated longest ago goes (approximated by first id).
+        // Over the limit, the record updated longest ago goes. One with no place in
+        // `record_order` (saved by an older core) is older than any that has.
         if !t.records.contains_key(&r.id) && t.records.len() >= MAX_RECORDS - 1 {
-            let oldest = t.records.keys().next().cloned().expect("non-empty");
+            let unordered = t.records.keys().find(|k| !t.record_order.contains(k));
+            let oldest = unordered.or(t.record_order.first()).cloned().expect("non-empty");
             t.records.remove(&oldest);
+            forget_order(t);
         }
         t.records.insert(r.id.clone(), Status::from(r));
+        t.record_order.retain(|k| *k != r.id);
+        t.record_order.push(r.id.clone());
     }
     stamp(t, was_word);
     Change {
@@ -132,6 +138,10 @@ pub fn apply(t: &mut Terminal, r: &StatusReport) -> Change {
     }
 }
 
+fn forget_order(t: &mut Terminal) {
+    t.record_order.retain(|k| t.records.contains_key(k));
+}
+
 /// Drops the root and child records whose state is one of `gone`.
 fn drop_states(t: &mut Terminal, gone: &[&str]) -> Change {
     let (was_working, was_word) = (working(t), word(t));
@@ -140,6 +150,7 @@ fn drop_states(t: &mut Terminal, gone: &[&str]) -> Change {
         t.status = None;
     }
     t.records.retain(|_, s| !gone.contains(&s.state.as_str()));
+    forget_order(t);
     stamp(t, was_word);
     let changed = t.records.len() + t.status.is_some() as usize != had;
     Change { status: changed, turn_ended: end_turn(t, was_working), ..Default::default() }
@@ -310,6 +321,49 @@ mod tests {
         }
         assert!(t.status.is_none() && t.records.is_empty());
         assert_eq!(t.turn, 1);
+    }
+
+    fn fill(t: &mut Terminal, n: usize) {
+        for i in 0..n {
+            apply(t, &report("working", &format!("r{i:03}")));
+        }
+    }
+
+    #[test]
+    fn at_the_cap_the_least_recently_updated_record_goes() {
+        let cap = MAX_RECORDS - 1;
+        let mut t = terminal();
+        fill(&mut t, cap);
+        assert_eq!(t.records.len(), cap, "exactly N fits");
+        apply(&mut t, &report("done", "r000")); // the lexicographically first is now the newest
+        apply(&mut t, &report("working", "new")); // N+1
+        assert_eq!(t.records.len(), cap);
+        assert!(t.records.contains_key("r000") && t.records.contains_key("new"));
+        assert!(!t.records.contains_key("r001"), "the oldest update was evicted");
+        apply(&mut t, &report("working", "r002")); // an update of a present record evicts nothing
+        assert_eq!(t.records.len(), cap);
+        assert!(t.records.contains_key("r003"));
+        apply(&mut t, &report("working", "newer"));
+        assert!(!t.records.contains_key("r003") && t.records.contains_key("r002"));
+    }
+
+    #[test]
+    fn eviction_order_survives_clears_and_a_reload() {
+        let cap = MAX_RECORDS - 1;
+        let mut t = terminal();
+        fill(&mut t, cap);
+        apply(&mut t, &report("clear", "r000")); // frees a slot: nothing evicted next
+        apply(&mut t, &report("working", "a"));
+        assert_eq!(t.records.len(), cap);
+        assert!(t.records.contains_key("r001"));
+        // Saved without the order: records it does not know are older than any it does.
+        t.record_order.clear();
+        apply(&mut t, &report("working", "b"));
+        apply(&mut t, &report("working", "c"));
+        assert_eq!(t.records.len(), cap);
+        assert!(!t.records.contains_key("a") && !t.records.contains_key("r001"), "the unknown ones go first");
+        assert!(t.records.contains_key("b") && t.records.contains_key("c") && t.records.contains_key("r002"));
+        assert_eq!(t.record_order.len(), 2);
     }
 
     #[test]

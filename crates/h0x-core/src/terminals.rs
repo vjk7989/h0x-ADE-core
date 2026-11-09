@@ -64,6 +64,9 @@ pub struct Terminal {
     /// Other 7501 records by id (programs reporting on several things).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub records: BTreeMap<String, crate::status::Status>,
+    /// Ids of `records`, least recently updated first (private; empty after a reload).
+    #[serde(skip)]
+    pub record_order: Vec<String>,
     /// Goes up each time the status leaves `working`.
     #[serde(default)]
     pub turn: u64,
@@ -281,6 +284,7 @@ impl Registry {
                 status: None,
                 status_ms: None,
                 records: BTreeMap::new(),
+                record_order: Vec::new(),
                 turn: 0,
                 first_task_turn: None,
                 reported: false,
