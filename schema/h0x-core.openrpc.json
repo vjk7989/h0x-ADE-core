@@ -1101,6 +1101,10 @@
               "null"
             ]
           },
+          "keep_awake": {
+            "description": "A sleep block is held now: `keep_awake` is on and a terminal is working.",
+            "type": "boolean"
+          },
           "live": {
             "format": "uint",
             "minimum": 0,
@@ -1127,7 +1131,8 @@
           "uptime_ms",
           "holders",
           "live",
-          "finished"
+          "finished",
+          "keep_awake"
         ],
         "type": "object"
       },

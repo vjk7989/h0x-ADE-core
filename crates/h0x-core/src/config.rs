@@ -21,6 +21,9 @@ pub struct Config {
     pub headless: Option<String>,
     /// Scrollback kept per live terminal, in MB (default 5).
     pub history_mb: Option<f64>,
+    /// Keep the machine from sleeping while a terminal's status is `working` (default off).
+    /// The display and the screen lock are not affected.
+    pub keep_awake: Option<bool>,
     /// Where the core listens (default under $XDG_RUNTIME_DIR). `H0X_CORE_SOCKET` wins.
     pub socket: Option<String>,
     /// Seconds another machine gets to answer a call (a wait gets its own

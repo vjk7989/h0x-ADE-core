@@ -220,6 +220,7 @@ async fn server_status(core: Ctx<'_>, _: Empty) -> Result<StatusResult, RpcError
         holders,
         live,
         finished: st.reg.terminals.len() - live,
+        keep_awake: crate::awake::held(),
         installed_by: crate::client::installed_by().map(String::from),
     })
 }

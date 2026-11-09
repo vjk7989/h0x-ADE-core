@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- `keep_awake = true` in the config keeps the machine from sleeping while a terminal's status is `working` (system sleep only; the display and the lock screen are untouched). Off by default; `server status` shows `keep_awake` while a block is held.
+
 ### Fixed
 
 - Output to a closed pipe (`h0x-core get x | head -c 0`) ends quietly with exit status 141 instead of a panic.

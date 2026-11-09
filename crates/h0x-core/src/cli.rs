@@ -624,7 +624,7 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
                 id.get(..8).unwrap_or(id),
                 r["pid"],
                 r["uptime_ms"].as_u64().unwrap_or(0) / 1000
-            );
+            ) + if r["keep_awake"] == true { ", keeping the machine awake" } else { "" };
             Out { json: r, human }
         }
         Cmd::Server { action: ServerCmd::Stop } => stop(&paths)?,
