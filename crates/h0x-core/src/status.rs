@@ -32,11 +32,24 @@ pub struct Status {
 }
 
 /// Text with nothing that can spoof or hide what a person reads: no C0/C1 controls,
-/// bidi overrides and isolates, zero-width or BOM characters.
+/// bidi overrides, marks and isolates, zero-width spaces, word joiners, invisible
+/// math operators, the Mongolian vowel separator or BOM. The joiners ZWNJ/ZWJ
+/// (U+200C/D) stay: emoji and Persian or Devanagari words need them.
 fn plain(text: &str) -> String {
     let hidden = |c: &char| {
         c.is_control()
-            || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+            || matches!(
+                c,
+                '\u{200B}'
+                    | '\u{200E}'
+                    | '\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{2064}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{061C}'
+                    | '\u{180E}'
+                    | '\u{FEFF}'
+            )
     };
     text.chars().filter(|c| !hidden(c)).collect()
 }
@@ -120,6 +133,7 @@ pub fn apply(t: &mut Terminal, r: &StatusReport) -> Change {
         if r.id.is_empty() {
             t.status = None;
             t.records.clear();
+            t.record_order.clear();
         } else {
             let child = format!("{}/", r.id);
             t.records.retain(|id, _| *id != r.id && !id.starts_with(&child));
@@ -634,7 +648,7 @@ mod tests {
     #[test]
     fn the_arabic_letter_mark_and_the_word_joiner_go_like_their_siblings() {
         // U+061C is a bidi mark like U+200E and U+200F; U+2060 is zero-width like U+FEFF.
-        for c in ['\u{61c}', '\u{2060}'] {
+        for c in ['\u{61c}', '\u{2060}', '\u{2061}', '\u{2062}', '\u{2063}', '\u{2064}', '\u{180E}'] {
             assert_eq!(said(&format!("a{c}b"), &format!("{c}x")), ("ab".into(), "x".into()), "{c:?}");
         }
     }
