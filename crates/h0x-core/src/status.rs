@@ -1,7 +1,8 @@
 //! Status facts from OSC 7501, kept per terminal exactly as reported.
 //! A report replaces its record; `clear` removes a record and its children.
 //! The turn goes up each time the root record leaves `working`, for any reason.
-//! When the program exits only `done` and `error` records stay.
+//! When the program exits only `done` and `error` records stay; a new shell prompt
+//! (OSC 133 A) drops `working` and `blocked` ones, and a full reset (RIS) all of them.
 
 use crate::terminals::Terminal;
 use ghostty_vt::StatusReport;
@@ -97,6 +98,10 @@ fn stamp(t: &mut Terminal, was: Option<String>) {
 }
 
 pub fn apply(t: &mut Terminal, r: &StatusReport) -> Change {
+    if r.state == "prompt" {
+        // A new shell prompt: whatever was running there is over, so working and blocked go.
+        return drop_states(t, &["working", "blocked"]);
+    }
     let (was_working, was_word) = (working(t), word(t));
     let was = stuck(t).map(String::from);
     t.reported = true;
@@ -269,6 +274,41 @@ mod tests {
         apply(&mut t, &report("error", ""));
         assert!(!reset(&mut t).status);
         assert_eq!(t.status.as_ref().map(|s| s.state.as_str()), Some("error"));
+        assert_eq!(t.turn, 1);
+    }
+
+    #[test]
+    fn a_new_shell_prompt_drops_working_and_blocked_records_only() {
+        let mut t = terminal();
+        let prompt = report("prompt", "");
+        assert_eq!(apply(&mut t, &prompt), Change::default(), "nothing to drop");
+        assert!(!t.reported, "a prompt is not a report");
+        apply(&mut t, &report("working", ""));
+        for (id, state) in [("w", "working"), ("b", "blocked"), ("i", "idle"), ("d", "done"), ("e", "error")] {
+            apply(&mut t, &report(state, id));
+        }
+        let change = apply(&mut t, &prompt);
+        assert!(change.status && change.turn_ended && !change.root_report && !change.stuck);
+        assert!(t.status.is_none());
+        assert_eq!(t.records.keys().collect::<Vec<_>>(), ["d", "e", "i"]);
+        assert_eq!(apply(&mut t, &prompt), Change::default(), "a repeated prompt changes nothing");
+        apply(&mut t, &report("idle", ""));
+        assert!(!apply(&mut t, &prompt).status, "an idle root stays");
+        assert_eq!(t.turn, 1);
+    }
+
+    #[test]
+    fn a_full_reset_arrives_as_clear_without_id_and_removes_everything() {
+        let mut screen = ghostty_vt::Terminal::new(80, 24, 1 << 20);
+        let mut t = terminal();
+        screen.write(b"\x1b]7501;state=working\x07\x1b]7501;state=done:id=a/b\x07\x1b]7501;state=error:id=c\x07");
+        screen.write(b"\x1bc");
+        let reports = screen.take_status_reports();
+        assert_eq!(reports.len(), 4, "{reports:?}");
+        for r in &reports {
+            apply(&mut t, r);
+        }
+        assert!(t.status.is_none() && t.records.is_empty());
         assert_eq!(t.turn, 1);
     }
 
