@@ -3,6 +3,66 @@ use crate::events::{Filter, Sink};
 use crate::paths::Paths;
 use std::sync::atomic::AtomicBool;
 
+#[tokio::test]
+async fn a_send_on_an_already_closed_line_fails_without_waiting() {
+    for writer_gone in [false, true] {
+        let (frames, mut rx) = mpsc::unbounded_channel();
+        let line = Line::new(frames, &json!({}));
+        if writer_gone {
+            rx.close();
+        } else {
+            line.close(); // The writer may not have finished shutting down yet.
+        }
+        let sent = tokio::time::timeout(
+            Duration::from_millis(200),
+            line.call("away", "terminal.send", json!({"terminal": "t1", "text": "hi"}), Duration::from_secs(30)),
+        )
+        .await
+        .expect("a closed transport must not hold a send");
+        assert!(sent.unwrap_err().message.contains("lost the line"));
+        assert!(lock(&line.pending).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_held_remote_send_stops_when_its_caller_cancels_and_tells_the_machine() {
+    let (frames, mut rx) = mpsc::unbounded_channel();
+    let line = Line::new(frames, &json!({}));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let flag = cancelled.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        flag.store(true, Ordering::Relaxed);
+    });
+    // A forwarded send has no deadline of its own: only the line or its caller ends it.
+    let sent = tokio::time::timeout(
+        Duration::from_secs(2),
+        crate::server::SEND_CANCELLED.scope(
+            cancelled,
+            line.call("away", "terminal.send", json!({"terminal": "t1", "text": "hi"}), Duration::MAX),
+        ),
+    )
+    .await
+    .expect("a cancelled send must not wait for its deadline");
+    assert_eq!(sent.unwrap_err().kind, "cancelled");
+    assert!(lock(&line.pending).is_empty());
+    let mut told = Vec::new();
+    while let Ok(frame) = rx.try_recv() {
+        told.push(String::from_utf8_lossy(&frame).into_owned());
+    }
+    assert!(told.iter().any(|f| f.contains("$/cancelRequest")), "{told:?}");
+
+    // Other calls ignore the cancelled flag and keep their deadline.
+    let flag = Arc::new(AtomicBool::new(true));
+    let keys = crate::server::SEND_CANCELLED
+        .scope(flag, line.call("away", "terminal.keys", json!({"terminal": "t1"}), Duration::from_millis(100)))
+        .await;
+    assert!(keys.unwrap_err().message.contains("didn't answer"));
+    // An unanswered send outside any caller scope times out with a read-first hint.
+    let sent = line.call("away", "terminal.send", json!({"terminal": "t1"}), Duration::from_millis(100)).await;
+    assert!(sent.unwrap_err().hint.contains("h0x-core read"));
+}
+
 #[test]
 fn automatic_input_requires_support_at_every_hop() {
     for features in [json!([]), json!(["automatic_input"])] {
