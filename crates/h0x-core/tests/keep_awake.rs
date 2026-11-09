@@ -84,7 +84,7 @@ fn the_sleep_helper_starts_once_per_working_turn_with_fixed_arguments_and_goes_w
     wait_until("held", || held(&s));
     // Several 2 s ticks of the same work start nothing more.
     std::thread::sleep(Duration::from_secs(5));
-    assert_eq!(inhibit_calls(&s), [expected.clone()], "only our own pid, nothing from a terminal");
+    assert_eq!(inhibit_calls(&s), std::slice::from_ref(&expected), "only our own pid, nothing from a terminal");
     assert_eq!(helpers(pid), 1);
 
     touch(&s, "go1");
