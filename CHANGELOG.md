@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- `keep_awake = true` in the config keeps the machine from sleeping while a terminal's status is `working` (system sleep only; the display and the lock screen are untouched). Off by default; `server status` shows `keep_awake` while a block is held. A stuck `working` agent keeps the machine awake until it reports `done` or the setting is turned off; there is no time limit.
+
+### Fixed
+
+- Output to a closed pipe (`h0x-core get x | head -c 0`) ends quietly with exit status 141 instead of a panic.
+
 ## [0.1.12] - 2026-11-09
 
 Program status (OSC 7501) now follows the Program Status Protocol rev 0.4, and remote approvals are stricter.

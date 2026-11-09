@@ -1,6 +1,7 @@
 pub mod addr;
 pub mod api;
 pub mod attach;
+mod awake;
 pub mod bridge;
 pub mod cli;
 pub mod client;

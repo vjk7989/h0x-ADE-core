@@ -605,6 +605,82 @@ while ($true) {
 }
 
 #[test]
+fn keep_awake_holds_the_block_only_while_a_program_reports_working() {
+    let s = Session::new();
+    let config = s.root.join("config/h0x-core/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let go = s.root.join("go.txt");
+    let agent = s.file(
+        "agent.ps1",
+        &format!(
+            r#"$e = [char]27
+function report($s) {{ [Console]::Out.Write("$e]7501;$s$e\"); [Console]::Out.Flush() }}
+report "state=working"
+while (-not (Test-Path '{}')) {{ Start-Sleep -Milliseconds 100 }}
+report "state=done"
+Start-Sleep 60
+"#,
+            go.display()
+        ),
+    );
+    let awake = |s: &Session| s.json(&["server", "status"])["keep_awake"] == true;
+    // Off by default: working holds nothing.
+    let t = s.bg(&["powershell", "-NoProfile", "-File", &agent]);
+    wait_until("working", || s.json(&["get", &t])["status"]["state"] == "working");
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(!awake(&s), "the setting is off");
+    std::fs::write(&config, "keep_awake = true").unwrap();
+    wait_until("held", || awake(&s));
+    std::fs::write(&config, "keep_awake = false").unwrap();
+    wait_until("released with the setting", || !awake(&s));
+    std::fs::write(&config, "keep_awake = true").unwrap();
+    wait_until("held again", || awake(&s));
+    std::fs::write(&go, "").unwrap();
+    wait_until("released when done", || !awake(&s));
+}
+
+#[test]
+fn keep_awake_holds_until_the_last_of_many_working_programs_is_done() {
+    let s = Session::new();
+    let config = s.root.join("config/h0x-core/config.toml");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "keep_awake = true").unwrap();
+    let agent = |name: &str| {
+        let go = s.root.join(format!("{name}.go"));
+        let script = s.file(
+            &format!("{name}.ps1"),
+            &format!(
+                r#"$e = [char]27
+function report($s) {{ [Console]::Out.Write("$e]7501;$s$e\"); [Console]::Out.Flush() }}
+report "state=working"
+while (-not (Test-Path '{}')) {{ Start-Sleep -Milliseconds 100 }}
+report "state=done"
+Start-Sleep 60
+"#,
+                go.display()
+            ),
+        );
+        (s.bg(&["powershell", "-NoProfile", "-File", &script]), go)
+    };
+    let agents: Vec<(String, PathBuf)> = ["a", "b", "c"].into_iter().map(agent).collect();
+    let state = |t: &str| s.json(&["get", t])["status"]["state"].clone();
+    let awake = || s.json(&["server", "status"])["keep_awake"] == true;
+    for (t, _) in &agents {
+        wait_until("working", || state(t) == "working");
+    }
+    wait_until("held", awake);
+    // Two of three finish: one working program is enough to keep holding.
+    for (t, go) in &agents[..2] {
+        std::fs::write(go, "").unwrap();
+        wait_until("done", || state(t) == "done");
+    }
+    std::thread::sleep(Duration::from_secs(5));
+    assert!(awake(), "the third program is still working");
+    std::fs::write(&agents[2].1, "").unwrap();
+    wait_until("released when the last is done", || !awake());
+}
+
+#[test]
 fn kill_ends_what_the_program_started_too() {
     let s = Session::new();
     let pid_file = s.root.join("pid.txt");
