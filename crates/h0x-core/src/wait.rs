@@ -163,7 +163,7 @@ impl Core {
                         }
                         Some("finished") | Some("lost") | Some("removed") => {
                             // With --rm the record may already be gone: the event says how it ended.
-                            let mut r = result(true, "exit", Some(None));
+                            let mut r = result(true, "exit", None);
                             let data = &event["data"];
                             r.exit_code = r.exit_code.or(data["exit_code"].as_i64().map(|c| c as i32));
                             r.signal = r.signal.or(data["signal"].as_i64().map(|s| s as i32));

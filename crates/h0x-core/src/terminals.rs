@@ -55,7 +55,7 @@ pub struct Terminal {
     #[serde(default)]
     pub identity: String,
     /// The program's own word for what it's doing (OSC 7501 root record);
-    /// null if it never said, or after it exited.
+    /// null if it never said, or it exited while working, blocked or idle.
     #[serde(default)]
     pub status: Option<crate::status::Status>,
     /// When that word last changed, ms since the epoch; null if it never said.
@@ -64,6 +64,9 @@ pub struct Terminal {
     /// Other 7501 records by id (programs reporting on several things).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub records: BTreeMap<String, crate::status::Status>,
+    /// Ids of `records`, least recently updated first (private; empty after a reload).
+    #[serde(skip)]
+    pub record_order: Vec<String>,
     /// Goes up each time the status leaves `working`.
     #[serde(default)]
     pub turn: u64,
@@ -281,6 +284,7 @@ impl Registry {
                 status: None,
                 status_ms: None,
                 records: BTreeMap::new(),
+                record_order: Vec::new(),
                 turn: 0,
                 first_task_turn: None,
                 reported: false,

@@ -837,7 +837,7 @@
               }
             ],
             "default": null,
-            "description": "The program's own word for what it's doing (OSC 7501 root record);\nnull if it never said, or after it exited."
+            "description": "The program's own word for what it's doing (OSC 7501 root record);\nnull if it never said, or it exited while working, blocked or idle."
           },
           "status_ms": {
             "default": null,
@@ -1386,7 +1386,7 @@
               }
             ],
             "default": null,
-            "description": "The program's own word for what it's doing (OSC 7501 root record);\nnull if it never said, or after it exited."
+            "description": "The program's own word for what it's doing (OSC 7501 root record);\nnull if it never said, or it exited while working, blocked or idle."
           },
           "status_ms": {
             "default": null,

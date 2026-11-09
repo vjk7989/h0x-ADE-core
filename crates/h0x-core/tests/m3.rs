@@ -75,8 +75,8 @@ fn events_arrive_in_order_after_a_snapshot() {
         seq = p["seq"].as_u64().unwrap();
         seen.push(p["type"].as_str().unwrap().to_string());
     }
-    // The last status is the reset at exit.
-    assert_eq!(seen, ["created", "labels", "status", "status", "turn", "status", "finished", "removed"]);
+    // Exit resets only working, blocked and idle: this program ended on done, so no status event.
+    assert_eq!(seen, ["created", "labels", "status", "status", "turn", "finished", "removed"]);
 }
 
 #[test]

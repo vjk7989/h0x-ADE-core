@@ -176,6 +176,19 @@ fn program_status_reports_and_title_changes_reach_us() {
 }
 
 #[test]
+fn a_new_shell_prompt_arrives_in_order_with_status_reports() {
+    let mut t = Terminal::new(80, 24, 1 << 20);
+    t.write(b"\x1b]7501;state=working\x1b\\\x1b]133;A\x07\x1b]7501;state=done\x1b\\");
+    let states: Vec<_> = t.take_status_reports().iter().map(|r| r.state).collect();
+    assert_eq!(states, ["working", "prompt", "done"]);
+    // Only a prompt start counts: not the input, output or end of a command, nor plain text.
+    t.write(b"\x1b]133;B\x07\x1b]133;C\x07\x1b]133;D;0\x07ls\r\n");
+    assert!(t.take_status_reports().is_empty());
+    t.write(b"\x1b]133;A;k=s\x1b\\\x1b]133;A\x07");
+    assert_eq!(t.take_status_reports().len(), 2, "a repeated prompt start is harmless but reported");
+}
+
+#[test]
 fn wheel_notches_follow_the_programs_mouse_mode_and_rows_keep_their_width() {
     let mut t = Terminal::new(20, 4, 1 << 20);
     assert!(t.wheel(true).is_empty(), "no mouse reports asked for");
