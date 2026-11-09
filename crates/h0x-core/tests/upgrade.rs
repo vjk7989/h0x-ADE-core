@@ -37,8 +37,7 @@ fn an_old_retained_holder_restores_the_new_cores_environment_after_raw_restart()
     // No autostarting CLI: only the released holder can launch the successor.
     wait_until("old holder launches the new executable", || {
         let Ok(stream) = h0x_core::platform::connect(&s.socket()) else { return false };
-        h0x_core::client::call(&stream, "server.status", serde_json::json!({}))
-            .is_ok_and(|status| status["pid"] != pid)
+        h0x_core::client::call(&stream, "server.status", serde_json::json!({})).is_ok_and(|status| status["pid"] != pid)
     });
     let out = s.core(&["exec", "printf '%s' \"$H0X_RESTART_VALUE\""]);
     assert!(out.status.success(), "{out:?}");

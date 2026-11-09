@@ -728,9 +728,11 @@ fn a_core_started_from_cmd_keeps_its_environment_across_restart() {
     }
     // cd records cmd.exe's hidden =C: working-directory entry for the drive.
     let script = format!("cd /d \"{}\" && \"{BIN}\" server start", s.root.display());
-    let out = launcher.env("H0X_CORE_SESSION_VALUE", "saved-from-cmd").args(["/d", "/c"]).raw_arg(script).output().unwrap();
+    let out =
+        launcher.env("H0X_CORE_SESSION_VALUE", "saved-from-cmd").args(["/d", "/c"]).raw_arg(script).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let out = cmd(&s.name, &s.root).env("H0X_CORE_SESSION_VALUE", "caller").args(["server", "restart"]).output().unwrap();
+    let out =
+        cmd(&s.name, &s.root).env("H0X_CORE_SESSION_VALUE", "caller").args(["server", "restart"]).output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let (code, out) = s.out(&["run", "cmd", "/d", "/c", "echo %H0X_CORE_SESSION_VALUE%"]);
     assert_eq!(code, 0, "{out}");
