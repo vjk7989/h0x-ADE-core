@@ -83,4 +83,31 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn path_expansion_keeps_literal_text_and_refuses_a_result_windows_cannot_hold() {
+        unsafe {
+            let mut token = null_mut();
+            assert_ne!(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &mut token), 0);
+            let token = OwnedHandle::from_raw_handle(token.cast());
+            let expand = |path: &str| expand_path(path, token.as_raw_handle() as HANDLE);
+            let appdata = std::env::var("APPDATA").unwrap();
+            for (path, expected) in [
+                ("", String::new()),
+                (";;%APPDATA%;", format!(";;{appdata};")),
+                ("%%;%APPDATA%", format!("%%;{appdata}")),
+                ("%APPDATA", "%APPDATA".into()),
+                (r"\\server\share\bin;%APPDATA%\上 é", format!(r"\\server\share\bin;{appdata}\上 é")),
+                (r"\\?\UNC\server\share;%APPDATA%", format!(r"\\?\UNC\server\share;{appdata}")),
+                ("%H0X_UNKNOWN_WINPATH_VAR%%APPDATA%", format!("%H0X_UNKNOWN_WINPATH_VAR%{appdata}")),
+            ] {
+                assert_eq!(expand(path).unwrap(), expected, "{path:?}");
+            }
+            // 32767 characters plus the terminating NUL fill the buffer exactly.
+            let fits = format!("%APPDATA%{}", "x".repeat(32767 - appdata.encode_utf16().count()));
+            assert_eq!(expand(&fits).unwrap().encode_utf16().count(), 32767);
+            let too_long = format!("{fits}x");
+            assert!(expand(&too_long).is_err(), "longer than a Windows environment value");
+        }
+    }
 }

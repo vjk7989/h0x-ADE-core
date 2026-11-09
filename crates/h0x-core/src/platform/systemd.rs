@@ -683,6 +683,74 @@ mod tests {
     }
 
     #[test]
+    fn manager_environment_handles_odd_but_complete_replies() {
+        let replies: [(&[u8], Option<BTreeMap<String, String>>); 10] = [
+            (b"", None),
+            (b"as", None),
+            (b"as -1", None),
+            (b"as 99999999999999999999 \"A=1\"", None),
+            (b"as 1 \"A=\xff\"", None),
+            (b"as 1 \"A=\x01\"", None),
+            (b"as 1 \"A=1\"\r\n", Some(map(&[("A", "1")]))),
+            (b"as 2  \"A=1\"\n \"B=2\" ", Some(map(&[("A", "1"), ("B", "2")]))),
+            (b"as 2 \"A=1\" \"A=2\"", Some(map(&[("A", "2")]))),
+            (b"as 2 \"NO_EQUALS\" \"B=\"", Some(map(&[("B", "")]))),
+        ];
+        for (reply, expected) in replies {
+            assert_eq!(super::parse_busctl_environment(reply), expected, "{:?}", String::from_utf8_lossy(reply));
+        }
+    }
+
+    #[test]
+    fn systemd_versions_at_and_around_240_pick_the_matching_service_shape() {
+        let mut core_command = Command::new("/bin/h0x-core");
+        core_command.arg("serve");
+        for (systemd_version, legacy) in [(0, true), (239, true), (240, false), (u32::MAX, false)] {
+            let unit_arguments = super::unit_args(
+                "h0x-core-serve-1",
+                Path::new("/run/user/1/h0x-core-serve-1/environment"),
+                &[],
+                Path::new("/s/x.log"),
+                Path::new("/"),
+                systemd_version,
+            );
+            let service_type = if legacy { "--service-type=simple" } else { "--service-type=exec" };
+            assert!(unit_arguments.contains(&service_type.into()), "{systemd_version}");
+            assert_eq!(unit_arguments.contains(&"StandardError=journal".into()), legacy, "{systemd_version}");
+            assert!(unit_arguments.contains(&"UnsetEnvironment=".into()), "{systemd_version}");
+            let command_arguments = super::service_command_args(&core_command, Path::new("/s/x.log"), systemd_version);
+            assert_eq!(command_arguments.first().map(|a| a == "/bin/sh"), Some(legacy), "{systemd_version}");
+            assert_eq!(
+                command_arguments[command_arguments.len() - 2..],
+                ["/bin/h0x-core", "serve"].map(std::ffi::OsString::from)
+            );
+        }
+    }
+
+    #[test]
+    fn older_systemd_log_wrapper_takes_double_quotes_and_command_text_in_the_log_path_literally() {
+        use std::os::unix::fs::DirBuilderExt;
+        let test_directory =
+            Path::new("/var/tmp").join(format!("h0x-core-legacy-quote-{}", super::super::random_hex()));
+        std::fs::DirBuilder::new().mode(0o700).create(&test_directory).unwrap();
+        let log_path = test_directory.join("-n \"quoted\" $(touch pwned); *.log");
+        let mut terminal_command = Command::new("/bin/sh");
+        terminal_command.args(["-c", "printf 'ok\\n' >&2"]);
+        let command_arguments = super::service_command_args(&terminal_command, &log_path, 239);
+        let output = Command::new(&command_arguments[0])
+            .args(&command_arguments[1..])
+            .current_dir(&test_directory)
+            .output()
+            .unwrap();
+        let log_contents = std::fs::read_to_string(&log_path);
+        let injected = test_directory.join("pwned").exists();
+        std::fs::remove_dir_all(&test_directory).unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(log_contents.unwrap(), "ok\n");
+        assert!(!injected, "the log path was evaluated as shell text");
+    }
+
+    #[test]
     fn programs_get_the_desktop_the_manager_has_now() {
         let mut env = map(&[("SSH_AUTH_SOCK", "/tmp/ssh-x/agent.1"), ("DISPLAY", ":1"), ("PATH", "/usr/bin")]);
         super::apply_session(&mut env, &map(&[("PATH", "/x"), ("SSH_AUTH_SOCK", "/run/user/1/my keys/ssh")]));

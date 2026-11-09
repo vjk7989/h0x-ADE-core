@@ -53,3 +53,22 @@ fn windows_path_keys_are_matched_without_case() {
     assert_eq!(env.get(std::ffi::OsStr::new("HOME")), Some(&std::ffi::OsString::from("new")));
     assert_eq!(env.get(std::ffi::OsStr::new("Path")), Some(&std::ffi::OsString::from("saved")));
 }
+
+#[test]
+fn an_empty_snapshot_restores_only_this_sessions_paths_and_the_runtime_mark() {
+    use std::ffi::OsString;
+    let none: [(OsString, OsString); 0] = [];
+    let only_mark = super::restored_environment(none.clone(), none);
+    assert_eq!(only_mark.into_iter().collect::<Vec<_>>(), [("H0X_RUNTIME".into(), "1".into())]);
+    let env = super::restored_environment(
+        [("H0X_RUNTIME".into(), "0".into())],
+        [
+            ("HOME".into(), "new-home".into()),
+            ("PATH".into(), "caller-path".into()),
+            ("H0X_SCOPE".into(), "caller-sweep".into()),
+        ],
+    );
+    let expected: Vec<(OsString, OsString)> =
+        vec![("H0X_RUNTIME".into(), "1".into()), ("HOME".into(), "new-home".into())];
+    assert_eq!(env.into_iter().collect::<Vec<_>>(), expected, "the caller's PATH does not replace a missing one");
+}

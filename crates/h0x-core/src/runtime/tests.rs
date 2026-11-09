@@ -224,6 +224,53 @@ async fn a_prepared_restart_survives_sigterm_and_rejects_stop() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[tokio::test]
+async fn a_second_restart_request_is_refused_and_keeps_the_first_note() {
+    let (core, root) = test_core();
+    let note = core.paths.state.join("restart-env.json");
+    crate::restart::prepare(&core).unwrap();
+    let first = std::fs::read(&note).unwrap();
+    assert!(crate::restart::prepare(&core).is_err());
+    assert_eq!(std::fs::read(&note).unwrap(), first, "the refused request neither rewrote nor removed it");
+    drop(core);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn sigterm_without_a_requested_restart_discards_a_stale_note() {
+    let (core, root) = test_core();
+    let note = core.paths.state.join("restart-env.json");
+    let tmp = core.paths.state.join("restart-env.abandoned.tmp");
+    std::fs::write(&note, b"{}").unwrap();
+    std::fs::write(&tmp, b"{}").unwrap();
+    crate::restart::on_sigterm(&core);
+    assert!(!note.exists(), "SIGTERM is not a restart: nothing is handed on");
+    assert!(!tmp.exists());
+    assert!(crate::restart::prepare(&core).is_err(), "a restart cannot start after SIGTERM");
+    assert!(!note.exists());
+    drop(core);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn an_unsavable_note_still_restarts_and_leaves_no_temporary_behind() {
+    let (core, root) = test_core();
+    let note = core.paths.state.join("restart-env.json");
+    std::fs::create_dir(&note).unwrap();
+    crate::restart::prepare(&core).unwrap();
+    assert!(core.restart.load(std::sync::atomic::Ordering::SeqCst), "the restart goes ahead");
+    let left: Vec<_> = std::fs::read_dir(&core.paths.state)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".tmp"))
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+    std::fs::remove_dir(&note).unwrap();
+    drop(core);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn host_shutdown_is_lost_without_overriding_explicit_actions() {
     for (killed, stopping, shutdown, expected) in [

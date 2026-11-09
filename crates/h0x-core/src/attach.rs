@@ -420,6 +420,35 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_or_untouched_payload_is_passed_on_without_a_copy() {
+        for payload in [&b""[..], b"\xe4", b"\x1b[?1004h", b"\x1b[?1004"] {
+            let out = shown(payload);
+            assert!(matches!(out, std::borrow::Cow::Borrowed(_)), "{payload:?}");
+            assert_eq!(&*out, payload);
+        }
+    }
+
+    #[test]
+    fn focus_off_at_either_edge_of_a_payload_is_turned_back_on_in_place() {
+        assert_eq!(&*shown(b"\x1b[?1004l"), b"\x1b[?1004h");
+        // The tail of a split character, then focus off, then the start of the next one.
+        assert_eq!(&*shown(b"\xb8\x8a\x1b[?1004l\xe4"), b"\xb8\x8a\x1b[?1004h\xe4");
+        let mut t = ghostty_vt::Terminal::new(80, 24, 0);
+        t.write(b"\x1b[?1004h");
+        t.write(&shown(b"A \xe4"));
+        t.write(&shown(b"\xb8\x8a\x1b[?1004l\xe4"));
+        t.write(&shown(b"\xb8\x8a B"));
+        assert_eq!(t.plain_text().trim_end(), "A 上上 B");
+        assert!(t.dec_mode(1004));
+    }
+
+    #[test]
+    fn dropping_win32_input_mode_cannot_leave_a_focus_off_behind() {
+        assert_eq!(&*shown(b"\x1b[?100\x1b[?9001h4l"), b"\x1b[?1004h");
+        assert_eq!(&*shown(b"\x1b[?900\x1b[?9001l1h"), b"");
+    }
+
+    #[test]
     fn conpty_never_switches_our_keys_to_win32_input_mode() {
         assert_eq!(&*shown(b"\x1b[?9001h\x1b[?1004hhi\x1b[?9001l"), b"\x1b[?1004hhi");
     }
