@@ -530,6 +530,42 @@ ZJhj3MtbsDPyt278bwB0BcVRB5ZoKqA6VCCZ5s51lq49BobYTBUuzlJqofyqGhaBwWB6iLyCd1cVXXQh
     }
 
     #[test]
+    fn the_sealed_copy_never_replaces_what_is_already_in_its_folder() {
+        let (scratch, file, sig) = signed(PAYLOAD, Some(SIG));
+        // The person's archive in a folder with spaces and non-ASCII letters.
+        let folder = scratch.0.join("my downloads ü");
+        std::fs::create_dir(&folder).unwrap();
+        let file = {
+            let moved = folder.join(file.file_name().unwrap());
+            std::fs::rename(&file, &moved).unwrap();
+            std::fs::rename(&sig, super::minisig(&moved)).unwrap();
+            moved
+        };
+        let name = file.file_name().unwrap();
+        // Something already there under the archive's name: refused, left as it was.
+        let keep = super::Scratch::new().unwrap();
+        std::fs::write(keep.0.join(name), "planted").unwrap();
+        let err = super::sealed(&file, None, TEST_KEY, &keep.0).unwrap_err();
+        assert_eq!(err.kind, "unavailable");
+        assert!(err.message.contains("cannot keep"), "{}", err.message);
+        assert_eq!(std::fs::read(keep.0.join(name)).unwrap(), b"planted");
+        // A folder that is not there: refused, nothing made.
+        let gone = keep.0.join("gone");
+        assert_eq!(super::sealed(&file, None, TEST_KEY, &gone).unwrap_err().kind, "unavailable");
+        assert!(!gone.exists());
+        // A refusal never deletes the person's own archive or its signature.
+        let wrong = super::Scratch::new().unwrap();
+        assert_eq!(super::sealed(&file, None, super::PUBLIC_KEY, &wrong.0).unwrap_err().kind, "refused");
+        assert_eq!(std::fs::read_dir(&wrong.0).unwrap().count(), 0);
+        assert!(file.exists() && super::minisig(&file).exists());
+        // An empty folder: the copy alone, under the archive's own name.
+        let fresh = super::Scratch::new().unwrap();
+        let copy = super::sealed(&file, None, TEST_KEY, &fresh.0).unwrap();
+        assert_eq!(copy, fresh.0.join(name));
+        assert_eq!(std::fs::read_dir(&fresh.0).unwrap().count(), 1, "the signature is not copied");
+    }
+
+    #[test]
     fn from_takes_only_a_signed_archive_or_a_debug_binary() {
         let scratch = super::Scratch::new().unwrap();
         let bare = scratch.0.join("h0x-core");

@@ -1526,6 +1526,19 @@ mod tests {
     }
 
     #[test]
+    fn with_neither_name_served_the_client_gets_not_found_so_it_starts_a_core() {
+        let tag = crate::platform::random_hex();
+        let salt = "0a".repeat(16);
+        let wanted = PathBuf::from(format!(r"\\.\pipe\h0x-core-absent-{salt}-{tag}.sock"));
+        let err = super::connect(&wanted).map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+        // A name without a salt has no older one to try: its own NotFound stands.
+        let plain = PathBuf::from(format!(r"\\.\pipe\h0x-core-absent-{tag}.sock"));
+        let err = super::connect(&plain).map(|_| ()).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+    }
+
+    #[test]
     fn a_salted_pipe_that_answers_with_an_error_is_not_swapped_for_the_older_name() {
         use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
         use windows_sys::Win32::System::Pipes::{CreateNamedPipeW, PIPE_TYPE_BYTE, PIPE_WAIT};

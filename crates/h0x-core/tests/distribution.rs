@@ -651,3 +651,49 @@ fn a_first_install_says_the_downloaded_core_checked_its_own_signature() {
     let said = String::from_utf8_lossy(&out.stdout);
     assert!(said.contains("trusted on first use"), "{said}");
 }
+
+/// Which h0x-core checks the download depends on the installed one's `--version`,
+/// compared as numbers (0.1.10 is newer than 0.1.9): 0.1.9 or newer checks it
+/// itself; older, unreadable or silent ones leave it to the downloaded core,
+/// which says so. Installed into a folder with spaces.
+#[test]
+fn the_install_script_reads_the_installed_version_as_numbers_to_pick_the_verifier() {
+    let cases = [
+        ("echo 'h0x-core 0.1.10'", "installed"),
+        ("echo 'h0x-core 0.2.0'", "installed"),
+        ("echo 'h0x-core 1.0.0'", "installed"),
+        ("echo 'h0x-core 0.1.10-rc.1'", "installed"),
+        ("echo 'h0x-core 0.1.9 (abc123)'", "installed"),
+        ("echo 'h0x-core 0.1.8'", "downloaded"),
+        ("echo 'h0x-core 0.0.99'", "downloaded"),
+        ("echo 'h0x-core 0.1'", "downloaded"),
+        ("echo 'hc 0.1.9'", "downloaded"),
+        ("echo 'h0x-core'", "downloaded"),
+        ("exit 1", "downloaded"),
+    ];
+    for (says, verifier) in cases {
+        let s = Session::new();
+        let asked = s.root.join("asked.log");
+        let downloaded = format!(
+            "#!/bin/sh\ncase \"$*\" in\n  --version) echo 'h0x-core 9.9.9' ;;\n  *--check*) echo downloaded >> '{}' ;;\nesac\nexit 0\n",
+            asked.display()
+        );
+        let (stub, _name, new_bytes) = stubbed_release(&s, "", &downloaded);
+        let bin = s.root.join("installed core ü");
+        std::fs::create_dir_all(&bin).unwrap();
+        let installed = format!(
+            "#!/bin/sh\ncase \"$*\" in\n  --version) {says} ;;\n  *--check*) echo installed >> '{}' ;;\n  update*) case \"$3\" in *.tar.gz) exit 1 ;; esac; cp \"$3\" \"$0\" ;;\nesac\n",
+            asked.display()
+        );
+        std::fs::write(bin.join("h0x-core"), &installed).unwrap();
+        std::fs::set_permissions(bin.join("h0x-core"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let out = install_signed(&stub, &bin);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{says}: {err}");
+        let log = std::fs::read_to_string(&asked).unwrap_or_default();
+        assert_eq!(log.trim(), verifier, "{says}: exactly one verifier is asked: {log:?} {err}");
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(said.contains("trusted on first use"), verifier == "downloaded", "{says}: {said}");
+        assert_eq!(std::fs::read(bin.join("h0x-core")).unwrap(), new_bytes, "{says}: swapped once verified");
+    }
+}
