@@ -141,17 +141,34 @@ pub fn through(req: &http::Request, tunnel: Option<&str>) -> Result<bool, u16> {
 /// Who is on the other end of a request: behind our tunnel the visitor's
 /// address from Cloudflare's `CF-Connecting-IP` (cloudflared connects from this
 /// machine, so the header is only believed from a loopback peer on a request
-/// that came through the tunnel), anywhere else the socket's own `peer`.
-pub fn client(req: &http::Request, peer: Option<IpAddr>, via_tunnel: bool) -> Option<IpAddr> {
-    if via_tunnel && peer.is_some_and(loopback) {
+/// that came through the tunnel). Behind `--via` (the request's `Host` is the vps's
+/// `public` host, and the ssh reverse forward connects from loopback) the visitor is the
+/// last hop of the proxy's `X-Forwarded-For`, else its `X-Real-IP`. Anywhere else, or
+/// without those headers, the socket's own `peer`.
+pub fn client(req: &http::Request, peer: Option<IpAddr>, via_tunnel: bool, public: Option<&str>) -> Option<IpAddr> {
+    if !peer.is_some_and(loopback) {
+        return peer;
+    }
+    if via_tunnel {
         let seen = req.header("cf-connecting-ip").and_then(|v| v.parse::<IpAddr>().ok());
         return seen.or(peer);
+    }
+    // The public host, with or without its scheme's default port.
+    let ours = |h: &str| {
+        let bare = h.strip_suffix(":443").or_else(|| h.strip_suffix(":80")).unwrap_or(h);
+        public.is_some_and(|host| bare.eq_ignore_ascii_case(host))
+    };
+    if req.header("host").is_some_and(ours) {
+        let hop = |v: &str| v.rsplit(',').next().and_then(|last| last.trim().parse::<IpAddr>().ok());
+        let forwarded = req.headers.iter().rev().find(|(n, _)| n == "x-forwarded-for").and_then(|(_, v)| hop(v));
+        let real = req.header("x-real-ip").and_then(|v| v.trim().parse::<IpAddr>().ok());
+        return forwarded.or(real).or(peer);
     }
     peer
 }
 
 /// Loopback, in either family, including `::ffff:127.0.0.1` (a dual-stack socket).
-fn loopback(ip: IpAddr) -> bool {
+pub fn loopback(ip: IpAddr) -> bool {
     ip.is_loopback() || matches!(ip, IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback()))
 }
 
@@ -1245,27 +1262,116 @@ mod hardening_tests {
     fn the_visitors_address_is_believed_only_behind_our_tunnel_from_this_machine() {
         let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
         let cf = request(&[("cf-connecting-ip", "198.51.100.7")]);
-        assert_eq!(client(&cf, ip("127.0.0.1"), true), ip("198.51.100.7"), "through the tunnel");
-        assert_eq!(client(&request(&[("cf-connecting-ip", "2001:db8::7")]), ip("::1"), true), ip("2001:db8::7"));
-        assert_eq!(client(&cf, ip("127.0.0.1"), false), ip("127.0.0.1"), "localhost: ignored");
-        assert_eq!(client(&cf, ip("192.168.1.20"), false), ip("192.168.1.20"), "LAN: ignored");
-        assert_eq!(client(&cf, ip("192.168.1.20"), true), ip("192.168.1.20"), "a LAN peer is not cloudflared");
+        assert_eq!(client(&cf, ip("127.0.0.1"), true, None), ip("198.51.100.7"), "through the tunnel");
+        assert_eq!(client(&request(&[("cf-connecting-ip", "2001:db8::7")]), ip("::1"), true, None), ip("2001:db8::7"));
+        assert_eq!(client(&cf, ip("127.0.0.1"), false, None), ip("127.0.0.1"), "localhost: ignored");
+        assert_eq!(client(&cf, ip("192.168.1.20"), false, None), ip("192.168.1.20"), "LAN: ignored");
+        assert_eq!(client(&cf, ip("192.168.1.20"), true, None), ip("192.168.1.20"), "a LAN peer is not cloudflared");
         for bad in ["", "not an ip", "198.51.100.7, 10.0.0.1", "198.51.100.7:80"] {
             let req = request(&[("cf-connecting-ip", bad)]);
-            assert_eq!(client(&req, ip("127.0.0.1"), true), ip("127.0.0.1"), "{bad:?}");
+            assert_eq!(client(&req, ip("127.0.0.1"), true, None), ip("127.0.0.1"), "{bad:?}");
         }
-        assert_eq!(client(&request(&[]), ip("127.0.0.1"), true), ip("127.0.0.1"), "no header");
-        assert_eq!(client(&cf, None, true), None, "no socket address, no answer");
+        assert_eq!(client(&request(&[]), ip("127.0.0.1"), true, None), ip("127.0.0.1"), "no header");
+        assert_eq!(client(&cf, None, true, None), None, "no socket address, no answer");
+    }
+
+    #[test]
+    fn behind_the_vps_the_proxys_last_hop_is_the_visitor_only_for_its_host_from_loopback() {
+        let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+        let pub_host = Some("panel.example.org");
+        let proxied = |extra: &[(&str, &str)]| {
+            let mut headers = vec![("host", "panel.example.org")];
+            headers.extend_from_slice(extra);
+            request(&headers)
+        };
+        let seen = |req: &http::Request, peer: &str, public: Option<&str>| client(req, ip(peer), false, public);
+        let xff = proxied(&[("x-forwarded-for", "6.6.6.6, 198.51.100.7")]);
+        assert_eq!(seen(&xff, "127.0.0.1", pub_host), ip("198.51.100.7"), "the last hop, not the client's own claim");
+        assert_eq!(seen(&proxied(&[("x-real-ip", "2001:db8::7")]), "::1", pub_host), ip("2001:db8::7"));
+        let both = proxied(&[("x-real-ip", "203.0.113.1"), ("x-forwarded-for", "198.51.100.7")]);
+        assert_eq!(seen(&both, "127.0.0.1", pub_host), ip("198.51.100.7"), "X-Forwarded-For first");
+        let two = proxied(&[("x-forwarded-for", "6.6.6.6"), ("x-forwarded-for", "198.51.100.8")]);
+        assert_eq!(seen(&two, "127.0.0.1", pub_host), ip("198.51.100.8"), "the last header line");
+        assert_eq!(seen(&proxied(&[]), "127.0.0.1", pub_host), ip("127.0.0.1"), "no header: the socket's");
+        let junk = proxied(&[("x-forwarded-for", "not an ip")]);
+        assert_eq!(seen(&junk, "127.0.0.1", pub_host), ip("127.0.0.1"), "unparsable: the socket's");
+        assert_eq!(seen(&xff, "127.0.0.1", None), ip("127.0.0.1"), "not in --via mode: ignored");
+        assert_eq!(seen(&xff, "192.168.1.20", pub_host), ip("192.168.1.20"), "LAN peer: ignored");
+        let local = request(&[("host", "127.0.0.1:7000"), ("x-forwarded-for", "198.51.100.7")]);
+        assert_eq!(seen(&local, "127.0.0.1", pub_host), ip("127.0.0.1"), "localhost, not the forward: ignored");
+        let tunnel = proxied(&[("x-forwarded-for", "198.51.100.7")]);
+        assert_eq!(client(&tunnel, ip("127.0.0.1"), true, pub_host), ip("127.0.0.1"), "the tunnel reads CF only");
+    }
+
+    #[test]
+    fn behind_the_vps_only_a_clean_last_hop_counts_and_anything_odd_falls_back() {
+        let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+        let pub_host = Some("panel.example.org");
+        let real = "203.0.113.1";
+        // The last X-Forwarded-For hop when it is a bare address, else X-Real-IP.
+        let seen = |xff: &str| {
+            let req = request(&[("host", "panel.example.org"), ("x-forwarded-for", xff), ("x-real-ip", real)]);
+            client(&req, ip("127.0.0.1"), false, pub_host)
+        };
+        assert_eq!(seen("6.6.6.6, 2001:db8::9"), ip("2001:db8::9"), "an IPv6 last hop");
+        assert_eq!(seen("6.6.6.6,198.51.100.7"), ip("198.51.100.7"), "no space after the comma");
+        assert_eq!(seen(" \t198.51.100.7 \t"), ip("198.51.100.7"), "spaces and tabs around it");
+        let many = (0..500).map(|n| format!("10.0.{}.{}", n / 250, n % 250)).collect::<Vec<_>>().join(", ");
+        assert_eq!(seen(&format!("{many}, 198.51.100.9")), ip("198.51.100.9"), "hundreds of hops: still the last");
+        for odd in [
+            "",
+            "198.51.100.7, garbage",
+            "198.51.100.7,",
+            "198.51.100.7:4711",
+            "[2001:db8::9]:443",
+            "198.51.100.7 198.51.100.8",
+            "unknown",
+        ] {
+            assert_eq!(seen(odd), ip(real), "never an earlier hop the visitor wrote: {odd:?}");
+        }
+        // A later X-Forwarded-For line that is unusable does not revive an earlier one.
+        let lines = request(&[
+            ("host", "panel.example.org"),
+            ("x-forwarded-for", "198.51.100.7"),
+            ("x-forwarded-for", "garbage"),
+        ]);
+        assert_eq!(client(&lines, ip("127.0.0.1"), false, pub_host), ip("127.0.0.1"), "the last line or nothing");
+        // X-Real-IP alone: trimmed, IPv6, and refused when it is not an address.
+        let only_real =
+            |v: &str| client(&request(&[("host", "panel.example.org"), ("x-real-ip", v)]), ip("::1"), false, pub_host);
+        assert_eq!(only_real(" 198.51.100.7 "), ip("198.51.100.7"));
+        assert_eq!(only_real("2001:db8::7"), ip("2001:db8::7"));
+        for odd in ["", "198.51.100.7:80", "198.51.100.7, 6.6.6.6"] {
+            assert_eq!(only_real(odd), ip("::1"), "{odd:?}");
+        }
+        // The host is matched in any case, with or without a default port; any other port or a lookalike is not the forward.
+        let host = |h: &str| {
+            let req = request(&[("host", h), ("x-forwarded-for", "198.51.100.7")]);
+            client(&req, ip("127.0.0.1"), false, pub_host)
+        };
+        assert_eq!(host("PANEL.Example.ORG"), ip("198.51.100.7"), "case does not matter");
+        for default_port in ["panel.example.org:443", "panel.example.org:80"] {
+            assert_eq!(host(default_port), ip("198.51.100.7"), "{default_port}: the same host");
+        }
+        for other in ["panel.example.org:8377", "panel.example.org.", "evil.panel.example.org", "", "example.org"] {
+            assert_eq!(host(other), ip("127.0.0.1"), "{other:?}");
+        }
+        let no_host = request(&[("x-forwarded-for", "198.51.100.7")]);
+        assert_eq!(client(&no_host, ip("127.0.0.1"), false, pub_host), ip("127.0.0.1"), "no Host header");
+        // A mapped loopback peer is the forward too; no peer stays no answer.
+        let xff = request(&[("host", "panel.example.org"), ("x-forwarded-for", "198.51.100.7")]);
+        assert_eq!(client(&xff, ip("::ffff:127.0.0.1"), false, pub_host), ip("198.51.100.7"));
+        assert_eq!(client(&xff, None, false, pub_host), None);
     }
 
     #[test]
     fn a_mapped_loopback_peer_is_cloudflared_too() {
         let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
         let cf = request(&[("cf-connecting-ip", "198.51.100.7")]);
-        assert_eq!(client(&cf, ip("::ffff:127.0.0.1"), true), ip("198.51.100.7"));
-        assert_eq!(client(&cf, ip("::ffff:127.0.0.1"), false), ip("::ffff:127.0.0.1"), "not through the tunnel");
+        assert_eq!(client(&cf, ip("::ffff:127.0.0.1"), true, None), ip("198.51.100.7"));
+        assert_eq!(client(&cf, ip("::ffff:127.0.0.1"), false, None), ip("::ffff:127.0.0.1"), "not through the tunnel");
         assert_eq!(
-            client(&cf, ip("::ffff:192.168.1.20"), true),
+            client(&cf, ip("::ffff:192.168.1.20"), true, None),
             ip("::ffff:192.168.1.20"),
             "a mapped LAN address is not"
         );

@@ -22,9 +22,10 @@ use crate::config::BridgeConfig;
 use crate::rpc::RpcError;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 /// Who can pair today.
 pub const TRANSPORTS: &[&str] = &["telegram", "web"];
@@ -36,6 +37,12 @@ const WRONG_CODES: u32 = 5;
 const BLOCK_MS: u64 = 10 * 60_000;
 /// audit.jsonl moves to audit.jsonl.1 (replacing the older one) once it holds this many bytes.
 const AUDIT_MAX: u64 = 1 << 20;
+/// Failed or unauthenticated attempts get this many verbatim audit lines a minute; the
+/// rest become one summary line, so rotating sources cannot flush real entries out of the log.
+const FAILURE_LINES: u32 = 5;
+const FAILURE_WINDOW_MS: u64 = 60_000;
+/// Distinct sources remembered for the summary line.
+const FAILURE_SOURCES: usize = 1024;
 /// No 0/O or 1/I: read off a screen and typed on a phone. 32 letters: no modulo bias.
 const ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
@@ -96,6 +103,17 @@ pub struct Bridge {
     recent: HashMap<String, VecDeque<u64>>,
     /// Destructive commands waiting for `confirm`, by token.
     tokens: HashMap<String, command::Waiting>,
+    /// The failed attempts of the current minute, for [`Bridge::audit_failed`].
+    failures: Mutex<Failures>,
+}
+
+/// One minute of failed attempts: when it began, how many lines were written, and what was held back.
+#[derive(Default)]
+struct Failures {
+    since: u64,
+    written: u32,
+    held_back: u32,
+    sources: HashSet<String>,
 }
 
 fn failed(e: impl std::fmt::Display) -> RpcError {
@@ -110,7 +128,7 @@ impl Bridge {
     }
 
     pub fn at(dir: PathBuf, config: BridgeConfig) -> Bridge {
-        Bridge { dir, config, recent: HashMap::new(), tokens: HashMap::new() }
+        Bridge { dir, config, recent: HashMap::new(), tokens: HashMap::new(), failures: Mutex::default() }
     }
 
     /// The state, or empty when there is none. A file that isn't a JSON
@@ -225,9 +243,12 @@ impl Bridge {
             Err(e) => format!("refused: {}", e.message),
         };
         // Logged before it counts: an attempt the log can't keep pairs no one.
-        self.audit(
-            json!({"time_ms": now, "identity": format!("{transport}:{user_id}"), "command": "pair", "result": outcome}),
-        )?;
+        let entry =
+            json!({"time_ms": now, "identity": format!("{transport}:{user_id}"), "command": "pair", "result": outcome});
+        match &result {
+            Ok(_) => self.audit(entry)?,
+            Err(_) => self.audit_failed(entry)?,
+        }
         self.save(&st)?;
         result
     }
@@ -307,7 +328,49 @@ impl Bridge {
         Ok(())
     }
 
+    /// One audit line, verbatim. A summary of held-back failures that is due goes first.
     fn audit(&self, entry: Value) -> Result<(), RpcError> {
+        let now = entry["time_ms"].as_u64().unwrap_or_default();
+        self.settle(&mut self.failures.lock().unwrap(), now)?;
+        self.append(entry)
+    }
+
+    /// An unauthenticated or failed attempt: the first [`FAILURE_LINES`] of each minute are
+    /// written verbatim, the rest only counted, and one summary line follows the minute.
+    pub(crate) fn audit_failed(&self, entry: Value) -> Result<(), RpcError> {
+        let now = entry["time_ms"].as_u64().unwrap_or_default();
+        let mut failures = self.failures.lock().unwrap();
+        self.settle(&mut failures, now)?;
+        if failures.written < FAILURE_LINES {
+            failures.written += 1;
+            drop(failures);
+            return self.append(entry);
+        }
+        failures.held_back += 1;
+        if failures.sources.len() < FAILURE_SOURCES {
+            failures.sources.insert(entry["identity"].as_str().unwrap_or_default().to_string());
+        }
+        Ok(())
+    }
+
+    /// Once a minute is over: its summary line (if attempts were held back), then a fresh minute.
+    fn settle(&self, failures: &mut Failures, now: u64) -> Result<(), RpcError> {
+        if now.saturating_sub(failures.since) < FAILURE_WINDOW_MS {
+            return Ok(());
+        }
+        let (held_back, sources) = (failures.held_back, failures.sources.len());
+        *failures = Failures { since: now, ..Failures::default() };
+        if held_back == 0 {
+            return Ok(());
+        }
+        let more = if sources >= FAILURE_SOURCES { "+" } else { "" };
+        let result = format!("{held_back} more failed attempts from {sources}{more} sources in the last minute");
+        self.append(
+            json!({"time_ms": now, "identity": "unauthenticated", "command": "failed-attempts", "result": result}),
+        )
+    }
+
+    fn append(&self, entry: Value) -> Result<(), RpcError> {
         self.rotate_audit(AUDIT_MAX).map_err(failed)?;
         let mut file = self.audit_file().map_err(failed)?;
         file.write_all(format!("{entry}\n").as_bytes()).map_err(failed)
@@ -704,5 +767,90 @@ mod audit_and_pairing_tests {
             std::fs::set_permissions(&old, perms).unwrap();
         }
         std::fs::remove_dir_all(&b.dir).unwrap();
+    }
+
+    fn failure(now: u64, who: &str) -> Value {
+        json!({"time_ms": now, "identity": who, "command": "auth", "result": "refused: wrong"})
+    }
+
+    #[test]
+    fn five_failures_a_minute_are_verbatim_and_the_minute_ends_exactly_sixty_seconds_after_it_began() {
+        let b = scratch();
+        for n in 0..FAILURE_LINES {
+            b.audit_failed(failure(T + u64::from(n), "web:203.0.113.1")).unwrap();
+        }
+        assert_eq!(b.log(100).unwrap().len(), 5, "the first five are lines");
+        b.audit_failed(failure(T + FAILURE_WINDOW_MS - 1, "web:203.0.113.2")).unwrap();
+        b.audit_failed(failure(T - 30_000, "web:203.0.113.2")).unwrap();
+        assert_eq!(b.log(100).unwrap().len(), 5, "the last millisecond, and a clock gone back, are the same minute");
+        b.audit_failed(failure(T + FAILURE_WINDOW_MS, "web:203.0.113.3")).unwrap();
+        let log = b.log(100).unwrap();
+        assert_eq!(log.len(), 7, "{log:?}");
+        assert_eq!(
+            log[5],
+            json!({"time_ms": T + FAILURE_WINDOW_MS, "identity": "unauthenticated", "command": "failed-attempts",
+                "result": "2 more failed attempts from 1 sources in the last minute"})
+        );
+        assert_eq!(log[6], failure(T + FAILURE_WINDOW_MS, "web:203.0.113.3"), "a new minute: verbatim again");
+        std::fs::remove_dir_all(&b.dir).unwrap();
+    }
+
+    #[test]
+    fn exactly_five_failures_leave_no_summary_line() {
+        let b = scratch();
+        for n in 0..FAILURE_LINES {
+            b.audit_failed(failure(T, &format!("web:203.0.113.{n}"))).unwrap();
+        }
+        b.audit(json!({"time_ms": T + 10 * FAILURE_WINDOW_MS, "identity": "web:me", "result": "ok"})).unwrap();
+        let log = b.log(100).unwrap();
+        assert_eq!(log.len(), 6, "{log:?}");
+        assert!(log.iter().all(|e| e["command"] != "failed-attempts"), "nothing was held back: {log:?}");
+        std::fs::remove_dir_all(&b.dir).unwrap();
+    }
+
+    #[test]
+    fn a_held_back_flood_is_summarised_at_the_next_write_however_late_and_successes_stay_verbatim() {
+        let b = scratch();
+        let (code, _) = b.pair("web", T).unwrap();
+        for n in 0..40 {
+            assert!(b.pair_verify("web", &format!("u{}", n % 3), "", "WRONGWRONG", T + n).is_err());
+        }
+        // A good code in the middle of the flood: its line is written, and the summary is not due yet.
+        assert!(b.pair_verify("web", "me", "", &code, T + 100).is_ok());
+        let log = b.log(100).unwrap();
+        assert_eq!(log.len(), 6, "{log:?}");
+        assert_eq!(log[5]["result"], "paired");
+        assert_eq!(log[5]["identity"], "web:me");
+        // Ten quiet minutes later the next failure brings the summary first, dated then.
+        let late = T + 10 * FAILURE_WINDOW_MS;
+        assert!(b.pair_verify("web", "u9", "", "WRONGWRONG", late).is_err());
+        let log = b.log(100).unwrap();
+        assert_eq!(log.len(), 8, "{log:?}");
+        assert_eq!(log[6]["command"], "failed-attempts");
+        assert_eq!(log[6]["time_ms"], late);
+        assert_eq!(log[6]["result"], "35 more failed attempts from 3 sources in the last minute");
+        assert_eq!((log[7]["identity"].as_str(), log[7]["command"].as_str()), (Some("web:u9"), Some("pair")));
+        std::fs::remove_dir_all(&b.dir).unwrap();
+    }
+
+    #[test]
+    fn the_summary_counts_sources_up_to_its_cap_and_marks_more_with_a_plus() {
+        let summary = |distinct: usize, attempts: usize| {
+            let b = scratch();
+            for n in 0..FAILURE_LINES {
+                b.audit_failed(failure(T, &format!("first:{n}"))).unwrap();
+            }
+            for n in 0..attempts {
+                b.audit_failed(failure(T + 1, &format!("web:{}", n % distinct))).unwrap();
+            }
+            b.audit(json!({"time_ms": T + FAILURE_WINDOW_MS, "identity": "web:me", "result": "ok"})).unwrap();
+            let log = b.log(2).unwrap();
+            std::fs::remove_dir_all(&b.dir).unwrap();
+            assert_eq!(log[1]["identity"], "web:me", "the success comes after its summary");
+            log[0]["result"].as_str().unwrap().to_string()
+        };
+        assert_eq!(summary(1023, 1023), "1023 more failed attempts from 1023 sources in the last minute");
+        assert_eq!(summary(5000, 5000), "5000 more failed attempts from 1024+ sources in the last minute");
+        assert_eq!(summary(2, 3000), "3000 more failed attempts from 2 sources in the last minute");
     }
 }
