@@ -6,7 +6,9 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Security::{TOKEN_DUPLICATE, TOKEN_QUERY};
-use windows_sys::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
+use windows_sys::Win32::System::Environment::{
+    CreateEnvironmentBlock, DestroyEnvironmentBlock, ExpandEnvironmentStringsForUserW,
+};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 pub(super) fn refresh(env: &mut BTreeMap<String, String>) -> io::Result<()> {
@@ -17,7 +19,7 @@ pub(super) fn refresh(env: &mut BTreeMap<String, String>) -> io::Result<()> {
         }
         let token = OwnedHandle::from_raw_handle(token.cast());
         let mut block = null_mut();
-        // Windows reads the registry, expands REG_EXPAND_SZ and joins system/user PATH.
+        // Windows reads the registry and joins system/user PATH.
         if CreateEnvironmentBlock(&mut block, token.as_raw_handle() as HANDLE, 0) == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -34,6 +36,78 @@ pub(super) fn refresh(env: &mut BTreeMap<String, String>) -> io::Result<()> {
             at = at.add(len + 1);
         }
         DestroyEnvironmentBlock(block);
+        if let Some((_, path)) = env.iter_mut().find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+            && path.contains('%')
+        {
+            // userenv can leave references to late-added variables such as ProgramFiles in PATH.
+            *path = expand_path(path, token.as_raw_handle() as HANDLE)?;
+        }
     }
     Ok(())
+}
+
+fn expand_path(path: &str, token: HANDLE) -> io::Result<String> {
+    let source: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+    let mut expanded = vec![0u16; 32768];
+    if unsafe { ExpandEnvironmentStringsForUserW(token, source.as_ptr(), expanded.as_mut_ptr(), expanded.len() as u32) }
+        == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let len = expanded.iter().position(|&c| c == 0).unwrap_or(expanded.len());
+    Ok(String::from_utf16_lossy(&expanded[..len]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_expands_user_and_late_added_system_variables() {
+        unsafe {
+            let mut token = null_mut();
+            assert_ne!(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &mut token), 0);
+            let token = OwnedHandle::from_raw_handle(token.cast());
+            let path = expand_path(
+                r"%ProgramFiles%\PowerShell\7;%APPDATA%\npm;%H0X_UNKNOWN_WINPATH_VAR%",
+                token.as_raw_handle() as HANDLE,
+            )
+            .unwrap();
+            assert_eq!(
+                path,
+                format!(
+                    r"{}\PowerShell\7;{}\npm;%H0X_UNKNOWN_WINPATH_VAR%",
+                    std::env::var("ProgramFiles").unwrap(),
+                    std::env::var("APPDATA").unwrap()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn path_expansion_keeps_literal_text_and_refuses_a_result_windows_cannot_hold() {
+        unsafe {
+            let mut token = null_mut();
+            assert_ne!(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &mut token), 0);
+            let token = OwnedHandle::from_raw_handle(token.cast());
+            let expand = |path: &str| expand_path(path, token.as_raw_handle() as HANDLE);
+            let appdata = std::env::var("APPDATA").unwrap();
+            for (path, expected) in [
+                ("", String::new()),
+                (";;%APPDATA%;", format!(";;{appdata};")),
+                ("%%;%APPDATA%", format!("%%;{appdata}")),
+                ("%APPDATA", "%APPDATA".into()),
+                (r"\\server\share\bin;%APPDATA%\上 é", format!(r"\\server\share\bin;{appdata}\上 é")),
+                (r"\\?\UNC\server\share;%APPDATA%", format!(r"\\?\UNC\server\share;{appdata}")),
+                ("%H0X_UNKNOWN_WINPATH_VAR%%APPDATA%", format!("%H0X_UNKNOWN_WINPATH_VAR%{appdata}")),
+            ] {
+                assert_eq!(expand(path).unwrap(), expected, "{path:?}");
+            }
+            // 32767 characters plus the terminating NUL fill the buffer exactly.
+            let fits = format!("%APPDATA%{}", "x".repeat(32767 - appdata.encode_utf16().count()));
+            assert_eq!(expand(&fits).unwrap().encode_utf16().count(), 32767);
+            let too_long = format!("{fits}x");
+            assert!(expand(&too_long).is_err(), "longer than a Windows environment value");
+        }
+    }
 }

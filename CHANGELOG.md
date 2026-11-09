@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Fixed
+- Updates and `h0x-core server restart` keep the environment the core started with; stopping and starting takes a fresh one. A failed save no longer blocks a restart; the saved note expires after three minutes and cannot cross a boot. (ported from herdr-core cd12ddd)
+
 ## [0.1.10] - 2026-11-09
 
 Security release from the second audit (Cloudflare security-audit tool).
