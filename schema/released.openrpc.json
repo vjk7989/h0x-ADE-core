@@ -1101,6 +1101,10 @@
               "null"
             ]
           },
+          "keep_awake": {
+            "description": "A sleep block is held now: `keep_awake` is on and a terminal is working.",
+            "type": "boolean"
+          },
           "live": {
             "format": "uint",
             "minimum": 0,
@@ -1127,7 +1131,8 @@
           "uptime_ms",
           "holders",
           "live",
-          "finished"
+          "finished",
+          "keep_awake"
         ],
         "type": "object"
       },
@@ -1515,7 +1520,7 @@
       "name": "Apache-2.0"
     },
     "title": "h0x-core",
-    "version": "0.1.12"
+    "version": "0.1.13"
   },
   "methods": [
     {
