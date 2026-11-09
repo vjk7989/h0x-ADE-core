@@ -907,6 +907,41 @@ mod tests {
     }
 
     #[test]
+    fn the_command_path_leaves_a_log_one_byte_under_its_limit_in_place() {
+        let mut f = fixture(BridgeConfig::default());
+        let path = f.bridge.dir.join("audit.jsonl");
+        let under = super::super::AUDIT_MAX - 1;
+        std::fs::write(&path, vec![b'x'; usize::try_from(under).unwrap()]).unwrap();
+        assert!(matches!(f.send(Command::List, T), Reply::Done(_)));
+        assert!(!f.bridge.dir.join("audit.jsonl.1").exists(), "no rotation under the limit");
+        assert!(std::fs::metadata(&path).unwrap().len() > under, "the entry was appended");
+        f.send(Command::List, T);
+        assert!(f.bridge.dir.join("audit.jsonl.1").exists(), "the next command rotates the now full log");
+    }
+
+    #[test]
+    fn a_full_audit_log_that_cannot_rotate_fails_the_command_and_runs_nothing() {
+        let mut f = fixture(BridgeConfig::default());
+        let kill = token(&f.send(Command::Kill { terminal: "t1".into() }, T));
+        f.calls.borrow_mut().clear();
+        let path = f.bridge.dir.join("audit.jsonl");
+        let max = super::super::AUDIT_MAX;
+        std::fs::write(&path, vec![b'x'; usize::try_from(max).unwrap()]).unwrap();
+        let old = f.bridge.dir.join("audit.jsonl.1");
+        std::fs::create_dir(&old).unwrap();
+        for command in [Command::List, Command::Confirm { token: kill.clone() }, Command::Lock] {
+            let reply = f.send(command, T);
+            assert!(matches!(&reply, Reply::Failed(m) if m.contains("audit log")), "{reply:?}");
+        }
+        assert!(f.calls.borrow().is_empty(), "nothing reached the core");
+        assert!(!f.bridge.locked().unwrap(), "nor the lock");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), max, "the full log is untouched");
+        std::fs::remove_dir(&old).unwrap();
+        assert!(matches!(f.send(Command::Confirm { token: kill }, T), Reply::Done(_)), "the token was not spent");
+        assert_eq!(std::fs::metadata(&old).unwrap().len(), max, "the log rotated once it could");
+    }
+
+    #[test]
     fn tokens_never_reach_the_log_but_the_confirmed_action_does() {
         let mut f = fixture(BridgeConfig::default());
         let kill = token(&f.send(Command::Kill { terminal: "t2".into() }, T));

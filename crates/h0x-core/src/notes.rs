@@ -412,6 +412,75 @@ mod tests {
     }
 
     #[test]
+    fn an_error_note_escapes_the_message_after_cutting_it_and_drops_controls() {
+        let mut r = Registry::default();
+        let id = r.create(NewTerminal { argv: vec!["x".into()], ..Default::default() }, 0).unwrap();
+        let t = r.terminals.get_mut(&id).unwrap();
+        t.turn = 2;
+        t.status = Some(crate::status::Status {
+            state: "error".into(),
+            kind: None,
+            progress: None,
+            app: String::new(),
+            title: String::new(),
+            msg: "a\u{0}b\u{1b}[2J\u{9b}c & C:\\Users\\me\\x.txt\r\nsecond line".into(),
+        });
+        assert_eq!(
+            note(t, "t1", &[]),
+            "<h0x>t1 hit an error: ab[2Jc &amp; C:\\Users\\me\\x.txt. See: h0x-core read t1</h0x>",
+            "first line only, controls dropped, a Windows path unchanged"
+        );
+        // 200 characters are kept, then escaped: an entity is never cut in half.
+        t.status.as_mut().unwrap().msg = "&".repeat(250);
+        let text = note(t, "t1", &[]);
+        assert_eq!(text, format!("<h0x>t1 hit an error: {}. See: h0x-core read t1</h0x>", "&amp;".repeat(200)));
+        t.status.as_mut().unwrap().msg = "\u{2713} caf\u{e9} \u{1f980} ]]> &amp;".into();
+        assert_eq!(
+            note(t, "t1", &[]),
+            "<h0x>t1 hit an error: \u{2713} caf\u{e9} \u{1f980} ]]&gt; &amp;amp;. See: h0x-core read t1</h0x>"
+        );
+    }
+
+    #[test]
+    fn last_lines_in_an_exit_note_are_escaped_and_otherwise_kept() {
+        let mut r = Registry::default();
+        let id = r.create(NewTerminal { argv: vec!["x".into()], ..Default::default() }, 0).unwrap();
+        r.finish(id, Some(1), None, "exited", 1);
+        let long = format!("{}<tail", "<".repeat(299));
+        let last = last_lines(&format!("C:\\work\\a&b.txt\r\n\u{0}\u{9b}\r\n{long}\n\u{1f980} ok\n"));
+        assert_eq!(last.len(), 3, "a line of only controls is blank: {last:?}");
+        let text = note(&r.terminals[&id], "t1", &last);
+        assert_eq!(text.matches("<h0x>").count(), 1, "{text}");
+        assert_eq!(text.matches("</h0x>").count(), 1, "{text}");
+        assert!(text.ends_with("</h0x>"), "{text}");
+        assert!(text.contains("\nC:\\work\\a&amp;b.txt\n"), "a Windows path survives: {text}");
+        assert!(text.contains(&format!("\n{}\n", "&lt;".repeat(300))), "300 characters, then escaped: {text}");
+        assert!(!text.contains("tail"), "{text}");
+        assert!(text.contains("\n\u{1f980} ok\n"), "{text}");
+    }
+
+    #[test]
+    fn a_note_from_another_machine_escapes_odd_machine_names_and_its_own_tags() {
+        assert_eq!(afar_note("lab box", "hi"), "<h0x from=\"lab box\">hi</h0x>");
+        assert_eq!(
+            afar_note("a<b>&\"c\"\n\u{0}\u{9b}", "x"),
+            "<h0x from=\"a&lt;b&gt;&amp;&quot;c&quot;\">x</h0x>",
+            "markup escaped, every control dropped in the name, including line breaks"
+        );
+        assert_eq!(afar_note("", "x"), "<h0x from=\"\">x</h0x>", "an empty name still cannot open a tag");
+        // The sender's own note, already tagged there, stays text: no second tag here.
+        let theirs = "<h0x from=\"t1\">done</h0x>";
+        let text = afar_note("rohan", theirs);
+        assert_eq!(text, "<h0x from=\"rohan\">&lt;h0x from=&quot;t1&quot;&gt;done&lt;/h0x&gt;</h0x>");
+        assert_eq!((text.matches("<h0x").count(), text.matches("</h0x>").count()), (1, 1));
+        assert_eq!(
+            afar_note("rohan", "a\r\nb\u{0}\u{7}\u{85}c\tC:\\x"),
+            "<h0x from=\"rohan\">a\r\nbc\tC:\\x</h0x>",
+            "line breaks, tabs and paths kept; NUL, BEL and C1 dropped"
+        );
+    }
+
+    #[test]
     fn a_caller_from_another_machine_cannot_break_out_of_its_tag() {
         let root = std::path::PathBuf::from(format!(
             "/var/tmp/h0x-core-notes-tag-{}-{}",
