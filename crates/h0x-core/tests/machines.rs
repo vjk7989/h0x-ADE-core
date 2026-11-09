@@ -288,7 +288,7 @@ exec {ssh} rohan '{core} connect'
                 r#"#!/bin/sh
 for arg do
   case "$arg" in
-    */h0x-core-install.zip) [ "$(cat "$arg")" = 'windows test build' ] || exit 1; zip=yes;;
+    */h0x-core-windows-x86_64.zip) [ "$(cat "$arg")" = 'windows test build' ] || exit 1; zip=yes;;
     */h0x-core-install.ps1) [ -s "$arg" ] || exit 1; script=yes;;
   esac
 done

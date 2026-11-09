@@ -105,5 +105,7 @@ When the signing profile is configured, the workflow signs and verifies the exec
 If the profile is unset, it publishes unsigned builds. Windows may block those builds.
 Do not assume every downloaded build is signed.
 
-`h0x-core update --from /path/to/h0x-core` installs a local build instead of downloading one.
-Only use a build you trust. The updater's compatibility checks are not a review of its code.
+`h0x-core update --from h0x-core-<target>.tar.gz` (or `.zip`) installs a release archive you already have.
+Its `.minisig` must sit beside it (or be given with `--signature`) and must verify against the embedded release key for that file name; a bare binary is refused in release builds, and nothing is swapped on any failure.
+`--check` only verifies. `install.sh` and `install.ps1` download the asset's `.minisig` and have the downloaded h0x-core check it before installing; that first check trusts the freshly downloaded binary itself (trust on first use, anchored in TLS to GitHub), and every later update is checked by the h0x-core already installed.
+On Windows `install.ps1` locks an install folder outside your profile (no inherited rights; only you, SYSTEM and Administrators).

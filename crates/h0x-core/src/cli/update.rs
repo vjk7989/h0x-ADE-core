@@ -47,7 +47,8 @@ pub(super) fn up_to_date(paths: &Paths, release: &str, human: String) -> Result<
     Ok(out)
 }
 
-/// Swaps the binary this h0x-core runs from for `from`, then restarts the core
+/// Swaps the binary this h0x-core runs from for `from` (a binary whose release
+/// signature was already checked, see `releases::from_file`), then restarts the core
 /// the planned way: every terminal keeps running. One swap path, for people
 /// and for apps that bundle h0x-core.
 pub(super) fn update(paths: &Paths, from: &std::path::Path, force: bool) -> Result<Out, RpcError> {
