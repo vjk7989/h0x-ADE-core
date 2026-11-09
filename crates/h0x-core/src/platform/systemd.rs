@@ -105,8 +105,9 @@ pub fn spawn(cmd: &Command, log: &Path) -> Option<io::Result<()>> {
             .arg("--version")
             .output()
             .ok()
-            .and_then(|out| String::from_utf8_lossy(&out.stdout).split_whitespace().nth(1)?.parse::<u32>().ok())
-            .unwrap_or(u32::MAX)
+            .and_then(|out| parse_version(String::from_utf8_lossy(&out.stdout).split_whitespace().nth(1)?))
+            // Unknown: the shape every supported systemd (239 and up) accepts.
+            .unwrap_or(239)
     });
     let dir = match write_environment(&run, &name, &env) {
         Ok(dir) => dir,
@@ -289,6 +290,12 @@ fn service_command_args(command: &Command, log_path: &Path, systemd_version: u32
     command_arguments.push(command.get_program().to_owned());
     command_arguments.extend(command.get_args().map(OsStr::to_owned));
     command_arguments
+}
+
+/// The leading digits of a `systemd-run --version` number: "239.1" is 239, "240~rc1" is 240.
+fn parse_version(text: &str) -> Option<u32> {
+    let digits = text.len() - text.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    text[..digits].parse().ok()
 }
 
 fn shutdown_order(cmd: &Command, log: &Path) -> OsString {
@@ -696,6 +703,22 @@ mod tests {
             (&b"as 2 \"NO_EQUALS\" \"B=\""[..], Some(map(&[("B", "")]))),
         ] {
             assert_eq!(super::parse_busctl_environment(reply), expected, "{:?}", String::from_utf8_lossy(reply));
+        }
+    }
+
+    #[test]
+    fn the_systemd_version_is_its_leading_digits() {
+        for (text, want) in [
+            ("239", Some(239)),
+            ("239.1", Some(239)),
+            ("240~rc1", Some(240)),
+            ("252-1", Some(252)),
+            ("v240", None),
+            ("", None),
+            ("rc", None),
+            ("99999999999", None),
+        ] {
+            assert_eq!(super::parse_version(text), want, "{text:?}");
         }
     }
 
