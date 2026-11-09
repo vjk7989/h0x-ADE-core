@@ -95,15 +95,46 @@ fn shown(payload: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     let mut out = Cow::Borrowed(payload);
     // ConPTY asks its viewer for win32-input-mode. A Windows console hosting
     // h0x-core would obey and send keys as key-event codes: no detach key, no replies.
-    for mode in [&b"\x1b[?9001h"[..], b"\x1b[?9001l"] {
-        while let Some(at) = out.windows(mode.len()).position(|w| w == mode) {
-            out.to_mut().drain(at..at + mode.len());
+    // Removing one can join the bytes around it into another (`ESC[?900` ESC[?9001l `1h`),
+    // so go again until a full pass removes nothing.
+    loop {
+        let mut removed = false;
+        for mode in [&b"\x1b[?9001h"[..], b"\x1b[?9001l"] {
+            while let Some(at) = out.windows(mode.len()).position(|w| w == mode) {
+                out.to_mut().drain(at..at + mode.len());
+                removed = true;
+            }
+        }
+        if !removed {
+            break;
         }
     }
-    if out.windows(OFF.len()).any(|w| w == OFF) {
-        out.to_mut().extend_from_slice(b"\x1b[?1004h");
+    // Turned back on where it was turned off, not at the end: a payload can
+    // end partway through a character that the next payload finishes.
+    while let Some(at) = out.windows(OFF.len()).position(|w| w == OFF) {
+        out.to_mut()[at + OFF.len() - 1] = b'h';
     }
     out
+}
+
+/// `shown` for a stream: a payload can end partway through one of the
+/// sequences it filters, so that tail (at most 7 bytes) waits in `held` for
+/// the next payload. `finish` passes on whatever is still held.
+fn shown_stream(held: &mut Vec<u8>, payload: &[u8]) -> Vec<u8> {
+    const FILTERED: [&[u8]; 3] = [b"\x1b[?9001h", b"\x1b[?9001l", b"\x1b[?1004l"];
+    held.extend_from_slice(payload);
+    let keep = (1..FILTERED[0].len().min(held.len() + 1))
+        .rev()
+        .find(|&n| FILTERED.iter().any(|seq| held.ends_with(&seq[..n])))
+        .unwrap_or(0);
+    let tail = held.split_off(held.len() - keep);
+    let out = shown(held).into_owned();
+    *held = tail;
+    out
+}
+
+fn finish(held: &mut Vec<u8>) -> Vec<u8> {
+    shown(&std::mem::take(held)).into_owned()
 }
 
 /// Pulls replies to `ASK_DISPLAY` out of input. Returns the rest and whether DA1 arrived.
@@ -236,10 +267,11 @@ pub fn run(paths: &Paths, terminal: &str, observe: bool, history: usize) -> Resu
         std::thread::spawn(move || {
             let mut frames =
                 early_frames.into_iter().map(Some).chain(std::iter::from_fn(|| Some(read_frame(&mut reader))));
+            let mut held = Vec::new();
             while let Some(Some((ch, kind, payload))) = frames.next() {
                 match (ch == channel, kind) {
                     (true, wire::DATA) => {
-                        out(&shown(&payload));
+                        out(&shown_stream(&mut held, &payload));
                         send(channel, wire::CREDIT, &(payload.len() as u32).to_le_bytes());
                     }
                     (true, wire::CLOSE) => {
@@ -249,6 +281,7 @@ pub fn run(paths: &Paths, terminal: &str, observe: bool, history: usize) -> Resu
                     _ => {}
                 }
             }
+            out(&finish(&mut held));
             done.store(true, Ordering::SeqCst);
         })
     };
@@ -395,6 +428,87 @@ mod tests {
         assert!(t.dec_mode(1004), "after first paint");
         t.write(&shown(b"hi\x1b[?1004l there"));
         assert!(t.dec_mode(1004), "after the program turned them off");
+    }
+
+    #[test]
+    fn a_character_cut_off_by_the_first_paint_joins_the_bytes_after_it() {
+        // 上 is E4 B8 8A; the program has printed only E4 when the viewer attaches.
+        let mut screen = ghostty_vt::Terminal::new(80, 24, 0);
+        screen.write(b"A \xe4");
+        let mut first = screen.paint(0);
+        first.extend(screen.continuation().unwrap());
+        let mut t = ghostty_vt::Terminal::new(80, 24, 0);
+        t.write(&shown(&first));
+        t.write(&shown(b"\xb8\x8a B"));
+        assert_eq!(t.plain_text().trim_end(), "A 上 B");
+        assert!(t.dec_mode(1004));
+    }
+
+    #[test]
+    fn every_focus_off_in_one_payload_is_turned_back_on_in_place() {
+        assert_eq!(&*shown(b"a\x1b[?1004lb\x1b[?1004lc"), b"a\x1b[?1004hb\x1b[?1004hc");
+        assert_eq!(&*shown(b"plain"), b"plain");
+    }
+
+    #[test]
+    fn an_empty_or_untouched_payload_is_passed_on_without_a_copy() {
+        for payload in [&b""[..], b"\xe4", b"\x1b[?1004h", b"\x1b[?1004"] {
+            let out = shown(payload);
+            assert!(matches!(out, std::borrow::Cow::Borrowed(_)), "{payload:?}");
+            assert_eq!(&*out, payload);
+        }
+    }
+
+    #[test]
+    fn focus_off_at_either_edge_of_a_payload_is_turned_back_on_in_place() {
+        assert_eq!(&*shown(b"\x1b[?1004l"), b"\x1b[?1004h");
+        // The tail of a split character, then focus off, then the start of the next one.
+        assert_eq!(&*shown(b"\xb8\x8a\x1b[?1004l\xe4"), b"\xb8\x8a\x1b[?1004h\xe4");
+        let mut t = ghostty_vt::Terminal::new(80, 24, 0);
+        t.write(b"\x1b[?1004h");
+        t.write(&shown(b"A \xe4"));
+        t.write(&shown(b"\xb8\x8a\x1b[?1004l\xe4"));
+        t.write(&shown(b"\xb8\x8a B"));
+        assert_eq!(t.plain_text().trim_end(), "A 上上 B");
+        assert!(t.dec_mode(1004));
+    }
+
+    #[test]
+    fn dropping_win32_input_mode_cannot_leave_a_focus_off_behind() {
+        assert_eq!(&*shown(b"\x1b[?100\x1b[?9001h4l"), b"\x1b[?1004h");
+        assert_eq!(&*shown(b"\x1b[?900\x1b[?9001l1h"), b"");
+    }
+
+    #[test]
+    fn a_filtered_sequence_split_at_any_byte_is_still_filtered() {
+        for (seq, whole) in
+            [(&b"\x1b[?1004l"[..], &b"a\x1b[?1004hb"[..]), (b"\x1b[?9001h", b"ab"), (b"\x1b[?9001l", b"ab")]
+        {
+            let mut input = b"a".to_vec();
+            input.extend_from_slice(seq);
+            input.push(b'b');
+            for at in 0..=input.len() {
+                let mut held = Vec::new();
+                let mut got = shown_stream(&mut held, &input[..at]);
+                got.extend(shown_stream(&mut held, &input[at..]));
+                got.extend(finish(&mut held));
+                assert_eq!(got, whole, "{:?} split at {at}", String::from_utf8_lossy(seq));
+            }
+        }
+    }
+
+    #[test]
+    fn a_trailing_escape_is_passed_on_when_the_stream_ends() {
+        let mut held = Vec::new();
+        let mut got = shown_stream(&mut held, b"x\x1b");
+        assert_eq!(got, b"x");
+        got.extend(finish(&mut held));
+        assert_eq!(got, b"x\x1b");
+        assert!(finish(&mut held).is_empty());
+        let mut held = Vec::new();
+        let mut got = shown_stream(&mut held, b"\x1b[?10");
+        got.extend(shown_stream(&mut held, b"5h"));
+        assert_eq!(got, b"\x1b[?105h", "a near miss is not held for ever");
     }
 
     #[test]

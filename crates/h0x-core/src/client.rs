@@ -104,8 +104,8 @@ fn connect_starting(paths: &Paths, explicit: bool) -> Result<Stream, RpcError> {
         if let Ok(stream) = platform::connect(&socket) {
             return Ok(stream);
         }
-        if start.elapsed() > Duration::from_secs(5) {
-            return Err(unavailable("core did not start within 5 s".into()));
+        if start.elapsed() > START_WAIT {
+            return Err(unavailable(format!("core did not start within {} s", START_WAIT.as_secs())));
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -191,9 +191,6 @@ pub fn spawn_detached(paths: &Paths, args: &[&str], log: &str) -> std::io::Resul
     let log = paths.state.join(log);
     let exe = EXE.get().cloned().map_or_else(std::env::current_exe, Ok)?;
     let mut cmd = Command::new(exe);
-    if args == ["serve"] {
-        crate::restart::apply(paths, &mut cmd)?;
-    }
     // A core or holder started from inside a terminal is not that terminal's:
     // ending the terminal must not end them.
     cmd.args(args).env_remove(crate::sweep::VAR).env(crate::sweep::RUNTIME, "1");
@@ -208,14 +205,19 @@ pub fn spawn_detached(paths: &Paths, args: &[&str], log: &str) -> std::io::Resul
     platform::spawn_detached(cmd, log)
 }
 
+/// How long a starting core or holder may take to answer. A busy machine (or
+/// one right after an update) can need well over 5 s; giving up early reports
+/// a failure while the program is still coming up.
+const START_WAIT: Duration = Duration::from_secs(15);
+
 pub fn wait_for_socket(path: &std::path::Path, what: &str) -> Result<Stream, String> {
     let start = Instant::now();
     loop {
         if let Ok(stream) = platform::connect(path) {
             return Ok(stream);
         }
-        if start.elapsed() > Duration::from_secs(5) {
-            return Err(format!("{what} did not start within 5 s"));
+        if start.elapsed() > START_WAIT {
+            return Err(format!("{what} did not start within {} s", START_WAIT.as_secs()));
         }
         std::thread::sleep(Duration::from_millis(10));
     }
