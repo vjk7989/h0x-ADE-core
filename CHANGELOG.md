@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.13] - 2026-11-10
+
 ### Added
 
 - `keep_awake = true` in the config keeps the machine from sleeping while a terminal's status is `working` (system sleep only; the display and the lock screen are untouched). Off by default; `server status` shows `keep_awake` while a block is held. A stuck `working` agent keeps the machine awake until it reports `done` or the setting is turned off; there is no time limit.
