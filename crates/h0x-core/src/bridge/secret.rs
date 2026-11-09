@@ -34,9 +34,16 @@ fn check(name: &str) -> io::Result<()> {
 pub(super) fn get(b: &Bridge, name: &str) -> io::Result<Option<Vec<u8>>> {
     check(name)?;
     let path = b.dir.join(name);
-    if let Some(value) = imp::get(b, name)? {
-        remove_file(&path)?; // the store wins; no plaintext may linger
-        return Ok(Some(value));
+    match imp::get(b, name) {
+        Ok(Some(value)) => {
+            remove_file(&path)?; // the store wins; no plaintext may linger
+            return Ok(Some(value));
+        }
+        Ok(None) => {}
+        // A store that is there but unusable (locked, hung, failing) is not "no
+        // secret": only the owner-only file it may have been kept in answers,
+        // else the caller hears the error and must not make a new secret.
+        Err(e) => return read_file(&path)?.map(Some).ok_or(e),
     }
     // A plaintext file from before the store (or the no-store fallback): move it in.
     let Some(value) = read_file(&path)? else { return Ok(None) };
@@ -251,7 +258,7 @@ mod imp {
         let home = std::env::var_os("HOME").ok_or_else(|| io::Error::other("no HOME"))?;
         let path = std::path::Path::new(&home).join("Library/Keychains/login.keychain-db");
         if !path.is_file() {
-            return Err(io::Error::other("no login keychain"));
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no login keychain"));
         }
         Ok(path.to_string_lossy().into_owned())
     }
@@ -299,7 +306,8 @@ mod imp {
     pub fn get(b: &Bridge, name: &str) -> io::Result<Option<Vec<u8>>> {
         match read_all(&account(b, name)?) {
             Ok(found) => found.map(|text| from_text(text.as_bytes())).transpose(), // a bad entry is an error
-            Err(_) => Ok(None), // no usable keychain: only a file can hold it
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None), // no keychain at all: nothing was stored
+            Err(e) => Err(e), // `security` failed or hung: not the same as "not found"
         }
     }
 
@@ -360,7 +368,8 @@ mod imp {
     pub fn get(b: &Bridge, name: &str) -> io::Result<Option<Vec<u8>>> {
         match lookup(&account(b, name)?) {
             Ok(found) => found.map(|text| from_text(&text)).transpose(), // a bad entry is an error
-            Err(_) => Ok(None),                                          // no tool or keyring: only a file can hold it
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),   // no secret-tool: nothing was stored
+            Err(e) => Err(e), // the tool failed or hung: not the same as "not found"
         }
     }
 
