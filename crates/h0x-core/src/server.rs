@@ -20,6 +20,9 @@ pub fn serve() -> io::Result<()> {
     platform::raise_nofile_limit();
     let paths = Paths::from_env().map_err(|e| io::Error::other(e.message))?;
     paths.create_dirs()?;
+    // The salted pipe name needs the salt: make it, then name the pipe again.
+    platform::ensure_pipe_salt(&paths.state)?;
+    let paths = Paths::from_env().map_err(|e| io::Error::other(e.message))?;
     let mut lock =
         std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(paths.state.join("core.lock"))?;
     // Someone else holds the lock: they serve (or are handing over to whoever

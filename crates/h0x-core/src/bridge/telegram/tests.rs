@@ -38,7 +38,10 @@ fn fake_core(method: &str, params: &Value) -> Result<Value, RpcError> {
     let t = params["terminal"].as_str().unwrap_or_default();
     let record = |state: Option<&str>| {
         let status = state.map_or(Value::Null, |s| json!({"state": s, "app": "claude-code"}));
-        json!({"address": t, "state": "live", "argv": ["/bin/sh"], "cwd": "/work", "reported": state.is_some(), "status": status})
+        // Started as a shell; a reporting terminal runs an agent now.
+        let front = if state.is_some() { "claude" } else { "bash" };
+        json!({"address": t, "state": "live", "argv": ["/bin/sh"], "cwd": "/work", "foreground": {"name": front},
+               "reported": state.is_some(), "status": status})
     };
     Ok(match (method, t) {
         ("terminal.get", "t1") => record(None),
