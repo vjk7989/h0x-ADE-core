@@ -82,7 +82,7 @@ bounded() {
   secs=$1; shift
   if command -v timeout >/dev/null 2>&1; then timeout "$secs" "$@"; return; fi
   "$@" & pid=$!
-  ( sleep "$secs"; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 & killer=$!
+  ( sleep "$secs"; pkill -P "$pid" 2>/dev/null; kill "$pid" 2>/dev/null ) >/dev/null 2>&1 & killer=$!
   rc=0; wait "$pid" || rc=$?
   kill "$killer" 2>/dev/null || true
   return "$rc"
