@@ -510,6 +510,8 @@ mod tests {
         calls: RefCell<Vec<(String, Value)>>,
         /// The `kind` of what k1 (an agent) and k2 (a shell printing a report) are blocked on.
         kind: RefCell<Value>,
+        /// What k3 (or box/k3, on another machine) is, as given; null: there is no such terminal.
+        k3: RefCell<Value>,
     }
 
     fn me() -> Sender {
@@ -521,7 +523,12 @@ mod tests {
         bridge.config = config;
         let (code, _) = bridge.pair("telegram", T).unwrap();
         bridge.pair_verify("telegram", "42", "me", &code, T).unwrap();
-        Fixture { bridge, calls: RefCell::new(Vec::new()), kind: RefCell::new(Value::Null) }
+        Fixture {
+            bridge,
+            calls: RefCell::new(Vec::new()),
+            kind: RefCell::new(Value::Null),
+            k3: RefCell::new(Value::Null),
+        }
     }
 
     impl Fixture {
@@ -530,7 +537,7 @@ mod tests {
         }
 
         fn send_as(&mut self, from: &Sender, command: Command, now: u64) -> Reply {
-            let (calls, kind) = (&self.calls, &self.kind);
+            let (calls, kind, k3) = (&self.calls, &self.kind, &self.k3);
             let core = |method: &str, params: Value| -> Result<Value, RpcError> {
                 calls.borrow_mut().push((method.into(), params.clone()));
                 let t = params["terminal"].as_str().unwrap_or_default();
@@ -558,6 +565,11 @@ mod tests {
                         json!({"address": t, "state": "live", "argv": ["pwsh.exe"], "cwd": "/work",
                                "foreground": {"name": "pwsh.exe", "argv": ["pwsh.exe"], "cwd": "/work"},
                                "reported": true, "status": {"state": "blocked", "kind": kind.borrow().clone()}})
+                    }
+                    ("terminal.get", "k3" | "box/k3") if !k3.borrow().is_null() => {
+                        let mut r = k3.borrow().clone();
+                        r["address"] = t.into();
+                        r
                     }
                     ("terminal.get", "t3") => record(t, Some("working")),
                     // A shell printing a status report of its own: forged.
@@ -862,6 +874,125 @@ mod tests {
         assert!(matches!(f.send(Command::Approve { terminal: "t1".into() }, T), Reply::NeedsConfirm { .. }));
     }
 
+    /// A terminal whose foreground program is `front` and whose root status is `status`.
+    fn k3(front: &str, status: Value) -> Value {
+        json!({"state": "live", "argv": [front], "cwd": "/work", "foreground": {"name": front, "argv": [front]},
+               "reported": true, "status": status})
+    }
+
+    #[test]
+    fn a_kind_that_differs_from_permission_only_by_spacing_or_case_is_not_one() {
+        let mut f = fixture(BridgeConfig::default());
+        for terminal in ["k1", "k2"] {
+            for kind in [" permission", "permission ", "permission\n", "PERMISSION", "permissions", "perm"] {
+                let reply = answer_with(&mut f, &me(), terminal, json!(kind), true);
+                assert!(
+                    matches!(&reply, Reply::Failed(m) if m.contains("a request of unknown kind")),
+                    "{terminal} {kind:?}: {reply:?}"
+                );
+                assert!(f.acted().is_empty(), "{terminal} {kind:?}: nothing typed");
+            }
+        }
+    }
+
+    #[test]
+    fn a_kind_on_a_status_that_is_not_blocked_neither_allows_nor_refuses_an_answer() {
+        let mut f = fixture(BridgeConfig::default());
+        // An agent at work or idle is not waiting on you, whatever kind its report carries.
+        for (state, kind) in
+            [("working", "permission"), ("idle", "question"), ("done", "auth"), ("Blocked", "permission")]
+        {
+            *f.k3.borrow_mut() = k3("claude", json!({"state": state, "kind": kind}));
+            let reply = f.send(Command::Approve { terminal: "k3".into() }, T);
+            assert!(
+                matches!(&reply, Reply::Failed(m) if m.contains(&format!("not waiting on you (it is {state})"))),
+                "{state} {kind}: {reply:?}"
+            );
+            assert!(f.acted().is_empty());
+        }
+        // A shell's report is not trusted either way: a stray kind on a working report keeps the y/n rule.
+        *f.k3.borrow_mut() =
+            k3(r"C:\Program Files\PowerShell\7\pwsh.exe", json!({"state": "working", "kind": "question"}));
+        let ask = f.send(Command::Deny { terminal: "k3".into() }, T);
+        assert!(f.acted().is_empty(), "asked first");
+        assert!(matches!(f.send(Command::Confirm { token: token(&ask) }, T), Reply::Done(_)));
+        assert_eq!(f.acted()[0].1["keys"], json!(["n", "enter"]));
+    }
+
+    #[test]
+    fn approve_goes_by_the_root_status_and_not_a_child_record() {
+        let mut f = fixture(BridgeConfig::default());
+        let permission = json!({"state": "blocked", "kind": "permission"});
+        // The root is at work; a child record asking a permission doesn't make it answerable.
+        let mut t = k3("claude", json!({"state": "working"}));
+        t["records"] = json!({"sub": permission});
+        *f.k3.borrow_mut() = t;
+        let reply = f.send(Command::Approve { terminal: "k3".into() }, T);
+        assert!(matches!(&reply, Reply::Failed(m) if m.contains("it is working")), "{reply:?}");
+        // The root asks a question; a child's permission doesn't turn it into one.
+        let mut t = k3("claude", json!({"state": "blocked", "kind": "question"}));
+        t["records"] = json!({"sub": permission, "sub/deeper": permission});
+        *f.k3.borrow_mut() = t;
+        let reply = f.send(Command::Approve { terminal: "k3".into() }, T);
+        assert!(matches!(&reply, Reply::Failed(m) if m.contains("a question")), "{reply:?}");
+        assert!(f.acted().is_empty());
+    }
+
+    #[test]
+    fn with_several_terminals_blocked_each_answer_reads_only_its_own_kind() {
+        let mut f = fixture(BridgeConfig::default());
+        *f.k3.borrow_mut() = k3("codex", json!({"state": "blocked", "kind": "auth"}));
+        *f.kind.borrow_mut() = json!("question");
+        for (terminal, said) in [("k3", "a sign-in"), ("k1", "a question")] {
+            let reply = f.send(Command::Approve { terminal: terminal.into() }, T);
+            assert!(matches!(&reply, Reply::Failed(m) if m.contains(said) && m.starts_with(terminal)), "{reply:?}");
+        }
+        // t2 asks a permission: answered, and only t2 gets the key.
+        assert!(matches!(f.send(Command::Approve { terminal: "t2".into() }, T), Reply::Done(_)));
+        assert_eq!(f.acted(), [("terminal.keys".to_string(), json!({"terminal": "t2", "keys": ["enter"]}))]);
+        // A permission on k1 now, k3 still signing in: k3's refusal is unchanged.
+        *f.kind.borrow_mut() = json!("permission");
+        assert!(matches!(f.send(Command::Deny { terminal: "k3".into() }, T), Reply::Failed(_)));
+        assert!(matches!(f.send(Command::Deny { terminal: "k1".into() }, T), Reply::Done(_)));
+        assert_eq!(f.acted(), [("terminal.keys".to_string(), json!({"terminal": "k1", "keys": ["esc"]}))]);
+    }
+
+    #[test]
+    fn a_question_on_another_machine_is_refused_by_its_address() {
+        let mut f = fixture(BridgeConfig::default());
+        *f.k3.borrow_mut() = k3("claude", json!({"state": "blocked", "kind": "question"}));
+        let reply = f.send(Command::Approve { terminal: "box/k3".into() }, T);
+        assert!(matches!(&reply, Reply::Failed(m) if m.starts_with("box/k3 is blocked on a question")), "{reply:?}");
+        assert!(f.acted().is_empty());
+        *f.k3.borrow_mut() = k3("claude", json!({"state": "blocked", "kind": "permission"}));
+        assert!(matches!(f.send(Command::Approve { terminal: "box/k3".into() }, T), Reply::Done(_)));
+        assert_eq!(f.acted()[0].1, json!({"terminal": "box/k3", "keys": ["enter"]}));
+    }
+
+    #[test]
+    fn a_confirmation_types_nothing_once_the_prompt_turned_into_a_sign_in_or_the_terminal_is_gone() {
+        let mut f = fixture(BridgeConfig::default());
+        let shell = |status| k3("bash", status);
+        for (then, said) in [
+            (shell(json!({"state": "blocked", "kind": "auth"})), "a sign-in"),
+            (shell(json!({"state": "blocked"})), "a request of unknown kind"),
+            (Value::Null, "no terminal k3"),
+        ] {
+            *f.k3.borrow_mut() = shell(json!({"state": "blocked", "kind": "permission"}));
+            let ask = f.send(Command::Approve { terminal: "k3".into() }, T);
+            *f.k3.borrow_mut() = then;
+            let reply = f.send(Command::Confirm { token: token(&ask) }, T + 1);
+            assert!(matches!(&reply, Reply::Failed(m) if m.contains(said)), "{said}: {reply:?}");
+            assert!(f.acted().is_empty(), "{said}: nothing typed");
+            assert_eq!(f.bridge.log(1).unwrap()[0]["result"], "failed", "{said}: audited");
+            // The token is spent: the same confirmation can't be retried into a later prompt.
+            *f.k3.borrow_mut() = shell(json!({"state": "blocked", "kind": "permission"}));
+            assert!(
+                matches!(f.send(Command::Confirm { token: token(&ask) }, T + 2), Reply::Failed(m) if m.contains("no such confirmation"))
+            );
+        }
+    }
+
     #[test]
     fn shell_names_are_recognised_by_program_not_path_or_case() {
         for p in ["bash", "/usr/bin/zsh", "C:\\Windows\\System32\\cmd.exe", "PowerShell.EXE", "nu"] {
@@ -1037,6 +1168,59 @@ mod tests {
         assert_eq!(summary["time_ms"], late);
         assert_eq!(summary["result"], "3 more failed attempts from 1 sources in the last minute");
         assert_eq!((own["identity"].as_str(), own["command"].as_str()), (Some("telegram:42"), Some("list")));
+    }
+
+    #[test]
+    fn a_command_with_no_summary_pending_writes_only_its_own_line_and_a_summary_is_written_once() {
+        let mut f = fixture(BridgeConfig::default());
+        // A minute and more since the bridge began, nothing held back: no summary line.
+        f.send(Command::List, T + 600_000);
+        assert_eq!(f.bridge.log(100).unwrap().len(), 2, "paired, then list");
+        // Exactly as many failures as are written verbatim: nothing held back, so still none.
+        f.bridge.pair("web", T + 600_000).unwrap();
+        for n in 0..5 {
+            assert!(f.bridge.pair_verify("web", "u1", "", "WRONGWRONG", T + 600_000 + n).is_err());
+        }
+        f.send(Command::List, T + 1_200_000);
+        let log = f.bridge.log(100).unwrap();
+        assert_eq!(log.len(), 8, "{log:?}");
+        assert!(log.iter().all(|e| e["command"] != "failed-attempts"), "{log:?}");
+        // One held back: one summary at the next command, and none at the one after.
+        for n in 0..6 {
+            assert!(f.bridge.pair_verify("web", "u1", "", "WRONGWRONG", T + 1_800_000 + n).is_err());
+        }
+        f.send(Command::List, T + 2_400_000);
+        f.send(Command::List, T + 3_000_000);
+        let log = f.bridge.log(100).unwrap();
+        let summaries: Vec<_> = log.iter().filter(|e| e["command"] == "failed-attempts").collect();
+        assert_eq!(summaries.len(), 1, "{log:?}");
+        assert_eq!(summaries[0]["result"], "1 more failed attempts from 1 sources in the last minute");
+    }
+
+    #[test]
+    fn a_summary_that_cannot_be_written_runs_nothing_and_is_written_later_not_lost() {
+        let mut f = fixture(BridgeConfig::default());
+        f.bridge.pair("web", T).unwrap();
+        for n in 0..8 {
+            assert!(f.bridge.pair_verify("web", "u1", "", "WRONGWRONG", T + n).is_err());
+        }
+        f.calls.borrow_mut().clear();
+        let audit = f.bridge.dir.join("audit.jsonl");
+        let kept = std::fs::read_to_string(&audit).unwrap();
+        std::fs::remove_file(&audit).unwrap();
+        std::fs::create_dir(&audit).unwrap();
+        // The summary is due but can't be written: the approve is refused before it reaches the core.
+        let reply = f.send(Command::Approve { terminal: "t2".into() }, T + 600_000);
+        assert!(matches!(&reply, Reply::Failed(m) if m.contains("audit log")), "{reply:?}");
+        assert!(f.calls.borrow().is_empty(), "nothing reached the core");
+        // The log is back: the three held-back failures still reach it, before the next command's line.
+        std::fs::remove_dir(&audit).unwrap();
+        std::fs::write(&audit, kept).unwrap();
+        assert!(matches!(f.send(Command::List, T + 600_001), Reply::Done(_)));
+        let log = f.bridge.log(2).unwrap();
+        assert_eq!(log[0]["command"], "failed-attempts", "the held-back failures were dropped: {log:?}");
+        assert_eq!(log[0]["result"], "3 more failed attempts from 1 sources in the last minute");
+        assert_eq!(log[1]["command"], "list");
     }
 
     #[test]
