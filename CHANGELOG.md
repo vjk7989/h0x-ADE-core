@@ -2,6 +2,24 @@
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-11-09
+
+Security release from the second audit (Cloudflare security-audit tool).
+
+### Changed
+
+- Install scripts check a new download with the h0x-core you already have (0.1.9 or newer); only a first install trusts the downloaded core's own check. Calls to the installed core time out instead of hanging, and odd version numbers are handled safely.
+- `update --from` unpacks exactly the bytes it verified.
+- Notes from another machine arrive labelled with that machine's name; a forged note cannot pose as a local agent.
+- Behind your own VPS proxy (`--via`), each visitor is counted by the proxy's `X-Forwarded-For` address; one visitor can hold at most 8 unauthenticated connections; floods of failed attempts are summarised in the audit log instead of pushing real entries out.
+- A phone you unpair is disconnected within 20 seconds.
+
+### Fixed
+
+- Every audit-log write respects the size cap.
+- Exit and error notes escape the program's output, and stray carriage returns can no longer act as Enter.
+- Windows: an old pipe name taken by another account no longer stops the core from starting.
+
 ## [0.1.9] - 2026-11-09
 
 Security release from a full audit.
