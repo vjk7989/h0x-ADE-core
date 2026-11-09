@@ -39,6 +39,8 @@ mod ffi {
     pub const OPT_XTVERSION: i32 = 4;
     pub const OPT_TITLE_CHANGED: i32 = 5;
     pub const OPT_PROGRAM_STATUS: i32 = 46;
+    pub const OPT_SEMANTIC_PROMPT: i32 = 42;
+    pub const SEMANTIC_PROMPT_START: i32 = 1;
     pub const OPT_SIZE: i32 = 6;
     pub const OPT_COLOR_SCHEME: i32 = 7;
     pub const OPT_DEVICE_ATTRIBUTES: i32 = 8;
@@ -178,6 +180,13 @@ mod ffi {
         pub message: Str,
     }
 
+    /// The head of `GhosttyTerminalSemanticPrompt`; only `kind` is read.
+    #[repr(C)]
+    pub struct SemanticPrompt {
+        pub size: usize,
+        pub kind: i32,
+    }
+
     #[repr(C)]
     pub struct ModeConfig {
         pub mode: u16,
@@ -283,7 +292,8 @@ pub type Rgb = [u8; 3];
 /// One OSC 7501 report, exactly as the program sent it (strings decoded).
 #[derive(Clone, Debug, PartialEq)]
 pub struct StatusReport {
-    /// idle, working, done, blocked, error, or clear (remove records).
+    /// idle, working, done, blocked, error, or clear (remove records); or prompt:
+    /// not a 7501 report but a new shell prompt (OSC 133 A), in order with them.
     pub state: &'static str,
     /// permission, question or auth, only when blocked and said.
     pub kind: Option<&'static str>,
@@ -340,6 +350,21 @@ extern "C" fn on_program_status(_: ffi::Terminal, ud: *mut c_void, r: *const ffi
         title: string(&r.title),
         message: string(&r.message),
     });
+}
+
+extern "C" fn on_semantic_prompt(_: ffi::Terminal, ud: *mut c_void, e: *const ffi::SemanticPrompt) {
+    if unsafe { (*e).kind } == ffi::SEMANTIC_PROMPT_START {
+        let hooks = unsafe { &mut *ud.cast::<Hooks>() };
+        hooks.statuses.push(StatusReport {
+            state: "prompt",
+            kind: None,
+            progress: None,
+            id: String::new(),
+            app: String::new(),
+            title: String::new(),
+            message: String::new(),
+        });
+    }
 }
 
 extern "C" fn on_title_changed(_: ffi::Terminal, ud: *mut c_void) {
@@ -420,6 +445,7 @@ impl Terminal {
             set(ffi::OPT_COLOR_SCHEME, on_color_scheme as *const c_void);
             set(ffi::OPT_DEVICE_ATTRIBUTES, on_device_attributes as *const c_void);
             set(ffi::OPT_PROGRAM_STATUS, on_program_status as *const c_void);
+            set(ffi::OPT_SEMANTIC_PROMPT, on_semantic_prompt as *const c_void);
             set(ffi::OPT_TITLE_CHANGED, on_title_changed as *const c_void);
         }
         let mut term = term;
