@@ -684,19 +684,17 @@ mod tests {
 
     #[test]
     fn manager_environment_handles_odd_but_complete_replies() {
-        let replies: [(&[u8], Option<BTreeMap<String, String>>); 10] = [
-            (b"", None),
-            (b"as", None),
-            (b"as -1", None),
-            (b"as 99999999999999999999 \"A=1\"", None),
-            (b"as 1 \"A=\xff\"", None),
-            (b"as 1 \"A=\x01\"", None),
-            (b"as 1 \"A=1\"\r\n", Some(map(&[("A", "1")]))),
-            (b"as 2  \"A=1\"\n \"B=2\" ", Some(map(&[("A", "1"), ("B", "2")]))),
-            (b"as 2 \"A=1\" \"A=2\"", Some(map(&[("A", "2")]))),
-            (b"as 2 \"NO_EQUALS\" \"B=\"", Some(map(&[("B", "")]))),
-        ];
-        for (reply, expected) in replies {
+        for rejected in
+            [&b""[..], b"as", b"as -1", b"as 99999999999999999999 \"A=1\"", b"as 1 \"A=\xff\"", b"as 1 \"A=\x01\""]
+        {
+            assert_eq!(super::parse_busctl_environment(rejected), None, "{:?}", String::from_utf8_lossy(rejected));
+        }
+        for (reply, expected) in [
+            (&b"as 1 \"A=1\"\r\n"[..], Some(map(&[("A", "1")]))),
+            (&b"as 2  \"A=1\"\n \"B=2\" "[..], Some(map(&[("A", "1"), ("B", "2")]))),
+            (&b"as 2 \"A=1\" \"A=2\""[..], Some(map(&[("A", "2")]))),
+            (&b"as 2 \"NO_EQUALS\" \"B=\""[..], Some(map(&[("B", "")]))),
+        ] {
             assert_eq!(super::parse_busctl_environment(reply), expected, "{:?}", String::from_utf8_lossy(reply));
         }
     }
