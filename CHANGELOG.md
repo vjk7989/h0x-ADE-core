@@ -4,6 +4,7 @@
 
 ### Fixed
 - Updates and `h0x-core server restart` keep the environment the core started with; stopping and starting takes a fresh one. A failed save no longer blocks a restart; the saved note expires after three minutes and cannot cross a boot. (ported from herdr-core cd12ddd)
+- Agent messages and parent notes wait for you to send or clear an unfinished draft, instead of submitting it with their message. A draft left alone holds messages for at most a minute (`H0X_CORE_DRAFT_MS`, in milliseconds; values above 10 minutes are cut to 10 minutes). Sends to another machine wait too. Ported from herdrdev/herdr-core 3ba03e6.
 
 ## [0.1.10] - 2026-11-09
 
