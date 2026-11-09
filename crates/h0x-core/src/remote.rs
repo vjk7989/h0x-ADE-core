@@ -556,7 +556,7 @@ async fn from_machine(core: Arc<Core>, m: Machine, line: Arc<Line>, message: Val
     });
     if method == "notes" {
         if let (Some(id), Some(text)) = (parent, params["text"].as_str()) {
-            core.lock().afar_notes.entry(id).or_default().push(text.into());
+            core.lock().afar_notes.entry(id).or_default().extend(crate::notes::afar_notes(&m.name, text));
             let _ = core.jobs.send(crate::notes::Job::Notes(id));
         }
         return;

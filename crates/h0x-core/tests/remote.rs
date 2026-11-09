@@ -201,7 +201,9 @@ fn a_child_on_another_machine_reports_back_to_its_parent() {
 
     touch(&s, "go");
     wait_until("the exit note", || {
-        text(&s, &parent).contains(&format!("<h0x>{child} exited (exit 3). Read: h0x-core read {child}</h0x>"))
+        let machine = child.split('/').next().unwrap();
+        text(&s, &parent)
+            .contains(&format!("<h0x from=\"{machine}\">{child} exited (exit 3). Read: h0x-core read {child}</h0x>"))
     });
 }
 
