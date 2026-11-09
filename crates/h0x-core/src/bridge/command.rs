@@ -253,7 +253,7 @@ impl Bridge {
         if let Err(retry_secs) = self.admit(&key, now) {
             return Reply::RateLimited { retry_secs };
         }
-        let mut log = match self.audit_file() {
+        let mut log = match self.rotate_audit(super::AUDIT_MAX).and_then(|()| self.audit_file()) {
             Ok(file) => file,
             Err(e) => return Reply::Failed(format!("the audit log can't be written: {e}")),
         };
@@ -891,6 +891,54 @@ mod tests {
         f.bridge.pair_verify("telegram", "42", "me", &code, T).unwrap();
         assert!(matches!(f.send(Command::Confirm { token: kill }, T), Reply::Failed(_)));
         assert!(f.acted().is_empty(), "nothing was killed");
+    }
+
+    #[test]
+    fn the_command_path_rotates_the_audit_log_at_its_size_limit() {
+        let mut f = fixture(BridgeConfig::default());
+        let path = f.bridge.dir.join("audit.jsonl");
+        std::fs::write(&path, vec![b'x'; usize::try_from(super::super::AUDIT_MAX).unwrap()]).unwrap();
+        f.send(Command::List, T);
+        let old = std::fs::metadata(f.bridge.dir.join("audit.jsonl.1")).unwrap().len();
+        assert_eq!(old, super::super::AUDIT_MAX, "the full log moved aside");
+        assert_eq!(f.bridge.log(5).unwrap().len(), 1, "a fresh log with just the new entry");
+        f.send(Command::List, T);
+        assert!(std::fs::metadata(&path).unwrap().len() < super::super::AUDIT_MAX);
+    }
+
+    #[test]
+    fn the_command_path_leaves_a_log_one_byte_under_its_limit_in_place() {
+        let mut f = fixture(BridgeConfig::default());
+        let path = f.bridge.dir.join("audit.jsonl");
+        let under = super::super::AUDIT_MAX - 1;
+        std::fs::write(&path, vec![b'x'; usize::try_from(under).unwrap()]).unwrap();
+        assert!(matches!(f.send(Command::List, T), Reply::Done(_)));
+        assert!(!f.bridge.dir.join("audit.jsonl.1").exists(), "no rotation under the limit");
+        assert!(std::fs::metadata(&path).unwrap().len() > under, "the entry was appended");
+        f.send(Command::List, T);
+        assert!(f.bridge.dir.join("audit.jsonl.1").exists(), "the next command rotates the now full log");
+    }
+
+    #[test]
+    fn a_full_audit_log_that_cannot_rotate_fails_the_command_and_runs_nothing() {
+        let mut f = fixture(BridgeConfig::default());
+        let kill = token(&f.send(Command::Kill { terminal: "t1".into() }, T));
+        f.calls.borrow_mut().clear();
+        let path = f.bridge.dir.join("audit.jsonl");
+        let max = super::super::AUDIT_MAX;
+        std::fs::write(&path, vec![b'x'; usize::try_from(max).unwrap()]).unwrap();
+        let old = f.bridge.dir.join("audit.jsonl.1");
+        std::fs::create_dir(&old).unwrap();
+        for command in [Command::List, Command::Confirm { token: kill.clone() }, Command::Lock] {
+            let reply = f.send(command, T);
+            assert!(matches!(&reply, Reply::Failed(m) if m.contains("audit log")), "{reply:?}");
+        }
+        assert!(f.calls.borrow().is_empty(), "nothing reached the core");
+        assert!(!f.bridge.locked().unwrap(), "nor the lock");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), max, "the full log is untouched");
+        std::fs::remove_dir(&old).unwrap();
+        assert!(matches!(f.send(Command::Confirm { token: kill }, T), Reply::Done(_)), "the token was not spent");
+        assert_eq!(std::fs::metadata(&old).unwrap().len(), max, "the log rotated once it could");
     }
 
     #[test]
