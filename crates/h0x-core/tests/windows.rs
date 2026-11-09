@@ -146,8 +146,41 @@ fn sessions_select_distinct_pipes_even_with_the_same_state_home() {
     };
     let first = status(&a.name);
     let second = status(&b.name);
+    let again = status(&a.name);
+    // b's core runs under a's root: b's own cleanup would look in b's, so stop it here.
+    let _ = cmd(&b.name, &a.root).args(["server", "stop"]).output();
     assert_ne!(first["pid"], second["pid"], "H0X_CORE_SESSION must select the pipe, not just state");
-    assert_eq!(status(&a.name)["pid"], first["pid"]);
+    assert_eq!(again["pid"], first["pid"]);
+}
+
+#[test]
+fn two_cores_starting_at_once_over_a_damaged_salt_share_one_and_both_answer() {
+    let a = Session::new();
+    let b = Session::new();
+    let salt_file = a.root.join("state").join("h0x-core").join("pipe-salt");
+    std::fs::create_dir_all(salt_file.parent().unwrap()).unwrap();
+    std::fs::write(&salt_file, "not a salt\r\n").unwrap();
+    // Both cores share a's state home; b's own root stays empty.
+    LIVE.lock().unwrap().push((b.name.clone(), a.root.clone()));
+    let starts = [&a.name, &b.name].map(|name| {
+        let piped = || std::process::Stdio::piped();
+        cmd(name, &a.root).args(["server", "start"]).stdout(piped()).stderr(piped()).spawn().unwrap()
+    });
+    for start in starts {
+        let out = start.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+    let salt = std::fs::read_to_string(&salt_file).unwrap();
+    assert!(salt.trim().len() == 32 && salt.trim().chars().all(|c| c.is_ascii_hexdigit()), "{salt:?}");
+    let status = |name: &str| {
+        let out = cmd(name, &a.root).args(["server", "status"]).output().unwrap();
+        assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()["pid"].clone()
+    };
+    let (first, second) = (status(&a.name), status(&b.name));
+    assert!(first.is_number() && second.is_number(), "{first} {second}");
+    assert_ne!(first, second);
+    let _ = cmd(&b.name, &a.root).args(["server", "stop"]).output();
 }
 
 #[test]
@@ -324,7 +357,9 @@ fn only_this_account_may_open_the_cores_pipe() {
     let s = Session::new();
     s.out(&["server", "start"]);
     let user: String = std::env::var("USERNAME").unwrap().chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-    let pipe = format!(r"\\.\pipe\h0x-core-{user}-{}.sock", s.name);
+    let salt = std::fs::read_to_string(s.root.join("state").join("h0x-core").join("pipe-salt")).expect("the pipe salt");
+    assert_eq!(salt.trim().len(), 32, "{salt:?}");
+    let pipe = format!(r"\\.\pipe\h0x-core-{user}-{}-{}.sock", salt.trim(), s.name);
     // From Windows itself: Get-Acl sometimes answers for the pipe root instead.
     let sddl = unsafe {
         use windows_sys::Win32::Security::Authorization::*;
@@ -625,7 +660,7 @@ fn planned_restarts_preserve_the_environment_for_new_terminals() {
         let (code, out) = s.out(&["run", "--timeout", "15", "powershell", "-NoProfile", "-File", &probe]);
         assert_eq!(code, 0, "{out}");
         assert!(out.contains("ENV:|original|"), "{args:?}: {out}");
-        let (directory, prefix) = h0x_core::platform::endpoints(&s.root);
+        let (directory, prefix) = h0x_core::platform::endpoints(&s.root.join("state").join("h0x-core").join(&s.name));
         let stream = h0x_core::platform::connect(&directory.join(format!("{prefix}{}.sock", s.name))).unwrap();
         let terminal = h0x_core::client::call(
             &stream,

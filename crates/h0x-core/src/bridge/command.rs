@@ -215,6 +215,20 @@ pub(super) struct Waiting {
     expires_ms: u64,
 }
 
+/// Whether what runs in the terminal now is a plain shell: its foreground
+/// program, else the program it was started with.
+fn at_shell(t: &Value) -> bool {
+    let program = [&t["foreground"]["name"], &t["foreground"]["argv"][0], &t["argv"][0]]
+        .into_iter()
+        .filter_map(Value::as_str)
+        .find(|s| !s.is_empty())
+        .unwrap_or_default();
+    let name = program.rsplit(['/', '\\']).next().unwrap_or_default().to_ascii_lowercase();
+    let name = name.strip_suffix(".exe").unwrap_or(&name);
+    ["cmd", "powershell", "pwsh", "bash", "sh", "zsh", "fish", "nu", "dash", "ash", "ksh", "csh", "tcsh", "xonsh"]
+        .contains(&name)
+}
+
 /// A text for the log: redacted, then cut short.
 fn brief(text: &str) -> String {
     let text = redact(text);
@@ -392,8 +406,9 @@ fn plan(
     let terminal = command.terminal().expect("run, list, read, lock and confirm are handled before");
     let t = call("terminal.get", json!({"terminal": terminal}))?;
     let address = t["address"].as_str().unwrap_or(terminal).to_string();
-    // Reports its status: an agent, answering its own dialogs.
-    let reports = t["reported"] == true;
+    // Reports its status: an agent, answering its own dialogs. A plain shell
+    // can print the same report, so it never counts.
+    let reports = t["reported"] == true && !at_shell(&t);
     let press = |names: &[&str]| json!({"terminal": address, "keys": names});
     Ok(match command {
         Command::Send { text, .. } => {
@@ -488,13 +503,26 @@ mod tests {
                 let t = params["terminal"].as_str().unwrap_or_default();
                 let record = |address: &str, state: Option<&str>| {
                     let status = state.map_or(Value::Null, |state| json!({"state": state, "app": "claude-code"}));
+                    // The terminal was started as a shell; a reporting one runs an agent now.
+                    let front = if state.is_some() { "claude" } else { "bash" };
                     json!({"address": address, "state": "live", "argv": ["/bin/sh"], "cwd": "/work",
+                           "foreground": {"name": front, "argv": [front], "cwd": "/work"},
                            "reported": state.is_some(), "status": status})
                 };
                 Ok(match (method, t) {
                     ("terminal.get", "t1") => record(t, None),
                     ("terminal.get", "t2") => record(t, Some("blocked")),
                     ("terminal.get", "t3") => record(t, Some("working")),
+                    // A shell printing a status report of its own: forged.
+                    ("terminal.get", "t4") => {
+                        json!({"address": t, "state": "live", "argv": ["pwsh.exe"], "cwd": "/work",
+                               "foreground": {"name": "pwsh.exe", "argv": ["pwsh.exe"], "cwd": "/work"},
+                               "reported": true, "status": {"state": "blocked", "app": "claude-code"}})
+                    }
+                    ("terminal.get", "t6") => {
+                        json!({"address": t, "state": "live", "argv": ["C:\\Windows\\System32\\cmd.exe"], "cwd": "/work",
+                               "reported": true, "status": {"state": "blocked"}})
+                    }
                     ("terminal.get", _) => return Err(RpcError::new("not_found", format!("no terminal {t}"), "")),
                     ("terminal.list", _) => {
                         json!({"terminals": [record("t2", Some("blocked")), {"address": "t9", "name": "web",
@@ -707,6 +735,60 @@ mod tests {
         assert!(f.acted().is_empty());
         let unknown = f.send(Command::Kill { terminal: "t404".into() }, T);
         assert_eq!(unknown, Reply::Failed("no terminal t404".into()));
+    }
+
+    #[test]
+    fn a_status_report_from_a_shell_still_needs_confirm() {
+        let mut f = fixture(BridgeConfig::default());
+        for t in ["t4", "t6"] {
+            let send = f.send(Command::Send { terminal: t.into(), text: "ls".into() }, T);
+            assert!(matches!(send, Reply::NeedsConfirm { .. }), "{t}");
+            let approve = f.send(Command::Approve { terminal: t.into() }, T);
+            assert!(matches!(approve, Reply::NeedsConfirm { .. }), "{t}");
+            assert!(f.acted().is_empty(), "{t}");
+            assert!(matches!(f.send(Command::Confirm { token: token(&approve) }, T), Reply::Done(_)));
+            assert_eq!(f.acted()[0].1["keys"], json!(["y", "enter"]), "{t}");
+        }
+    }
+
+    #[test]
+    fn shell_names_are_recognised_by_program_not_path_or_case() {
+        for p in ["bash", "/usr/bin/zsh", "C:\\Windows\\System32\\cmd.exe", "PowerShell.EXE", "nu"] {
+            assert!(at_shell(&json!({"argv": [p]})), "{p}");
+        }
+        for p in ["claude", "/usr/bin/node", "bashful", ""] {
+            assert!(!at_shell(&json!({"argv": [p]})), "{p}");
+        }
+        assert!(!at_shell(&json!({"argv": ["bash"], "foreground": {"name": "claude"}})));
+        assert!(at_shell(&json!({"argv": ["claude"], "foreground": {"name": "fish"}})));
+        assert!(!at_shell(&json!({})));
+        // An empty name is a missing one.
+        assert!(at_shell(&json!({"argv": ["zsh"], "foreground": {"name": ""}})));
+        assert!(!at_shell(&json!({"argv": ["zsh"], "foreground": {"name": "", "argv": ["claude"]}})));
+    }
+
+    #[test]
+    fn shell_detection_reads_program_paths_with_spaces_and_skips_look_alikes() {
+        // Windows paths with spaces and arguments after the program; mixed separators and case.
+        for argv in [
+            json!(["C:\\Program Files\\PowerShell\\7\\pwsh.exe", "-NoLogo"]),
+            json!(["C:/Program Files/Git/usr/bin/bash.EXE", "--login", "-i"]),
+            json!(["\\\\server\\share\\tools\\CMD.exe", "/k"]),
+        ] {
+            assert!(at_shell(&json!({ "argv": argv })), "{argv}");
+        }
+        // Names that only start or end like a shell are programs of their own.
+        for p in ["shellcheck", "C:\\tools\\shellcheck.exe", "/usr/bin/bash-language-server", "zsh.exe.bak", "pwsh."] {
+            assert!(!at_shell(&json!({"argv": [p]})), "{p}");
+        }
+        // No program at all, or not a string: not a shell.
+        for t in [json!({"argv": []}), json!({"argv": [null]}), json!({"argv": [7]}), json!({"foreground": {}})] {
+            assert!(!at_shell(&t), "{t}");
+        }
+        // A foreground without a name falls back to its argv, then to the start argv.
+        assert!(at_shell(&json!({"argv": ["claude"], "foreground": {"name": null, "argv": ["/bin/zsh", "-l"]}})));
+        assert!(at_shell(&json!({"argv": ["pwsh.exe"], "foreground": {"argv": []}})));
+        assert!(!at_shell(&json!({"argv": ["bash"], "foreground": {"argv": ["C:\\agents\\codex.exe"]}})));
     }
 
     #[test]

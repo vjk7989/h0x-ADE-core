@@ -97,7 +97,18 @@ fn connect_starting(paths: &Paths, explicit: bool) -> Result<Stream, RpcError> {
     }
     platform::may_autostart(explicit)?;
     spawn_core(paths)?;
-    wait_for_socket(&paths.socket, "core").map_err(unavailable)
+    // The new core makes the pipe salt as it starts: name its socket again each try.
+    let start = Instant::now();
+    loop {
+        let socket = Paths::from_env().map_or_else(|_| paths.socket.clone(), |p| p.socket);
+        if let Ok(stream) = platform::connect(&socket) {
+            return Ok(stream);
+        }
+        if start.elapsed() > Duration::from_secs(5) {
+            return Err(unavailable("core did not start within 5 s".into()));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 pub fn require_existing(paths: &Paths) -> Result<Stream, RpcError> {

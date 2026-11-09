@@ -116,6 +116,11 @@ pub fn endpoints(state: &Path) -> (PathBuf, String) {
     (run.map_or_else(|| state.to_path_buf(), |run| run.join("h0x-core")), String::new())
 }
 
+/// Pipe names are Windows' only; sockets sit in the user's own directory.
+pub fn ensure_pipe_salt(_state: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 /// A directory only this user can enter: made 0700, or one of ours put back
 /// to 0700. One owned by another user is refused, never used.
 pub fn private_dir(path: &Path) -> io::Result<()> {
