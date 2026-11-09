@@ -481,4 +481,176 @@ mod tests {
         assert_eq!(base64(b"Apply?"), "QXBwbHk/");
         assert_eq!(base64(b"ab"), "YWI=");
     }
+
+    /// Feeds bytes to a screen and applies the reports it parsed, as the runtime does.
+    fn applied(t: &mut Terminal, screen: &mut ghostty_vt::Terminal, bytes: &[u8]) {
+        screen.write(bytes);
+        for r in screen.take_status_reports() {
+            apply(t, &r);
+        }
+    }
+
+    #[test]
+    fn a_prompt_between_working_and_done_ends_the_turn_once_in_one_write_or_split() {
+        let sent: &[u8] =
+            b"\x1b]7501;state=working:id=job\x1b\\\x1b]7501;state=working\x07\x1b]133;A\x07\x1b]7501;state=done\x1b\\";
+        let mut whole = terminal();
+        applied(&mut whole, &mut ghostty_vt::Terminal::new(80, 24, 1 << 20), sent);
+        assert_eq!(whole.status.as_ref().map(|s| s.state.as_str()), Some("done"));
+        assert!(whole.records.is_empty(), "the working child went with the prompt");
+        assert_eq!(whole.turn, 1, "the prompt ended the turn; a done after it is no second one");
+        for cut in 1..sent.len() {
+            let (mut t, mut screen) = (terminal(), ghostty_vt::Terminal::new(80, 24, 1 << 20));
+            applied(&mut t, &mut screen, &sent[..cut]);
+            applied(&mut t, &mut screen, &sent[cut..]);
+            assert_eq!((&t.status, &t.records, t.turn), (&whole.status, &whole.records, whole.turn), "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn a_shell_prompt_inside_an_agent_drops_its_working_records_too_as_the_spec_says() {
+        // The terminal cannot tell whose prompt it is; the spec drops working and blocked
+        // records on any OSC 133 A, so a nested shell's prompt ends the agent's turn.
+        let mut t = terminal();
+        apply(&mut t, &report_app("working", "", "claude-code"));
+        apply(&mut t, &report("blocked", "tool"));
+        apply(&mut t, &report("done", "tool/earlier"));
+        let change = apply(&mut t, &report("prompt", ""));
+        assert!(change.status && change.turn_ended);
+        assert!(t.status.is_none());
+        assert_eq!(t.records.keys().collect::<Vec<_>>(), ["tool/earlier"]);
+        assert_eq!(app_of(&t, "tool/earlier"), "claude-code", "inherited when stored, kept after the root went");
+        apply(&mut t, &report_app("working", "", "claude-code")); // the agent's next report brings it back
+        let change = apply(&mut t, &report("done", ""));
+        assert!(change.turn_ended && change.root_report);
+        assert_eq!(t.turn, 2, "one turn for the dropped work, one for the real finish");
+    }
+
+    #[test]
+    fn a_full_reset_inside_a_report_drops_everything_before_it_and_keeps_what_follows() {
+        let (mut t, mut screen) = (terminal(), ghostty_vt::Terminal::new(80, 24, 1 << 20));
+        applied(
+            &mut t,
+            &mut screen,
+            b"\x1b]7501;state=working\x07\x1b]7501;state=error:id=a\x07\x1b]7501;state=done:id=b:msg=QWxs",
+        );
+        applied(&mut t, &mut screen, b"\x1bc");
+        applied(&mut t, &mut screen, b"bCBkb25l\x1b\\\x1b]7501;state=idle:id=c\x07");
+        assert!(t.status.is_none(), "{:?}", t.status);
+        assert_eq!(t.records.keys().collect::<Vec<_>>(), ["c"], "only the record reported after the reset");
+        assert_eq!(t.turn, 1);
+    }
+
+    #[test]
+    fn clearing_every_record_forgets_their_order_too() {
+        let cap = MAX_RECORDS - 1;
+        let mut t = terminal();
+        fill(&mut t, cap);
+        apply(&mut t, &report("clear", "")); // a full reset (RIS) arrives the same way
+        for i in 0..=cap {
+            apply(&mut t, &report("working", &format!("n{i:03}")));
+        }
+        assert_eq!(t.records.len(), cap, "one past the cap evicts, also after everything was cleared");
+        assert!(!t.records.contains_key("n000") && t.records.contains_key("n001"));
+        // A program that reports and clears over and over must not grow the order without end.
+        let mut t = terminal();
+        for round in 0..20 {
+            for i in 0..10 {
+                apply(&mut t, &report("done", &format!("x{round}-{i}")));
+            }
+            apply(&mut t, &report("clear", ""));
+        }
+        assert_eq!(t.record_order, Vec::<String>::new());
+    }
+
+    #[test]
+    fn after_a_reload_the_cap_holds_at_256_records_with_the_root() {
+        let mut t = terminal();
+        apply(&mut t, &report("idle", ""));
+        fill(&mut t, MAX_RECORDS - 2); // 254 children and the root: 255 records
+        let mut t: Terminal = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert!(t.record_order.is_empty(), "the order is not saved");
+        assert_eq!(t.records.len(), MAX_RECORDS - 2);
+        apply(&mut t, &report("working", "x")); // 256: the cap, nothing goes
+        assert_eq!(t.records.len(), MAX_RECORDS - 1);
+        assert!(t.records.contains_key("r000"));
+        apply(&mut t, &report("working", "y")); // 257 would be one too many: the first unknown goes
+        assert_eq!(t.records.len(), MAX_RECORDS - 1);
+        assert!(!t.records.contains_key("r000") && t.records.contains_key("x"));
+        apply(&mut t, &report("done", "r001")); // updated: now newer than every unknown one
+        apply(&mut t, &report("working", "z"));
+        assert_eq!(t.records.len(), MAX_RECORDS - 1);
+        assert!(!t.records.contains_key("r002"));
+        assert!(["x", "y", "z", "r001"].iter().all(|k| t.records.contains_key(*k)));
+        assert_eq!(t.record_order, ["x", "y", "r001", "z"]);
+        assert!(t.status.is_some(), "the root is never evicted");
+    }
+
+    #[test]
+    fn a_child_reported_before_its_ancestor_keeps_no_app_until_it_reports_again() {
+        // Known limitation: the app is inherited when the child is stored, not when it is shown.
+        let mut t = terminal();
+        apply(&mut t, &report("working", "a/b"));
+        apply(&mut t, &report_app("working", "a", "cargo"));
+        assert_eq!(app_of(&t, "a/b"), "", "the parent came later");
+        apply(&mut t, &report("done", "a/b"));
+        assert_eq!(app_of(&t, "a/b"), "cargo");
+        apply(&mut t, &report_app("working", "a", "rustc"));
+        assert_eq!(app_of(&t, "a/b"), "cargo", "nor does it follow a parent that changes its app");
+        apply(&mut t, &report("clear", "a"));
+        assert!(t.records.is_empty());
+    }
+
+    #[test]
+    fn title_and_msg_keep_combining_marks_variation_selectors_and_text_around_the_surrogates() {
+        let kept = [
+            "e\u{301}",
+            "\u{2764}\u{fe0f}",
+            "\u{d7ff}\u{e000}\u{10ffff}",
+            "\u{1f1fa}\u{1f1f8}",
+            "\u{5d0}\u{5d1} abc",
+            r"C:\Users\me\src\main.rs",
+        ];
+        for text in kept {
+            assert_eq!(said(text, text), (text.into(), text.into()), "{text:?}");
+        }
+        assert_eq!(said("\u{200b}e\u{301}\u{202e}", "").0, "e\u{301}", "a mark keeps its base");
+    }
+
+    #[test]
+    fn joiners_that_build_emoji_and_words_stay() {
+        // U+200D joins a family emoji into one; U+200C is part of Persian and Indic spelling.
+        // Neither reorders nor hides text, which is what the spec asks to disarm.
+        let joined = [
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}",
+            "\u{645}\u{6cc}\u{200c}\u{62e}\u{648}\u{627}\u{647}\u{645}",
+            "\u{915}\u{94d}\u{200d}\u{937}",
+        ];
+        for text in joined {
+            assert_eq!(said(text, text), (text.into(), text.into()), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn the_arabic_letter_mark_and_the_word_joiner_go_like_their_siblings() {
+        // U+061C is a bidi mark like U+200E and U+200F; U+2060 is zero-width like U+FEFF.
+        for c in ['\u{61c}', '\u{2060}'] {
+            assert_eq!(said(&format!("a{c}b"), &format!("{c}x")), ("ab".into(), "x".into()), "{c:?}");
+        }
+    }
+
+    #[test]
+    fn length_limits_count_the_text_as_sent_and_stripping_only_shortens_it() {
+        let send = |title: &str, msg: &str| {
+            let mut screen = ghostty_vt::Terminal::new(80, 24, 1 << 20);
+            let (title, msg) = (base64(title.as_bytes()), base64(msg.as_bytes()));
+            screen.write(format!("\x1b]7501;state=working:title={title}:msg={msg}\x1b\\").as_bytes());
+            screen.take_status_reports().first().map(Status::from).map(|s| (s.title, s.msg))
+        };
+        let (title, msg) = ("\u{200b}".repeat(64), format!("{}ab", "\u{200b}".repeat(682)));
+        assert_eq!((title.len(), msg.len()), (192, 2048));
+        assert_eq!(send(&title, &msg), Some((String::new(), "ab".into())), "at the limits, all invisible");
+        assert_eq!(send(&format!("{title}a"), "x"), None, "a title one byte over is refused whole");
+        assert_eq!(send("x", &format!("{msg}a")), None, "a msg one byte over is refused whole");
+    }
 }
