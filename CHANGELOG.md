@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-11-09
+
+Program status (OSC 7501) now follows the Program Status Protocol rev 0.4, and remote approvals are stricter.
+
+### Changed
+
+- Telegram and the web panel answer only a `permission` prompt. A question, a sign-in or a prompt of unknown kind must be answered in the terminal, and a pending question in any sub-task blocks a remote answer. The prompt is checked again at confirmation; if it changed or is no longer waiting, nothing is typed. Programs that want phone or chat answers send `kind=permission` with `state=blocked`.
+- When a program exits, its `done` and `error` statuses stay; `working`, `blocked` and `idle` are cleared. `wait` answers the same either way.
+- A new shell prompt clears `working` and `blocked` statuses.
+- At the status limit the least recently updated record is dropped, and a sub-task without a program name takes its nearest parent's.
+
+### Fixed
+
+- Status titles and messages lose control, direction-changing and invisible characters; joiners used by emoji and scripts are kept.
+- A failure summary that can't be written to the audit log is kept and written later instead of being lost, and a due summary is written before the next command.
+
 ## [0.1.11] - 2026-11-09
 
 Fixes ported from upstream herdr-core, hardened and tested.
