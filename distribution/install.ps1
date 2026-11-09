@@ -110,10 +110,12 @@ try {
         $vout = "$tmp\installed.version"
         $have = ""
         if ((Invoke-Installed "--version" 30000 $vout) -eq 0) { $have = [string](Get-Content $vout | Select-Object -First 1) }
-        # Plain X.Y.Z only: a prerelease (0.1.9-rc.1) is older than 0.1.9.
-        if ($have -match "^h0x-core (\d{1,9})\.(\d{1,9})\.(\d{1,9})$") {
+        # X.Y.Z, then anything. A prerelease sorts below its release (semver): 0.1.9-rc.1
+        # is older than 0.1.9, 0.1.10-rc.1 is newer.
+        if ($have -match "^h0x-core (\d{1,9})\.(\d{1,9})\.(\d{1,9})(.*)$") {
             $n = [int64[]]($Matches[1], $Matches[2], $Matches[3])
-            if ($n[0] -gt 0 -or $n[1] -gt 1 -or ($n[1] -eq 1 -and $n[2] -ge 9)) {
+            $pre = $Matches[4].StartsWith("-")
+            if ($n[0] -gt 0 -or $n[1] -gt 1 -or ($n[1] -eq 1 -and ($n[2] -gt 9 -or ($n[2] -eq 9 -and -not $pre)))) {
                 if ((Invoke-Installed "update --from `"$archive`" --check" 120000 "$tmp\check.out") -ne 0) {
                     Fail "$asset is not signed by the h0x-core release key, or the installed h0x-core could not check it (see above)"
                 }

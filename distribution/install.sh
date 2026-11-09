@@ -90,13 +90,17 @@ bounded() {
 checks_signatures() {
   [ -x "$bin/h0x-core" ] || return 1
   bounded "${H0X_CORE_INSTALL_SECS:-30}" "$bin/h0x-core" --version >"$tmp/installed.version" 2>/dev/null || return 1
-  # Plain X.Y.Z only: a prerelease (0.1.9-rc.1) is older than 0.1.9.
-  v=$(sed -n 's/^h0x-core \([0-9][0-9]*\)\.\([0-9][0-9]*\)\.\([0-9][0-9]*\)$/\1 \2 \3/p' "$tmp/installed.version" | head -n 1)
+  # X.Y.Z, then anything (a build note, a prerelease). A prerelease sorts below its
+  # release (semver): 0.1.9-rc.1 is older than 0.1.9, 0.1.10-rc.1 is newer.
+  v=$(sed -n 's/^h0x-core \([0-9][0-9]*\)\.\([0-9][0-9]*\)\.\([0-9][0-9]*\)\(.*\)$/\1 \2 \3 \4/p' "$tmp/installed.version" | head -n 1)
   [ -n "$v" ] || return 1
   # shellcheck disable=SC2086
-  set -- $v
+  set -f; set -- $v; set +f
   [ "${#1}" -le 9 ] && [ "${#2}" -le 9 ] && [ "${#3}" -le 9 ] || return 1
-  [ "$1" -gt 0 ] || [ "$2" -gt 1 ] || { [ "$2" -eq 1 ] && [ "$3" -ge 9 ]; }
+  [ "$1" -gt 0 ] || [ "$2" -gt 1 ] || { [ "$2" -eq 1 ] && [ "$3" -gt 9 ]; } && return 0
+  [ "$1" -eq 0 ] && [ "$2" -eq 1 ] && [ "$3" -eq 9 ] || return 1
+  case ${4:-} in -*) return 1 ;; esac
+  return 0
 }
 signed=
 if [ -z "${H0X_CORE_RELEASES_URL:-}" ]; then

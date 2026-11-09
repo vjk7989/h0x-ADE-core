@@ -733,7 +733,7 @@ fn the_install_script_does_not_hang_on_an_installed_core_that_hangs() {
     let bin = s.root.join("hangs-version");
     put_installed(
         &bin,
-        "#!/bin/sh\ncase \"$1\" in\n  --version) sleep 600 ;;\n  update*) case \"$3\" in *.tar.gz) exit 1 ;; esac; cp \"$3\" \"$0\" ;;\nesac\n",
+        "#!/bin/sh\ncase \"$1\" in\n  --version) sleep 600 ;;\n  update*) case \"$3\" in *.tar.gz) exit 1 ;; esac; cp \"$3\" \"$0.new\" && mv \"$0.new\" \"$0\" ;;\nesac\n",
     );
     let started = std::time::Instant::now();
     let out = install_signed_within(&stub, &bin, "1");
@@ -756,7 +756,7 @@ fn the_install_script_does_not_hang_on_an_installed_core_that_hangs() {
 /// A prerelease of 0.1.9 is older than 0.1.9: it is not trusted to verify.
 #[test]
 fn a_prerelease_installed_core_is_older_and_the_downloaded_core_verifies() {
-    for version in ["0.1.9-rc.1", "0.1.9+build", "99999999999.0.0", "0.1", "junk"] {
+    for version in ["0.1.9-rc.1", "99999999999.0.0", "0.1", "junk"] {
         let s = Session::new();
         let asked = s.root.join("asked.log");
         let downloaded = format!(
