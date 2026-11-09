@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Output to a closed pipe (`h0x-core get x | head -c 0`) ends quietly with exit status 141 instead of a panic.
+
 ## [0.1.12] - 2026-11-09
 
 Program status (OSC 7501) now follows the Program Status Protocol rev 0.4, and remote approvals are stricter.

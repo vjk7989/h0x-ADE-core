@@ -157,8 +157,33 @@ pub fn command_names() -> Vec<String> {
         .collect()
 }
 
+/// Exit status when output goes to a closed pipe (`h0x-core --skill | head -c 0`): the unix
+/// convention for death by SIGPIPE, 128 + 13, on every platform.
+const BROKEN_PIPE_EXIT: i32 = 141;
+
+/// `print!` panics when stdout is closed. On the main thread that is a person's `| head`, not a
+/// bug: leave quietly. The OS error number is matched because the text is localized.
+fn quiet_on_broken_pipe() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let message = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        let closed = message.starts_with("failed printing to std")
+            && ["(os error 32)", "(os error 109)", "(os error 232)"].iter().any(|code| message.ends_with(code));
+        if closed && std::thread::current().name() == Some("main") {
+            std::process::exit(BROKEN_PIPE_EXIT);
+        }
+        default(info);
+    }));
+}
+
 pub fn main() -> i32 {
     let daemon = crate::platform::daemon_startup();
+    quiet_on_broken_pipe();
     client::remember_exe();
     let args: Vec<_> = if daemon { vec!["serve".into()] } else { std::env::args_os().skip(1).collect() };
     match args.iter().map(|a| a.to_str()).collect::<Vec<_>>().as_slice() {
