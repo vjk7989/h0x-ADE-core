@@ -412,7 +412,7 @@ fn a_token_file_with_spaces_in_its_path_or_only_a_line_end_and_the_token_never_s
 }
 
 #[test]
-fn bridge_web_json_while_locked_has_all_four_keys_with_a_null_pair() {
+fn bridge_web_json_while_locked_has_all_its_keys_with_a_null_pair() {
     use std::io::{BufRead, BufReader, Read};
     let s = Session::new();
     assert_eq!(s.json(&["bridge", "lock"]), json!({"locked": true}));
@@ -428,12 +428,16 @@ fn bridge_web_json_while_locked_has_all_four_keys_with_a_null_pair() {
     out.read_line(&mut line).unwrap();
     let ready: Value = serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line}"));
     let keys = ready.as_object().unwrap();
-    assert_eq!(keys.len(), 4, "{line}");
-    for key in ["url", "pair", "tunnel", "via"] {
+    assert_eq!(keys.len(), 5, "{line}");
+    for key in ["url", "pair", "tunnel", "via", "warning"] {
         assert!(keys.contains_key(key), "{key} present, even as null: {line}");
     }
     assert!(ready["url"].as_str().unwrap().starts_with("http://127.0.0.1:"), "{line}");
-    assert_eq!((&ready["pair"], &ready["tunnel"], &ready["via"]), (&Value::Null, &Value::Null, &Value::Null), "locked");
+    assert_eq!(
+        (&ready["pair"], &ready["tunnel"], &ready["via"], &ready["warning"]),
+        (&Value::Null, &Value::Null, &Value::Null, &Value::Null),
+        "locked"
+    );
     web.kill().unwrap();
     let mut rest = String::new();
     out.read_to_string(&mut rest).unwrap();

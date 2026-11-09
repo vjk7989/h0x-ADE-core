@@ -64,7 +64,7 @@ The desktop app's Settings page drives the same commands; they all print JSON wi
 
 - `h0x-core bridge qr <text> --json` prints `{"size": N, "rows": ["0101...", ...]}`: N rows of N modules, `1` dark, no quiet zone. Without `--json` it draws the code in the terminal. Empty text, or text longer than a QR code holds, is an error.
 - `h0x-core bridge telegram token --file <path>` reads the token from the first line of that file instead of stdin, and checks it the same way. The file is not deleted: the caller does that. It cannot be combined with `--clear`.
-- `h0x-core bridge web --json` prints one line once the panel is reachable (after the tunnel's address is known when `--tunnel` is set), then keeps serving: `{"url": "http://ip:port/", "pair": "<link>", "tunnel": "<https address or null>", "via": "<public host or null>"}`. With a tunnel, `pair` is the link through it; `pair` is null when remote control is locked, and `tunnel` is null if the tunnel could not start. Its text output, the QR code included, goes away. Read the line with `h0x-core read <terminal>` when the panel runs under `h0x-core run --bg --keep`.
+- `h0x-core bridge web --json` prints one line once the panel is reachable (after the tunnel's address is known when `--tunnel` is set), then keeps serving: `{"url": "http://ip:port/", "pair": "<link>", "tunnel": "<https address or null>", "via": "<public host or null>", "warning": "<text or null>"}`. `warning` says that the page is delivered by your Wi-Fi, Cloudflare or your VPS (whichever apply), so an attacker who controls that path could change it; it is null when the panel is reachable from this machine only. With a tunnel, `pair` is the link through it; `pair` is null when remote control is locked, and `tunnel` is null if the tunnel could not start. Its text output, the QR code included, goes away. Read the line with `h0x-core read <terminal>` when the panel runs under `h0x-core run --bg --keep`.
 
 ## Web panel
 
@@ -87,6 +87,11 @@ Everything else is as for Telegram: confirmations, the lock (no notices go out w
 `--lan` only binds a private address: 10.x, 172.16–31.x, 192.168.x, or 100.64.0.0/10 (Tailscale and other private overlays).
 It refuses public, loopback and link-local addresses.
 The page comes over plain http, but everything the page and the panel say to each other is encrypted (see "Encryption"). Anyone on that network can still change the page you load, so use it only on a network you trust.
+In every mode but localhost the panel prints (and `--json` carries in `warning`) that the messages are end-to-end encrypted but the page itself is delivered by your Wi-Fi, Cloudflare or your VPS, so an attacker who controls that path could change it.
+
+A web session lasts 30 days from pairing; after that the device pairs again. A session saved before this limit existed counts from the first time it is used.
+Wrong pairing codes sent over the web are counted per connection source (behind the tunnel, the visitor's address from Cloudflare's `CF-Connecting-IP`, which is believed only on requests that came through the tunnel from this machine): five in a row refuse that source for 10 minutes, before the code is even checked. They never count against Telegram pairing, and Telegram's wrong codes never block web pairing. Failed `auth`s are counted per source the same way and refuse it for a minute.
+The panel serves at most 64 connections at once and answers the next with `503`; the log of what happened is capped (see "Audit log").
 
 ### Ways to reach it
 
@@ -241,6 +246,7 @@ A `cloudflared` on `PATH` is used first. Otherwise the panel uses one downloaded
 If there is none, `bridge web --tunnel` and `bridge tunnel on` ask before downloading one (pass `--yes` to skip the question; without a terminal and without `--yes` they refuse).
 The download is a pinned cloudflared release (2026.10.7) from github.com/cloudflare/cloudflared, about 20–55 MB depending on the platform, fetched with the system `curl` over https only.
 It is installed only if its SHA-256 matches the one pinned in core; otherwise it is deleted and refused.
+The downloaded copy is hashed again before every start and refused if it no longer matches (Windows and Linux; the macOS download is pinned as an archive, so the unpacked program has nothing to compare). A `cloudflared` on `PATH` is yours and is not checked.
 Pinned builds: Windows x64, Linux x64 and arm64, macOS x64 and arm64 (unpacked with `tar`). Elsewhere, install cloudflared yourself.
 
 ## Full control means full control
@@ -268,7 +274,7 @@ A new code replaces the previous one.
 The account that sends the code to the bridge is paired: it is added to the allow-list (`h0x-core bridge ls`) with its transport, its id there, a label and the time.
 Messages from any other account are refused without reaching core.
 
-Five wrong codes in a row disable pairing for 10 minutes and throw the live code away, so guessing a code doesn't work.
+Five wrong codes in a row disable chat pairing for 10 minutes and throw the live chat code away, so guessing a code doesn't work. (A live web link is left alone, and wrong codes over the web are limited per source instead; see "Web panel".)
 
 ```sh
 h0x-core bridge ls              # paired accounts, and whether the bridge is locked
@@ -345,6 +351,7 @@ Each entry has the time, the account, the command, the terminal and the result.
 Typed text, commands, folders and terminal names are stored redacted and cut to 24 characters; text keeps its length.
 Pairing codes and confirmation tokens are never stored: a confirmation is logged as `confirm` with the action it ran.
 If the log can't be written, the command doesn't run.
+When `audit.jsonl` reaches 1 MiB it is moved to `audit.jsonl.1`, replacing the older one, so the log keeps between 1 and 2 MiB of the latest entries.
 
 ```sh
 h0x-core bridge log         # the last 20 entries
