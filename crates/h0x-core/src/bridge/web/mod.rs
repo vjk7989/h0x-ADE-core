@@ -202,11 +202,16 @@ impl Bridge {
         Ok((now.saturating_sub(made) < SESSION_MS).then_some(user))
     }
 
-    /// Whether `user`'s session is still under [`SESSION_MS`] old at `now`, for a socket
-    /// that authenticated earlier. A state that cannot be read, or has no date, counts as alive.
+    /// Whether `user`'s session still stands at `now`, for a socket that authenticated
+    /// earlier: the device is still paired with a session, and the session is under
+    /// [`SESSION_MS`] old. A session from before dates has none yet (the next `auth` dates it),
+    /// and a state that cannot be read counts as alive.
     fn session_live(&self, user: &str, now: u64) -> bool {
         let Ok(st) = self.load() else { return true };
-        st.session_times.get(user).is_none_or(|made| now.saturating_sub(*made) < SESSION_MS)
+        let paired = st.identities.iter().any(|i| i.transport == "web" && i.user_id == user);
+        paired
+            && st.sessions.contains_key(user)
+            && st.session_times.get(user).is_none_or(|made| now.saturating_sub(*made) < SESSION_MS)
     }
 }
 

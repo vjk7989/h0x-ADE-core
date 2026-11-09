@@ -153,7 +153,12 @@ pub fn client(req: &http::Request, peer: Option<IpAddr>, via_tunnel: bool, publi
         let seen = req.header("cf-connecting-ip").and_then(|v| v.parse::<IpAddr>().ok());
         return seen.or(peer);
     }
-    if public.is_some_and(|host| req.header("host").is_some_and(|h| h.eq_ignore_ascii_case(host))) {
+    // The public host, with or without its scheme's default port.
+    let ours = |h: &str| {
+        let bare = h.strip_suffix(":443").or_else(|| h.strip_suffix(":80")).unwrap_or(h);
+        public.is_some_and(|host| bare.eq_ignore_ascii_case(host))
+    };
+    if req.header("host").is_some_and(ours) {
         let hop = |v: &str| v.rsplit(',').next().and_then(|last| last.trim().parse::<IpAddr>().ok());
         let forwarded = req.headers.iter().rev().find(|(n, _)| n == "x-forwarded-for").and_then(|(_, v)| hop(v));
         let real = req.header("x-real-ip").and_then(|v| v.trim().parse::<IpAddr>().ok());
@@ -1339,13 +1344,16 @@ mod hardening_tests {
         for odd in ["", "198.51.100.7:80", "198.51.100.7, 6.6.6.6"] {
             assert_eq!(only_real(odd), ip("::1"), "{odd:?}");
         }
-        // The host is matched in any case, but exactly: a port or a lookalike is not the forward.
+        // The host is matched in any case, with or without a default port; any other port or a lookalike is not the forward.
         let host = |h: &str| {
             let req = request(&[("host", h), ("x-forwarded-for", "198.51.100.7")]);
             client(&req, ip("127.0.0.1"), false, pub_host)
         };
         assert_eq!(host("PANEL.Example.ORG"), ip("198.51.100.7"), "case does not matter");
-        for other in ["panel.example.org:443", "panel.example.org.", "evil.panel.example.org", "", "example.org"] {
+        for default_port in ["panel.example.org:443", "panel.example.org:80"] {
+            assert_eq!(host(default_port), ip("198.51.100.7"), "{default_port}: the same host");
+        }
+        for other in ["panel.example.org:8377", "panel.example.org.", "evil.panel.example.org", "", "example.org"] {
             assert_eq!(host(other), ip("127.0.0.1"), "{other:?}");
         }
         let no_host = request(&[("x-forwarded-for", "198.51.100.7")]);

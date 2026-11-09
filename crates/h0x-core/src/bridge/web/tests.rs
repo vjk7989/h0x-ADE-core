@@ -1842,8 +1842,13 @@ fn an_open_sessions_age_ends_exactly_at_thirty_days_and_what_cannot_be_aged_stay
     assert!(!f.web.session_alive(&conn, u64::MAX), "the far future");
     assert!(f.web.session_alive(&conn, 0), "a clock gone back does not end it");
     assert!(f.web.session_alive(&phone(), u64::MAX), "a socket that never authenticated has no session to age");
-    let undated = Conn { device: Some(Sender { transport: "web".into(), user_id: "nobody".into() }), ..phone() };
-    assert!(f.web.session_alive(&undated, u64::MAX), "no date: the next auth decides");
+    let nobody = Conn { device: Some(Sender { transport: "web".into(), user_id: "nobody".into() }), ..phone() };
+    assert!(!f.web.session_alive(&nobody, T), "a user the state does not know is closed at the heartbeat");
+    let path = f.dir.join("state.json");
+    let mut state: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    state.as_object_mut().unwrap().remove("session_times");
+    std::fs::write(&path, state.to_string()).unwrap();
+    assert!(f.web.session_alive(&conn, u64::MAX), "still paired, from before dates: the next auth dates it");
     std::fs::write(f.dir.join("state.json"), "not json").unwrap();
     assert!(f.web.session_alive(&conn, u64::MAX), "an unreadable state: the next auth decides");
 }
@@ -1885,4 +1890,42 @@ fn authenticating_gives_one_place_back_to_its_source_and_closing_after_frees_not
     std::thread::sleep(Duration::from_millis(300));
     let (still, _) = ws_via(addr, a);
     assert!(still.starts_with("HTTP/1.1 503 "), "still full: {still}");
+}
+
+#[test]
+fn an_unpaired_or_revoked_devices_open_socket_is_closed_at_the_next_check() {
+    let f = fixture(Vec::new());
+    let (one, _) = f.paired_at(T);
+    let (two, _) = f.paired_at(T);
+    assert!(f.web.session_alive(&one, T + 1) && f.web.session_alive(&two, T + 1));
+    let id = f.web.bridge.lock().unwrap().identities().unwrap()[0].id;
+    f.web.bridge.lock().unwrap().unpair(Some(id)).unwrap();
+    let alive = [&one, &two].map(|c| f.web.session_alive(c, T + 2));
+    assert_eq!(alive.iter().filter(|a| **a).count(), 1, "exactly the unpaired device is closed: {alive:?}");
+    f.web.bridge.lock().unwrap().unpair(None).unwrap();
+    assert!(!f.web.session_alive(&one, T + 3) && !f.web.session_alive(&two, T + 3), "unpair all closes all");
+}
+
+#[test]
+fn the_vps_host_is_the_public_host_with_or_without_its_default_port_only() {
+    let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+    for (host, via) in [
+        (PANEL, true),
+        ("panel.example.org:443", true),
+        ("panel.example.org:80", true),
+        ("PANEL.Example.ORG:443", true),
+        ("panel.example.org:8377", false),
+        ("panel.example.org:4430", false),
+        ("panel.example.org:", false),
+        ("panel.example.org.evil.test", false),
+        ("127.0.0.1:443", false),
+    ] {
+        let req = http::Request {
+            method: "GET".into(),
+            path: "/ws".into(),
+            headers: vec![("host".into(), host.into()), ("x-forwarded-for".into(), "198.51.100.7".into())],
+        };
+        let seen = tunnel::client(&req, ip("127.0.0.1"), false, Some(PANEL));
+        assert_eq!(seen, if via { ip("198.51.100.7") } else { ip("127.0.0.1") }, "{host}");
+    }
 }
