@@ -545,4 +545,51 @@ mod tests {
         assert_ne!(id(Some("d")), "old", "and from then on a copy is told apart");
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn only_sends_are_cancelled_by_their_own_id_and_all_when_the_connection_goes() {
+        use serde_json::json;
+        use std::sync::atomic::Ordering::Relaxed;
+        let send = |id: Value| json!({"jsonrpc": "2.0", "id": id, "method": "terminal.send", "params": {}});
+        let mut sends = Sends::default();
+        let number = sends.track(&send(json!(1)));
+        let string = sends.track(&send(json!("1")));
+        let exec = sends.track(&json!({"jsonrpc": "2.0", "id": 2, "method": "machine.exec"}));
+        sends.cancel(Some("2"));
+        assert!(!exec.load(Relaxed), "only sends watch for cancellation");
+        sends.cancel(Some("99"));
+        assert!(!number.load(Relaxed) && !string.load(Relaxed), "an unknown id cancels nothing");
+        sends.cancel(Some("1"));
+        assert!(number.load(Relaxed));
+        assert!(!string.load(Relaxed), "the string id \"1\" is another request than the number 1");
+        sends.cancel(Some(&json!("1").to_string()));
+        assert!(string.load(Relaxed));
+        // A finished send is forgotten at the next one.
+        drop(number);
+        let later = sends.track(&send(json!(3)));
+        assert_eq!(sends.0.len(), 2);
+        drop(sends);
+        assert!(later.load(Relaxed), "a closed connection cancels its held sends");
+        assert!(!exec.load(Relaxed));
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_seen_only_inside_a_send() {
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        use std::time::Duration;
+        assert!(check_cancelled().is_ok(), "no send in scope");
+        let outside = tokio::time::timeout(Duration::from_millis(100), send_cancelled()).await;
+        assert!(outside.is_err(), "outside a send it never fires");
+        let flag = Arc::new(AtomicBool::new(false));
+        SEND_CANCELLED
+            .scope(flag.clone(), async {
+                assert!(check_cancelled().is_ok());
+                assert!(tokio::time::timeout(Duration::from_millis(100), send_cancelled()).await.is_err());
+                flag.store(true, Relaxed);
+                assert_eq!(check_cancelled().unwrap_err().kind, "cancelled");
+                let err = tokio::time::timeout(Duration::from_secs(1), send_cancelled()).await.expect("fires");
+                assert_eq!(err.kind, "cancelled");
+            })
+            .await;
+    }
 }

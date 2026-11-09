@@ -627,6 +627,163 @@ mod tests {
     }
 
     #[test]
+    fn editing_keys_keep_the_draft_and_the_note_held() {
+        let quiet = Duration::from_secs(3);
+        for edit in [
+            b"\x1b[D".as_slice(),
+            b"\x1b[C",
+            b"\x1bOD",
+            b"\x1b[H",
+            b"\x1b[F",
+            b"\x1bOH",
+            b"\x1b[1~",
+            b"\x1b[4~",
+            b"\x1b[3~",
+            b"\x1b[1;5D",
+            b"\x17", // ctrl+w
+            b"\x0b", // ctrl+k
+            b"\x01",
+            b"\x05",
+            b"\x1bb",
+            b"\x1bf",
+            b"\x1b\x7f",
+            b"\x1b[100;3u",
+            b"\x1b[107;5u", // kitty ctrl+k
+        ] {
+            let mut g = Gate::default();
+            g.viewer(b"hello", true);
+            g.viewer(edit, true);
+            assert_eq!((g.draft, g.draft_ended), (5, false), "{edit:?}");
+            assert!(g.wait(quiet, true) > quiet, "{edit:?}: the note is still held");
+            assert!(g.wait(quiet, true) <= draft_timeout().max(quiet), "{edit:?}: and only up to the draft timeout");
+        }
+    }
+
+    #[test]
+    fn a_lone_esc_then_a_key_in_its_own_write_still_types_a_draft() {
+        // A separate write is a separate key press: esc, then a.
+        let mut g = Gate::default();
+        g.viewer(b"\x1b", true);
+        g.viewer(b"a", true);
+        assert_eq!(g.draft, 1, "the a after a lone esc is part of the draft");
+        assert!(g.wait(Duration::from_secs(3), true) > Duration::from_secs(3));
+        // In one write it is alt+a, which types nothing.
+        let mut alt = Gate::default();
+        alt.viewer(b"\x1ba", true);
+        assert_eq!(alt.draft, 0);
+    }
+
+    #[test]
+    fn ime_and_unicode_input_count_characters_and_malformed_keys_count_nothing() {
+        let draft = |chunks: &[&[u8]]| {
+            let mut g = Gate::default();
+            for chunk in chunks {
+                g.viewer(chunk, true);
+            }
+            (g.draft, g.draft_ended)
+        };
+        assert_eq!(draft(&["日本語".as_bytes()]), (3, false), "an IME commit");
+        assert_eq!(draft(&["👍".as_bytes()]).0, 1);
+        assert_eq!(draft(&["e\u{301}".as_bytes()]).0, 2, "a combining mark counts on its own");
+        let ni = "日".as_bytes();
+        assert_eq!(draft(&[&ni[..1], &ni[1..]]).0, 1, "a character split across writes");
+        assert_eq!(draft(&[b"\x1b[26085u"]).0, 1, "a kitty key with a non-ASCII code point");
+        for junk in [
+            b"\x1b[55296u".as_slice(), // a surrogate
+            b"\x1b[1114112u",          // beyond Unicode
+            b"\x1b[57399u",            // kitty functional key (private use)
+            b"\x1b[99999999999999999999u",
+            b"\x1b[u",
+            b"\x1b[;u",
+            b"\x1b[=;?u",
+            b"\x1b[97;=u",
+            b"\x1b[\xffu",
+        ] {
+            assert_eq!(draft(&[b"hey", junk]), (3, false), "{junk:?}");
+        }
+    }
+
+    #[test]
+    fn windows_enter_forms_submit_or_fall_back_to_the_quiet_wait() {
+        let quiet = Duration::from_secs(3);
+        // CR-only Enter, as ConPTY and Windows terminals send it.
+        let mut cr = Gate::default();
+        cr.viewer(br"cd C:\Users\me", true);
+        assert_eq!(cr.draft, 14, "backslashes in a Windows path are typed text");
+        cr.viewer(b"\r", true);
+        assert_eq!((cr.draft, cr.draft_ended), (0, true));
+        assert!(cr.wait(quiet, true) <= PASTE_GAP);
+        // CRLF, in one write or split: the LF clears draft_ended, so the quiet wait
+        // applies, never the longer draft timeout.
+        for chunks in [&[b"abc\r\n".as_slice()][..], &[b"abc\r", b"\n"]] {
+            let mut g = Gate::default();
+            for chunk in chunks {
+                g.viewer(chunk, true);
+            }
+            assert_eq!((g.draft, g.draft_ended), (0, false), "{chunks:?}");
+            let left = g.wait(quiet, true);
+            assert!(left <= quiet && left > PASTE_GAP, "{chunks:?}: {left:?}");
+        }
+        // win32-input-mode key records type no text and do not submit: the draft
+        // stays held, bounded by the draft timeout.
+        let mut g = Gate::default();
+        g.viewer(b"hey", true);
+        g.viewer(b"\x1b[65;30;97;1;0;1_\x1b[13;28;13;1;0;1_", true);
+        assert_eq!((g.draft, g.draft_ended), (3, false));
+        assert!(g.wait(quiet, true) <= draft_timeout().max(quiet));
+    }
+
+    #[test]
+    fn empty_input_huge_waits_and_long_sequences_never_panic_or_grow() {
+        let quiet = Duration::from_secs(3);
+        // A fresh gate (also what a restarted core has) holds nothing.
+        let mut g = Gate::default();
+        assert!(g.wait(Duration::MAX, true).is_zero());
+        g.viewer(b"", true);
+        assert_eq!((g.draft, g.draft_ended), (0, false), "an empty write types nothing");
+        assert!(g.wait(quiet, true) <= quiet);
+        g.viewer(b"ab", true);
+        g.viewer(b"", true);
+        assert_eq!(g.draft, 2, "an empty write keeps the draft");
+        // The largest quiet wins over the draft timeout without overflowing.
+        assert!(g.wait(Duration::MAX, true) > draft_timeout());
+        assert!(g.wait(Duration::MAX, false) > draft_timeout());
+        // The draft count saturates.
+        g.draft = usize::MAX;
+        g.viewer(b"a", true);
+        assert_eq!(g.draft, usize::MAX);
+        // An unterminated sequence is cut off at 128 bytes.
+        let mut long = b"\x1b[".to_vec();
+        long.extend([b'1'; 300]);
+        let mut g = Gate::default();
+        g.viewer(&long, true);
+        assert!(g.sequence.len() < 128, "{}", g.sequence.len());
+    }
+
+    #[test]
+    fn timeout_settings_fall_back_on_bad_values_and_never_panic() {
+        // Only this test reads this variable, so setting it races nothing.
+        let var = "H0X_CORE_TEST_DRAFT_MS_PARSE";
+        let parse = |value: Option<&str>| {
+            match value {
+                Some(v) => unsafe { std::env::set_var(var, v) },
+                None => unsafe { std::env::remove_var(var) },
+            }
+            env_ms(var, 60_000)
+        };
+        let default = Duration::from_secs(60);
+        assert_eq!(parse(None), default, "unset");
+        assert_eq!(parse(Some("0")), Duration::ZERO, "zero: only the quiet wait is left");
+        assert_eq!(parse(Some("1500")), Duration::from_millis(1500));
+        assert_eq!(parse(Some("+1500")), Duration::from_millis(1500));
+        for bad in ["", "-1", "-60000", "abc", "1.5", "1e3", " 1500", "1500 ", "\t1500\n", "18446744073709551616"] {
+            assert_eq!(parse(Some(bad)), default, "{bad:?}");
+        }
+        assert_eq!(parse(Some("18446744073709551615")), Duration::from_millis(u64::MAX), "the largest is taken as is");
+        parse(None);
+    }
+
+    #[test]
     fn pastes_are_bracketed_only_when_asked_and_cannot_end_early() {
         assert_eq!(paste(true, "hi"), b"\x1b[200~hi\x1b[201~");
         assert_eq!(paste(false, "hi"), b"hi");
