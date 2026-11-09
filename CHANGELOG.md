@@ -2,9 +2,17 @@
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-11-09
+
+Fixes ported from upstream herdr-core, hardened and tested.
+
 ### Fixed
 - Updates and `h0x-core server restart` keep the environment the core started with; stopping and starting takes a fresh one. A failed save no longer blocks a restart; the saved note expires after three minutes and cannot cross a boot. (ported from herdr-core cd12ddd)
 - Agent messages and parent notes wait for you to send or clear an unfinished draft, instead of submitting it with their message. A draft left alone holds messages for at most a minute (`H0X_CORE_DRAFT_MS`, in milliseconds; values above 10 minutes are cut to 10 minutes). Sends to another machine wait too. Ported from herdrdev/herdr-core 3ba03e6.
+- Windows: PATH entries like `%USERPROFILE%\bin` are expanded, so PowerShell 7, Git and other tools on such entries are found. (ported from herdr-core c0a205e)
+- Linux: works with systemd 239 (RHEL/Rocky 8); an unknown systemd version uses the older, compatible unit. (ported from herdr-core 1fe7bc6)
+- `attach` no longer garbles text or misses focus reports around multi-byte characters, and a program can no longer slip a hidden mode change past the filter by nesting or splitting it. (ported from herdr-core f4ca1c0, hardened)
+- Clients wait up to 15 s for a starting core. (ported from herdr-core ad23942)
 
 ## [0.1.10] - 2026-11-09
 
