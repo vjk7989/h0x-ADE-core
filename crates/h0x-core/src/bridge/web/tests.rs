@@ -1796,9 +1796,18 @@ fn an_open_socket_closes_at_the_next_heartbeat_once_its_session_turns_thirty_day
         let (_, hello) = read_frame(&mut rd).await;
         let mut chan = pending.finish(&hello, &f.web.key.fp()).unwrap();
         wr.write_all(&http::client_frame(2, &chan.seal(auth.to_string().as_bytes()).unwrap())).await.unwrap();
-        // Authenticated: the snapshot has arrived.
+        // Authenticated: the snapshot has arrived. The wait spins instead of idling: an idle
+        // paused runtime jumps the clock ahead, and the server would run its heartbeats before
+        // the session below is aged.
         loop {
-            let (op, payload) = read_frame(&mut rd).await;
+            let mut next = Box::pin(read_frame(&mut rd));
+            let (op, payload) = loop {
+                tokio::select! {
+                    biased;
+                    frame = &mut next => break frame,
+                    () = tokio::task::yield_now() => {}
+                }
+            };
             assert_eq!(op, 2);
             let msg: Value = serde_json::from_slice(&chan.open(&payload).unwrap()).unwrap();
             if msg["name"] == "snapshot" {
