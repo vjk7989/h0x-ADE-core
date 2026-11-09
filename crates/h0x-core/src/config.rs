@@ -155,4 +155,20 @@ mod tests {
             assert!(bridge(&format!("[bridge]\nrate_limit = {bad}")).is_err(), "{bad}");
         }
     }
+
+    #[test]
+    fn keep_awake_is_off_unless_a_readable_config_says_true() {
+        let keep_awake = |text: &str| toml::from_str::<Config>(text).map(|c| c.keep_awake);
+        assert_eq!(keep_awake("").unwrap(), None, "absent means the default, off");
+        assert_eq!(keep_awake("keep_awake = true").unwrap(), Some(true));
+        assert_eq!(keep_awake("keep_awake = false").unwrap(), Some(false));
+        // Not a boolean: the whole file is rejected, so the watcher sees no `true`.
+        for bad in ["\"true\"", "\"yes\"", "1", "0", "[]", "\"\""] {
+            assert!(keep_awake(&format!("keep_awake = {bad}")).is_err(), "{bad}");
+        }
+        // A missing file is the defaults (off); a path that cannot be read as a file is an error.
+        let missing = Path::new(env!("CARGO_MANIFEST_DIR")).join("no-such-dir").join("config.toml");
+        assert_eq!(load(&missing).unwrap().keep_awake, None);
+        assert!(load(Path::new(env!("CARGO_MANIFEST_DIR"))).is_err(), "a directory is not a config file");
+    }
 }

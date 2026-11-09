@@ -949,6 +949,25 @@ mod tests {
     }
 
     #[test]
+    fn a_broken_pipe_panic_off_the_main_thread_still_panics() {
+        // Installed for the rest of this test process; it hands every other panic on.
+        quiet_on_broken_pipe();
+        for message in [
+            "failed printing to stdout: Broken pipe (os error 32)",
+            "failed printing to stderr: The pipe is being closed. (os error 232)",
+            "failed printing to stdout: The pipe has been ended. (os error 109)",
+        ] {
+            let worker = std::thread::Builder::new()
+                .name("worker".into())
+                .spawn(move || std::panic::panic_any(message.to_string()))
+                .unwrap();
+            // Had the hook exited, this test process would have ended with 141 here.
+            let payload = worker.join().expect_err("the worker panics");
+            assert_eq!(payload.downcast_ref::<String>().map(String::as_str), Some(message));
+        }
+    }
+
+    #[test]
     fn the_picker_orders_by_last_change_by_what_needs_you_and_by_name() {
         let t = |address: &str, name: &str, state: Option<&str>, ms: u64| {
             let status = state.map(|s| serde_json::json!({"state": s}));

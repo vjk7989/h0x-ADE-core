@@ -199,4 +199,42 @@ mod tests {
         drop(awake);
         assert_eq!(log(&fake), ["hold", "release"]);
     }
+
+    #[test]
+    fn rapid_toggling_never_holds_twice_or_releases_what_it_does_not_hold() {
+        let fake = Fake::default();
+        let mut awake = KeepAwake::new(fake.clone());
+        // A fixed pseudo-random walk over (setting, working), including runs of the same input.
+        let mut seed: u32 = 0x9e37_79b9;
+        let mut want = false;
+        for _ in 0..2000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            let (enabled, working) = (seed & 1 == 1, seed & 2 == 2);
+            awake.update(enabled, working);
+            want = enabled && working;
+        }
+        let calls = log(&fake);
+        assert!(!calls.is_empty());
+        for pair in calls.windows(2) {
+            assert_ne!(pair[0], pair[1], "a hold is always followed by a release and back: {calls:?}");
+        }
+        assert_eq!(calls[0], "hold", "nothing to release before the first hold");
+        assert_eq!(calls.last() == Some(&"hold"), want, "the last call matches the last input");
+        // Shutdown gives back exactly what is still held.
+        drop(awake);
+        assert_eq!(log(&fake), if want { vec!["release"] } else { vec![] });
+    }
+
+    #[test]
+    fn a_release_after_the_setting_goes_off_is_not_repeated_at_shutdown() {
+        let fake = Fake::default();
+        let mut awake = KeepAwake::new(fake.clone());
+        awake.update(true, true);
+        awake.update(false, true);
+        awake.update(false, false);
+        drop(awake);
+        assert_eq!(log(&fake), ["hold", "release"]);
+    }
 }
