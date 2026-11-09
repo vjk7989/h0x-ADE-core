@@ -1,5 +1,6 @@
 //! Status facts from OSC 7501, kept per terminal exactly as reported.
 //! A report replaces its record; a child record without `app` takes its nearest ancestor's; `clear` removes a record and its children.
+//! Title and msg are stripped of controls, bidi and zero-width characters.
 //! The turn goes up each time the root record leaves `working`, for any reason.
 //! When the program exits only `done` and `error` records stay; a new shell prompt
 //! (OSC 133 A) drops `working` and `blocked` ones, and a full reset (RIS) all of them.
@@ -30,6 +31,16 @@ pub struct Status {
     pub msg: String,
 }
 
+/// Text with nothing that can spoof or hide what a person reads: no C0/C1 controls,
+/// bidi overrides and isolates, zero-width or BOM characters.
+fn plain(text: &str) -> String {
+    let hidden = |c: &char| {
+        c.is_control()
+            || matches!(c, '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+    };
+    text.chars().filter(|c| !hidden(c)).collect()
+}
+
 impl Status {
     fn from(r: &StatusReport) -> Status {
         Status {
@@ -37,8 +48,8 @@ impl Status {
             kind: r.kind.map(Into::into),
             progress: r.progress,
             app: r.app.clone(),
-            title: r.title.clone(),
-            msg: r.message.clone(),
+            title: plain(&r.title),
+            msg: plain(&r.message),
         }
     }
 
@@ -379,6 +390,35 @@ mod tests {
         let mut screen = ghostty_vt::Terminal::new(80, 24, 1 << 20);
         screen.write(t.records["a/b"].encode("a/b").as_bytes());
         assert_eq!(screen.take_status_reports()[0].app, "root-app");
+    }
+
+    fn said(title: &str, message: &str) -> (String, String) {
+        let s = Status::from(&StatusReport { title: title.into(), message: message.into(), ..report("working", "") });
+        (s.title, s.msg)
+    }
+
+    #[test]
+    fn title_and_msg_lose_controls_bidi_and_zero_width_characters() {
+        assert_eq!(said("", ""), (String::new(), String::new()), "empty stays empty");
+        let kept = "caf\u{e9} \u{2713} \u{1f980}";
+        assert_eq!(said("Run tests", kept), ("Run tests".into(), kept.into()));
+        // Every range at both ends, and the neighbours just outside each.
+        let hidden = ['\0', '\u{1f}', '\n', '\t', '\u{1b}', '\u{7f}', '\u{80}', '\u{9f}']
+            .into_iter()
+            .chain(['\u{200B}', '\u{200F}', '\u{202A}', '\u{202E}', '\u{2066}', '\u{2069}', '\u{FEFF}']);
+        for c in hidden {
+            assert_eq!(said(&format!("a{c}b"), &format!("{c}x{c}")), ("ab".into(), "x".into()), "{c:?}");
+        }
+        let shown = [
+            ' ', '\u{a0}', '\u{200A}', '\u{2010}', '\u{2029}', '\u{202F}', '\u{2065}', '\u{206A}', '\u{FEFE}',
+            '\u{FF00}',
+        ];
+        for c in shown {
+            let text = format!("a{c}b");
+            assert_eq!(said(&text, &text), (text.clone(), text), "{c:?}");
+        }
+        assert_eq!(said("\u{202E}\u{200B}\x07", "\r\n\u{2066}"), (String::new(), String::new()), "nothing left");
+        assert_eq!(said("a\u{202E}txt.exe", "x").0, "atxt.exe");
     }
 
     fn fill(t: &mut Terminal, n: usize) {
