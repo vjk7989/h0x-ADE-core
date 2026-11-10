@@ -77,7 +77,11 @@ expect "killed terminal is finished" 20 '"state": *"finished"' get slow
 if [ -n "${E2E_SANDBOX:-}" ] && ! "$HC" get slow 2>&1 | grep -Eq '"state": *"finished"'; then
   echo "DIAG kill did not end the program inside the sandbox:"; "$HC" get slow 2>&1 | head -c 700; echo
   ps -eo pid,ppid,pgid,stat,user,args 2>&1 | head -30
-  kill -0 "$(ps -eo pid,args | awk '$2=="sleep"{print $1; exit}')" 2>&1 | head -3
+  spid=$(ps -eo pid,args | awk '$2=="sleep"{print $1; exit}')
+  kill -HUP -- "-$spid"; echo "killpg HUP rc=$?"; sleep 1; kill -0 "$spid" 2>/dev/null && echo "still alive after killpg HUP" || echo "gone after killpg HUP"
+  kill -TERM "$spid"; echo "kill TERM rc=$?"; sleep 1; kill -0 "$spid" 2>/dev/null && echo "still alive after TERM" || echo "gone after TERM"
+  kill -KILL "$spid"; echo "kill KILL rc=$?"; sleep 1; kill -0 "$spid" 2>/dev/null && echo "still alive after KILL" || echo "gone after KILL"
+  ps -eo pid,ppid,pgid,stat,args | grep -E "sleep|defunct" | head
   grep -E "^(Seccomp|NoNewPrivs|Cap(Eff|Bnd))" /proc/self/status
 fi
 if poll 15 "$HC" rm slow; then pass "rm"; else fail "rm" "$(tailc "$("$HC" rm slow 2>&1)")"; fi
