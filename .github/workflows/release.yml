@@ -158,6 +158,9 @@ jobs:
     needs: build
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
+    # The signing key lives in the protected "signing" environment: each
+    # release waits for the owner's approval and only v* tags may use it.
+    environment: signing
     timeout-minutes: 15
     permissions:
       contents: write
