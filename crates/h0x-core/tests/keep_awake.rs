@@ -20,6 +20,7 @@ fn serve(s: &Session, path: &str) -> Child {
     let core = s
         .cmd()
         .env("PATH", path)
+        .env("H0X_CORE_HELPER_DIRS", path)
         .env("SSH_CONNECTION", "test-direct")
         .arg("serve")
         .stdin(Stdio::null())
@@ -47,9 +48,14 @@ fn inhibit_calls(s: &Session) -> Vec<String> {
     std::fs::read_to_string(s.root.join("inhibit.log")).unwrap_or_default().lines().map(String::from).collect()
 }
 
-/// Processes running `tail --pid <core> -f /dev/null`: the helper holding the block.
+/// The `tail` the core runs: by absolute path, from the first of these that has it.
+fn tail() -> String {
+    ["/usr/bin/tail", "/bin/tail"].into_iter().find(|p| Path::new(p).is_file()).unwrap().to_string()
+}
+
+/// Processes running `<tail> --pid <core> -f /dev/null`: the helper holding the block.
 fn helpers(core: u64) -> usize {
-    let want = format!("tail\0--pid\0{core}\0-f\0/dev/null\0");
+    let want = format!("{}\0--pid\0{core}\0-f\0/dev/null\0", tail());
     std::fs::read_dir("/proc")
         .unwrap()
         .flatten()
@@ -77,8 +83,10 @@ fn the_sleep_helper_starts_once_per_working_turn_with_fixed_arguments_and_goes_w
     config(&s, "keep_awake = true");
     let core = serve(&s, &fake_inhibit(&s));
     let pid = s.json(&["server", "status"])["pid"].as_u64().unwrap();
-    let expected =
-        format!("--what=sleep --mode=block --who=h0x-core --why=an agent is working tail --pid {pid} -f /dev/null");
+    let expected = format!(
+        "--what=sleep --mode=block --who=h0x-core --why=an agent is working {} --pid {pid} -f /dev/null",
+        tail()
+    );
 
     let first = agent(&s, "go1");
     wait_until("held", || held(&s));

@@ -105,10 +105,16 @@ impl Inhibitor for Os {
 pub struct Os(Option<std::process::Child>);
 
 /// A helper that ships with the system, at a fixed place. Never looked up on PATH: a planted
-/// binary earlier on it would run with the user's rights.
+/// binary earlier on it would run with the user's rights. Debug builds only: the integration
+/// tests point `H0X_CORE_HELPER_DIRS` at a stand-in; a release build never reads it.
 #[cfg(unix)]
 fn system_helper(name: &str) -> Option<std::path::PathBuf> {
-    ["/usr/bin", "/bin"].iter().map(|dir| std::path::Path::new(dir).join(name)).find(|p| p.is_file())
+    let dirs = if cfg!(debug_assertions) { std::env::var("H0X_CORE_HELPER_DIRS").ok() } else { None };
+    dirs.as_deref()
+        .unwrap_or("/usr/bin:/bin")
+        .split(':')
+        .map(|dir| std::path::Path::new(dir).join(name))
+        .find(|p| p.is_file())
 }
 
 #[cfg(unix)]
@@ -121,13 +127,19 @@ impl Inhibitor for Os {
             c.args(["-i", "-w", &pid]);
             c
         } else {
-            let (Some(inhibit), Some(tail)) = (system_helper("systemd-inhibit"), system_helper("tail")) else {
-                eprintln!("core: keep_awake: systemd-inhibit or tail is not in /usr/bin or /bin; no sleep block");
-                return false;
-            };
-            let mut c = std::process::Command::new(inhibit);
+            let mut found = Vec::new();
+            for name in ["systemd-inhibit", "tail"] {
+                match system_helper(name) {
+                    Some(path) => found.push(path),
+                    None => {
+                        eprintln!("core: keep_awake: cannot start {name}: not found in /usr/bin or /bin");
+                        return false;
+                    }
+                }
+            }
+            let mut c = std::process::Command::new(&found[0]);
             c.args(["--what=sleep", "--mode=block", "--who=h0x-core", "--why=an agent is working"]);
-            c.arg(tail).args(["--pid", &pid, "-f", "/dev/null"]);
+            c.arg(&found[1]).args(["--pid", &pid, "-f", "/dev/null"]);
             c
         };
         // Its own group: release ends the helper and whatever it started (`tail` under systemd-inhibit).
