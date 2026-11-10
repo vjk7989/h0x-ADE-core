@@ -1,0 +1,137 @@
+name: e2e
+
+# End-to-end tests of the LATEST RELEASED trio (h0x-core, h0x-ade, h0x), installed the
+# way a user installs it, in an isolated home. Nothing here builds from source.
+#   e2e      Linux, Windows, macOS: install + black-box checks (scripts/e2e/).
+#   sandbox  Linux only: the same checks inside an NVIDIA OpenShell sandbox whose
+#            policy allows GitHub only and writes only in the workspace.
+# Run it by hand (workflow_dispatch), nightly, when a release is published, and on a
+# PR that changes this workflow or the scripts. No secrets; read-only token.
+# (A release published by another workflow with GITHUB_TOKEN does not start this one;
+# the nightly run then catches it.)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+  release:
+    types: [published]
+  pull_request:
+    paths:
+      - .github/workflows/e2e.yml
+      - scripts/e2e/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install test tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          # minisign checks the runtime download; the rest lets the app open a window under xvfb.
+          sudo apt-get install -y --no-install-recommends minisign xvfb libvulkan1 mesa-vulkan-drivers \
+            libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 libfontconfig1 libx11-xcb1 libxcb-xkb1 libegl1 libgl1
+
+      - name: Install test tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install minisign
+
+      - name: Install the released trio and run the black-box checks
+        run: |
+          if [ "$RUNNER_OS" = Windows ]; then root=$(cygpath -u "$RUNNER_TEMP")/e2e; else root=$RUNNER_TEMP/e2e; fi
+          E2E_ROOT=$root bash scripts/e2e/run.sh 2>&1 | tee "$RUNNER_TEMP/e2e.log"
+          exit "${PIPESTATUS[0]}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### e2e (${{ matrix.os }})"
+            echo '```'
+            grep -E '^(trio:|PASS|FAIL|WARN|SKIP|SUMMARY)' "$RUNNER_TEMP/e2e.log" || echo "no results"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  sandbox:
+    name: e2e in an OpenShell sandbox (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Pinned: the release the installer script is taken from, and that script's own
+      # sha256 (the script then checks the package against the release's checksums).
+      OPENSHELL_VERSION: v0.1.7
+      OPENSHELL_INSTALLER_SHA256: 04c1a437d4a4fc11930d75a336fc4f52bf0c95251e8469c306e407e203769ae7
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the sandbox image
+        run: docker build -t h0x-e2e:ci scripts/e2e
+
+      # Installing OpenShell and starting its gateway is infrastructure: when that fails
+      # the job reports it as a warning and goes on (the e2e matrix above is the gate).
+      # Once the sandbox exists, a failing check fails the job.
+      - name: Install OpenShell (pinned, verified)
+        id: install
+        continue-on-error: true
+        run: |
+          curl -fsSL --proto '=https' "https://raw.githubusercontent.com/NVIDIA/OpenShell/${OPENSHELL_VERSION}/install.sh" -o "$RUNNER_TEMP/openshell-install.sh"
+          echo "${OPENSHELL_INSTALLER_SHA256}  $RUNNER_TEMP/openshell-install.sh" | sha256sum -c -
+          sudo loginctl enable-linger "$USER" || true
+          export XDG_RUNTIME_DIR=/run/user/$(id -u)
+          OPENSHELL_VERSION="$OPENSHELL_VERSION" sh "$RUNNER_TEMP/openshell-install.sh"
+
+      - name: Wait for the OpenShell gateway
+        id: gateway
+        if: steps.install.outcome == 'success'
+        continue-on-error: true
+        run: |
+          export XDG_RUNTIME_DIR=/run/user/$(id -u)
+          for i in $(seq 1 30); do
+            if openshell status; then exit 0; fi
+            sleep 3
+          done
+          openshell gateway info || true
+          systemctl --user status openshell-gateway --no-pager || true
+          journalctl --user -u openshell-gateway --no-pager -n 80 || true
+          exit 1
+
+      - name: Run the black-box checks inside the sandbox
+        if: steps.gateway.outcome == 'success'
+        run: |
+          export XDG_RUNTIME_DIR=/run/user/$(id -u)
+          openshell sandbox create --name e2e --no-keep \
+            --from h0x-e2e:ci --policy scripts/e2e/sandbox/policy.yaml \
+            -- env E2E_SANDBOX=1 E2E_ROOT=/sandbox/run bash /sandbox/e2e/run.sh
+
+      - name: Report
+        if: always()
+        run: |
+          if [ "${{ steps.gateway.outcome }}" = success ]; then
+            echo "### sandbox: OpenShell ${OPENSHELL_VERSION} ran the checks (job result decides)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning title=OpenShell sandbox not run::OpenShell ${OPENSHELL_VERSION} could not be installed or its gateway did not start on this runner (install: ${{ steps.install.outcome }}, gateway: ${{ steps.gateway.outcome }}). See the step logs; the OS matrix still ran."
+            echo "### sandbox: NOT RUN (OpenShell install: ${{ steps.install.outcome }}, gateway: ${{ steps.gateway.outcome }})" >> "$GITHUB_STEP_SUMMARY"
+          fi

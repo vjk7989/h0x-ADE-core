@@ -5,3 +5,6 @@ crates/h0x-core/src/bridge/web/*.mjs text eol=lf
 crates/h0x-core/src/bridge/web/*.html text eol=lf
 crates/h0x-core/src/bridge/web/*.css text eol=lf
 crates/h0x-core/src/bridge/web/*.json text eol=lf
+
+# The e2e scripts run under Git Bash on Windows runners: LF only.
+scripts/e2e/** text eol=lf
