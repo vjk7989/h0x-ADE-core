@@ -10,7 +10,10 @@ use ghostty_vt::Rgb;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// The most often a terminal's coalescable status update (same word) is told.
+const STATUS_EVERY: Duration = Duration::from_millis(100);
 
 #[cfg(test)]
 mod tests;
@@ -189,45 +192,99 @@ impl Core {
         }
     }
 
-    /// Applies 7501 reports and tells subscribers what changed.
+    /// Applies 7501 reports and tells subscribers, in order.
+    /// A report that changes the word (and with it a turn, or news) is told at once, as
+    /// it was at that moment: waits and notices follow these. A report that only
+    /// changes a message, progress, title or a record is coalesced: at most one such
+    /// event per terminal per `STATUS_EVERY`, the rest left to a timer, or told just
+    /// before the next word change so the order holds.
     pub fn report_status(&self, st: &mut State, id: u32, reports: &[ghostty_vt::StatusReport]) {
-        let word = |st: &State| st.reg.terminals[&id].status.as_ref().map(|s| s.state.clone());
         let mut word_changed = false;
         for r in reports {
-            let was = word(st);
+            let t = st.reg.terminals.get_mut(&id).expect("live terminal");
+            let was = t.status.as_ref().map(|s| s.state.clone());
+            let may_change = r.state == "prompt" || (r.id.is_empty() && was.as_deref() != Some(r.state));
+            if may_change {
+                self.flush_status(st, id);
+            }
             let t = st.reg.terminals.get_mut(&id).expect("live terminal");
             let change = crate::status::apply(t, r);
-            self.status_changed(st, id, change);
-            word_changed |= word(st) != was;
+            let first_task_finished = Self::settle_first_task(t, &change);
+            let moved = may_change && t.status.as_ref().map(|s| &s.state) != was.as_ref();
+            if moved || change.turn_ended || change.stuck || first_task_finished {
+                word_changed |= moved;
+                t.status_owed = false;
+                t.status_sent = Some(Instant::now());
+                self.announce(st, id, change, first_task_finished);
+            } else if change.status {
+                self.coalesce_status(st, id);
+            }
         }
-        // Losing the holder too (a reboot) leaves no tail to replay: queue a new word,
-        // and with it a turn or news, for immediate persistence. Messages and progress can wait.
-        if word_changed { self.save(st) } else { self.save_soon() }
+        // A new word, and with it a turn or news, would be lost with the holder too (a
+        // reboot): it is saved right away, unless many were saved lately. The rest waits.
+        if word_changed {
+            self.save_paced(st)
+        } else if !reports.is_empty() {
+            self.save_soon()
+        }
+    }
+
+    /// Tells the status now if the last such event is old enough, else leaves it to `status_due`.
+    fn coalesce_status(&self, st: &mut State, id: u32) {
+        let t = st.reg.terminals.get_mut(&id).expect("live terminal");
+        if t.status_sent.is_none_or(|at| at.elapsed() >= STATUS_EVERY) {
+            t.status_sent = Some(Instant::now());
+            t.status_owed = false;
+            self.emit_status(st, id, true, false);
+        } else if !std::mem::replace(&mut t.status_owed, true) {
+            self.status_due.notify_one();
+        }
+    }
+
+    /// Tells a status update that was left waiting for its timer.
+    pub fn flush_status(&self, st: &mut State, id: u32) {
+        let Some(t) = st.reg.terminals.get_mut(&id) else { return };
+        if std::mem::take(&mut t.status_owed) {
+            t.status_sent = Some(Instant::now());
+            self.emit_status(st, id, true, false);
+        }
+    }
+
+    /// Runs for the life of the core: tells the coalesced updates once their window is over.
+    pub async fn flush_statuses_when_due(self: Arc<Self>) {
+        loop {
+            self.status_due.notified().await;
+            tokio::time::sleep(STATUS_EVERY).await;
+            let mut st = self.lock();
+            let owed: Vec<u32> = st.reg.terminals.iter().filter(|(_, t)| t.status_owed).map(|(id, _)| *id).collect();
+            for id in owed {
+                self.flush_status(&mut st, id);
+            }
+        }
     }
 
     pub fn status_changed(&self, st: &mut State, id: u32, change: crate::status::Change) {
+        self.flush_status(st, id);
         let t = st.reg.terminals.get_mut(&id).expect("reported terminal");
-        let first_task_finished = t.first_task_turn.is_some_and(|turn| {
+        let first_task_finished = Self::settle_first_task(t, &change);
+        self.announce(st, id, change, first_task_finished);
+    }
+
+    /// Ends the launch task's first-turn wait if this change finished it.
+    fn settle_first_task(t: &mut crate::terminals::Terminal, change: &crate::status::Change) -> bool {
+        let finished = t.first_task_turn.is_some_and(|turn| {
             t.turn > turn
                 || (change.root_report
                     && t.status.as_ref().is_some_and(|s| matches!(s.state.as_str(), "done" | "blocked" | "error")))
         });
-        if first_task_finished {
+        if finished {
             t.first_task_turn = None;
         }
-        let (status, records, turn, reported) = (t.status.clone(), t.records.clone(), t.turn, t.reported);
-        if change.status {
-            self.emit(
-                st,
-                "status",
-                id,
-                serde_json::json!({"status": status, "records": records, "reported": reported}),
-            );
-        }
-        if change.turn_ended {
-            let state = status.map(|s| s.state);
-            self.emit(st, "turn", id, serde_json::json!({"turn": turn, "state": state}));
-        }
+        finished
+    }
+
+    fn announce(&self, st: &mut State, id: u32, change: crate::status::Change, first_task_finished: bool) {
+        self.emit_status(st, id, change.status, change.turn_ended);
         if (change.turn_ended || change.stuck || first_task_finished) && st.reg.terminals[&id].is_live() {
             self.news(st, id);
         }

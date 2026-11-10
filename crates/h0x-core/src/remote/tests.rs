@@ -465,3 +465,41 @@ fn a_machine_cannot_pass_its_terminals_off_as_ours() {
     drop(core);
     let _ = std::fs::remove_dir_all(root);
 }
+
+#[tokio::test]
+async fn a_batch_of_status_reports_reaches_a_mirror_with_the_whole_record_set() {
+    let (core, root, machine) = here_with_rohan("status-batch");
+    // What a terminal here tells subscribers stands in for what rohan's sends us.
+    let id = *core.lock().reg.terminals.keys().next().unwrap();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    core.subscribe(&mut core.lock(), Filter::default(), Sink::Waiter(tx));
+    let report = |state: &'static str, id: &str| ghostty_vt::StatusReport {
+        state,
+        kind: None,
+        progress: None,
+        id: id.into(),
+        app: String::new(),
+        title: String::new(),
+        message: String::new(),
+    };
+    let batch = [report("working", ""), report("working", "a"), report("done", "a/b"), report("idle", "")];
+    core.report_status(&mut core.lock(), id, &batch);
+    let mut wire = Vec::new();
+    while let Ok(params) = rx.try_recv() {
+        wire.extend_from_slice(json!({"method": "event", "params": params}).to_string().as_bytes());
+        wire.push(b'\n');
+    }
+    let address = crate::terminals::address(id);
+    mirror_replace(&core, &machine, vec![json!({"address": address, "state": "live", "turn": 0})]);
+    let (frames, _rx) = mpsc::unbounded_channel();
+    let line = Line::new(frames, &json!({}));
+    mirror_events(&core, &machine, &line, &wire);
+    let here = core.lock().reg.terminals[&id].clone();
+    let mirrored = core.lock().mirrors[&machine.id][&format!("rohan/{address}")].clone();
+    assert_eq!(mirrored["records"], json!(here.records), "clients replace the records with the event's");
+    assert_eq!(mirrored["records"].as_object().map(|r| r.len()), Some(2));
+    assert_eq!((mirrored["status"]["state"].as_str(), mirrored["turn"].as_u64()), (Some("idle"), Some(1)));
+    assert_eq!(mirrored["reported"], true);
+    drop(core);
+    let _ = std::fs::remove_dir_all(root);
+}

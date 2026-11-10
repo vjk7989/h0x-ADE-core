@@ -111,6 +111,28 @@ impl Core {
         self.deliver(st, kind, &crate::terminals::address(id), data, &t, was.map(record).as_ref());
     }
 
+    /// The status and/or turn event of a status change. The terminal is serialized once
+    /// for both, and not at all when nobody listens.
+    pub fn emit_status(&self, st: &mut State, id: u32, status: bool, turn: bool) {
+        let Some(t) = st.reg.terminals.get(&id) else { return };
+        if st.events.subs.is_empty() {
+            st.events.seq += status as u64 + turn as u64;
+            self.changed.notify_waiters();
+            return;
+        }
+        let rec = record(t);
+        let address = crate::terminals::address(id);
+        if status {
+            let records = rec.get("records").cloned().unwrap_or_else(|| json!({}));
+            let data = json!({"status": rec["status"], "records": records, "reported": rec["reported"]});
+            self.deliver(st, "status", &address, data, &rec, None);
+        }
+        if turn {
+            let data = json!({"turn": rec["turn"], "state": rec["status"]["state"]});
+            self.deliver(st, "turn", &address, data, &rec, None);
+        }
+    }
+
     /// One fact change about the terminal at `address` to every subscriber it
     /// concerns: `record` is it now (or as it was, when removed), `was` before.
     pub fn deliver(&self, st: &mut State, kind: &str, address: &str, data: Value, record: &Value, was: Option<&Value>) {
@@ -131,7 +153,7 @@ impl Core {
         st.events.seq += 1;
         params["seq"] = st.events.seq.into();
         let afar = params["machine"].is_string() || params["terminal"].as_str().is_some_and(|a| a.contains('/'));
-        let plain = notification("event", params.clone());
+        let plain = std::cell::LazyCell::new(|| notification("event", params.clone()));
         let with_record = || {
             let mut params = params.clone();
             params["data"]["record"] = record.clone();
@@ -143,7 +165,7 @@ impl Core {
             if (!now && !before) || (afar && sub.filter.here_only) {
                 return true;
             }
-            let line = if now && was.is_some() && !before { with_record() } else { plain.clone() };
+            let line = if now && was.is_some() && !before { with_record() } else { (*plain).clone() };
             match &sub.sink {
                 Sink::Framed { conn, channel } => {
                     let fresh = || notification("missed", self.snapshot(st, &sub.filter));
