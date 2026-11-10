@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-11-11
+
+Security release from the final QA round.
+
+### Fixed
+- Built on Ghostty 1.4.0 (Zig 0.17), which fixes four terminal-engine advisories (GHSA-w9q4-5jvv-mcv4, GHSA-qjfx-r533-6vx3, GHSA-jqr7-69mm-v35h, GHSA-3r5j-c6rj-xq2v). Terminals saved by the previous version still restore.
+- A program flooding status reports no longer freezes the core: every word change is still told at once and in order, routine updates are coalesced, and saves are paced.
+- `attach` filters split screen-mode sequences across reads, never holds back more than 64 bytes, and filters in one pass.
+- keep_awake runs its helpers from fixed system paths only and never signals a helper it has already reaped.
+- Ending a terminal falls back to its leader process when the group signal is refused (sandboxes such as OpenShell) and never signals an invalid process id.
+
 ## [0.1.13] - 2026-11-10
 
 ### Added
