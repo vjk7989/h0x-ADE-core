@@ -142,6 +142,8 @@ impl Link {
 }
 
 const SAVE_SOON: Duration = Duration::from_secs(2);
+/// A save that takes this long under the lock makes `save_unless_busy` pace itself.
+const SAVE_COSTLY: Duration = Duration::from_millis(2);
 /// At most one reconnect per holder in this long: a failure that comes back is not retried.
 const RELINK_GAP: Duration = Duration::from_secs(5);
 /// How long a reconnect waits for the holder's welcome.
@@ -231,10 +233,13 @@ impl Core {
 
     /// Saves now, unless the last save was so recent that saving this often would take
     /// more than about 5% of the core (a large registry, a program flipping its status
-    /// all the time): then `save_soon` covers it. A small registry saves every time.
+    /// all the time): then `save_soon` covers it. A registry that saves in under `SAVE_COSTLY` saves every time.
     pub fn save_unless_busy(&self, st: &State) {
-        let busy =
-            self.last_save.lock().unwrap_or_else(|p| p.into_inner()).is_some_and(|(at, cost)| at.elapsed() < cost * 20);
+        let busy = self
+            .last_save
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_some_and(|(at, cost)| cost >= SAVE_COSTLY && at.elapsed() < cost * 20);
         if busy { self.save_soon() } else { self.save(st) }
     }
 

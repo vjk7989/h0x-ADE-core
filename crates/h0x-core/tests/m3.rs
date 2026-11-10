@@ -109,10 +109,11 @@ fn a_subscriber_that_falls_behind_gets_missed_and_a_snapshot() {
     s.json(&["server", "start"]);
     let mut slow = s.connect();
     slow.call(1, "events.subscribe", json!({}));
-    // Flood events, not durable turn boundaries: each new status word must be synced to disk.
+    // Flood events, not durable turn boundaries. One status event covers all the reports
+    // of an output chunk, so each report is a chunk of its own (a pause between them).
     let flood = script(
         &s,
-        "i=0; while [ $i -lt 3000 ]; do r state=working:progress=0; r state=working:progress=1; i=$((i+1)); done; r state=done; sleep 100",
+        "i=0; while [ $i -lt 2500 ]; do r state=working:progress=$((i%2)); sleep 0.002; i=$((i+1)); done; r state=done; sleep 100",
     );
     let t = run(&s, &["sh", "-c", &flood]);
     wait_status(&s, &t, "done");
