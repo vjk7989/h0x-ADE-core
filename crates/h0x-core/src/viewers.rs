@@ -192,21 +192,37 @@ impl Core {
     /// Applies 7501 reports and tells subscribers what changed: once for the whole
     /// batch, not per report (a program can print thousands in one chunk). The
     /// event keeps its wire shape (the whole record set, which clients replace), so
-    /// it is built once. The registry is saved by the debounced `save_soon`.
+    /// it is built once.
     pub fn report_status(&self, st: &mut State, id: u32, reports: &[ghostty_vt::StatusReport]) {
         let mut batch = crate::status::Change::default();
-        let mut first_task_finished = false;
+        let (mut first_task_finished, mut word_changed) = (false, false);
+        // A report that got the program stuck (blocked, error) and was undone in the
+        // same chunk still gets its own event: waiters must not miss a quick flicker.
+        let mut flicker = None;
         for r in reports {
             let t = st.reg.terminals.get_mut(&id).expect("live terminal");
+            let was = t.status.as_ref().map(|s| s.state.clone());
             let change = crate::status::apply(t, r);
+            word_changed |= t.status.as_ref().map(|s| &s.state) != was.as_ref();
+            if change.stuck && flicker.is_none() {
+                flicker = t.status.clone();
+            }
             first_task_finished |= Self::settle_first_task(t, &change);
             batch.status |= change.status;
             batch.root_report |= change.root_report;
             batch.turn_ended |= change.turn_ended;
             batch.stuck |= change.stuck;
         }
+        if let Some(stuck) = flicker.filter(|f| st.reg.terminals[&id].status.as_ref() != Some(f)) {
+            let t = &st.reg.terminals[&id];
+            let data = serde_json::json!({"status": stuck, "records": t.records, "reported": t.reported});
+            self.emit(st, "status", id, data);
+        }
         self.announce(st, id, batch, first_task_finished);
-        self.save_soon();
+        // A new word, and with it a turn or news, would be lost with the holder too
+        // (a reboot): it is saved right away, unless saving is already costing too much.
+        // Messages and progress can wait.
+        if word_changed { self.save_unless_busy(st) } else { self.save_soon() }
     }
 
     pub fn status_changed(&self, st: &mut State, id: u32, change: crate::status::Change) {

@@ -562,13 +562,24 @@ async fn a_flood_of_status_flips_saves_once_and_emits_one_event_per_batch() {
         assert_eq!(st.events.seq - seq, 2);
     }
     assert!(started.elapsed() < Duration::from_secs(5), "4000 flips took {:?}", started.elapsed());
-    assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), saved, "nothing is saved per report");
+    let written = || writes.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(written() <= saved + 1, "at most one save for the whole burst, not one per report");
     core.save_if_dirty();
     core.flush_saved().await.unwrap();
-    assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), saved + 1, "one save for the burst, final state kept");
+    assert_eq!(written(), saved + 1, "the final state is saved once, now or when due");
     core.save_if_dirty();
     core.flush_saved().await.unwrap();
-    assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), saved + 1, "clean state is not saved again");
+    assert_eq!(written(), saved + 1, "clean state is not saved again");
+
+    // A blocked word undone in the same chunk still gets its own event, for waiters.
+    let seq = core.lock().events.seq;
+    let flicker = [
+        report("working", "", String::new()),
+        report("blocked", "", String::new()),
+        report("working", "", String::new()),
+    ];
+    core.report_status(&mut core.lock(), id, &flicker);
+    assert_eq!(core.lock().events.seq - seq, 3, "the flicker, the final status and the turn");
     drop(core);
     remove_root(&root);
 }

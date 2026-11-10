@@ -39,6 +39,8 @@ pub struct Core {
     holder_start: Mutex<()>,
     /// The registry changed in a way a crash may lose: `save_soon` writes it shortly.
     dirty: std::sync::atomic::AtomicBool,
+    /// When the last save finished and how long its serialization took (under the lock).
+    last_save: Mutex<Option<(Instant, Duration)>>,
     save_due: Notify,
     registry_writer: RegistryWriter,
 }
@@ -190,6 +192,7 @@ impl Core {
             sweeps: Default::default(),
             holder_start: Default::default(),
             dirty: Default::default(),
+            last_save: Default::default(),
             save_due: Notify::new(),
         });
         core.attach_all()?;
@@ -220,8 +223,19 @@ impl Core {
 
     pub fn save(&self, st: &State) {
         self.dirty.store(false, std::sync::atomic::Ordering::SeqCst);
+        let started = Instant::now();
         let bytes = serde_json::to_vec(&st.reg).expect("registry serializes");
+        *self.last_save.lock().unwrap_or_else(|p| p.into_inner()) = Some((Instant::now(), started.elapsed()));
         self.registry_writer.save(bytes);
+    }
+
+    /// Saves now, unless the last save was so recent that saving this often would take
+    /// more than about 5% of the core (a large registry, a program flipping its status
+    /// all the time): then `save_soon` covers it. A small registry saves every time.
+    pub fn save_unless_busy(&self, st: &State) {
+        let busy =
+            self.last_save.lock().unwrap_or_else(|p| p.into_inner()).is_some_and(|(at, cost)| at.elapsed() < cost * 20);
+        if busy { self.save_soon() } else { self.save(st) }
     }
 
     /// Acknowledged mutations wait here without holding the state lock or blocking the executor.
