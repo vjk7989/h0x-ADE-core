@@ -90,6 +90,13 @@ fn parses_reads_and_round_trips_a_snapshot() {
     t.write(b"m\x1b[?1049h");
     assert!(t.alt_screen());
     assert!(Terminal::restore(b"garbage", 1 << 20).is_none());
+    // A snapshot an older Ghostty wrote (here: cut short, or with a foreign
+    // header) is refused, never half-restored; callers then start a fresh screen.
+    assert!(Terminal::restore(&snap[..snap.len() / 2], 1 << 20).is_none());
+    assert!(Terminal::restore(&snap[..4], 1 << 20).is_none());
+    let mut foreign = snap;
+    foreign[0] ^= 0xff;
+    assert!(Terminal::restore(&foreign, 1 << 20).is_none());
 }
 
 #[test]
@@ -234,4 +241,67 @@ fn grapheme_clustering_is_on_like_ghostty() {
     assert_eq!(t.plain_text().trim_end(), "\u{270d}\u{fe0f}!");
     t.write(b"\x1bc");
     assert!(t.dec_mode(2027), "a reset keeps it on");
+}
+
+// Regression tests for the Ghostty fixes of 2026-10-27 (pin v1.4.0). They would
+// crash, or corrupt the terminal, on the previous pin.
+
+#[test]
+fn narrowing_a_65535_column_terminal_does_not_overflow_the_row_count() {
+    // GHSA-jqr7-69mm-v35h: a page this wide, narrowed, holds more than 65535 rows.
+    let mut t = Terminal::new(u16::MAX, 24, 1 << 20);
+    t.write(b"wide");
+    t.resize(4, 24);
+    assert_eq!(t.size(), (4, 24));
+    t.write(b"\r\nok");
+    assert!(t.plain_text().contains("ok"));
+
+    // The same through a snapshot, the way a crafted one reaches the decoder.
+    let wide = Terminal::new(u16::MAX, 24, 1 << 20);
+    let mut back = Terminal::restore(&wide.snapshot().unwrap(), 1 << 20).unwrap();
+    back.resize(3, 24);
+    assert_eq!(back.size(), (3, 24));
+}
+
+#[test]
+fn line_feeds_on_a_one_row_terminal_with_a_scrollback_limit_do_not_free_the_cursor_page() {
+    // GHSA-qjfx-r533-6vx3: reflow a long hyperlinked line wider, then fill the page.
+    let mut t = Terminal::new(10, 1, 1 << 12);
+    t.write(b"\x1b]8;;http://a.example\x1b\\");
+    t.write(&[b'x'; 200]);
+    t.resize(200, 1);
+    for _ in 0..4000 {
+        t.write(b"\n");
+    }
+    t.write(b"\x1b]8;;\x1b\\done");
+    assert!(t.plain_text().contains("done"));
+}
+
+#[test]
+fn clearing_the_screen_with_a_styled_hyperlinked_cursor_and_a_tiny_scrollback_is_safe() {
+    // GHSA-w9q4-5jvv-mcv4: CSI 22 J / CSI 2 J may prune the cursor's page.
+    for clear in [b"\x1b[22J".as_slice(), b"\x1b[2J"] {
+        let mut t = Terminal::new(80, 24, 1);
+        t.write(b"\x1b[1;31m\x1b]8;;http://a.example\x1b\\");
+        for i in 0..200 {
+            t.write(format!("line {i}\r\n").as_bytes());
+            t.write(clear);
+            t.write(b"\x1b[4;32mtext");
+        }
+        t.write(b"\x1b[0m\x1b]8;;\x1b\\\x1b[Hend");
+        assert!(t.plain_text().contains("end"));
+    }
+}
+
+#[test]
+fn kitty_clipboard_alias_updates_stay_bounded() {
+    // GHSA-3r5j-c6rj-xq2v: an open OSC 5522 write transaction updating one alias.
+    // We install no clipboard_write callback, so Ghostty rejects the transaction (with an error reply); no crash.
+    let mut t = Terminal::new(80, 24, 0);
+    t.write(b"\x1b]5522;type=write\x1b\\");
+    for _ in 0..20_000 {
+        t.write(b"\x1b]5522;type=walias:mime=text/plain;dGV4dC9wbGFpbg==\x1b\\");
+    }
+    t.write(b"ok");
+    assert!(t.plain_text().contains("ok"));
 }

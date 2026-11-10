@@ -98,7 +98,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.16.0
+          version: 0.17.0
       # Zig has no download timeout: a stalled GitHub fetch hung macOS builds.
       # Fetch the packages here, with time limits and retries, before cargo's
       # build script runs `zig build`; it then finds them in the cache.
@@ -107,7 +107,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .zig-cache
-          key: zig-pkg-v1-${{ runner.os }}-${{ runner.arch }}-0.16.0-${{ hashFiles('vendor/ghostty/**/build.zig.zon') }}
+          key: zig-pkg-v1-${{ runner.os }}-${{ runner.arch }}-0.17.0-${{ hashFiles('vendor/ghostty/**/build.zig.zon') }}
       - name: Fetch Zig packages
         shell: bash
         timeout-minutes: 20
@@ -162,7 +162,7 @@ jobs:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          version: 0.16.0
+          version: 0.17.0
       # Zig has no download timeout: a stalled GitHub fetch hung macOS builds.
       # Fetch the packages here, with time limits and retries, before cargo's
       # build script runs `zig build`; it then finds them in the cache.
@@ -171,7 +171,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .zig-cache
-          key: zig-pkg-v1-${{ runner.os }}-${{ runner.arch }}-0.16.0-${{ hashFiles('vendor/ghostty/**/build.zig.zon') }}
+          key: zig-pkg-v1-${{ runner.os }}-${{ runner.arch }}-0.17.0-${{ hashFiles('vendor/ghostty/**/build.zig.zon') }}
       - name: Fetch Zig packages
         shell: bash
         timeout-minutes: 20

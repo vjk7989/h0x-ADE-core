@@ -168,7 +168,7 @@ For a quick lookup, run `h0x-core --help` or a command's help, such as `h0x-core
 
 ## Build from source
 
-You need Rust 1.95 or newer and Zig 0.16.0.
+You need Rust 1.95 or newer and Zig 0.17.0.
 
 ```sh
 git clone --recurse-submodules https://github.com/vjk7989/h0x-ADE-core
