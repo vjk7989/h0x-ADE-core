@@ -3,15 +3,15 @@ use std::process::{Command, Stdio};
 
 #[test]
 fn a_closed_stdout_exits_141_without_a_panic() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_h0x-core"))
+    // The read end is closed before the child exists, so its first write cannot succeed.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let output = Command::new(env!("CARGO_BIN_EXE_h0x-core"))
         .arg("--skill")
-        .stdout(Stdio::piped())
+        .stdout(writer)
         .stderr(Stdio::piped())
-        .spawn()
+        .output()
         .unwrap();
-    // Close our end before the child starts printing.
-    drop(child.stdout.take());
-    let output = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(141), "stderr: {stderr}");
     assert!(!stderr.contains("panicked"), "stderr: {stderr}");

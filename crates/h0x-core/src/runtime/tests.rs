@@ -545,6 +545,9 @@ async fn a_flood_of_status_flips_costs_no_event_text_and_few_saves() {
     let (saved, seq) = (writes.load(std::sync::atomic::Ordering::SeqCst), core.lock().events.seq);
     let flips: Vec<_> =
         (0..4000).map(|i| report(if i % 2 == 0 { "working" } else { "idle" }, "", String::new())).collect();
+    // The burst window is one that cannot end (an instant ahead of now has no time elapsed): a slow
+    // runner cannot cross into a new second while the flips go in.
+    *core.word_saves.lock().unwrap() = (Instant::now() + Duration::from_secs(3600), 0);
     let started = Instant::now();
     {
         let mut st = core.lock();
@@ -617,10 +620,15 @@ async fn new_words_are_saved_at_once_up_to_a_burst_a_second_and_then_paced() {
     core.flush_saved().await.unwrap();
     assert_eq!((core.lock().events.seq, writes.load(SeqCst)), (seq, 0), "an empty batch tells and saves nothing");
 
+    // The burst window cannot end (an instant ahead of now has no time elapsed), so a slow runner
+    // cannot cross into a new second. And each flip is flushed before the next: the registry writer
+    // keeps only the newest of the saves queued behind a busy write, so without it the count of
+    // writes would depend on how fast the writer thread wakes.
+    *core.word_saves.lock().unwrap() = (Instant::now() + Duration::from_secs(3600), 0);
     for i in 0..10 {
         core.report_status(&mut core.lock(), id, &[root_report(if i % 2 == 0 { "working" } else { "idle" })]);
+        core.flush_saved().await.unwrap();
     }
-    core.flush_saved().await.unwrap();
     assert_eq!(writes.load(SeqCst), SAVE_BURST as usize, "the first words of a second are saved at once");
     assert!(core.dirty.load(SeqCst) && core.save_urgent.load(SeqCst), "the rest is owed within SAVE_PACE");
     core.save_if_dirty();

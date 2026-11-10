@@ -191,3 +191,19 @@ pub mod signal {
 #[cfg(test)]
 #[path = "environment_tests.rs"]
 mod environment_tests;
+
+/// Where tests keep a core's files. Unix socket paths are length-limited and the macOS temp dir is
+/// long, so unix uses `/var/tmp`. Windows has neither `/var/tmp` (it would be `<drive>:\var\tmp`)
+/// nor a TEMP that is safe (it may be on C:): it uses a dir next to the test binary, in the cargo
+/// target dir.
+#[cfg(test)]
+pub fn test_scratch() -> std::path::PathBuf {
+    if cfg!(windows) {
+        let exe = std::env::current_exe().unwrap();
+        let dir = exe.parent().and_then(|deps| deps.parent()).unwrap().join("h0x-test-scratch");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    } else {
+        "/var/tmp".into()
+    }
+}

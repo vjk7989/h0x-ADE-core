@@ -575,8 +575,8 @@ mod tests {
 
     #[test]
     fn a_caller_from_another_machine_cannot_break_out_of_its_tag() {
-        let root = std::path::PathBuf::from(format!(
-            "/var/tmp/h0x-core-notes-tag-{}-{}",
+        let root = crate::platform::test_scratch().join(format!(
+            "h0x-core-notes-tag-{}-{}",
             std::process::id(),
             crate::platform::random_hex()
         ));

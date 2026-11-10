@@ -104,19 +104,58 @@ impl Inhibitor for Os {
 #[derive(Default)]
 pub struct Os(Option<std::process::Child>);
 
+/// A helper that ships with the system, at a fixed place. Never looked up on PATH: a planted
+/// binary earlier on it would run with the user's rights. Debug builds only: the integration
+/// tests point `H0X_CORE_HELPER_DIRS` (absolute dirs; empty and relative entries are dropped, and
+/// nothing valid left means the system dirs) at a stand-in; a release build never reads it.
+/// A file that is not executable is reported and the search goes on.
+#[cfg(unix)]
+fn system_helper(name: &str) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let set = if cfg!(debug_assertions) { std::env::var("H0X_CORE_HELPER_DIRS").ok() } else { None };
+    let mut dirs: Vec<&str> =
+        set.as_deref().unwrap_or("").split(':').filter(|d| std::path::Path::new(d).is_absolute()).collect();
+    if dirs.is_empty() {
+        dirs = vec!["/usr/bin", "/bin"];
+    }
+    for dir in dirs {
+        let path = std::path::Path::new(dir).join(name);
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        if meta.permissions().mode() & 0o111 == 0 {
+            eprintln!("core: keep_awake: cannot start {}: permission denied (not executable)", path.display());
+            continue;
+        }
+        return Some(path);
+    }
+    None
+}
+
 #[cfg(unix)]
 impl Inhibitor for Os {
     fn hold(&mut self) -> bool {
         use std::os::unix::process::CommandExt;
         let pid = std::process::id().to_string();
         let mut helper = if cfg!(target_os = "macos") {
-            let mut c = std::process::Command::new("caffeinate");
+            let mut c = std::process::Command::new("/usr/bin/caffeinate");
             c.args(["-i", "-w", &pid]);
             c
         } else {
-            let mut c = std::process::Command::new("systemd-inhibit");
+            let mut found = Vec::new();
+            for name in ["systemd-inhibit", "tail"] {
+                match system_helper(name) {
+                    Some(path) => found.push(path),
+                    None => {
+                        eprintln!("core: keep_awake: cannot start {name}: not found in /usr/bin or /bin");
+                        return false;
+                    }
+                }
+            }
+            let mut c = std::process::Command::new(&found[0]);
             c.args(["--what=sleep", "--mode=block", "--who=h0x-core", "--why=an agent is working"]);
-            c.args(["tail", "--pid", &pid, "-f", "/dev/null"]);
+            c.arg(&found[1]).args(["--pid", &pid, "-f", "/dev/null"]);
             c
         };
         // Its own group: release ends the helper and whatever it started (`tail` under systemd-inhibit).
@@ -133,7 +172,16 @@ impl Inhibitor for Os {
     }
 
     fn alive(&mut self) -> bool {
-        self.0.as_mut().is_some_and(|child| child.try_wait().is_ok_and(|exited| exited.is_none()))
+        let Some(child) = self.0.as_mut() else { return false };
+        match child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) => {
+                // Reaped: its pid may be reused, so release must not signal that group any more.
+                self.0 = None;
+                false
+            }
+            Err(_) => false,
+        }
     }
 
     fn release(&mut self) {
@@ -329,5 +377,43 @@ mod tests {
         awake.update(true, true);
         assert!(awake.holding());
         assert_eq!(log(&fake), ["release", "hold"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reaped_helper_is_forgotten_so_release_never_signals_its_old_group() {
+        let mut os = Os(Some(std::process::Command::new("/bin/sh").args(["-c", "exit 0"]).spawn().unwrap()));
+        while os.alive() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(os.0.is_none(), "the reaped child is dropped");
+        os.release();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_helpers_come_from_fixed_system_dirs_only() {
+        let sh = system_helper("sh").unwrap();
+        assert!(sh.starts_with("/usr/bin") || sh.starts_with("/bin"), "{sh:?}");
+        assert!(system_helper("h0x-no-such-helper").is_none());
+    }
+
+    /// Runs under `cargo test --release` only: there the override must be dead. (No other test
+    /// can race on the variable: a release build never reads it.)
+    #[cfg(all(unix, not(debug_assertions)))]
+    #[test]
+    fn a_release_build_ignores_the_helper_dir_override() {
+        let dir = std::env::temp_dir().join(format!("h0x-core-helper-dirs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("h0x-planted-helper"), "#!/bin/sh\n").unwrap();
+        std::fs::write(dir.join("sh"), "#!/bin/sh\n").unwrap();
+        unsafe { std::env::set_var("H0X_CORE_HELPER_DIRS", &dir) };
+        let planted = system_helper("h0x-planted-helper");
+        let sh = system_helper("sh");
+        unsafe { std::env::remove_var("H0X_CORE_HELPER_DIRS") };
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(planted, None);
+        let sh = sh.unwrap();
+        assert!(sh.starts_with("/usr/bin") || sh.starts_with("/bin"), "{sh:?}");
     }
 }
