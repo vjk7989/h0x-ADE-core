@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# CI: download every Zig package of a vendored Ghostty tree into Zig's global
+# cache (ZIG_GLOBAL_CACHE_DIR) before cargo's build script runs `zig build`.
+# Zig has no download timeout: a stalled GitHub fetch hung macOS builds for
+# hours. Here each attempt gets a hard limit, and a failure is retried.
+# Usage: scripts/zig-fetch <vendored ghostty dir>
+set -u
+cd "${1:?usage: scripts/zig-fetch <vendored ghostty dir>}"
+
+# GNU timeout (Linux, Git Bash), gtimeout (macOS coreutils), else perl's alarm
+# (macOS has neither timeout nor, by default, coreutils). Windows' timeout.exe
+# is a sleep command: only GNU's answers --version.
+limit() {
+  if timeout --version >/dev/null 2>&1; then timeout "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then gtimeout "$@"
+  else perl -e 'alarm shift; exec @ARGV or die "exec: $!"' "$@"
+  fi
+}
+
+for attempt in 1 2 3; do
+  start=$SECONDS
+  # =all: also the lazy dependencies, which the build fetches on demand.
+  if limit 300 "${ZIG:-zig}" build --fetch=all; then
+    echo "zig packages fetched in $((SECONDS - start)) s (attempt $attempt)"
+    exit 0
+  fi
+  echo "zig fetch attempt $attempt failed after $((SECONDS - start)) s"
+  [ "$attempt" -lt 3 ] && sleep 20
+done
+exit 1
