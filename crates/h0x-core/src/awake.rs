@@ -381,4 +381,23 @@ mod tests {
         assert!(sh.starts_with("/usr/bin") || sh.starts_with("/bin"), "{sh:?}");
         assert!(system_helper("h0x-no-such-helper").is_none());
     }
+
+    /// Runs under `cargo test --release` only: there the override must be dead. (No other test
+    /// can race on the variable: a release build never reads it.)
+    #[cfg(all(unix, not(debug_assertions)))]
+    #[test]
+    fn a_release_build_ignores_the_helper_dir_override() {
+        let dir = std::env::temp_dir().join(format!("h0x-core-helper-dirs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("h0x-planted-helper"), "#!/bin/sh\n").unwrap();
+        std::fs::write(dir.join("sh"), "#!/bin/sh\n").unwrap();
+        unsafe { std::env::set_var("H0X_CORE_HELPER_DIRS", &dir) };
+        let planted = system_helper("h0x-planted-helper");
+        let sh = system_helper("sh");
+        unsafe { std::env::remove_var("H0X_CORE_HELPER_DIRS") };
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(planted, None);
+        let sh = sh.unwrap();
+        assert!(sh.starts_with("/usr/bin") || sh.starts_with("/bin"), "{sh:?}");
+    }
 }

@@ -570,6 +570,67 @@ mod tests {
             assert!(!out.windows(8).any(|w| w == b"\x1b[?1004l" || w == b"\x1b[?9001l"));
         }
     }
+
+    #[test]
+    fn interleaved_and_joined_sequences_split_across_two_or_three_payloads_give_what_the_whole_gives() {
+        for input in [
+            &b"a\x1b[?9001h\x1b[?1004lb\x1b[?9001l\x1b[?1004l\x1b[?9001hc"[..],
+            b"\x1b[?1004l\x1b[?9001l\x1b[?1004l",
+            b"x\x1b[?900\x1b[?9001l1hy",
+            b"x\x1b[?100\x1b[?9001h4ly",
+            b"\x1b[?10\x1b[?900\x1b[?9001l1h04l",
+        ] {
+            let whole = shown(input).into_owned();
+            // i == j or i == 0 is a split into two payloads; otherwise three.
+            for i in 0..=input.len() {
+                for j in i..=input.len() {
+                    let mut held = Vec::new();
+                    let mut got = shown_stream(&mut held, &input[..i]);
+                    got.extend(shown_stream(&mut held, &input[i..j]));
+                    got.extend(shown_stream(&mut held, &input[j..]));
+                    got.extend(finish(&mut held));
+                    assert_eq!(
+                        String::from_utf8_lossy(&got),
+                        String::from_utf8_lossy(&whole),
+                        "{:?} split at {i} and {j}",
+                        String::from_utf8_lossy(input)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_large_stream_cut_into_odd_sized_reads_is_filtered_at_every_boundary() {
+        let unit = b"x\x1b[?9001h\x1b[?1004l\x1b[?9001l";
+        let input = unit.repeat(131_072);
+        let want = b"x\x1b[?1004h".repeat(131_072);
+        assert!(*shown(&input) == want[..], "the whole {} B payload, filtered", input.len());
+        // 4093 is prime and not a multiple of the unit, so the cuts land on every offset in it.
+        let mut held = Vec::new();
+        let mut got = Vec::with_capacity(want.len());
+        for read in input.chunks(4093) {
+            got.extend(shown_stream(&mut held, read));
+            assert!(held.len() < 8, "at most a partial sequence is held, not {} B", held.len());
+        }
+        got.extend(finish(&mut held));
+        assert!(got == want, "a {} B stream differs from the whole once filtered", input.len());
+    }
+
+    #[test]
+    fn near_misses_ending_in_h_or_l_are_passed_on_without_a_copy() {
+        let large = [b"\x1b[?9002h\x1b[?1005l\x1b[?1004h".repeat(1 << 15), b"\x1b[?9001".to_vec()].concat();
+        for payload in
+            [&b"\x1b[?9002h"[..], b"\x1b[?1005l", b"\x1b[?9001x", b"h\x1bl", b"\x1b[?9001", b"\x1b?9001h", &large[..]]
+        {
+            let out = shown(payload);
+            let std::borrow::Cow::Borrowed(out) = out else {
+                panic!("{:?} was copied", String::from_utf8_lossy(&payload[..payload.len().min(16)]))
+            };
+            assert!(std::ptr::eq(out, payload), "the payload itself, not an equal copy");
+        }
+    }
+
     #[test]
     fn detach_chord_is_found_in_every_keyboard_encoding() {
         for input in [

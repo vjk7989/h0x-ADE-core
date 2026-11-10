@@ -416,6 +416,58 @@ mod tests {
         assert_eq!(calls.take(), [(42, libc::SIGKILL)]);
     }
 
+    #[test]
+    fn a_denied_leader_kill_after_a_denied_group_kill_is_tried_once_without_a_panic() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let denied = |pid: i32, signal: i32| {
+            calls.borrow_mut().push((pid, signal));
+            Err(io::Error::from_raw_os_error(libc::EPERM))
+        };
+        signal_group(42, libc::SIGTERM, denied, denied);
+        assert_eq!(calls.take(), [(42, libc::SIGTERM), (42, libc::SIGTERM)], "group, then the leader, then nothing");
+    }
+
+    #[test]
+    fn the_leader_fallback_never_signals_pid_0_1_or_a_negative_pid() {
+        // kill(0) is the caller's own group, kill(1) is init, kill(-n) is a whole group, kill(-1) is everyone.
+        for pgid in [0, 1, -1, -42, i32::MIN] {
+            let pids = std::cell::RefCell::new(Vec::new());
+            let denied = |_: i32, _: i32| Err(io::Error::from_raw_os_error(libc::EPERM));
+            signal_group(pgid, libc::SIGKILL, denied, |pid: i32, _: i32| {
+                pids.borrow_mut().push(pid);
+                Ok(())
+            });
+            assert_eq!(pids.take(), [0; 0], "group {pgid} was denied: no single pid may be signalled");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_foreground_job_in_its_own_group_is_signalled_with_the_program() {
+        let env = [("PATH".to_string(), "/usr/bin:/bin".to_string())].into();
+        // `set -m` gives `sleep` its own group and puts it in the foreground; `; :` keeps sh from exec'ing it.
+        let argv = ["/bin/sh", "-c", "set -m; sleep 100; :"].map(String::from);
+        let (pty, mut child) = spawn_pty(&argv, &env, "/", 80, 24).unwrap();
+        let program = child.id() as i32;
+        let start = std::time::Instant::now();
+        let job = loop {
+            let fg = pty.foreground();
+            if fg > 0 && fg != program {
+                break fg;
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(10), "no foreground job (fg {fg})");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        pty.signal(child.id(), libc::SIGKILL);
+        assert_eq!(wait(&mut child).unwrap(), (None, Some(libc::SIGKILL)));
+        // Its parent is gone, so it may linger as a zombie until it is reaped: dead either way.
+        let gone = || !std::fs::read_to_string(format!("/proc/{job}/stat")).is_ok_and(|s| !s.contains(") Z "));
+        while !gone() {
+            assert!(start.elapsed() < std::time::Duration::from_secs(10), "the foreground job {job} outlived the kill");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     fn dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("h0x-core-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
