@@ -104,19 +104,30 @@ impl Inhibitor for Os {
 #[derive(Default)]
 pub struct Os(Option<std::process::Child>);
 
+/// A helper that ships with the system, at a fixed place. Never looked up on PATH: a planted
+/// binary earlier on it would run with the user's rights.
+#[cfg(unix)]
+fn system_helper(name: &str) -> Option<std::path::PathBuf> {
+    ["/usr/bin", "/bin"].iter().map(|dir| std::path::Path::new(dir).join(name)).find(|p| p.is_file())
+}
+
 #[cfg(unix)]
 impl Inhibitor for Os {
     fn hold(&mut self) -> bool {
         use std::os::unix::process::CommandExt;
         let pid = std::process::id().to_string();
         let mut helper = if cfg!(target_os = "macos") {
-            let mut c = std::process::Command::new("caffeinate");
+            let mut c = std::process::Command::new("/usr/bin/caffeinate");
             c.args(["-i", "-w", &pid]);
             c
         } else {
-            let mut c = std::process::Command::new("systemd-inhibit");
+            let (Some(inhibit), Some(tail)) = (system_helper("systemd-inhibit"), system_helper("tail")) else {
+                eprintln!("core: keep_awake: systemd-inhibit or tail is not in /usr/bin or /bin; no sleep block");
+                return false;
+            };
+            let mut c = std::process::Command::new(inhibit);
             c.args(["--what=sleep", "--mode=block", "--who=h0x-core", "--why=an agent is working"]);
-            c.args(["tail", "--pid", &pid, "-f", "/dev/null"]);
+            c.arg(tail).args(["--pid", &pid, "-f", "/dev/null"]);
             c
         };
         // Its own group: release ends the helper and whatever it started (`tail` under systemd-inhibit).
@@ -133,7 +144,16 @@ impl Inhibitor for Os {
     }
 
     fn alive(&mut self) -> bool {
-        self.0.as_mut().is_some_and(|child| child.try_wait().is_ok_and(|exited| exited.is_none()))
+        let Some(child) = self.0.as_mut() else { return false };
+        match child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) => {
+                // Reaped: its pid may be reused, so release must not signal that group any more.
+                self.0 = None;
+                false
+            }
+            Err(_) => false,
+        }
     }
 
     fn release(&mut self) {
@@ -329,5 +349,24 @@ mod tests {
         awake.update(true, true);
         assert!(awake.holding());
         assert_eq!(log(&fake), ["release", "hold"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reaped_helper_is_forgotten_so_release_never_signals_its_old_group() {
+        let mut os = Os(Some(std::process::Command::new("/bin/sh").args(["-c", "exit 0"]).spawn().unwrap()));
+        while os.alive() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(os.0.is_none(), "the reaped child is dropped");
+        os.release();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_helpers_come_from_fixed_system_dirs_only() {
+        let sh = system_helper("sh").unwrap();
+        assert!(sh.starts_with("/usr/bin") || sh.starts_with("/bin"), "{sh:?}");
+        assert!(system_helper("h0x-no-such-helper").is_none());
     }
 }
