@@ -23,6 +23,8 @@ concurrency:
 
 env:
   RUST_TOOLCHAIN: 1.95.0
+  # Where scripts/zig-fetch puts the packages and cargo's `zig build` finds them.
+  ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
   # SQLite (rusqlite's bundled C source) builds against musl's own headers on Linux.
   CC_x86_64_unknown_linux_musl: musl-gcc
   CC_aarch64_unknown_linux_musl: musl-gcc
@@ -77,6 +79,25 @@ jobs:
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.16.0
+      # Zig has no download timeout: a stalled GitHub fetch hung macOS builds.
+      # Fetch the packages here, with time limits and retries, before cargo's
+      # build script runs `zig build`; it then finds them in the cache.
+      - name: Restore Zig packages
+        id: zig-packages
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: zig-pkg-v1-${{ runner.os }}-${{ runner.arch }}-0.16.0-${{ hashFiles('vendor/ghostty/**/build.zig.zon') }}
+      - name: Fetch Zig packages
+        shell: bash
+        timeout-minutes: 20
+        run: scripts/zig-fetch vendor/ghostty
+      - name: Save Zig packages
+        if: github.ref == 'refs/heads/main' && steps.zig-packages.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .zig-cache
+          key: ${{ steps.zig-packages.outputs.cache-primary-key }}
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}-release
@@ -85,6 +106,8 @@ jobs:
           # Tags can't share their caches; only manual builds on main save one.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build
+        # A stuck build fails here, not at the job's limit.
+        timeout-minutes: 30
         run: cargo build --release --locked --target ${{ matrix.target }} -p h0x-core
       # Ad-hoc signed unless the release environment holds an Apple certificate.
       - name: Sign macOS binary
