@@ -404,7 +404,11 @@ fn a_snapshot_written_by_the_previous_ghostty_pin_still_restores() {
     // Ghostty's complete fixture, byte for byte the same at the previous pin (1e5cdb8)
     // and written by its encoder. v1.4.0 kept wire version 1 and only added optional
     // records, so an old core handing over passes its screens on.
-    let old: Vec<u8> = include_str!("../../../vendor/ghostty/src/terminal/snapshot/testdata/complete-v1.hex")
+    // Read at run time: the lint job has no submodule checkout.
+    let path =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../vendor/ghostty/src/terminal/snapshot/testdata/complete-v1.hex");
+    let old: Vec<u8> = std::fs::read_to_string(path)
+        .unwrap()
         .lines()
         .flat_map(|line| line.split('#').next().unwrap_or_default().split_whitespace())
         .map(|byte| u8::from_str_radix(byte, 16).unwrap())
