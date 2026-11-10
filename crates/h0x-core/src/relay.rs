@@ -264,6 +264,22 @@ mod tests {
     }
 
     #[test]
+    fn recovery_keeps_status_reports_prompts_and_resets_on_both_sides_of_ground() {
+        let mut screen = Screen::new(80, 24, 1 << 20);
+        let mut relay = Relay::default();
+        screen.write(b"\x1b]7501;state=work");
+        let tail = b"ing:progress=5\x1b\\\x1b]133;A\x07\x1bc\x1b]7501;state=done\x1b\\";
+        let (out, recovered) = relay.feed_to_ground(&mut screen, tail);
+        let (at, _) = recovered.expect("ground inside the read");
+        assert_eq!(at, b"ing:progress=5\x1b\\".len());
+        assert_eq!(out, tail);
+        let reports = screen.take_status_reports();
+        let states: Vec<_> = reports.iter().map(|r| r.state).collect();
+        assert_eq!(states, ["working", "prompt", "clear", "done"]);
+        assert_eq!(reports[0].progress, Some(5));
+    }
+
+    #[test]
     fn long_strings_pass_through_untouched() {
         let mut screen = Screen::new(80, 24, 1 << 20);
         let mut relay = Relay::default();
