@@ -390,6 +390,32 @@ pub fn shell_line(line: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_denied_group_kill_falls_back_to_the_leader_pid_and_only_then() {
+        use std::cell::RefCell;
+        let calls = RefCell::new(Vec::new());
+        let reply = |code: Option<i32>| {
+            let calls = &calls;
+            move |pid: i32, signal: i32| {
+                calls.borrow_mut().push((pid, signal));
+                code.map_or(Ok(()), |c| Err(io::Error::from_raw_os_error(c)))
+            }
+        };
+        let pid_only = |pid: i32, signal: i32| {
+            calls.borrow_mut().push((-pid, signal));
+            Ok(())
+        };
+        // Allowed: the group alone.
+        signal_group(42, libc::SIGKILL, reply(None), pid_only);
+        assert_eq!(calls.take(), [(42, libc::SIGKILL)]);
+        // Denied: the leader's pid follows (recorded negated).
+        signal_group(42, libc::SIGKILL, reply(Some(libc::EPERM)), pid_only);
+        assert_eq!(calls.take(), [(42, libc::SIGKILL), (-42, libc::SIGKILL)]);
+        // Gone (ESRCH) is not a denial: no pid signal, the pid may be someone else's now.
+        signal_group(42, libc::SIGKILL, reply(Some(libc::ESRCH)), pid_only);
+        assert_eq!(calls.take(), [(42, libc::SIGKILL)]);
+    }
+
     fn dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("h0x-core-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -745,18 +771,38 @@ impl Pty {
 
     /// The program's group, plus whatever group is in the foreground.
     pub fn signal(&self, pid: u32, signal: i32) {
-        unsafe {
-            libc::killpg(pid as i32, signal);
-            let fg = libc::tcgetpgrp(self.master.as_raw_fd());
-            if fg > 0 && fg != pid as i32 {
-                libc::killpg(fg, signal);
-            }
+        let send_group = |pgid: i32, signal: i32| {
+            if unsafe { libc::killpg(pgid, signal) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+        };
+        let send_pid = |pid: i32, signal: i32| {
+            if unsafe { libc::kill(pid, signal) } == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+        };
+        signal_group(pid as i32, signal, send_group, send_pid);
+        let fg = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
+        if fg > 0 && fg != pid as i32 {
+            signal_group(fg, signal, send_group, send_pid);
         }
     }
 
     /// Its program is gone: hang up what still holds the terminal.
     pub fn hang_up(&self, pid: u32) {
         unsafe { libc::killpg(pid as i32, libc::SIGHUP) };
+    }
+}
+
+/// Signals a process group. Where that is denied (EPERM: a sandbox policy such as OpenShell's
+/// seccomp filter can refuse `killpg` yet allow a signal to one pid), signals the leader alone:
+/// the group id is the leader's pid, so the program at least still ends.
+fn signal_group(
+    pgid: i32,
+    signal: i32,
+    send_group: impl Fn(i32, i32) -> io::Result<()>,
+    send_pid: impl Fn(i32, i32) -> io::Result<()>,
+) {
+    if let Err(e) = send_group(pgid, signal)
+        && e.raw_os_error() == Some(libc::EPERM)
+    {
+        let _ = send_pid(pgid, signal);
     }
 }
 
