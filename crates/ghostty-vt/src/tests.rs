@@ -90,8 +90,9 @@ fn parses_reads_and_round_trips_a_snapshot() {
     t.write(b"m\x1b[?1049h");
     assert!(t.alt_screen());
     assert!(Terminal::restore(b"garbage", 1 << 20).is_none());
-    // A snapshot an older Ghostty wrote (here: cut short, or with a foreign
-    // header) is refused, never half-restored; callers then start a fresh screen.
+    // A damaged snapshot (cut short, or with a foreign header) is refused, never
+    // half-restored; callers then start a fresh screen. Snapshots of the previous
+    // Ghostty pin are not damaged: they restore (see the test for that below).
     assert!(Terminal::restore(&snap[..snap.len() / 2], 1 << 20).is_none());
     assert!(Terminal::restore(&snap[..4], 1 << 20).is_none());
     let mut foreign = snap;
