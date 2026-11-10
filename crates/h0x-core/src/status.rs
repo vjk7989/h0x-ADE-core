@@ -9,8 +9,62 @@ use crate::terminals::Terminal;
 use ghostty_vt::StatusReport;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 
 const MAX_RECORDS: usize = 256;
+
+/// Record ids by update time, least recent first. A tick per update keeps
+/// touching, removing and finding the oldest at O(log n).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RecordOrder {
+    tick: u64,
+    ticks: HashMap<String, u64>,
+    by_tick: BTreeMap<u64, String>,
+}
+
+impl RecordOrder {
+    fn touch(&mut self, id: &str) {
+        self.remove(id);
+        self.tick += 1;
+        self.ticks.insert(id.to_string(), self.tick);
+        self.by_tick.insert(self.tick, id.to_string());
+    }
+
+    fn remove(&mut self, id: &str) {
+        if let Some(tick) = self.ticks.remove(id) {
+            self.by_tick.remove(&tick);
+        }
+    }
+
+    fn oldest(&self) -> Option<&String> {
+        self.by_tick.values().next()
+    }
+
+    fn contains(&self, id: &str) -> bool {
+        self.ticks.contains_key(id)
+    }
+
+    fn len(&self) -> usize {
+        self.ticks.len()
+    }
+
+    pub fn clear(&mut self) {
+        self.ticks.clear();
+        self.by_tick.clear();
+    }
+
+    fn retain(&mut self, keep: impl Fn(&str) -> bool) {
+        let gone: Vec<String> = self.ticks.keys().filter(|k| !keep(k)).cloned().collect();
+        for id in gone {
+            self.remove(&id);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn ids(&self) -> Vec<String> {
+        self.by_tick.values().cloned().collect()
+    }
+}
 
 /// One 7501 record. Words are the program's own; nothing is translated.
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq)]
@@ -145,18 +199,20 @@ pub fn apply(t: &mut Terminal, r: &StatusReport) -> Change {
         // Over the limit, the record updated longest ago goes. One with no place in
         // `record_order` (saved by an older core) is older than any that has.
         if !t.records.contains_key(&r.id) && t.records.len() >= MAX_RECORDS - 1 {
-            let unordered = t.records.keys().find(|k| !t.record_order.contains(k));
-            let oldest = unordered.or(t.record_order.first()).cloned().expect("non-empty");
+            // Only a reload leaves records out of the order, so the scan is rare.
+            let unordered = (t.record_order.len() < t.records.len())
+                .then(|| t.records.keys().find(|k| !t.record_order.contains(k)))
+                .flatten();
+            let oldest = unordered.or(t.record_order.oldest()).cloned().expect("non-empty");
             t.records.remove(&oldest);
-            forget_order(t);
+            t.record_order.remove(&oldest);
         }
         let mut status = Status::from(r);
         if status.app.is_empty() {
             status.app = inherited_app(t, &r.id);
         }
         t.records.insert(r.id.clone(), status);
-        t.record_order.retain(|k| *k != r.id);
-        t.record_order.push(r.id.clone());
+        t.record_order.touch(&r.id);
     }
     stamp(t, was_word);
     Change {
@@ -479,6 +535,47 @@ mod tests {
     }
 
     #[test]
+    fn a_record_cleared_and_reported_again_counts_as_the_newest() {
+        let cap = MAX_RECORDS - 1;
+        let mut t = terminal();
+        fill(&mut t, cap); // r000 is the oldest
+        apply(&mut t, &report("clear", "r000"));
+        apply(&mut t, &report("done", "r000")); // back in the freed slot
+        assert_eq!(t.records.len(), cap);
+        apply(&mut t, &report("working", "new"));
+        assert_eq!(t.records.len(), cap, "the cap holds");
+        assert!(t.records.contains_key("r000"), "its old place in the order is gone");
+        assert!(!t.records.contains_key("r001"), "the oldest update goes");
+        assert_eq!(t.record_order.len(), cap, "one place per record");
+        assert_eq!(t.record_order.ids().last().map(String::as_str), Some("new"));
+    }
+
+    #[test]
+    fn the_record_order_keeps_one_place_per_id_and_finds_the_oldest() {
+        let mut order = RecordOrder::default();
+        assert_eq!((order.oldest(), order.len()), (None, 0), "empty");
+        order.remove("nothing"); // not there: nothing happens
+        for id in ["a", "b", "a", "c", "a"] {
+            order.touch(id);
+        }
+        assert_eq!(order.ids(), ["b", "c", "a"], "touching again moves an id to the back, once");
+        assert_eq!(order.len(), 3);
+        assert_eq!(order.oldest().map(String::as_str), Some("b"));
+        order.remove("b");
+        order.remove("b");
+        assert_eq!(order.ids(), ["c", "a"]);
+        assert!(!order.contains("b"));
+        order.touch("b"); // removed, then back: the newest
+        assert_eq!(order.ids(), ["c", "a", "b"]);
+        order.retain(|id| id != "a");
+        assert_eq!(order.ids(), ["c", "b"]);
+        order.clear();
+        assert_eq!((order.oldest(), order.len()), (None, 0), "cleared");
+        order.touch("z");
+        assert_eq!(order.ids(), ["z"], "usable after a clear");
+    }
+
+    #[test]
     fn reports_encode_back_to_what_the_parser_reads() {
         let mut screen = ghostty_vt::Terminal::new(80, 24, 1 << 20);
         let sent = StatusReport {
@@ -574,7 +671,7 @@ mod tests {
             }
             apply(&mut t, &report("clear", ""));
         }
-        assert_eq!(t.record_order, Vec::<String>::new());
+        assert_eq!(t.record_order.ids(), Vec::<String>::new());
     }
 
     #[test]
@@ -583,7 +680,7 @@ mod tests {
         apply(&mut t, &report("idle", ""));
         fill(&mut t, MAX_RECORDS - 2); // 254 children and the root: 255 records
         let mut t: Terminal = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
-        assert!(t.record_order.is_empty(), "the order is not saved");
+        assert!(t.record_order.ids().is_empty(), "the order is not saved");
         assert_eq!(t.records.len(), MAX_RECORDS - 2);
         apply(&mut t, &report("working", "x")); // 256: the cap, nothing goes
         assert_eq!(t.records.len(), MAX_RECORDS - 1);
@@ -596,7 +693,7 @@ mod tests {
         assert_eq!(t.records.len(), MAX_RECORDS - 1);
         assert!(!t.records.contains_key("r002"));
         assert!(["x", "y", "z", "r001"].iter().all(|k| t.records.contains_key(*k)));
-        assert_eq!(t.record_order, ["x", "y", "r001", "z"]);
+        assert_eq!(t.record_order.ids(), ["x", "y", "r001", "z"]);
         assert!(t.status.is_some(), "the root is never evicted");
     }
 

@@ -39,6 +39,12 @@ pub struct Core {
     holder_start: Mutex<()>,
     /// The registry changed in a way a crash may lose: `save_soon` writes it shortly.
     dirty: std::sync::atomic::AtomicBool,
+    /// Immediate saves of a new status word: when this second began, and how many so far.
+    word_saves: Mutex<(Instant, u32)>,
+    /// A paced-off word save is owed: `save_when_due` writes it within `SAVE_PACE`.
+    save_urgent: std::sync::atomic::AtomicBool,
+    /// Coalesced status updates are waiting for their timer.
+    pub(crate) status_due: Notify,
     save_due: Notify,
     registry_writer: RegistryWriter,
 }
@@ -140,6 +146,11 @@ impl Link {
 }
 
 const SAVE_SOON: Duration = Duration::from_secs(2);
+/// A new status word is saved at once, up to `SAVE_BURST` times a second (an average of
+/// one per `SAVE_PACE`); past that the next save waits at most `SAVE_PACE`, so a crash
+/// loses at most that much of a flood of words. Isolated changes lose nothing.
+const SAVE_PACE: Duration = Duration::from_millis(250);
+const SAVE_BURST: u32 = 4;
 /// At most one reconnect per holder in this long: a failure that comes back is not retried.
 const RELINK_GAP: Duration = Duration::from_secs(5);
 /// How long a reconnect waits for the holder's welcome.
@@ -190,6 +201,9 @@ impl Core {
             sweeps: Default::default(),
             holder_start: Default::default(),
             dirty: Default::default(),
+            word_saves: Mutex::new((Instant::now(), 0)),
+            save_urgent: Default::default(),
+            status_due: Notify::new(),
             save_due: Notify::new(),
         });
         core.attach_all()?;
@@ -224,6 +238,23 @@ impl Core {
         self.registry_writer.save(bytes);
     }
 
+    /// Saves a new status word now, unless `SAVE_BURST` such saves already happened this second.
+    pub fn save_paced(&self, st: &State) {
+        let mut window = self.word_saves.lock().unwrap_or_else(|p| p.into_inner());
+        if window.0.elapsed() >= Duration::from_secs(1) {
+            *window = (Instant::now(), 0);
+        }
+        window.1 += 1;
+        let now = window.1 <= SAVE_BURST;
+        drop(window);
+        if now {
+            self.save(st);
+        } else {
+            self.save_urgent.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.save_soon();
+        }
+    }
+
     /// Acknowledged mutations wait here without holding the state lock or blocking the executor.
     /// Attach, events.subscribe snapshots, forwarded run `afar`, and NotesAfar replies do not wait.
     /// Completed write failures are logged, as before; a stuck disk still times out.
@@ -248,14 +279,24 @@ impl Core {
         }
     }
 
+    /// Writes what `save_soon` still holds back; shutdown calls it so no state is lost.
+    pub fn save_if_dirty(&self) {
+        if self.dirty.load(std::sync::atomic::Ordering::SeqCst) {
+            self.save(&self.lock());
+        }
+    }
+
     pub async fn save_when_due(self: Arc<Self>) {
         loop {
             self.save_due.notified().await;
-            tokio::time::sleep(SAVE_SOON).await;
-            let st = self.lock();
-            if self.dirty.load(std::sync::atomic::Ordering::SeqCst) {
-                self.save(&st);
+            let asked = Instant::now();
+            loop {
+                tokio::time::sleep(SAVE_PACE).await;
+                if self.save_urgent.swap(false, std::sync::atomic::Ordering::SeqCst) || asked.elapsed() >= SAVE_SOON {
+                    break;
+                }
             }
+            self.save_if_dirty();
         }
     }
 
