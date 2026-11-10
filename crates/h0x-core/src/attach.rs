@@ -91,45 +91,66 @@ pub(crate) fn incomplete_tail(input: &[u8]) -> usize {
 /// asked), so a repaint or program turning them off turns them back on.
 fn shown(payload: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     use std::borrow::Cow;
-    const OFF: &[u8] = b"\x1b[?1004l";
-    let mut out = Cow::Borrowed(payload);
-    // ConPTY asks its viewer for win32-input-mode. A Windows console hosting
-    // h0x-core would obey and send keys as key-event codes: no detach key, no replies.
-    // Removing one can join the bytes around it into another (`ESC[?900` ESC[?9001l `1h`),
-    // so go again until a full pass removes nothing.
-    loop {
-        let mut removed = false;
-        for mode in [&b"\x1b[?9001h"[..], b"\x1b[?9001l"] {
-            while let Some(at) = out.windows(mode.len()).position(|w| w == mode) {
-                out.to_mut().drain(at..at + mode.len());
-                removed = true;
-            }
+    if !payload.contains(&0x1b) {
+        return Cow::Borrowed(payload);
+    }
+    // One pass, deciding on each byte as it lands in `out`. ConPTY asks its viewer for
+    // win32-input-mode; a Windows console hosting h0x-core would obey and send keys as key-event
+    // codes: no detach key, no replies. So `ESC[?9001h/l` is dropped as soon as its last byte lands.
+    // Dropping one can join the bytes around it into another (`ESC[?900` ESC[?9001l `1h`), which
+    // the same check sees next. Focus-off is turned back on where it was turned off, not at the
+    // end: a payload can end partway through a character that the next payload finishes.
+    let mut out = Vec::with_capacity(payload.len());
+    let mut changed = false;
+    for &byte in payload {
+        out.push(byte);
+        if byte != b'h' && byte != b'l' {
+            continue;
         }
-        if !removed {
-            break;
+        let len = out.len();
+        if len >= 8 && &out[len - 8..len - 1] == b"\x1b[?9001" {
+            out.truncate(len - 8);
+            changed = true;
+        } else if byte == b'l' && out.ends_with(b"\x1b[?1004l") {
+            out[len - 1] = b'h';
+            changed = true;
         }
     }
-    // Turned back on where it was turned off, not at the end: a payload can
-    // end partway through a character that the next payload finishes.
-    while let Some(at) = out.windows(OFF.len()).position(|w| w == OFF) {
-        out.to_mut()[at + OFF.len() - 1] = b'h';
-    }
-    out
+    if changed { Cow::Owned(out) } else { Cow::Borrowed(payload) }
 }
 
-/// `shown` for a stream: a payload can end partway through one of the
-/// sequences it filters, so that tail (at most 7 bytes) waits in `held` for
-/// the next payload. `finish` passes on whatever is still held.
+/// The most `shown_stream` holds back.
+const MAX_HELD: usize = 64;
+
+/// `shown` for a stream: a payload can end partway through one of the sequences it filters, so
+/// the tail of the filtered output that is the start of one waits in `held` for the next payload.
+/// Decided on the output, not the raw bytes: a removal can leave the start of a sequence that the
+/// next payload finishes (`ESC[?900` + `1h`), and a start can sit inside another start's removal
+/// (`ESC[?10` `ESC[?900` `ESC[?9001l`). So the hold is the run of trailing segments, each an ESC
+/// and what follows it up to the next ESC, that are all starts of a filtered sequence: at most 7
+/// bytes for any one start, longer while the stream keeps opening new ones, up to `MAX_HELD`.
+/// `finish` passes on what is held.
 fn shown_stream(held: &mut Vec<u8>, payload: &[u8]) -> Vec<u8> {
     const FILTERED: [&[u8]; 3] = [b"\x1b[?9001h", b"\x1b[?9001l", b"\x1b[?1004l"];
     held.extend_from_slice(payload);
-    let keep = (1..FILTERED[0].len().min(held.len() + 1))
-        .rev()
-        .find(|&n| FILTERED.iter().any(|seq| held.ends_with(&seq[..n])))
-        .unwrap_or(0);
-    let tail = held.split_off(held.len() - keep);
-    let out = shown(held).into_owned();
-    *held = tail;
+    let mut out = shown(held).into_owned();
+    let mut start = out.len();
+    while let Some(esc) = out[..start].iter().rposition(|&b| b == 0x1b) {
+        if FILTERED.iter().any(|seq| seq.starts_with(&out[esc..start])) {
+            start = esc;
+        } else {
+            break;
+        }
+    }
+    let mut tail = out.split_off(start);
+    // A program that keeps opening starts must not stall the viewer or grow this without limit:
+    // the oldest starts are dropped (unfinished escapes; letting them out could join into a
+    // filtered sequence later, dropping them cannot).
+    let mut skip = 0;
+    while tail.len() - skip > MAX_HELD {
+        skip += 1 + tail[skip + 1..].iter().position(|&b| b == 0x1b).unwrap_or(tail.len() - skip - 1);
+    }
+    *held = tail.split_off(skip);
     out
 }
 
@@ -515,6 +536,135 @@ mod tests {
     fn conpty_never_switches_our_keys_to_win32_input_mode() {
         assert_eq!(&*shown(b"\x1b[?9001h\x1b[?1004hhi\x1b[?9001l"), b"\x1b[?1004hhi");
     }
+
+    /// The filter as it was before the single pass: rescan until a full pass removes nothing.
+    fn rescanning(payload: &[u8]) -> Vec<u8> {
+        let mut out = payload.to_vec();
+        loop {
+            let mut removed = false;
+            for mode in [&b"\x1b[?9001h"[..], b"\x1b[?9001l"] {
+                while let Some(at) = out.windows(mode.len()).position(|w| w == mode) {
+                    out.drain(at..at + mode.len());
+                    removed = true;
+                }
+            }
+            if !removed {
+                break;
+            }
+        }
+        while let Some(at) = out.windows(8).position(|w| w == b"\x1b[?1004l") {
+            out[at + 7] = b'h';
+        }
+        out
+    }
+
+    #[test]
+    fn the_single_pass_filter_gives_what_the_rescanning_one_gave() {
+        const PIECES: [&[u8]; 9] = [b"\x1b", b"[?", b"900", b"1004", b"1", b"h", b"l", b"\x1b[?9001h", b"x"];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..20_000 {
+            let mut input = Vec::new();
+            for _ in 0..12 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                input.extend_from_slice(PIECES[(seed % PIECES.len() as u64) as usize]);
+            }
+            assert_eq!(&*shown(&input), &rescanning(&input)[..], "{:?}", String::from_utf8_lossy(&input));
+        }
+    }
+
+    #[test]
+    fn near_misses_and_removals_cost_one_pass_not_one_per_match() {
+        let near = b"\x1b[?9001x\x1b[?1004\x1b[?900\x1b[?".repeat(65_536 / 28);
+        let removed = b"\x1b[?9001l".repeat(65_536 / 8);
+        let off = b"\x1b[?1004l".repeat(65_536 / 8);
+        // Each `ESC[?10` is closed by `04l` only after a run of removals joins them up.
+        let nested = [b"\x1b[?10".repeat(4_096), b"\x1b[?9001l".repeat(4_096), b"04l".repeat(4_096)].concat();
+        for input in [near, removed, off, nested] {
+            let start = std::time::Instant::now();
+            let out = shown(&input).into_owned();
+            let took = start.elapsed();
+            assert!(took < std::time::Duration::from_millis(20), "{} B took {took:?}", input.len());
+            assert!(!out.windows(8).any(|w| w == b"\x1b[?1004l" || w == b"\x1b[?9001l"));
+        }
+    }
+
+    #[test]
+    fn interleaved_and_joined_sequences_split_across_two_or_three_payloads_give_what_the_whole_gives() {
+        for input in [
+            &b"a\x1b[?9001h\x1b[?1004lb\x1b[?9001l\x1b[?1004l\x1b[?9001hc"[..],
+            b"\x1b[?1004l\x1b[?9001l\x1b[?1004l",
+            b"x\x1b[?900\x1b[?9001l1hy",
+            b"x\x1b[?100\x1b[?9001h4ly",
+            b"\x1b[?10\x1b[?900\x1b[?9001l1h04l",
+        ] {
+            let whole = shown(input).into_owned();
+            // i == j or i == 0 is a split into two payloads; otherwise three.
+            for i in 0..=input.len() {
+                for j in i..=input.len() {
+                    let mut held = Vec::new();
+                    let mut got = shown_stream(&mut held, &input[..i]);
+                    got.extend(shown_stream(&mut held, &input[i..j]));
+                    got.extend(shown_stream(&mut held, &input[j..]));
+                    got.extend(finish(&mut held));
+                    assert_eq!(
+                        String::from_utf8_lossy(&got),
+                        String::from_utf8_lossy(&whole),
+                        "{:?} split at {i} and {j}",
+                        String::from_utf8_lossy(input)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_stream_of_endless_escape_starts_holds_a_bounded_run_and_leaks_no_filtered_sequence() {
+        let input = [b"\x1b[?9".repeat(1 << 20 >> 2), b"x".to_vec()].concat();
+        let mut held = Vec::new();
+        let mut got = Vec::new();
+        for read in input.chunks(4093) {
+            got.extend(shown_stream(&mut held, read));
+            assert!(held.len() <= 64, "held {} B", held.len());
+        }
+        got.extend(finish(&mut held));
+        assert!(got.contains(&b'x'), "the text after the starts is shown");
+        for seq in [&b"\x1b[?9001h"[..], b"\x1b[?9001l", b"\x1b[?1004l"] {
+            assert!(!got.windows(seq.len()).any(|w| w == seq), "{seq:?} reached the output");
+        }
+    }
+    #[test]
+    fn a_large_stream_cut_into_odd_sized_reads_is_filtered_at_every_boundary() {
+        let unit = b"x\x1b[?9001h\x1b[?1004l\x1b[?9001l";
+        let input = unit.repeat(131_072);
+        let want = b"x\x1b[?1004h".repeat(131_072);
+        assert!(*shown(&input) == want[..], "the whole {} B payload, filtered", input.len());
+        // 4093 is prime and not a multiple of the unit, so the cuts land on every offset in it.
+        let mut held = Vec::new();
+        let mut got = Vec::with_capacity(want.len());
+        for read in input.chunks(4093) {
+            got.extend(shown_stream(&mut held, read));
+            assert!(held.len() < 8, "at most a partial sequence is held, not {} B", held.len());
+        }
+        got.extend(finish(&mut held));
+        assert!(got == want, "a {} B stream differs from the whole once filtered", input.len());
+    }
+
+    #[test]
+    fn near_misses_ending_in_h_or_l_are_passed_on_without_a_copy() {
+        let large = [b"\x1b[?9002h\x1b[?1005l\x1b[?1004h".repeat(1 << 15), b"\x1b[?9001".to_vec()].concat();
+        for payload in
+            [&b"\x1b[?9002h"[..], b"\x1b[?1005l", b"\x1b[?9001x", b"h\x1bl", b"\x1b[?9001", b"\x1b?9001h", &large[..]]
+        {
+            let out = shown(payload);
+            let std::borrow::Cow::Borrowed(out) = out else {
+                panic!("{:?} was copied", String::from_utf8_lossy(&payload[..payload.len().min(16)]))
+            };
+            assert!(std::ptr::eq(out, payload), "the payload itself, not an equal copy");
+        }
+    }
+
     #[test]
     fn detach_chord_is_found_in_every_keyboard_encoding() {
         for input in [

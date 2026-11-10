@@ -80,8 +80,8 @@ fn automatic_input_requires_support_at_every_hop() {
 #[tokio::test]
 async fn automatic_input_survives_relays_but_not_a_capability_downgrade() {
     for (feature, confirmed) in [(false, true), (true, false), (true, true)] {
-        let root = std::path::PathBuf::from(format!(
-            "/var/tmp/h0x-core-automatic-relay-{}-{}",
+        let root = crate::platform::test_scratch().join(format!(
+            "h0x-core-automatic-relay-{}-{}",
             std::process::id(),
             crate::platform::random_hex()
         ));
@@ -193,8 +193,8 @@ async fn reconnect_rejects_downgrade_before_mapping_fallback_data() {
 
 #[tokio::test]
 async fn failed_reattach_drains_pending_data_before_close() {
-    let root = std::path::PathBuf::from(format!(
-        "/var/tmp/h0x-core-reattach-drain-{}-{}",
+    let root = crate::platform::test_scratch().join(format!(
+        "h0x-core-reattach-drain-{}-{}",
         std::process::id(),
         crate::platform::random_hex()
     ));
@@ -265,8 +265,8 @@ async fn failed_reattach_drains_pending_data_before_close() {
 
 #[test]
 fn remote_misses_and_renames_keep_subscribers_on_the_current_machine() {
-    let root = std::path::PathBuf::from(format!(
-        "/var/tmp/h0x-core-doc-missed-{}-{}",
+    let root = crate::platform::test_scratch().join(format!(
+        "h0x-core-doc-missed-{}-{}",
         std::process::id(),
         crate::platform::random_hex()
     ));
@@ -356,8 +356,8 @@ fn remote_misses_and_renames_keep_subscribers_on_the_current_machine() {
 
 /// A core here (`here`) that has added `rohan`, with terminals t1 and t2.
 fn here_with_rohan(tag: &str) -> (Arc<Core>, std::path::PathBuf, Machine) {
-    let root = std::path::PathBuf::from(format!(
-        "/var/tmp/h0x-core-{tag}-{}-{}",
+    let root = crate::platform::test_scratch().join(format!(
+        "h0x-core-{tag}-{}-{}",
         std::process::id(),
         crate::platform::random_hex()
     ));

@@ -16,10 +16,17 @@ fn config(s: &Session, toml: &str) {
 
 /// `serve` started directly with this PATH, its stderr in `core.err`.
 fn serve(s: &Session, path: &str) -> Child {
+    serve_with(s, path, path)
+}
+
+/// `serve` with its own helper dirs, started in the session's root.
+fn serve_with(s: &Session, path: &str, helper_dirs: &str) -> Child {
     let err = std::fs::File::create(s.root.join("core.err")).unwrap();
     let core = s
         .cmd()
+        .current_dir(&s.root)
         .env("PATH", path)
+        .env("H0X_CORE_HELPER_DIRS", helper_dirs)
         .env("SSH_CONNECTION", "test-direct")
         .arg("serve")
         .stdin(Stdio::null())
@@ -47,9 +54,14 @@ fn inhibit_calls(s: &Session) -> Vec<String> {
     std::fs::read_to_string(s.root.join("inhibit.log")).unwrap_or_default().lines().map(String::from).collect()
 }
 
-/// Processes running `tail --pid <core> -f /dev/null`: the helper holding the block.
+/// The `tail` the core runs: by absolute path, from the first of these that has it.
+fn tail() -> String {
+    ["/usr/bin/tail", "/bin/tail"].into_iter().find(|p| Path::new(p).is_file()).unwrap().to_string()
+}
+
+/// Processes running `<tail> --pid <core> -f /dev/null`: the helper holding the block.
 fn helpers(core: u64) -> usize {
-    let want = format!("tail\0--pid\0{core}\0-f\0/dev/null\0");
+    let want = format!("{}\0--pid\0{core}\0-f\0/dev/null\0", tail());
     std::fs::read_dir("/proc")
         .unwrap()
         .flatten()
@@ -77,8 +89,10 @@ fn the_sleep_helper_starts_once_per_working_turn_with_fixed_arguments_and_goes_w
     config(&s, "keep_awake = true");
     let core = serve(&s, &fake_inhibit(&s));
     let pid = s.json(&["server", "status"])["pid"].as_u64().unwrap();
-    let expected =
-        format!("--what=sleep --mode=block --who=h0x-core --why=an agent is working tail --pid {pid} -f /dev/null");
+    let expected = format!(
+        "--what=sleep --mode=block --who=h0x-core --why=an agent is working {} --pid {pid} -f /dev/null",
+        tail()
+    );
 
     let first = agent(&s, "go1");
     wait_until("held", || held(&s));
@@ -155,5 +169,97 @@ fn server_status_does_not_claim_a_block_the_helper_could_not_take() {
     wait_until("working", || get(&s, &t)["status"]["state"] == "working");
     std::thread::sleep(Duration::from_secs(5));
     assert!(!held(&s), "systemd-inhibit could not start: nothing keeps the machine awake");
+    stop(&s, core);
+}
+
+fn core_err(s: &Session) -> String {
+    std::fs::read_to_string(s.root.join("core.err")).unwrap_or_default()
+}
+
+/// `<dir>/tail`, a link to the system's.
+fn link_tail(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::os::unix::fs::symlink(tail(), dir.join("tail")).unwrap();
+}
+
+#[test]
+fn a_systemd_inhibit_on_path_but_not_in_the_helper_dirs_is_never_run() {
+    let s = Session::new();
+    config(&s, "keep_awake = true");
+    let core = serve_with(&s, &fake_inhibit(&s), &without_inhibit(&s));
+    let t = agent(&s, "go");
+    wait_until("working", || get(&s, &t)["status"]["state"] == "working");
+    wait_until("the missing helper is reported", || core_err(&s).contains("keep_awake: cannot start systemd-inhibit"));
+    assert_eq!(inhibit_calls(&s), [""; 0], "the one on PATH ran");
+    assert!(!held(&s));
+    stop(&s, core);
+}
+
+#[test]
+fn empty_colon_only_and_relative_helper_dirs_never_find_a_helper() {
+    for dirs in ["", "::", "bin", "./bin"] {
+        let s = Session::new();
+        config(&s, "keep_awake = true");
+        // A fake in `bin` (also first on PATH), and both helpers in the core's working directory.
+        let path = fake_inhibit(&s);
+        link_tail(&s.root.join("bin"));
+        std::os::unix::fs::symlink(s.root.join("bin/systemd-inhibit"), s.root.join("systemd-inhibit")).unwrap();
+        link_tail(&s.root);
+        let core = serve_with(&s, &path, dirs);
+        let t = agent(&s, "go");
+        wait_until("working", || get(&s, &t)["status"]["state"] == "working");
+        // No valid dir means the system dirs: the real helper may hold the block, fail on its own, or be absent.
+        wait_until("a helper run, or the attempt reported", || {
+            !inhibit_calls(&s).is_empty() || held(&s) || core_err(&s).contains("keep_awake:")
+        });
+        assert_eq!(inhibit_calls(&s), [""; 0], "helper dirs {dirs:?}: a helper ran by a relative path or from PATH");
+        stop(&s, core);
+    }
+}
+
+#[test]
+fn the_first_real_helper_file_wins_past_a_missing_dir_a_directory_and_a_dangling_link() {
+    let s = Session::new();
+    config(&s, "keep_awake = true");
+    fake_inhibit(&s);
+    // As on a system with no /usr/bin: the first dir is not there.
+    let odd = s.root.join("odd");
+    std::fs::create_dir_all(odd.join("systemd-inhibit")).unwrap();
+    std::os::unix::fs::symlink(s.root.join("no-such-tail"), odd.join("tail")).unwrap();
+    // The helper found is a link to the fake, as `/bin` is a link to `/usr/bin` on merged-usr systems.
+    let linked = s.root.join("linked");
+    link_tail(&linked);
+    std::os::unix::fs::symlink(s.root.join("bin/systemd-inhibit"), linked.join("systemd-inhibit")).unwrap();
+    let dirs = format!("{}:{}:{}", s.root.join("no-such-dir").display(), odd.display(), linked.display());
+    let core = serve_with(&s, "/usr/bin:/bin", &dirs);
+    let pid = s.json(&["server", "status"])["pid"].as_u64().unwrap();
+    agent(&s, "go");
+    wait_until("held", || held(&s));
+    let expected = format!(
+        "--what=sleep --mode=block --who=h0x-core --why=an agent is working {} --pid {pid} -f /dev/null",
+        linked.join("tail").display()
+    );
+    assert_eq!(inhibit_calls(&s), [expected]);
+    touch(&s, "go");
+    wait_until("released", || !held(&s));
+    stop(&s, core);
+}
+
+#[test]
+fn a_helper_that_is_not_executable_is_reported_and_no_block_is_claimed() {
+    let s = Session::new();
+    config(&s, "keep_awake = true");
+    let bin = s.root.join("noexec");
+    link_tail(&bin);
+    std::fs::write(bin.join("systemd-inhibit"), "#!/bin/sh\nexec \"$@\"\n").unwrap();
+    std::fs::set_permissions(bin.join("systemd-inhibit"), std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+    let core = serve_with(&s, "/usr/bin:/bin", &bin.display().to_string());
+    let t = agent(&s, "go");
+    wait_until("working", || get(&s, &t)["status"]["state"] == "working");
+    wait_until("the failed start is reported", || core_err(&s).contains("keep_awake: cannot start"));
+    let log = core_err(&s);
+    assert!(log.contains("systemd-inhibit") && log.contains("ermission denied"), "core.err: {log}");
+    assert!(!log.contains("panicked"), "core.err: {log}");
+    assert!(!held(&s), "nothing keeps the machine awake");
     stop(&s, core);
 }
