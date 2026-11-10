@@ -84,6 +84,7 @@ pub fn serve() -> io::Result<()> {
         tokio::spawn(core.clone().watch_foreground());
         tokio::spawn(core.clone().watch_awake());
         tokio::spawn(core.clone().save_when_due());
+        tokio::spawn(core.clone().flush_statuses_when_due());
         let term = platform::termination();
         tokio::pin!(term);
         loop {

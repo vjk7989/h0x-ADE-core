@@ -518,16 +518,10 @@ fn remove_root(root: impl AsRef<std::path::Path>) {
 }
 
 #[tokio::test]
-async fn a_flood_of_status_flips_saves_once_and_emits_one_event_per_batch() {
+async fn a_flood_of_status_flips_costs_no_event_text_and_few_saves() {
     let (mut core, root) = test_core();
     core.flush_saved().await.unwrap();
-    let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let counted = writes.clone();
-    Arc::get_mut(&mut core).unwrap().registry_writer = RegistryWriter::start(move |_| {
-        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(())
-    })
-    .unwrap();
+    let writes = count_writes(&mut core);
     let report = |state: &'static str, id: &str, message: String| ghostty_vt::StatusReport {
         state,
         kind: None,
@@ -558,28 +552,20 @@ async fn a_flood_of_status_flips_saves_once_and_emits_one_event_per_batch() {
         let t = &st.reg.terminals[&id];
         assert_eq!(t.records.len(), 255, "the cap holds");
         assert_eq!(t.turn, 2000, "every working to idle still counts a turn");
-        // One status event and one turn event for the whole batch.
-        assert_eq!(st.events.seq - seq, 2);
+        // The same events as before: a status per word, a turn per ended turn (and the
+        // update of the records that was still waiting for its timer, told first).
+        assert_eq!(st.events.seq - seq, 1 + 4000 + 2000);
     }
     assert!(started.elapsed() < Duration::from_secs(5), "4000 flips took {:?}", started.elapsed());
     let written = || writes.load(std::sync::atomic::Ordering::SeqCst);
-    assert!(written() <= saved + 1, "at most one save for the whole burst, not one per report");
+    assert!(written() <= saved + SAVE_BURST as usize, "saves are paced, not one per flip: {}", written() - saved);
     core.save_if_dirty();
     core.flush_saved().await.unwrap();
-    assert_eq!(written(), saved + 1, "the final state is saved once, now or when due");
+    let after = written();
     core.save_if_dirty();
     core.flush_saved().await.unwrap();
-    assert_eq!(written(), saved + 1, "clean state is not saved again");
-
-    // A blocked word undone in the same chunk still gets its own event, for waiters.
-    let seq = core.lock().events.seq;
-    let flicker = [
-        report("working", "", String::new()),
-        report("blocked", "", String::new()),
-        report("working", "", String::new()),
-    ];
-    core.report_status(&mut core.lock(), id, &flicker);
-    assert_eq!(core.lock().events.seq - seq, 3, "the flicker, the final status and the turn");
+    assert_eq!(written(), after, "clean state is not saved again");
+    assert!(after > saved && !core.dirty.load(std::sync::atomic::Ordering::SeqCst), "the final state was written");
     drop(core);
     remove_root(&root);
 }
@@ -620,69 +606,100 @@ fn saved_terminal(root: &std::path::Path, id: u32) -> crate::terminals::Terminal
 }
 
 #[tokio::test]
-async fn a_new_word_is_saved_at_once_unless_the_last_save_was_costly_and_recent() {
+async fn new_words_are_saved_at_once_up_to_a_burst_a_second_and_then_paced() {
     use std::sync::atomic::Ordering::SeqCst;
     let (mut core, root) = test_core();
     core.flush_saved().await.unwrap();
     let writes = count_writes(&mut core);
     let id = new_terminal(&core);
-    let last_save =
-        |ago: Duration, cost: Duration| *core.last_save.lock().unwrap() = Some((Instant::now() - ago, cost));
     let seq = core.lock().events.seq;
     core.report_status(&mut core.lock(), id, &[]);
     core.flush_saved().await.unwrap();
     assert_eq!((core.lock().events.seq, writes.load(SeqCst)), (seq, 0), "an empty batch tells and saves nothing");
 
-    last_save(Duration::ZERO, SAVE_COSTLY - Duration::from_micros(1));
+    for i in 0..10 {
+        core.report_status(&mut core.lock(), id, &[root_report(if i % 2 == 0 { "working" } else { "idle" })]);
+    }
+    core.flush_saved().await.unwrap();
+    assert_eq!(writes.load(SeqCst), SAVE_BURST as usize, "the first words of a second are saved at once");
+    assert!(core.dirty.load(SeqCst) && core.save_urgent.load(SeqCst), "the rest is owed within SAVE_PACE");
+    core.save_if_dirty();
+    core.flush_saved().await.unwrap();
+    assert_eq!(writes.load(SeqCst), SAVE_BURST as usize + 1);
+
+    *core.word_saves.lock().unwrap() = (Instant::now() - Duration::from_secs(2), SAVE_BURST);
     core.report_status(&mut core.lock(), id, &[root_report("working")]);
     core.flush_saved().await.unwrap();
-    assert_eq!(writes.load(SeqCst), 1, "a cheap registry saves every new word, however recent the last save");
+    assert_eq!(writes.load(SeqCst), SAVE_BURST as usize + 2, "a new second: saved at once again");
     assert!(!core.dirty.load(SeqCst));
 
-    last_save(Duration::ZERO, SAVE_COSTLY);
-    core.report_status(&mut core.lock(), id, &[root_report("idle")]);
-    core.flush_saved().await.unwrap();
-    assert_eq!(writes.load(SeqCst), 1, "a costly save just now: save_soon takes it");
-    assert!(core.dirty.load(SeqCst), "and it is still owed");
-
-    last_save(SAVE_COSTLY * 20, SAVE_COSTLY);
-    core.report_status(&mut core.lock(), id, &[root_report("working")]);
-    core.flush_saved().await.unwrap();
-    assert_eq!(writes.load(SeqCst), 2, "a costly save long enough ago: saved at once again");
-    assert!(!core.dirty.load(SeqCst));
-
-    *core.last_save.lock().unwrap() = None;
     let progress = ghostty_vt::StatusReport { message: "half way".into(), ..root_report("working") };
     core.report_status(&mut core.lock(), id, &[progress]);
     core.flush_saved().await.unwrap();
-    assert_eq!(writes.load(SeqCst), 2, "the same word with a new message waits for save_soon");
+    assert_eq!(writes.load(SeqCst), SAVE_BURST as usize + 2, "the same word with a new message waits for save_soon");
     assert!(core.dirty.load(SeqCst));
     drop(core);
     remove_root(&root);
 }
 
 #[tokio::test]
-async fn one_report_chunks_while_saving_is_costly_are_saved_once_when_due() {
-    use std::sync::atomic::Ordering::SeqCst;
-    let (mut core, root) = test_core();
-    core.flush_saved().await.unwrap();
-    let writes = count_writes(&mut core);
+async fn updates_to_the_same_word_are_told_once_a_window_and_in_order_with_word_changes() {
+    let (core, root) = test_core();
     let id = new_terminal(&core);
-    // The last save took a second: new words wait for save_soon for the next twenty.
-    *core.last_save.lock().unwrap() = Some((Instant::now(), Duration::from_secs(1)));
-    let seq = core.lock().events.seq;
-    for i in 0..1000 {
-        core.report_status(&mut core.lock(), id, &[root_report(if i % 2 == 0 { "working" } else { "idle" })]);
-    }
-    core.flush_saved().await.unwrap();
-    assert_eq!(writes.load(SeqCst), 0, "no save per chunk");
-    assert!(core.dirty.load(SeqCst), "but one is owed");
-    assert_eq!(core.lock().events.seq - seq, 1500, "a status per chunk, and a turn per ended turn");
-    assert_eq!(core.lock().reg.terminals[&id].turn, 500);
-    core.save_if_dirty();
-    core.flush_saved().await.unwrap();
-    assert_eq!(writes.load(SeqCst), 1, "the whole flood is saved once, when due");
-    assert!(!core.dirty.load(SeqCst));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    core.subscribe(&mut core.lock(), crate::events::Filter::default(), crate::events::Sink::Waiter(tx));
+    let drain = |rx: &mut tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>| {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    };
+    let said = |message: &str| ghostty_vt::StatusReport { message: message.into(), ..root_report("working") };
+    core.report_status(&mut core.lock(), id, &[root_report("working")]);
+    assert_eq!(drain(&mut rx).len(), 1, "a new word is told at once");
+    // Inside a window that has just opened, updates wait.
+    core.lock().reg.terminals.get_mut(&id).unwrap().status_sent = Some(Instant::now() + Duration::from_secs(3600));
+    let updates: Vec<_> = (0..100).map(|i| said(&format!("step {i}"))).collect();
+    core.report_status(&mut core.lock(), id, &updates);
+    assert!(drain(&mut rx).is_empty(), "no event per report");
+    assert!(core.lock().reg.terminals[&id].status_owed);
+    // The next word change tells what was owed first, so the order holds.
+    core.report_status(&mut core.lock(), id, &[said("last"), root_report("blocked")]);
+    let events = drain(&mut rx);
+    let words: Vec<_> = events
+        .iter()
+        .map(|e| {
+            (e["type"].as_str().unwrap(), e["data"]["status"]["state"].as_str(), e["data"]["status"]["msg"].as_str())
+        })
+        .collect();
+    assert_eq!(
+        words,
+        [("status", Some("working"), Some("last")), ("status", Some("blocked"), None), ("turn", None, None)]
+    );
+    assert_eq!(events[2]["data"]["state"], "blocked");
+    assert!(!core.lock().reg.terminals[&id].status_owed);
+    drop(core);
+    remove_root(&root);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_update_left_waiting_is_told_by_the_timer() {
+    let (core, root) = test_core();
+    let id = new_terminal(&core);
+    tokio::spawn(core.clone().flush_statuses_when_due());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    core.subscribe(&mut core.lock(), crate::events::Filter::default(), crate::events::Sink::Waiter(tx));
+    core.report_status(&mut core.lock(), id, &[root_report("working")]);
+    assert!(rx.try_recv().is_ok());
+    core.lock().reg.terminals.get_mut(&id).unwrap().status_sent = Some(Instant::now() + Duration::from_secs(3600));
+    let said = ghostty_vt::StatusReport { message: "later".into(), ..root_report("working") };
+    core.report_status(&mut core.lock(), id, &[said]);
+    assert!(rx.try_recv().is_err(), "not at once");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let event = rx.try_recv().expect("told when the window is over");
+    assert_eq!(event["data"]["status"]["msg"], "later");
+    assert!(rx.try_recv().is_err(), "once");
     drop(core);
     remove_root(&root);
 }
@@ -691,7 +708,6 @@ async fn one_report_chunks_while_saving_is_costly_are_saved_once_when_due() {
 async fn a_graceful_stop_writes_what_save_soon_held_back() {
     let (core, root) = test_core();
     let id = new_terminal(&core);
-    *core.last_save.lock().unwrap() = None;
     core.report_status(&mut core.lock(), id, &[root_report("working")]);
     let held = ghostty_vt::StatusReport { message: "held back".into(), ..root_report("working") };
     core.report_status(&mut core.lock(), id, &[held]);
@@ -707,7 +723,6 @@ async fn a_graceful_stop_writes_what_save_soon_held_back() {
 async fn a_new_word_is_on_disk_before_any_stop() {
     let (core, root) = test_core();
     let id = new_terminal(&core);
-    *core.last_save.lock().unwrap() = None;
     core.report_status(&mut core.lock(), id, &[root_report("working"), root_report("blocked")]);
     // Killed here: no stop and no save_if_dirty, only what the writer already has.
     core.flush_saved().await.unwrap();
@@ -719,7 +734,7 @@ async fn a_new_word_is_on_disk_before_any_stop() {
 }
 
 #[tokio::test]
-async fn a_stuck_word_undone_in_its_chunk_is_told_and_one_kept_is_not_told_twice() {
+async fn every_stuck_word_and_turn_end_in_a_chunk_is_told_in_order_as_it_was() {
     let (core, root) = test_core();
     let id = new_terminal(&core);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -732,29 +747,84 @@ async fn a_stuck_word_undone_in_its_chunk_is_told_and_one_kept_is_not_told_twice
         }
         events
     };
-    let kinds = |events: &[serde_json::Value]| -> Vec<(String, Option<String>)> {
+    // Status events by word, turn events by turn number and the word it ended in.
+    let kinds = |events: &[serde_json::Value]| -> Vec<(String, String)> {
         events
             .iter()
-            .map(|e| (e["type"].as_str().unwrap().to_string(), e["data"]["status"]["state"].as_str().map(String::from)))
+            .map(|e| match e["type"].as_str().unwrap() {
+                "status" => ("status".into(), e["data"]["status"]["state"].as_str().unwrap().into()),
+                _ => ("turn".into(), format!("{} {}", e["data"]["turn"], e["data"]["state"].as_str().unwrap())),
+            })
             .collect()
     };
+    let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
     told(&[root_report("working")]);
+    core.lock().reg.terminals.get_mut(&id).unwrap().status_sent = Some(Instant::now() + Duration::from_secs(3600));
     let child = ghostty_vt::StatusReport { id: "sub".into(), ..root_report("working") };
     let events = told(&[child, root_report("error"), root_report("working")]);
     assert_eq!(
         kinds(&events),
-        [("status".into(), Some("error".into())), ("status".into(), Some("working".into())), ("turn".into(), None)]
+        [pair("status", "working"), pair("status", "error"), pair("turn", "1 error"), pair("status", "working")]
     );
     for status in &events[..2] {
         assert_eq!(status["data"]["records"]["sub"]["state"], "working", "the whole record set, as before");
         assert_eq!(status["data"]["reported"], true);
     }
-    assert_eq!(events[2]["data"]["turn"], 1);
 
-    // Stuck at the end as in the middle: one status, not the same one twice.
-    let events = told(&[root_report("blocked"), root_report("working"), root_report("blocked")]);
-    assert_eq!(kinds(&events), [("status".into(), Some("blocked".into())), ("turn".into(), None)]);
-    assert_eq!(events[1]["data"]["turn"], 3, "both turns count");
+    let events =
+        told(&[root_report("blocked"), root_report("working"), root_report("blocked"), root_report("working")]);
+    assert_eq!(
+        kinds(&events),
+        [
+            pair("status", "blocked"),
+            pair("turn", "2 blocked"),
+            pair("status", "working"),
+            pair("status", "blocked"),
+            pair("turn", "3 blocked"),
+            pair("status", "working"),
+        ],
+        "each stuck word keeps its own event, with the state it had"
+    );
+    drop(core);
+    remove_root(&root);
+}
+
+#[tokio::test]
+async fn a_wait_ends_on_a_turn_that_ended_and_restarted_in_one_chunk() {
+    let (core, root) = test_core();
+    let id = new_terminal(&core);
+    core.report_status(&mut core.lock(), id, &[root_report("working")]);
+    let spec = crate::wait::WaitSpec { output: None, timeout: Duration::from_secs(5), after_turn: None };
+    let ended = {
+        let waiting = core.wait(id, spec, None);
+        tokio::pin!(waiting);
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut waiting).await.is_err(), "still working");
+        // An agent that finishes and picks up its next prompt before the core reads.
+        core.report_status(&mut core.lock(), id, &[root_report("idle"), root_report("working")]);
+        tokio::time::timeout(Duration::from_secs(2), waiting).await
+    };
+    let ended = ended.expect("the wait missed the turn's end");
+    assert_eq!((ended.ended, ended.reason.as_str()), (true, "status"));
+    drop(core);
+    remove_root(&root);
+}
+
+#[tokio::test]
+async fn a_turn_that_ended_done_and_restarted_in_one_chunk_still_says_done() {
+    let (core, root) = test_core();
+    let id = new_terminal(&core);
+    core.report_status(&mut core.lock(), id, &[root_report("working")]);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    core.subscribe(&mut core.lock(), crate::events::Filter::default(), crate::events::Sink::Waiter(tx));
+    core.report_status(&mut core.lock(), id, &[root_report("done"), root_report("working")]);
+    let mut turns = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if event["type"] == "turn" {
+            turns.push(event["data"].clone());
+        }
+    }
+    // The bridge tells the phone a turn finished from a turn event that says done or idle.
+    assert!(turns.iter().any(|t| t["state"] == "done"), "the finished turn is told: {turns:?}");
     drop(core);
     remove_root(&root);
 }

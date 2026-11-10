@@ -67,6 +67,12 @@ pub struct Terminal {
     /// Ids of `records`, least recently updated first (private; empty after a reload).
     #[serde(skip)]
     pub record_order: crate::status::RecordOrder,
+    /// When the last coalescable status event went out (private).
+    #[serde(skip)]
+    pub status_sent: Option<std::time::Instant>,
+    /// A coalescable status update is waiting for its timer (private).
+    #[serde(skip)]
+    pub status_owed: bool,
     /// Goes up each time the status leaves `working`.
     #[serde(default)]
     pub turn: u64,
@@ -285,6 +291,8 @@ impl Registry {
                 status_ms: None,
                 records: BTreeMap::new(),
                 record_order: Default::default(),
+                status_sent: None,
+                status_owed: false,
                 turn: 0,
                 first_task_turn: None,
                 reported: false,

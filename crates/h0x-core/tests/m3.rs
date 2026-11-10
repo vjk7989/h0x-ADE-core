@@ -109,15 +109,13 @@ fn a_subscriber_that_falls_behind_gets_missed_and_a_snapshot() {
     s.json(&["server", "start"]);
     let mut slow = s.connect();
     slow.call(1, "events.subscribe", json!({}));
-    // Flood events, not durable turn boundaries. One status event covers all the reports
-    // of an output chunk, so each report is a chunk of its own (a pause between them).
+    // Flood events: every word change is told (progress and message updates are coalesced).
     let flood = script(
         &s,
-        "i=0; while [ $i -lt 2500 ]; do r state=working:progress=$((i%2)); sleep 0.002; i=$((i+1)); done; r state=done; sleep 100",
+        "i=0; while [ $i -lt 3000 ]; do r state=working; r state=idle; i=$((i+1)); done; r state=done; sleep 100",
     );
     let t = run(&s, &["sh", "-c", &flood]);
-    // A `sleep` process per report: slower than the usual wait on a busy runner (macOS).
-    wait_until_for(&format!("{t} done"), Duration::from_secs(60), || get(&s, &t)["status"]["state"] == "done");
+    wait_status(&s, &t, "done");
 
     // It gets `missed` (only once its queue filled), and ends up with the true final state.
     let finished_here = |x: &Value| x["address"] == t.as_str() && x["status"]["state"] == "done";
