@@ -65,7 +65,12 @@ get_verified() {
 
 echo "== h0x-ade (app)"
 get_verified "$app_rel" "h0x-ade-$target.tar.gz"
-tar -xzf "$root/dl/h0x-ade-$target.tar.gz" -C "$root/bin/app"
+if [ "$os" = windows ]; then
+  # Windows' own tar: Git Bash's reads `D:` as a remote host.
+  /c/Windows/System32/tar.exe -xzf "$(native "$root/dl/h0x-ade-$target.tar.gz")" -C "$(native "$root/bin/app")"
+else
+  tar -xzf "$root/dl/h0x-ade-$target.tar.gz" -C "$root/bin/app"
+fi
 case $os in
   linux) hx=$root/bin/app/h0x-ade/h0x-ade ;;
   macos) hx=$root/bin/app/HyperOx.app/Contents/MacOS/HyperOx ;;

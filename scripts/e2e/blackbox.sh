@@ -142,12 +142,13 @@ else
 fi
 
 # --- a closed pipe is a quiet exit 141, not a panic
-"$HC" --skill | head -c 0 >/dev/null; rc=${PIPESTATUS[0]}
+# head exits at once; the core writes a second later, into a closed pipe.
+{ sleep 1; "$HC" --skill; } | head -c 0 >/dev/null; rc=${PIPESTATUS[0]}
 if [ "$rc" = 141 ]; then pass "broken pipe exits 141"; elif [ "$os" = windows ]; then warn "broken pipe exit code" "rc=$rc under Git Bash (a pipe there may accept the write); the exit is unit-tested"; else fail "broken pipe exit code" "rc=$rc, want 141"; fi
 
 out=$("$HC" server stop 2>&1) && pass "server stop" || fail "server stop" "$(tailc "$out")"
 stopped() { "$HC" server status 2>&1 | grep -q unavailable; }
-if poll 15 stopped; then pass "server really stopped"; else fail "server really stopped" "server status still answers"; fi
+if poll 15 stopped; then pass "server really stopped"; else fail "server really stopped" "server status: $(tailc "$("$HC" server status 2>&1)")"; fi
 
 # --- the runtime (h0x)
 echo "== h0x (runtime)"

@@ -88,7 +88,7 @@ jobs:
           persist-credentials: false
 
       - name: Build the sandbox image
-        run: docker build -t h0x-e2e:ci scripts/e2e
+        run: docker build -t h0x-e2e:ci -f scripts/e2e/sandbox/Dockerfile scripts/e2e
 
       # Installing OpenShell and starting its gateway is infrastructure: when that fails
       # the job reports it as a warning and goes on (the e2e matrix above is the gate).
