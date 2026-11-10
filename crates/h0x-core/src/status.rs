@@ -535,6 +535,47 @@ mod tests {
     }
 
     #[test]
+    fn a_record_cleared_and_reported_again_counts_as_the_newest() {
+        let cap = MAX_RECORDS - 1;
+        let mut t = terminal();
+        fill(&mut t, cap); // r000 is the oldest
+        apply(&mut t, &report("clear", "r000"));
+        apply(&mut t, &report("done", "r000")); // back in the freed slot
+        assert_eq!(t.records.len(), cap);
+        apply(&mut t, &report("working", "new"));
+        assert_eq!(t.records.len(), cap, "the cap holds");
+        assert!(t.records.contains_key("r000"), "its old place in the order is gone");
+        assert!(!t.records.contains_key("r001"), "the oldest update goes");
+        assert_eq!(t.record_order.len(), cap, "one place per record");
+        assert_eq!(t.record_order.ids().last().map(String::as_str), Some("new"));
+    }
+
+    #[test]
+    fn the_record_order_keeps_one_place_per_id_and_finds_the_oldest() {
+        let mut order = RecordOrder::default();
+        assert_eq!((order.oldest(), order.len()), (None, 0), "empty");
+        order.remove("nothing"); // not there: nothing happens
+        for id in ["a", "b", "a", "c", "a"] {
+            order.touch(id);
+        }
+        assert_eq!(order.ids(), ["b", "c", "a"], "touching again moves an id to the back, once");
+        assert_eq!(order.len(), 3);
+        assert_eq!(order.oldest().map(String::as_str), Some("b"));
+        order.remove("b");
+        order.remove("b");
+        assert_eq!(order.ids(), ["c", "a"]);
+        assert!(!order.contains("b"));
+        order.touch("b"); // removed, then back: the newest
+        assert_eq!(order.ids(), ["c", "a", "b"]);
+        order.retain(|id| id != "a");
+        assert_eq!(order.ids(), ["c", "b"]);
+        order.clear();
+        assert_eq!((order.oldest(), order.len()), (None, 0), "cleared");
+        order.touch("z");
+        assert_eq!(order.ids(), ["z"], "usable after a clear");
+    }
+
+    #[test]
     fn reports_encode_back_to_what_the_parser_reads() {
         let mut screen = ghostty_vt::Terminal::new(80, 24, 1 << 20);
         let sent = StatusReport {

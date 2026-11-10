@@ -583,3 +583,178 @@ async fn a_flood_of_status_flips_saves_once_and_emits_one_event_per_batch() {
     drop(core);
     remove_root(&root);
 }
+
+fn root_report(state: &'static str) -> ghostty_vt::StatusReport {
+    ghostty_vt::StatusReport {
+        state,
+        kind: None,
+        progress: None,
+        id: String::new(),
+        app: String::new(),
+        title: String::new(),
+        message: String::new(),
+    }
+}
+
+fn new_terminal(core: &Core) -> u32 {
+    core.lock().reg.create(crate::terminals::NewTerminal { argv: vec!["sh".into()], ..Default::default() }, 0).unwrap()
+}
+
+/// Swaps the registry writer for one that only counts writes (flush the old one first).
+fn count_writes(core: &mut Arc<Core>) -> Arc<std::sync::atomic::AtomicUsize> {
+    let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = writes.clone();
+    Arc::get_mut(core).unwrap().registry_writer = RegistryWriter::start(move |_| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    })
+    .unwrap();
+    writes
+}
+
+/// The terminal as the registry file on disk has it.
+fn saved_terminal(root: &std::path::Path, id: u32) -> crate::terminals::Terminal {
+    let bytes = std::fs::read(root.join("state").join("terminals.json")).unwrap();
+    let mut reg: crate::terminals::Registry = serde_json::from_slice(&bytes).unwrap();
+    reg.terminals.remove(&id).expect("saved")
+}
+
+#[tokio::test]
+async fn a_new_word_is_saved_at_once_unless_the_last_save_was_costly_and_recent() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (mut core, root) = test_core();
+    core.flush_saved().await.unwrap();
+    let writes = count_writes(&mut core);
+    let id = new_terminal(&core);
+    let last_save =
+        |ago: Duration, cost: Duration| *core.last_save.lock().unwrap() = Some((Instant::now() - ago, cost));
+    let seq = core.lock().events.seq;
+    core.report_status(&mut core.lock(), id, &[]);
+    core.flush_saved().await.unwrap();
+    assert_eq!((core.lock().events.seq, writes.load(SeqCst)), (seq, 0), "an empty batch tells and saves nothing");
+
+    last_save(Duration::ZERO, SAVE_COSTLY - Duration::from_micros(1));
+    core.report_status(&mut core.lock(), id, &[root_report("working")]);
+    core.flush_saved().await.unwrap();
+    assert_eq!(writes.load(SeqCst), 1, "a cheap registry saves every new word, however recent the last save");
+    assert!(!core.dirty.load(SeqCst));
+
+    last_save(Duration::ZERO, SAVE_COSTLY);
+    core.report_status(&mut core.lock(), id, &[root_report("idle")]);
+    core.flush_saved().await.unwrap();
+    assert_eq!(writes.load(SeqCst), 1, "a costly save just now: save_soon takes it");
+    assert!(core.dirty.load(SeqCst), "and it is still owed");
+
+    last_save(SAVE_COSTLY * 20, SAVE_COSTLY);
+    core.report_status(&mut core.lock(), id, &[root_report("working")]);
+    core.flush_saved().await.unwrap();
+    assert_eq!(writes.load(SeqCst), 2, "a costly save long enough ago: saved at once again");
+    assert!(!core.dirty.load(SeqCst));
+
+    *core.last_save.lock().unwrap() = None;
+    let progress = ghostty_vt::StatusReport { message: "half way".into(), ..root_report("working") };
+    core.report_status(&mut core.lock(), id, &[progress]);
+    core.flush_saved().await.unwrap();
+    assert_eq!(writes.load(SeqCst), 2, "the same word with a new message waits for save_soon");
+    assert!(core.dirty.load(SeqCst));
+    drop(core);
+    remove_root(&root);
+}
+
+#[tokio::test]
+async fn one_report_chunks_while_saving_is_costly_are_saved_once_when_due() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (mut core, root) = test_core();
+    core.flush_saved().await.unwrap();
+    let writes = count_writes(&mut core);
+    let id = new_terminal(&core);
+    // The last save took a second: new words wait for save_soon for the next twenty.
+    *core.last_save.lock().unwrap() = Some((Instant::now(), Duration::from_secs(1)));
+    let seq = core.lock().events.seq;
+    for i in 0..1000 {
+        core.report_status(&mut core.lock(), id, &[root_report(if i % 2 == 0 { "working" } else { "idle" })]);
+    }
+    core.flush_saved().await.unwrap();
+    assert_eq!(writes.load(SeqCst), 0, "no save per chunk");
+    assert!(core.dirty.load(SeqCst), "but one is owed");
+    assert_eq!(core.lock().events.seq - seq, 1500, "a status per chunk, and a turn per ended turn");
+    assert_eq!(core.lock().reg.terminals[&id].turn, 500);
+    core.save_if_dirty();
+    core.flush_saved().await.unwrap();
+    assert_eq!(writes.load(SeqCst), 1, "the whole flood is saved once, when due");
+    assert!(!core.dirty.load(SeqCst));
+    drop(core);
+    remove_root(&root);
+}
+
+#[tokio::test]
+async fn a_graceful_stop_writes_what_save_soon_held_back() {
+    let (core, root) = test_core();
+    let id = new_terminal(&core);
+    *core.last_save.lock().unwrap() = None;
+    core.report_status(&mut core.lock(), id, &[root_report("working")]);
+    let held = ghostty_vt::StatusReport { message: "held back".into(), ..root_report("working") };
+    core.report_status(&mut core.lock(), id, &[held]);
+    core.flush_saved().await.unwrap();
+    assert_eq!(saved_terminal(&root, id).status.unwrap().msg, "", "a message alone waits for save_soon");
+    crate::server::finish(&core).await.unwrap();
+    assert_eq!(saved_terminal(&root, id).status.unwrap().msg, "held back", "a stop does not lose it");
+    drop(core);
+    remove_root(&root);
+}
+
+#[tokio::test]
+async fn a_new_word_is_on_disk_before_any_stop() {
+    let (core, root) = test_core();
+    let id = new_terminal(&core);
+    *core.last_save.lock().unwrap() = None;
+    core.report_status(&mut core.lock(), id, &[root_report("working"), root_report("blocked")]);
+    // Killed here: no stop and no save_if_dirty, only what the writer already has.
+    core.flush_saved().await.unwrap();
+    let saved = saved_terminal(&root, id);
+    assert_eq!((saved.status.unwrap().state.as_str(), saved.turn), ("blocked", 1));
+    assert!(!core.dirty.load(std::sync::atomic::Ordering::SeqCst), "nothing left owed");
+    drop(core);
+    remove_root(&root);
+}
+
+#[tokio::test]
+async fn a_stuck_word_undone_in_its_chunk_is_told_and_one_kept_is_not_told_twice() {
+    let (core, root) = test_core();
+    let id = new_terminal(&core);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    core.subscribe(&mut core.lock(), crate::events::Filter::default(), crate::events::Sink::Waiter(tx));
+    let mut told = |reports: &[ghostty_vt::StatusReport]| {
+        core.report_status(&mut core.lock(), id, reports);
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    };
+    let kinds = |events: &[serde_json::Value]| -> Vec<(String, Option<String>)> {
+        events
+            .iter()
+            .map(|e| (e["type"].as_str().unwrap().to_string(), e["data"]["status"]["state"].as_str().map(String::from)))
+            .collect()
+    };
+    told(&[root_report("working")]);
+    let child = ghostty_vt::StatusReport { id: "sub".into(), ..root_report("working") };
+    let events = told(&[child, root_report("error"), root_report("working")]);
+    assert_eq!(
+        kinds(&events),
+        [("status".into(), Some("error".into())), ("status".into(), Some("working".into())), ("turn".into(), None)]
+    );
+    for status in &events[..2] {
+        assert_eq!(status["data"]["records"]["sub"]["state"], "working", "the whole record set, as before");
+        assert_eq!(status["data"]["reported"], true);
+    }
+    assert_eq!(events[2]["data"]["turn"], 1);
+
+    // Stuck at the end as in the middle: one status, not the same one twice.
+    let events = told(&[root_report("blocked"), root_report("working"), root_report("blocked")]);
+    assert_eq!(kinds(&events), [("status".into(), Some("blocked".into())), ("turn".into(), None)]);
+    assert_eq!(events[1]["data"]["turn"], 3, "both turns count");
+    drop(core);
+    remove_root(&root);
+}
