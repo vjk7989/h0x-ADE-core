@@ -41,6 +41,7 @@ mod ffi {
     pub const OPT_PROGRAM_STATUS: i32 = 46;
     pub const OPT_SEMANTIC_PROMPT: i32 = 42;
     pub const SEMANTIC_PROMPT_START: i32 = 1;
+    pub const BOUNDARY_GROUND: u32 = 1;
     pub const OPT_SIZE: i32 = 6;
     pub const OPT_COLOR_SCHEME: i32 = 7;
     pub const OPT_DEVICE_ATTRIBUTES: i32 = 8;
@@ -149,6 +150,18 @@ mod ffi {
         pub len: usize,
     }
 
+    /// `GhosttyTerminalWriteStop`; only `consumed` is read.
+    #[repr(C)]
+    pub struct WriteStop {
+        pub size: usize,
+        pub consumed: usize,
+        pub reached: u32,
+        pub kind: i32,
+        pub introducer: i32,
+        pub end: i32,
+        pub byte: u8,
+    }
+
     #[repr(C)]
     pub struct SizeReport {
         pub rows: u16,
@@ -199,11 +212,12 @@ mod ffi {
         pub fn ghostty_terminal_set(t: Terminal, opt: i32, value: *const c_void) -> i32;
         pub fn ghostty_terminal_get(t: Terminal, data: i32, out: *mut c_void) -> i32;
         pub fn ghostty_terminal_vt_write(t: Terminal, data: *const u8, len: usize);
-        pub fn ghostty_terminal_vt_write_until_ground(
+        pub fn ghostty_terminal_vt_write_until(
             t: Terminal,
             data: *const u8,
             len: usize,
-            consumed: *mut usize,
+            boundaries: u32,
+            out: *mut WriteStop,
         ) -> i32;
         pub fn ghostty_terminal_continuation_alloc(
             t: Terminal,
@@ -464,11 +478,19 @@ impl Terminal {
 
     /// Consumes through the first clean parser boundary, or the entire slice if none is reached.
     pub fn write_until_ground(&mut self, bytes: &[u8]) -> Option<usize> {
-        let mut consumed = 0;
-        let rc = unsafe {
-            ffi::ghostty_terminal_vt_write_until_ground(self.raw, bytes.as_ptr(), bytes.len(), &mut consumed)
+        let mut stop = ffi::WriteStop {
+            size: size_of::<ffi::WriteStop>(),
+            consumed: 0,
+            reached: 0,
+            kind: 0,
+            introducer: 0,
+            end: 0,
+            byte: 0,
         };
-        (rc == ffi::SUCCESS).then_some(consumed)
+        let rc = unsafe {
+            ffi::ghostty_terminal_vt_write_until(self.raw, bytes.as_ptr(), bytes.len(), ffi::BOUNDARY_GROUND, &mut stop)
+        };
+        (rc == ffi::SUCCESS).then_some(stop.consumed)
     }
 
     /// Query replies and subscribed notifications since the last call, for the program's PTY.
