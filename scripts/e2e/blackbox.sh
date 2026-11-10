@@ -74,6 +74,12 @@ w=$("$HC" wait slow --output ready-x --timeout 30 2>&1)
 case $w in *'"reason": "output"'* | *'"reason":"output"'*) pass "wait --output returns at the output" ;; *) fail "wait --output" "$(tailc "$w")" ;; esac
 ok "kill" "$HC" kill slow
 expect "killed terminal is finished" 20 '"state": *"finished"' get slow
+if [ -n "${E2E_SANDBOX:-}" ] && ! "$HC" get slow 2>&1 | grep -Eq '"state": *"finished"'; then
+  echo "DIAG kill did not end the program inside the sandbox:"; "$HC" get slow 2>&1 | head -c 700; echo
+  ps -eo pid,ppid,pgid,stat,user,args 2>&1 | head -30
+  kill -0 "$(ps -eo pid,args | awk '$2=="sleep"{print $1; exit}')" 2>&1 | head -3
+  grep -E "^(Seccomp|NoNewPrivs|Cap(Eff|Bnd))" /proc/self/status
+fi
 if poll 15 "$HC" rm slow; then pass "rm"; else fail "rm" "$(tailc "$("$HC" rm slow 2>&1)")"; fi
 ok "kill shell" "$HC" kill sh1
 x=$("$HC" exec "$bashx" -c 'echo exec-out; exit 7' 2>&1); rc=$?
