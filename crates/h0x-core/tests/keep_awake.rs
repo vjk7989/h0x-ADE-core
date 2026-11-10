@@ -208,8 +208,9 @@ fn empty_colon_only_and_relative_helper_dirs_never_find_a_helper() {
         let core = serve_with(&s, &path, dirs);
         let t = agent(&s, "go");
         wait_until("working", || get(&s, &t)["status"]["state"] == "working");
-        wait_until("a helper found or reported missing", || {
-            !inhibit_calls(&s).is_empty() || core_err(&s).contains("keep_awake: cannot start systemd-inhibit")
+        // No valid dir means the system dirs: the real helper may hold the block, fail on its own, or be absent.
+        wait_until("a helper run, or the attempt reported", || {
+            !inhibit_calls(&s).is_empty() || held(&s) || core_err(&s).contains("keep_awake:")
         });
         assert_eq!(inhibit_calls(&s), [""; 0], "helper dirs {dirs:?}: a helper ran by a relative path or from PATH");
         stop(&s, core);
