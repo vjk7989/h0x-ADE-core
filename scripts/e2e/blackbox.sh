@@ -73,7 +73,7 @@ ok "run --bg slow program" "$HC" run --bg --name slow -- "$bashx" "$scripts/slow
 w=$("$HC" wait slow --output ready-x --timeout 30 2>&1)
 case $w in *'"reason": "output"'* | *'"reason":"output"'*) pass "wait --output returns at the output" ;; *) fail "wait --output" "$(tailc "$w")" ;; esac
 ok "kill" "$HC" kill slow
-expect "killed terminal is finished" 15 '"name": *"slow"' ls --all
+expect "killed terminal is finished" 20 '"state": *"finished"' get slow
 if poll 15 "$HC" rm slow; then pass "rm"; else fail "rm" "$(tailc "$("$HC" rm slow 2>&1)")"; fi
 ok "kill shell" "$HC" kill sh1
 x=$("$HC" exec "$bashx" -c 'echo exec-out; exit 7' 2>&1); rc=$?
