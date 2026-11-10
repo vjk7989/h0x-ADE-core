@@ -91,30 +91,32 @@ pub(crate) fn incomplete_tail(input: &[u8]) -> usize {
 /// asked), so a repaint or program turning them off turns them back on.
 fn shown(payload: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     use std::borrow::Cow;
-    const OFF: &[u8] = b"\x1b[?1004l";
-    let mut out = Cow::Borrowed(payload);
-    // ConPTY asks its viewer for win32-input-mode. A Windows console hosting
-    // h0x-core would obey and send keys as key-event codes: no detach key, no replies.
-    // Removing one can join the bytes around it into another (`ESC[?900` ESC[?9001l `1h`),
-    // so go again until a full pass removes nothing.
-    loop {
-        let mut removed = false;
-        for mode in [&b"\x1b[?9001h"[..], b"\x1b[?9001l"] {
-            while let Some(at) = out.windows(mode.len()).position(|w| w == mode) {
-                out.to_mut().drain(at..at + mode.len());
-                removed = true;
-            }
+    if !payload.contains(&0x1b) {
+        return Cow::Borrowed(payload);
+    }
+    // One pass, deciding on each byte as it lands in `out`. ConPTY asks its viewer for
+    // win32-input-mode; a Windows console hosting h0x-core would obey and send keys as key-event
+    // codes: no detach key, no replies. So `ESC[?9001h/l` is dropped as soon as its last byte lands.
+    // Dropping one can join the bytes around it into another (`ESC[?900` ESC[?9001l `1h`), which
+    // the same check sees next. Focus-off is turned back on where it was turned off, not at the
+    // end: a payload can end partway through a character that the next payload finishes.
+    let mut out = Vec::with_capacity(payload.len());
+    let mut changed = false;
+    for &byte in payload {
+        out.push(byte);
+        if byte != b'h' && byte != b'l' {
+            continue;
         }
-        if !removed {
-            break;
+        let len = out.len();
+        if len >= 8 && &out[len - 8..len - 1] == b"\x1b[?9001" {
+            out.truncate(len - 8);
+            changed = true;
+        } else if byte == b'l' && out.ends_with(b"\x1b[?1004l") {
+            out[len - 1] = b'h';
+            changed = true;
         }
     }
-    // Turned back on where it was turned off, not at the end: a payload can
-    // end partway through a character that the next payload finishes.
-    while let Some(at) = out.windows(OFF.len()).position(|w| w == OFF) {
-        out.to_mut()[at + OFF.len() - 1] = b'h';
-    }
-    out
+    if changed { Cow::Owned(out) } else { Cow::Borrowed(payload) }
 }
 
 /// `shown` for a stream: a payload can end partway through one of the
@@ -514,6 +516,59 @@ mod tests {
     #[test]
     fn conpty_never_switches_our_keys_to_win32_input_mode() {
         assert_eq!(&*shown(b"\x1b[?9001h\x1b[?1004hhi\x1b[?9001l"), b"\x1b[?1004hhi");
+    }
+
+    /// The filter as it was before the single pass: rescan until a full pass removes nothing.
+    fn rescanning(payload: &[u8]) -> Vec<u8> {
+        let mut out = payload.to_vec();
+        loop {
+            let mut removed = false;
+            for mode in [&b"\x1b[?9001h"[..], b"\x1b[?9001l"] {
+                while let Some(at) = out.windows(mode.len()).position(|w| w == mode) {
+                    out.drain(at..at + mode.len());
+                    removed = true;
+                }
+            }
+            if !removed {
+                break;
+            }
+        }
+        while let Some(at) = out.windows(8).position(|w| w == b"\x1b[?1004l") {
+            out[at + 7] = b'h';
+        }
+        out
+    }
+
+    #[test]
+    fn the_single_pass_filter_gives_what_the_rescanning_one_gave() {
+        const PIECES: [&[u8]; 9] = [b"\x1b", b"[?", b"900", b"1004", b"1", b"h", b"l", b"\x1b[?9001h", b"x"];
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..20_000 {
+            let mut input = Vec::new();
+            for _ in 0..12 {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                input.extend_from_slice(PIECES[(seed % PIECES.len() as u64) as usize]);
+            }
+            assert_eq!(&*shown(&input), &rescanning(&input)[..], "{:?}", String::from_utf8_lossy(&input));
+        }
+    }
+
+    #[test]
+    fn near_misses_and_removals_cost_one_pass_not_one_per_match() {
+        let near = b"\x1b[?9001x\x1b[?1004\x1b[?900\x1b[?".repeat(65_536 / 28);
+        let removed = b"\x1b[?9001l".repeat(65_536 / 8);
+        let off = b"\x1b[?1004l".repeat(65_536 / 8);
+        // Each `ESC[?10` is closed by `04l` only after a run of removals joins them up.
+        let nested = [b"\x1b[?10".repeat(4_096), b"\x1b[?9001l".repeat(4_096), b"04l".repeat(4_096)].concat();
+        for input in [near, removed, off, nested] {
+            let start = std::time::Instant::now();
+            let out = shown(&input).into_owned();
+            let took = start.elapsed();
+            assert!(took < std::time::Duration::from_millis(20), "{} B took {took:?}", input.len());
+            assert!(!out.windows(8).any(|w| w == b"\x1b[?1004l" || w == b"\x1b[?9001l"));
+        }
     }
     #[test]
     fn detach_chord_is_found_in_every_keyboard_encoding() {
