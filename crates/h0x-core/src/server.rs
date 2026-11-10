@@ -107,6 +107,7 @@ pub fn serve() -> io::Result<()> {
 
 /// Finish queued registry work before the runtime cancels its tasks (which still own Core).
 pub(crate) async fn finish(core: &Core) -> io::Result<()> {
+    core.save_if_dirty();
     if core.restart.load(std::sync::atomic::Ordering::SeqCst) {
         core.handover().await?;
     }

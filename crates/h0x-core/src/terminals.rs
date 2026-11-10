@@ -66,7 +66,7 @@ pub struct Terminal {
     pub records: BTreeMap<String, crate::status::Status>,
     /// Ids of `records`, least recently updated first (private; empty after a reload).
     #[serde(skip)]
-    pub record_order: Vec<String>,
+    pub record_order: crate::status::RecordOrder,
     /// Goes up each time the status leaves `working`.
     #[serde(default)]
     pub turn: u64,
@@ -284,7 +284,7 @@ impl Registry {
                 status: None,
                 status_ms: None,
                 records: BTreeMap::new(),
-                record_order: Vec::new(),
+                record_order: Default::default(),
                 turn: 0,
                 first_task_turn: None,
                 reported: false,

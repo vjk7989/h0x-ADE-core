@@ -248,14 +248,18 @@ impl Core {
         }
     }
 
+    /// Writes what `save_soon` still holds back; shutdown calls it so no state is lost.
+    pub fn save_if_dirty(&self) {
+        if self.dirty.load(std::sync::atomic::Ordering::SeqCst) {
+            self.save(&self.lock());
+        }
+    }
+
     pub async fn save_when_due(self: Arc<Self>) {
         loop {
             self.save_due.notified().await;
             tokio::time::sleep(SAVE_SOON).await;
-            let st = self.lock();
-            if self.dirty.load(std::sync::atomic::Ordering::SeqCst) {
-                self.save(&st);
-            }
+            self.save_if_dirty();
         }
     }
 

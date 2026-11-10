@@ -516,3 +516,59 @@ fn remove_root(root: impl AsRef<std::path::Path>) {
         }
     }
 }
+
+#[tokio::test]
+async fn a_flood_of_status_flips_saves_once_and_emits_one_event_per_batch() {
+    let (mut core, root) = test_core();
+    core.flush_saved().await.unwrap();
+    let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = writes.clone();
+    Arc::get_mut(&mut core).unwrap().registry_writer = RegistryWriter::start(move |_| {
+        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    })
+    .unwrap();
+    let report = |state: &'static str, id: &str, message: String| ghostty_vt::StatusReport {
+        state,
+        kind: None,
+        progress: None,
+        id: id.into(),
+        app: String::new(),
+        title: String::new(),
+        message,
+    };
+    let id = {
+        let mut st = core.lock();
+        let id =
+            st.reg.create(crate::terminals::NewTerminal { argv: vec!["sh".into()], ..Default::default() }, 0).unwrap();
+        let big = "m".repeat(2048);
+        let fill: Vec<_> = (0..300).map(|i| report("idle", &format!("r{i}"), big.clone())).collect();
+        core.report_status(&mut st, id, &fill);
+        id
+    };
+    core.save_if_dirty();
+    core.flush_saved().await.unwrap();
+    let (saved, seq) = (writes.load(std::sync::atomic::Ordering::SeqCst), core.lock().events.seq);
+    let flips: Vec<_> =
+        (0..4000).map(|i| report(if i % 2 == 0 { "working" } else { "idle" }, "", String::new())).collect();
+    let started = Instant::now();
+    {
+        let mut st = core.lock();
+        core.report_status(&mut st, id, &flips);
+        let t = &st.reg.terminals[&id];
+        assert_eq!(t.records.len(), 255, "the cap holds");
+        assert_eq!(t.turn, 2000, "every working to idle still counts a turn");
+        // One status event and one turn event for the whole batch.
+        assert_eq!(st.events.seq - seq, 2);
+    }
+    assert!(started.elapsed() < Duration::from_secs(5), "4000 flips took {:?}", started.elapsed());
+    assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), saved, "nothing is saved per report");
+    core.save_if_dirty();
+    core.flush_saved().await.unwrap();
+    assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), saved + 1, "one save for the burst, final state kept");
+    core.save_if_dirty();
+    core.flush_saved().await.unwrap();
+    assert_eq!(writes.load(std::sync::atomic::Ordering::SeqCst), saved + 1, "clean state is not saved again");
+    drop(core);
+    remove_root(&root);
+}

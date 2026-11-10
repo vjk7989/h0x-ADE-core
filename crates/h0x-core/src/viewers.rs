@@ -189,44 +189,55 @@ impl Core {
         }
     }
 
-    /// Applies 7501 reports and tells subscribers what changed.
+    /// Applies 7501 reports and tells subscribers what changed: once for the whole
+    /// batch, not per report (a program can print thousands in one chunk). The
+    /// event keeps its wire shape (the whole record set, which clients replace), so
+    /// it is built once. The registry is saved by the debounced `save_soon`.
     pub fn report_status(&self, st: &mut State, id: u32, reports: &[ghostty_vt::StatusReport]) {
-        let word = |st: &State| st.reg.terminals[&id].status.as_ref().map(|s| s.state.clone());
-        let mut word_changed = false;
+        let mut batch = crate::status::Change::default();
+        let mut first_task_finished = false;
         for r in reports {
-            let was = word(st);
             let t = st.reg.terminals.get_mut(&id).expect("live terminal");
             let change = crate::status::apply(t, r);
-            self.status_changed(st, id, change);
-            word_changed |= word(st) != was;
+            first_task_finished |= Self::settle_first_task(t, &change);
+            batch.status |= change.status;
+            batch.root_report |= change.root_report;
+            batch.turn_ended |= change.turn_ended;
+            batch.stuck |= change.stuck;
         }
-        // Losing the holder too (a reboot) leaves no tail to replay: queue a new word,
-        // and with it a turn or news, for immediate persistence. Messages and progress can wait.
-        if word_changed { self.save(st) } else { self.save_soon() }
+        self.announce(st, id, batch, first_task_finished);
+        self.save_soon();
     }
 
     pub fn status_changed(&self, st: &mut State, id: u32, change: crate::status::Change) {
         let t = st.reg.terminals.get_mut(&id).expect("reported terminal");
-        let first_task_finished = t.first_task_turn.is_some_and(|turn| {
+        let first_task_finished = Self::settle_first_task(t, &change);
+        self.announce(st, id, change, first_task_finished);
+    }
+
+    /// Ends the launch task's first-turn wait if this change finished it.
+    fn settle_first_task(t: &mut crate::terminals::Terminal, change: &crate::status::Change) -> bool {
+        let finished = t.first_task_turn.is_some_and(|turn| {
             t.turn > turn
                 || (change.root_report
                     && t.status.as_ref().is_some_and(|s| matches!(s.state.as_str(), "done" | "blocked" | "error")))
         });
-        if first_task_finished {
+        if finished {
             t.first_task_turn = None;
         }
-        let (status, records, turn, reported) = (t.status.clone(), t.records.clone(), t.turn, t.reported);
+        finished
+    }
+
+    fn announce(&self, st: &mut State, id: u32, change: crate::status::Change, first_task_finished: bool) {
         if change.status {
-            self.emit(
-                st,
-                "status",
-                id,
-                serde_json::json!({"status": status, "records": records, "reported": reported}),
-            );
+            let t = &st.reg.terminals[&id];
+            let data = serde_json::json!({"status": t.status, "records": t.records, "reported": t.reported});
+            self.emit(st, "status", id, data);
         }
         if change.turn_ended {
-            let state = status.map(|s| s.state);
-            self.emit(st, "turn", id, serde_json::json!({"turn": turn, "state": state}));
+            let t = &st.reg.terminals[&id];
+            let data = serde_json::json!({"turn": t.turn, "state": t.status.as_ref().map(|s| &s.state)});
+            self.emit(st, "turn", id, data);
         }
         if (change.turn_ended || change.stuck || first_task_finished) && st.reg.terminals[&id].is_live() {
             self.news(st, id);
