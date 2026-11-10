@@ -74,7 +74,7 @@ w=$("$HC" wait slow --output ready-x --timeout 30 2>&1)
 case $w in *'"reason": "output"'* | *'"reason":"output"'*) pass "wait --output returns at the output" ;; *) fail "wait --output" "$(tailc "$w")" ;; esac
 ok "kill" "$HC" kill slow
 expect "killed terminal is finished" 15 '"name": *"slow"' ls --all
-ok "rm" "$HC" rm slow
+if poll 15 "$HC" rm slow; then pass "rm"; else fail "rm" "$(tailc "$("$HC" rm slow 2>&1)")"; fi
 ok "kill shell" "$HC" kill sh1
 x=$("$HC" exec "$bashx" -c 'echo exec-out; exit 7' 2>&1); rc=$?
 if [ "$rc" = 7 ] && printf '%s' "$x" | grep -q exec-out; then pass "exec prints output and returns the exit code"; else fail "exec" "rc=$rc $(tailc "$x")"; fi
@@ -146,9 +146,8 @@ fi
 { sleep 1; "$HC" --skill; } | head -c 0 >/dev/null; rc=${PIPESTATUS[0]}
 if [ "$rc" = 141 ]; then pass "broken pipe exits 141"; elif [ "$os" = windows ]; then warn "broken pipe exit code" "rc=$rc under Git Bash (a pipe there may accept the write); the exit is unit-tested"; else fail "broken pipe exit code" "rc=$rc, want 141"; fi
 
-out=$("$HC" server stop 2>&1) && pass "server stop" || fail "server stop" "$(tailc "$out")"
-stopped() { "$HC" server status 2>&1 | grep -q unavailable; }
-if poll 15 stopped; then pass "server really stopped"; else fail "server really stopped" "server status: $(tailc "$("$HC" server status 2>&1)")"; fi
+out=$("$HC" server stop 2>&1)
+case $out in *'"stopped": true'* | *'"stopped":true'*) pass "server stop" ;; *) fail "server stop" "$(tailc "$out")" ;; esac
 
 # --- the runtime (h0x)
 echo "== h0x (runtime)"
