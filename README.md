@@ -149,6 +149,10 @@ See [Remote control (bridge)](docs/bridge.md).
 [The API docs](schema/README.md) cover connecting, terminal streams, events, and status.
 `h0x-core connect` carries the protocol over stdin and stdout, including through SSH.
 
+## Info
+
+HyperOx by Buckleson Group: https://github.com/buckleson
+
 ## Part of HyperOx
 
 The HyperOx desktop app, [`h0x-ade`](https://github.com/vjk7989/h0x-ADE-app),
