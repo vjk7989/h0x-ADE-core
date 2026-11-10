@@ -1,0 +1,21 @@
+# OpenShell policy for the e2e sandbox: network only to GitHub (the release pages and
+# the hosts GitHub redirects downloads to), writes only in the workspace (/sandbox),
+# /tmp and the terminal devices h0x-core needs.
+version: 1
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /lib64, /bin, /sbin, /etc, /proc, /var/log, /app]
+  read_write: [/sandbox, /tmp, /dev]
+landlock:
+  compatibility: best_effort
+network_policies:
+  github:
+    endpoints:
+      - host: github.com
+        port: 443
+      - host: objects.githubusercontent.com
+        port: 443
+      - host: release-assets.githubusercontent.com
+        port: 443
+    binaries:
+      - path: /usr/bin/curl
