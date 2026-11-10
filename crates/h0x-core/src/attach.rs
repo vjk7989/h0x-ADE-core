@@ -119,13 +119,16 @@ fn shown(payload: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     if changed { Cow::Owned(out) } else { Cow::Borrowed(payload) }
 }
 
+/// The most `shown_stream` holds back.
+const MAX_HELD: usize = 64;
+
 /// `shown` for a stream: a payload can end partway through one of the sequences it filters, so
 /// the tail of the filtered output that is the start of one waits in `held` for the next payload.
 /// Decided on the output, not the raw bytes: a removal can leave the start of a sequence that the
 /// next payload finishes (`ESC[?900` + `1h`), and a start can sit inside another start's removal
 /// (`ESC[?10` `ESC[?900` `ESC[?9001l`). So the hold is the run of trailing segments, each an ESC
 /// and what follows it up to the next ESC, that are all starts of a filtered sequence: at most 7
-/// bytes for any one start, longer only while the stream keeps opening new ones.
+/// bytes for any one start, longer while the stream keeps opening new ones, up to `MAX_HELD`.
 /// `finish` passes on what is held.
 fn shown_stream(held: &mut Vec<u8>, payload: &[u8]) -> Vec<u8> {
     const FILTERED: [&[u8]; 3] = [b"\x1b[?9001h", b"\x1b[?9001l", b"\x1b[?1004l"];
@@ -139,7 +142,15 @@ fn shown_stream(held: &mut Vec<u8>, payload: &[u8]) -> Vec<u8> {
             break;
         }
     }
-    *held = out.split_off(start);
+    let mut tail = out.split_off(start);
+    // A program that keeps opening starts must not stall the viewer or grow this without limit:
+    // the oldest starts are dropped (unfinished escapes; letting them out could join into a
+    // filtered sequence later, dropping them cannot).
+    let mut skip = 0;
+    while tail.len() - skip > MAX_HELD {
+        skip += 1 + tail[skip + 1..].iter().position(|&b| b == 0x1b).unwrap_or(tail.len() - skip - 1);
+    }
+    *held = tail.split_off(skip);
     out
 }
 
@@ -608,6 +619,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_stream_of_endless_escape_starts_holds_a_bounded_run_and_leaks_no_filtered_sequence() {
+        let input = [b"\x1b[?9".repeat(1 << 20 >> 2), b"x".to_vec()].concat();
+        let mut held = Vec::new();
+        let mut got = Vec::new();
+        for read in input.chunks(4093) {
+            got.extend(shown_stream(&mut held, read));
+            assert!(held.len() <= 64, "held {} B", held.len());
+        }
+        got.extend(finish(&mut held));
+        assert!(got.contains(&b'x'), "the text after the starts is shown");
+        for seq in [&b"\x1b[?9001h"[..], b"\x1b[?9001l", b"\x1b[?1004l"] {
+            assert!(!got.windows(seq.len()).any(|w| w == seq), "{seq:?} reached the output");
+        }
+    }
     #[test]
     fn a_large_stream_cut_into_odd_sized_reads_is_filtered_at_every_boundary() {
         let unit = b"x\x1b[?9001h\x1b[?1004l\x1b[?9001l";
