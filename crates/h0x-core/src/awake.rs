@@ -106,15 +106,31 @@ pub struct Os(Option<std::process::Child>);
 
 /// A helper that ships with the system, at a fixed place. Never looked up on PATH: a planted
 /// binary earlier on it would run with the user's rights. Debug builds only: the integration
-/// tests point `H0X_CORE_HELPER_DIRS` at a stand-in; a release build never reads it.
+/// tests point `H0X_CORE_HELPER_DIRS` (absolute dirs; empty and relative entries are dropped, and
+/// nothing valid left means the system dirs) at a stand-in; a release build never reads it.
+/// A file that is not executable is reported and the search goes on.
 #[cfg(unix)]
 fn system_helper(name: &str) -> Option<std::path::PathBuf> {
-    let dirs = if cfg!(debug_assertions) { std::env::var("H0X_CORE_HELPER_DIRS").ok() } else { None };
-    dirs.as_deref()
-        .unwrap_or("/usr/bin:/bin")
-        .split(':')
-        .map(|dir| std::path::Path::new(dir).join(name))
-        .find(|p| p.is_file())
+    use std::os::unix::fs::PermissionsExt;
+    let set = if cfg!(debug_assertions) { std::env::var("H0X_CORE_HELPER_DIRS").ok() } else { None };
+    let mut dirs: Vec<&str> =
+        set.as_deref().unwrap_or("").split(':').filter(|d| std::path::Path::new(d).is_absolute()).collect();
+    if dirs.is_empty() {
+        dirs = vec!["/usr/bin", "/bin"];
+    }
+    for dir in dirs {
+        let path = std::path::Path::new(dir).join(name);
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        if meta.permissions().mode() & 0o111 == 0 {
+            eprintln!("core: keep_awake: cannot start {}: permission denied (not executable)", path.display());
+            continue;
+        }
+        return Some(path);
+    }
+    None
 }
 
 #[cfg(unix)]

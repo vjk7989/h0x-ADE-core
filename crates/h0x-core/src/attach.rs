@@ -119,19 +119,27 @@ fn shown(payload: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     if changed { Cow::Owned(out) } else { Cow::Borrowed(payload) }
 }
 
-/// `shown` for a stream: a payload can end partway through one of the
-/// sequences it filters, so that tail (at most 7 bytes) waits in `held` for
-/// the next payload. `finish` passes on whatever is still held.
+/// `shown` for a stream: a payload can end partway through one of the sequences it filters, so
+/// the tail of the filtered output that is the start of one waits in `held` for the next payload.
+/// Decided on the output, not the raw bytes: a removal can leave the start of a sequence that the
+/// next payload finishes (`ESC[?900` + `1h`), and a start can sit inside another start's removal
+/// (`ESC[?10` `ESC[?900` `ESC[?9001l`). So the hold is the run of trailing segments, each an ESC
+/// and what follows it up to the next ESC, that are all starts of a filtered sequence: at most 7
+/// bytes for any one start, longer only while the stream keeps opening new ones.
+/// `finish` passes on what is held.
 fn shown_stream(held: &mut Vec<u8>, payload: &[u8]) -> Vec<u8> {
     const FILTERED: [&[u8]; 3] = [b"\x1b[?9001h", b"\x1b[?9001l", b"\x1b[?1004l"];
     held.extend_from_slice(payload);
-    let keep = (1..FILTERED[0].len().min(held.len() + 1))
-        .rev()
-        .find(|&n| FILTERED.iter().any(|seq| held.ends_with(&seq[..n])))
-        .unwrap_or(0);
-    let tail = held.split_off(held.len() - keep);
-    let out = shown(held).into_owned();
-    *held = tail;
+    let mut out = shown(held).into_owned();
+    let mut start = out.len();
+    while let Some(esc) = out[..start].iter().rposition(|&b| b == 0x1b) {
+        if FILTERED.iter().any(|seq| seq.starts_with(&out[esc..start])) {
+            start = esc;
+        } else {
+            break;
+        }
+    }
+    *held = out.split_off(start);
     out
 }
 

@@ -80,7 +80,7 @@ fn automatic_input_requires_support_at_every_hop() {
 #[tokio::test]
 async fn automatic_input_survives_relays_but_not_a_capability_downgrade() {
     for (feature, confirmed) in [(false, true), (true, false), (true, true)] {
-        let root = scratch_base().join(format!(
+        let root = crate::platform::test_scratch().join(format!(
             "h0x-core-automatic-relay-{}-{}",
             std::process::id(),
             crate::platform::random_hex()
@@ -193,7 +193,7 @@ async fn reconnect_rejects_downgrade_before_mapping_fallback_data() {
 
 #[tokio::test]
 async fn failed_reattach_drains_pending_data_before_close() {
-    let root = scratch_base().join(format!(
+    let root = crate::platform::test_scratch().join(format!(
         "h0x-core-reattach-drain-{}-{}",
         std::process::id(),
         crate::platform::random_hex()
@@ -265,8 +265,11 @@ async fn failed_reattach_drains_pending_data_before_close() {
 
 #[test]
 fn remote_misses_and_renames_keep_subscribers_on_the_current_machine() {
-    let root =
-        scratch_base().join(format!("h0x-core-doc-missed-{}-{}", std::process::id(), crate::platform::random_hex()));
+    let root = crate::platform::test_scratch().join(format!(
+        "h0x-core-doc-missed-{}-{}",
+        std::process::id(),
+        crate::platform::random_hex()
+    ));
     let paths = Paths {
         socket: root.join("core.sock"),
         holder_socket: root.join("holder.sock"),
@@ -351,15 +354,13 @@ fn remote_misses_and_renames_keep_subscribers_on_the_current_machine() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
-/// Where these tests keep a core's files: unix socket paths are length-limited and the macOS temp
-/// dir is long, so unix keeps `/var/tmp`; Windows has no `/var/tmp` (it would be `<drive>:\var\tmp`).
-fn scratch_base() -> std::path::PathBuf {
-    if cfg!(windows) { std::env::temp_dir() } else { "/var/tmp".into() }
-}
-
 /// A core here (`here`) that has added `rohan`, with terminals t1 and t2.
 fn here_with_rohan(tag: &str) -> (Arc<Core>, std::path::PathBuf, Machine) {
-    let root = scratch_base().join(format!("h0x-core-{tag}-{}-{}", std::process::id(), crate::platform::random_hex()));
+    let root = crate::platform::test_scratch().join(format!(
+        "h0x-core-{tag}-{}-{}",
+        std::process::id(),
+        crate::platform::random_hex()
+    ));
     let paths = Paths {
         socket: root.join("core.sock"),
         holder_socket: root.join("holder.sock"),

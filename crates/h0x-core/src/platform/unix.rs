@@ -851,6 +851,10 @@ fn signal_group(
     send_group: impl Fn(i32, i32) -> io::Result<()>,
     send_pid: impl Fn(i32, i32) -> io::Result<()>,
 ) {
+    // Never 0 (our own group), 1 (init) or negative (a whole group, or everyone): as `ExecGroup::signal`.
+    if pgid <= 1 {
+        return;
+    }
     if let Err(e) = send_group(pgid, signal)
         && e.raw_os_error() == Some(libc::EPERM)
     {
