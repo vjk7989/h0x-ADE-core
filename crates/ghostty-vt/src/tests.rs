@@ -90,6 +90,14 @@ fn parses_reads_and_round_trips_a_snapshot() {
     t.write(b"m\x1b[?1049h");
     assert!(t.alt_screen());
     assert!(Terminal::restore(b"garbage", 1 << 20).is_none());
+    // A damaged snapshot (cut short, or with a foreign header) is refused, never
+    // half-restored; callers then start a fresh screen. Snapshots of the previous
+    // Ghostty pin are not damaged: they restore (see the test for that below).
+    assert!(Terminal::restore(&snap[..snap.len() / 2], 1 << 20).is_none());
+    assert!(Terminal::restore(&snap[..4], 1 << 20).is_none());
+    let mut foreign = snap;
+    foreign[0] ^= 0xff;
+    assert!(Terminal::restore(&foreign, 1 << 20).is_none());
 }
 
 #[test]
@@ -234,4 +242,203 @@ fn grapheme_clustering_is_on_like_ghostty() {
     assert_eq!(t.plain_text().trim_end(), "\u{270d}\u{fe0f}!");
     t.write(b"\x1bc");
     assert!(t.dec_mode(2027), "a reset keeps it on");
+}
+
+// Regression tests for the Ghostty fixes of 2026-10-27 (pin v1.4.0). They would
+// crash, or corrupt the terminal, on the previous pin.
+
+#[test]
+fn narrowing_a_65535_column_terminal_does_not_overflow_the_row_count() {
+    // GHSA-jqr7-69mm-v35h: a page this wide, narrowed, holds more than 65535 rows.
+    let mut t = Terminal::new(u16::MAX, 24, 1 << 20);
+    t.write(b"wide");
+    t.resize(4, 24);
+    assert_eq!(t.size(), (4, 24));
+    t.write(b"\r\nok");
+    assert!(t.plain_text().contains("ok"));
+
+    // The same through a snapshot, the way a crafted one reaches the decoder.
+    let wide = Terminal::new(u16::MAX, 24, 1 << 20);
+    let mut back = Terminal::restore(&wide.snapshot().unwrap(), 1 << 20).unwrap();
+    back.resize(3, 24);
+    assert_eq!(back.size(), (3, 24));
+}
+
+#[test]
+fn line_feeds_on_a_one_row_terminal_with_a_scrollback_limit_do_not_free_the_cursor_page() {
+    // GHSA-qjfx-r533-6vx3: reflow a long hyperlinked line wider, then fill the page.
+    let mut t = Terminal::new(10, 1, 1 << 12);
+    t.write(b"\x1b]8;;http://a.example\x1b\\");
+    t.write(&[b'x'; 200]);
+    t.resize(200, 1);
+    for _ in 0..4000 {
+        t.write(b"\n");
+    }
+    t.write(b"\x1b]8;;\x1b\\done");
+    assert!(t.plain_text().contains("done"));
+}
+
+#[test]
+fn clearing_the_screen_with_a_styled_hyperlinked_cursor_and_a_tiny_scrollback_is_safe() {
+    // GHSA-w9q4-5jvv-mcv4: CSI 22 J / CSI 2 J may prune the cursor's page.
+    for clear in [b"\x1b[22J".as_slice(), b"\x1b[2J"] {
+        let mut t = Terminal::new(80, 24, 1);
+        t.write(b"\x1b[1;31m\x1b]8;;http://a.example\x1b\\");
+        for i in 0..200 {
+            t.write(format!("line {i}\r\n").as_bytes());
+            t.write(clear);
+            t.write(b"\x1b[4;32mtext");
+        }
+        t.write(b"\x1b[0m\x1b]8;;\x1b\\\x1b[Hend");
+        assert!(t.plain_text().contains("end"));
+    }
+}
+
+#[test]
+fn kitty_clipboard_alias_updates_stay_bounded() {
+    // GHSA-3r5j-c6rj-xq2v: an open OSC 5522 write transaction updating one alias.
+    // We install no clipboard_write callback, so Ghostty rejects the transaction (with an error reply); no crash.
+    let mut t = Terminal::new(80, 24, 0);
+    t.write(b"\x1b]5522;type=write\x1b\\");
+    // The rejection is the whole story: no transaction exists for the aliases to grow.
+    assert_eq!(String::from_utf8_lossy(&t.take_responses()), "\x1b]5522;type=write:status=ENOSYS\x1b\\");
+    for _ in 0..20_000 {
+        t.write(b"\x1b]5522;type=walias:mime=text/plain;dGV4dC9wbGFpbg==\x1b\\");
+    }
+    assert!(t.take_responses().is_empty(), "alias updates outside a transaction are ignored");
+    t.write(b"ok");
+    assert!(t.plain_text().contains("ok"));
+}
+
+#[test]
+fn write_until_ground_stops_right_after_a_sequence_split_at_any_byte() {
+    let sequences: [&[u8]; 12] = [
+        b"\x1b[38;2;1;2;3m",
+        b"\x1b]2;title\x07",
+        b"\x1b]2;title\x1b\\",
+        b"\x1bP+q544e\x1b\\",
+        b"\x1b_Ga=T,f=100;iVBORw0KGgo=\x1b\\",
+        b"\x1b]7501;state=working:progress=40\x1b\\",
+        b"\x1b]133;A\x07",
+        b"\x1bc",
+        b"\x1b7",
+        "é".as_bytes(),
+        "€".as_bytes(),
+        "😀".as_bytes(),
+    ];
+    for seq in sequences {
+        // Text right after the sequence, or the next sequence: neither may be consumed.
+        for tail in [b"Zq".as_slice(), b"\x1b[1mZ"] {
+            let mut whole = Terminal::new(20, 4, 1 << 20);
+            whole.write(seq);
+            whole.write(tail);
+            let (reports, responses) = (whole.take_status_reports(), whole.take_responses());
+            // The core's effects fire on this engine: OSC 7501, a prompt start (133 A), a reset (RIS).
+            let expected: &[&str] = match seq {
+                s if s.starts_with(b"\x1b]7501") => &["working"],
+                s if s.starts_with(b"\x1b]133") => &["prompt"],
+                b"\x1bc" => &["clear"],
+                _ => &[],
+            };
+            assert_eq!(reports.iter().map(|r| r.state).collect::<Vec<_>>(), expected, "{seq:?}");
+            for k in 1..seq.len() {
+                let mut t = Terminal::new(20, 4, 1 << 20);
+                t.write(&seq[..k]);
+                let rest = [&seq[k..], tail].concat();
+                assert_eq!(t.write_until_ground(&rest), Some(seq.len() - k), "{seq:?} split at {k}, tail {tail:?}");
+                assert_eq!(t.continuation(), Some(Vec::new()), "{seq:?} split at {k}");
+                assert!(!t.plain_text().contains('Z'), "{seq:?} split at {k}: wrote past ground");
+                t.write(&rest[seq.len() - k..]);
+                assert_eq!(t.plain_text(), whole.plain_text(), "{seq:?} split at {k}");
+                assert_eq!(t.title(), whole.title(), "{seq:?} split at {k}");
+                assert_eq!(t.take_status_reports(), reports, "{seq:?} split at {k}");
+                assert_eq!(t.take_responses(), responses, "{seq:?} split at {k}");
+            }
+        }
+    }
+}
+
+#[test]
+fn write_until_ground_on_empty_input_at_ground_and_on_input_that_never_gets_there() {
+    let mut t = Terminal::new(20, 4, 1 << 20);
+    // Already at ground: it stops at once and consumes nothing, not even text.
+    assert_eq!(t.write_until_ground(b""), Some(0));
+    assert_eq!(t.write_until_ground(b"text"), Some(0));
+    assert!(!t.plain_text().contains("text"));
+    // Inside a sequence: an empty write is no progress, the rest is all consumed.
+    t.write(b"\x1b]2;ti");
+    assert_eq!(t.write_until_ground(b""), None);
+    assert_eq!(t.write_until_ground(b"tl"), None);
+    assert_eq!(t.continuation().unwrap(), b"\x1b]2;titl");
+    assert_eq!(t.write_until_ground(b"e\x1b"), None, "the ESC of an ST is not ground yet");
+    assert_eq!(t.write_until_ground(b"\\\x1b[31"), Some(1), "the first ground, not the end of the write");
+    assert_eq!(t.title(), "title");
+    assert_eq!(t.continuation(), Some(Vec::new()));
+    // A UTF-8 character split three ways.
+    t.write(b"\xf0");
+    assert_eq!(t.write_until_ground(b"\x9f"), None);
+    assert_eq!(t.write_until_ground(b"\x98"), None);
+    assert_eq!(t.write_until_ground(b"\x80x"), Some(1));
+    assert!(t.plain_text().contains('😀') && !t.plain_text().contains('x'));
+}
+
+#[test]
+fn write_until_ground_finds_ground_at_any_offset_of_a_huge_write() {
+    // Ghostty parses large writes in 4096-byte chunks: put the ST on and around their edges.
+    for payload in [0, 1, 4093, 4094, 4095, 4096, 8190, 8191, 1 << 20] {
+        let mut t = Terminal::new(80, 24, 1 << 20);
+        t.write(b"\x1b_Gm=1;");
+        let mut input = vec![b'A'; payload];
+        input.extend_from_slice(b"\x1b\\\x1b_Gm=1;BBBB");
+        assert_eq!(t.write_until_ground(&input), Some(payload + 2), "payload {payload}");
+        assert_eq!(t.continuation(), Some(Vec::new()), "payload {payload}");
+    }
+    // No ground anywhere in a huge write: all of it is consumed.
+    let mut t = Terminal::new(80, 24, 1 << 20);
+    t.write(b"\x1b]2;");
+    assert_eq!(t.write_until_ground(&vec![b'x'; 1 << 20]), None);
+    assert_eq!(t.write_until_ground(b"\x07after"), Some(1));
+}
+
+#[test]
+fn a_snapshot_written_by_the_previous_ghostty_pin_still_restores() {
+    // Ghostty's complete fixture, byte for byte the same at the previous pin (1e5cdb8)
+    // and written by its encoder. v1.4.0 kept wire version 1 and only added optional
+    // records, so an old core handing over passes its screens on.
+    // Read at run time: the lint job has no submodule checkout.
+    let path =
+        concat!(env!("CARGO_MANIFEST_DIR"), "/../../vendor/ghostty/src/terminal/snapshot/testdata/complete-v1.hex");
+    let old: Vec<u8> = std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .flat_map(|line| line.split('#').next().unwrap_or_default().split_whitespace())
+        .map(|byte| u8::from_str_radix(byte, 16).unwrap())
+        .collect();
+    assert_eq!(&old[..10], b"GHOSTSNP\x01\x00");
+    let mut t = Terminal::restore(&old, 1 << 20).expect("an old snapshot restores");
+    assert_eq!(t.size(), (2, 3));
+    assert!(t.alt_screen());
+    t.write(b"\x1b[?1049l");
+    assert!(!t.alt_screen());
+    let text = t.plain_text();
+    assert!(text.contains('C') && text.contains('D') && text.contains('E'), "{text:?}");
+    // It snapshots again (in the new format) and keeps working.
+    let mut again = Terminal::restore(&t.snapshot().unwrap(), 1 << 20).unwrap();
+    assert_eq!(again.plain_text(), text);
+    again.write(b"\r\nok");
+    assert!(again.plain_text().contains("ok"));
+
+    // Damaged: cut short anywhere it is refused; with any byte flipped it is
+    // refused or usable, never a crash.
+    for cut in 0..old.len() {
+        assert!(Terminal::restore(&old[..cut], 1 << 20).is_none(), "cut at {cut}");
+    }
+    for i in 0..old.len() {
+        let mut bad = old.clone();
+        bad[i] ^= 0x5a;
+        if let Some(mut t) = Terminal::restore(&bad, 1 << 20) {
+            t.write(b"\r\nok");
+            assert!(t.plain_text().contains("ok"), "byte {i} flipped");
+        }
+    }
 }

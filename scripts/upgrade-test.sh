@@ -17,7 +17,8 @@ if [ ! -x "$bin" ]; then
     else
         git -C "$src" submodule update --init --depth 1 vendor/ghostty
     fi
-    (cd "$src" && CARGO_TARGET_DIR=/var/tmp/h0x-core-upgrade/target cargo build -q --bin h0x-core)
+    # The release may need an older Zig than this checkout (ZIG_OLD, set by CI).
+    (cd "$src" && ZIG="${ZIG_OLD:-${ZIG:-zig}}" CARGO_TARGET_DIR=/var/tmp/h0x-core-upgrade/target cargo build -q --bin h0x-core)
     mkdir -p "$(dirname "$bin")"
     cp /var/tmp/h0x-core-upgrade/target/debug/h0x-core "$bin"
     git -C "$root" worktree remove --force "$src"
