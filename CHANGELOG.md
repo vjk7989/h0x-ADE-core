@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-11-11
+
+Telegram you can navigate.
+
+### Added
+- The bot registers its commands with Telegram, so the menu button next to the message box lists them.
+- `/menu` shows buttons for Sessions, Projects and Help.
+- `/sessions` lists running and finished terminals; tap one to select it, then plain messages are typed into it, through the same checks as `/send` (rate limit, audit log, lock, and a confirmation for a plain shell). The selection ends on `/lock`, a lock at the machine, unpairing, or when the terminal ends.
+- `/projects` (or `/folders`) lists the app's saved spaces and the folders of live terminals; tap one to see its sessions.
+- `h0x-core bridge spaces --file <json>` / `--clear` stores the app's saved spaces for `/projects` in an owner-only file.
+
+### Fixed
+- CI's upgrade check builds the last release with Zig 0.17.
+
 ## [0.1.14] - 2026-11-11
 
 Security release from the final QA round.
