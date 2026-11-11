@@ -571,6 +571,71 @@ mod tests {
     }
 
     #[test]
+    fn spaces_keep_duplicates_and_dot_dot_folders_as_given_but_refuse_nul_and_read_exactly_8_mib() {
+        let dir = std::env::temp_dir().join(format!("h0x-core-spaces-{}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bridge = crate::bridge::Bridge::at(dir.join("bridge"), Default::default());
+        assert!(!bridge.clear_spaces().unwrap(), "--clear with nothing stored, not even the folder");
+        let entry = |name: &str, folder: &str| serde_json::json!({"name": name, "folder": folder});
+        let list = |entries: Vec<serde_json::Value>| serde_json::to_vec(&entries).unwrap();
+
+        // Absolute with `..` inside is still absolute: kept as typed, never resolved.
+        let kept = list(vec![
+            entry("Dup", "/work"),
+            entry("Dup", "/work"),
+            entry("Up", "/work/../etc"),
+            entry("WinUp", r"C:\Users\..\Windows"),
+            entry("UNC", r"\\server\share\..\other"),
+            entry("Ünïcode 项目", "/home/jäne/项目"),
+        ]);
+        assert_eq!(bridge.set_spaces(&kept).unwrap(), 6);
+        let stored = bridge.spaces();
+        assert_eq!(stored.len(), 6, "duplicates are not merged");
+        assert_eq!((stored[2].folder.as_str(), stored[3].folder.as_str()), ("/work/../etc", r"C:\Users\..\Windows"));
+        assert_eq!(stored[5].name, "Ünïcode 项目");
+
+        for (bad, why) in [
+            (list(vec![entry("a\0b", "/x")]), "a NUL in the name"),
+            (list(vec![entry("a", "/x\0/y")]), "a NUL in the folder"),
+            (list(vec![entry("a", "/x\u{1b}[31m")]), "an escape in the folder"),
+            (list(vec![entry("a\u{7f}", "/x")]), "DEL in the name"),
+            (list(vec![entry("a", "../work")]), "a relative folder with .."),
+            (list(vec![entry("a", r"\work")]), "one backslash is not UNC"),
+            (list(vec![entry("a", "C:work")]), "a drive-relative folder"),
+        ] {
+            assert_eq!(bridge.set_spaces(&bad).unwrap_err().kind, "invalid_params", "{why}");
+            assert_eq!(bridge.spaces().len(), 6, "{why}: the stored list is untouched");
+        }
+        // A verbatim path starts with two backslashes: taken like UNC.
+        assert_eq!(bridge.set_spaces(&list(vec![entry("a", r"\\?\C:\work")])).unwrap(), 1);
+        assert_eq!(bridge.set_spaces(&kept).unwrap(), 6);
+
+        // Exactly 8 MiB is read whole (then judged as JSON); one byte more is refused.
+        let path = dir.join("big.json");
+        std::fs::write(&path, vec![b' '; 8 << 20]).unwrap();
+        assert_eq!(super::read_spaces(&path).unwrap().len(), 8 << 20);
+        assert_eq!(bridge.set_spaces(&super::read_spaces(&path).unwrap()).unwrap_err().kind, "invalid_params");
+        assert_eq!(bridge.spaces().len(), 6);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_spaces_file_is_read_through_its_link() {
+        let dir = std::env::temp_dir().join(format!("h0x-core-spaces-{}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.json");
+        std::fs::write(&real, br#"[{"name":"a","folder":"/x"}]"#).unwrap();
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(super::read_spaces(&link).unwrap(), std::fs::read(&real).unwrap());
+        std::os::unix::fs::symlink(dir.join("gone.json"), dir.join("dangling.json")).unwrap();
+        let e = super::read_spaces(&dir.join("dangling.json")).unwrap_err();
+        assert!(e.message.starts_with("cannot read the spaces file "), "{}", e.message);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn tunnel_minutes_are_one_to_a_day_and_default_to_an_hour() {
         use super::{BridgeCmd, TunnelCmd};
         use clap::Parser;

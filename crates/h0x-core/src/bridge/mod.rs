@@ -347,6 +347,11 @@ impl Bridge {
         self.save(&st)
     }
 
+    /// How many times the bridge has been locked: what an earlier lock voids is compared by this.
+    pub fn locks(&self) -> Result<u64, RpcError> {
+        Ok(self.load()?.locks)
+    }
+
     /// The last `n` audit entries, oldest first.
     pub fn log(&self, n: usize) -> Result<Vec<Value>, RpcError> {
         let text = match std::fs::read_to_string(self.dir.join("audit.jsonl")) {
@@ -734,6 +739,21 @@ mod tests {
         assert!(b.spaces().is_empty());
         assert_eq!(b.set_spaces(br#"[{"name":"a","folder":"/x"}]"#).unwrap(), 1);
         assert_eq!(b.spaces(), [Space { name: "a".into(), folder: "/x".into() }]);
+        std::fs::remove_dir_all(&b.dir).unwrap();
+    }
+
+    #[test]
+    fn a_store_that_cannot_be_written_keeps_the_old_spaces() {
+        let b = scratch();
+        b.set_spaces(br#"[{"name":"old","folder":"C:\\work"}]"#).unwrap();
+        // The new list's temporary file can't be made: a folder with something in it is in its way.
+        let blocked = b.dir.join("spaces.json.tmp");
+        std::fs::create_dir_all(blocked.join("inside")).unwrap();
+        assert!(b.set_spaces(br#"[{"name":"new","folder":"/new"}]"#).is_err());
+        assert_eq!(b.spaces(), [Space { name: "old".into(), folder: r"C:\work".into() }]);
+        std::fs::remove_dir_all(&blocked).unwrap();
+        assert_eq!(b.set_spaces(br#"[{"name":"new","folder":"/new"}]"#).unwrap(), 1);
+        assert_eq!(b.spaces()[0].name, "new");
         std::fs::remove_dir_all(&b.dir).unwrap();
     }
 

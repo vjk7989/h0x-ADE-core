@@ -31,7 +31,13 @@ fn fixture() -> Fixture {
     let (code, _) = bridge.pair("telegram", T).unwrap();
     bridge.pair_verify("telegram", &ME.to_string(), "vijay", &code, T).unwrap();
     Fixture {
-        front: Frontend { bridge, replies: Arc::default(), own: "h0x_bot".into(), selected: HashMap::new() },
+        front: Frontend {
+            bridge,
+            replies: Arc::default(),
+            own: "h0x_bot".into(),
+            selected: HashMap::new(),
+            selected_at_lock: 0,
+        },
         calls: RefCell::default(),
     }
 }
@@ -1091,4 +1097,350 @@ fn the_command_menu_is_sent_once_and_a_failure_is_not_fatal() {
     set_menu(&Api::at(&refused.url, TOKEN));
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
     set_menu(&Api::at(&format!("http://{closed}"), TOKEN));
+}
+
+const NO_SELECTION: &str = "Send /help for commands, or reply to a notice to type into its terminal.";
+
+/// The callback data of every button in a request body sent to Telegram.
+fn sent_data(body: &Value) -> Vec<String> {
+    body["reply_markup"]["inline_keyboard"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|row| row.as_array().unwrap().iter().map(|b| b["callback_data"].as_str().unwrap().to_string()))
+        .collect()
+}
+
+#[test]
+fn each_paired_account_has_its_own_selection_and_never_types_into_anothers() {
+    let mut f = fixture();
+    let (code, _) = f.front.bridge.pair("telegram", T).unwrap();
+    let other = f.front.bridge.pair_verify("telegram", "7", "other", &code, T).unwrap();
+    f.handle(tapped(ME, "t:t3"));
+    f.acted();
+    assert_eq!(texts(&f.handle(said(7, "hello")))[0], NO_SELECTION, "42's selection is not 7's");
+    assert!(f.acted().is_empty(), "nothing typed anywhere");
+
+    f.handle(tapped(7, "t:t2"));
+    f.acted();
+    f.handle(said(7, "for t2"));
+    f.handle(said(ME, "for t3"));
+    let sent: Vec<Value> = f.acted().into_iter().map(|(_, p)| p).collect();
+    assert_eq!(sent, [json!({"terminal": "t2", "text": "for t2"}), json!({"terminal": "t3", "text": "for t3"})]);
+
+    // A group message from a paired account with a selection types nothing.
+    let mut group = said(ME, "in a group");
+    group["message"]["chat"]["type"] = "supergroup".into();
+    assert!(f.handle(group).is_empty());
+    assert!(f.acted().is_empty());
+
+    // Unpairing 7 drops only 7's selection.
+    f.front.bridge.unpair(Some(other.id)).unwrap();
+    assert!(f.handle(said(7, "still t2?")).is_empty(), "an unpaired account gets nothing");
+    f.handle(said(ME, "again"));
+    assert_eq!(f.acted(), [("terminal.send".to_string(), json!({"terminal": "t3", "text": "again"}))]);
+    assert_eq!(f.front.selected.keys().collect::<Vec<_>>(), ["42"]);
+}
+
+#[test]
+fn a_delivered_session_button_does_nothing_for_strangers_groups_or_bots() {
+    let server = stub(|_, _| json!({"ok": true, "result": {"message_id": 500}}));
+    let mut f = fixture();
+    let out = f.handle(said(ME, "/sessions"));
+    let api = Api::at(&server.url, TOKEN);
+    for o in out {
+        deliver(&api, &f.front.replies, o).unwrap();
+    }
+    let data = sent_data(&server.seen.lock().unwrap()[0].1);
+    assert_eq!(data.len(), 4);
+    let t3 = data[2].clone();
+    assert!(t3.starts_with("k:") && t3.len() <= 64, "{t3}");
+    f.acted();
+
+    // A forwarded or copied button tapped by someone else is ignored outright.
+    assert!(f.handle(tapped(7, &t3)).is_empty(), "a stranger");
+    let mut group = tapped(ME, &t3);
+    group["callback_query"]["message"]["chat"]["type"] = "group".into();
+    assert!(f.handle(group).is_empty(), "the button forwarded into a group");
+    let mut bot = tapped(ME, &t3);
+    bot["callback_query"]["from"]["is_bot"] = true.into();
+    assert!(f.handle(bot).is_empty(), "a bot with the paired id");
+    assert!(f.front.selected.is_empty() && f.acted().is_empty());
+
+    let out = f.handle(tapped(ME, &t3));
+    assert_eq!(texts(&out)[1], "Selected api. Send a message to type it there.");
+}
+
+#[test]
+fn after_unpairing_and_pairing_again_the_old_selection_is_gone() {
+    let mut f = fixture();
+    f.handle(tapped(ME, "t:t3"));
+    f.front.bridge.unpair(None).unwrap();
+    let (code, _) = f.front.bridge.pair("telegram", T).unwrap();
+    let out = f.handle(said(ME, &format!("/pair {code}")));
+    assert!(texts(&out)[0].starts_with("Paired as"), "{out:?}");
+    f.acted();
+    assert_eq!(texts(&f.handle(said(ME, "hello")))[0], NO_SELECTION);
+    assert!(f.acted().is_empty(), "nothing typed into the old selection");
+}
+
+#[test]
+fn a_lock_and_unlock_at_the_machine_between_two_messages_still_clears_the_selection() {
+    let mut f = fixture();
+    f.handle(tapped(ME, "t:t3"));
+    // Locked and unlocked again before the bot hears anything: like a pending
+    // confirmation (which dies with a lock), the selection must not survive.
+    f.front.bridge.set_locked(true).unwrap();
+    f.front.bridge.set_locked(false).unwrap();
+    f.acted();
+    assert_eq!(texts(&f.handle(said(ME, "hello")))[0], NO_SELECTION);
+    assert!(f.acted().is_empty(), "nothing typed after a lock");
+}
+
+#[test]
+fn a_refused_send_to_the_selection_clears_it_even_as_a_reply_to_a_plain_message() {
+    let mut f = fixture();
+    f.handle(tapped(ME, "t:t3"));
+    let refuses = |_: &str, _: Value| Err(RpcError::new("not_found", "no such terminal", ""));
+    let mut reply = said(ME, "hello");
+    reply["message"]["reply_to_message"] = json!({"message_id": 4242});
+    let out = f.front.handle(&refuses, &reply, T);
+    assert!(texts(&out)[0].starts_with("Failed: "), "{out:?}");
+    assert!(f.front.selected.is_empty());
+}
+
+#[test]
+fn session_lists_and_selected_text_are_audited_and_rate_limited() {
+    let mut f = fixture();
+    f.handle(said(ME, "/sessions"));
+    f.handle(tapped(ME, "t:t3"));
+    f.handle(said(ME, "secret plan API_KEY=abcdef0123456789"));
+    let log = f.front.bridge.log(3).unwrap();
+    let words: Vec<(&str, &str)> =
+        log.iter().map(|e| (e["command"].as_str().unwrap(), e["result"].as_str().unwrap())).collect();
+    assert_eq!(words, [("sessions", "done"), ("sessions", "done"), ("send", "done")], "{log:?}");
+    assert!(log.iter().all(|e| e["identity"] == "telegram:42"), "{log:?}");
+    assert_eq!(log[2]["terminal"], "t3");
+    let lines = log.iter().map(Value::to_string).collect::<String>();
+    assert!(!lines.contains("abcdef0123456789"), "no secret in the log: {lines}");
+    assert_eq!(log[2]["chars"], 36);
+    assert!(log[2]["text"].as_str().unwrap().ends_with('…'), "never the whole text: {lines}");
+
+    // Three of thirty used; the rest goes to the selection, then everything is refused.
+    for n in 3..30 {
+        f.handle(said(ME, &format!("line {n}")));
+    }
+    f.acted();
+    let refused = "Too many commands; try again in 60 s.";
+    assert_eq!(texts(&f.handle(said(ME, "one more"))), [refused], "text to the selection");
+    assert_eq!(texts(&f.handle(said(ME, "/sessions"))), [refused]);
+    assert_eq!(texts(&f.handle(said(ME, "/projects"))), [refused]);
+    assert_eq!(texts(&f.handle(tapped(ME, "t:t1")))[1], refused, "a tap on a session");
+    assert!(f.acted().is_empty(), "the core heard nothing");
+    assert_eq!(f.front.selected.get("42").map(String::as_str), Some("t3"), "a refusal keeps the selection");
+    assert_eq!(f.front.bridge.log(1).unwrap()[0]["command"], "send", "refusals are not logged as run");
+
+    // The limit is per account.
+    let (code, _) = f.front.bridge.pair("telegram", T).unwrap();
+    f.front.bridge.pair_verify("telegram", "7", "other", &code, T).unwrap();
+    assert_eq!(keyboard(&f.handle(said(7, "/sessions")), 0).len(), 4);
+}
+
+#[test]
+fn a_reply_to_an_unknown_message_goes_to_the_selection_and_a_failed_notice_reply_keeps_it() {
+    let mut f = fixture();
+    f.handle(tapped(ME, "t:t3"));
+    f.acted();
+    // A reply to something that is not a notice (the menu, a list): the selection.
+    let mut reply = said(ME, "to the selection");
+    reply["message"]["reply_to_message"] = json!({"message_id": 999});
+    f.handle(reply);
+    assert_eq!(f.acted()[0].1["terminal"], "t3");
+
+    // A reply to a notice whose terminal is gone fails, but the selection stays.
+    f.front.replies.lock().unwrap().remember((ME, 5), "t2".into());
+    let mut reply = said(ME, "to the notice");
+    reply["message"]["reply_to_message"] = json!({"message_id": 5});
+    let refuses = |_: &str, _: Value| Err(RpcError::new("not_found", "no such terminal", ""));
+    let out = f.front.handle(&refuses, &reply, T);
+    assert!(texts(&out)[0].starts_with("Failed: "), "{out:?}");
+    assert_eq!(f.front.selected.get("42").map(String::as_str), Some("t3"));
+}
+
+#[test]
+fn long_unc_and_unicode_folders_and_addresses_fit_button_data_and_taps_find_them() {
+    let folder = format!(r"\\{}\share\{}", "server-".repeat(20), "проект-ü".repeat(60));
+    let address = format!("{}/t1", "gpu-box-".repeat(30));
+    let space = serde_json::to_vec(&[json!({"name": "Ünïcode 项目 🚀".repeat(10), "folder": folder})]).unwrap();
+    let server = stub(|_, _| json!({"ok": true, "result": {"message_id": 500}}));
+    let api = Api::at(&server.url, TOKEN);
+    let mut f = fixture();
+    f.front.bridge.set_spaces(&space).unwrap();
+    let inside = format!(r"{folder}\src\");
+    let core = |method: &str, _: Value| -> Result<Value, RpcError> {
+        Ok(match method {
+            "terminal.list" => json!({"terminals": [
+                {"address": address, "name": "агент", "argv": ["claude"], "cwd": inside, "state": "live"}]}),
+            _ => json!({}),
+        })
+    };
+    let replies = f.front.replies.clone();
+    let press = |out: Vec<Out>| -> Vec<String> {
+        for o in out {
+            deliver(&api, &replies, o).unwrap();
+        }
+        let body = server.seen.lock().unwrap().last().unwrap().1.clone();
+        let data = sent_data(&body);
+        assert!(data.iter().all(|d| d.starts_with("k:") && d.len() <= 64), "{data:?}");
+        let labels = body["reply_markup"]["inline_keyboard"].to_string();
+        assert!(!labels.contains(&folder), "the folder itself never goes out as a label");
+        data
+    };
+
+    let out = f.front.handle(&core, &said(ME, "/projects"), T);
+    let label = &keyboard(&out, 0)[0].0;
+    assert!(label.chars().count() <= 61 && label.ends_with('…'), "{label}");
+    let projects = press(out);
+    assert_eq!(projects.len(), 1, "the live terminal is inside the space");
+    assert_eq!(f.front.replies.lock().unwrap().action(&projects[0]), Some(format!("p:{folder}")), "kept whole");
+
+    let out = f.front.handle(&core, &tapped(ME, &projects[0]), T);
+    let sessions = press(out);
+    assert_eq!(sessions.len(), 1);
+    let out = f.front.handle(&core, &tapped(ME, &sessions[0]), T);
+    assert_eq!(texts(&out)[1], "Selected агент. Send a message to type it there.");
+    assert_eq!(f.front.selected.get("42"), Some(&address));
+}
+
+#[test]
+fn an_evicted_button_id_selects_nothing_and_ids_are_never_handed_out_twice() {
+    let mut f = fixture();
+    let first = f.front.replies.lock().unwrap().button("t:t3".into());
+    let mut seen = std::collections::HashSet::from([first.clone()]);
+    for _ in 0..REMEMBERED {
+        let id = f.front.replies.lock().unwrap().button("t:t1".into());
+        assert!(seen.insert(id), "a fresh id");
+    }
+    f.acted();
+    assert_eq!(f.handle(tapped(ME, &first)), [Out::Answer { callback: "q1".into() }]);
+    assert!(f.front.selected.is_empty(), "neither t3 nor what replaced it");
+    assert!(f.acted().is_empty());
+}
+
+#[test]
+fn folders_match_by_whole_parts_with_case_ignored_only_on_windows_paths() {
+    for (path, folder, want) in [
+        (r"C:\proj\src", r"C:\proj", true),
+        (r"C:\project", r"C:\proj", false),
+        (r"C:\proj", r"C:\project", false),
+        (r"c:/PROJ/", r"C:\proj", true),
+        (r"C:/proj\sub\deeper\", r"C:\proj\", true),
+        (r"C:\proj", r"C:\proj\\", true),
+        (r"D:\proj", r"C:\proj", false),
+        (r"C:\anything", r"C:\", true),
+        ("/Work/a", "/work", false),
+        ("/work", "/Work", false),
+        ("/work//", "/work", true),
+        ("/workshop/x", "/work", false),
+        ("/anything", "/", true),
+        ("/home/jäne/项目/a", "/home/jäne/项目", true),
+        ("/home/jäne/项目x", "/home/jäne/项目", false),
+        (r"\\server\share\app", r"\\server\share", true),
+        (r"\\server\shared", r"\\server\share", false),
+        (r"\\SERVER\share\app", r"\\server\share", true),
+        (r"\\?\C:\Ü\x", r"\\?\c:\ü", true),
+        (r"C:\Ü\x", r"c:\ü", true),
+        ("/Ü/x", "/ü", false),
+        ("", "/work", false),
+    ] {
+        assert_eq!(within(path, folder), want, "{path:?} in {folder:?}");
+    }
+}
+
+#[test]
+fn duplicate_spaces_and_unicode_names_are_listed_as_given() {
+    let mut f = fixture();
+    let spaces = r#"[{"name":"Ünïcode 项目 🚀","folder":"C:\\Users\\Jane Doe\\项目"},
+        {"name":"Again","folder":"c:/users/jane doe/项目/"},{"name":"Work","folder":"/work"},{"name":"Work","folder":"/work"}]"#;
+    assert_eq!(f.front.bridge.set_spaces(spaces.as_bytes()).unwrap(), 4);
+    let core = |method: &str, _: Value| -> Result<Value, RpcError> {
+        Ok(match method {
+            "terminal.list" => json!({"terminals": [
+                {"address": "t1", "argv": ["sh"], "cwd": "C:\\Users\\Jane Doe\\项目\\src", "state": "live"},
+                {"address": "t2", "argv": ["sh"], "cwd": "/work/a", "state": "live"}]}),
+            _ => json!({}),
+        })
+    };
+    let out = f.front.handle(&core, &said(ME, "/projects"), T);
+    assert_eq!(
+        keyboard(&out, 0),
+        [
+            ("Ünïcode 项目 🚀 (1)".into(), r"p:C:\Users\Jane Doe\项目".into()),
+            ("Again (1)".into(), "p:c:/users/jane doe/项目/".into()),
+            ("Work (1)".into(), "p:/work".into()),
+            ("Work (1)".into(), "p:/work".into()),
+        ],
+        "no extra button for a folder a space already holds"
+    );
+}
+
+#[test]
+fn lists_of_39_and_40_are_whole_and_41_is_cut_to_40() {
+    for (n, title) in [(39, "Sessions"), (40, "Sessions"), (41, "Sessions (first 40 of 41)")] {
+        let mut f = fixture();
+        let many = move |_: &str, _: Value| {
+            let rows: Vec<Value> = (0..n)
+                .map(|i| json!({"address": format!("t{i}"), "argv": ["sh"], "cwd": "/p", "state": "live"}))
+                .collect();
+            Ok(json!({"terminals": rows}))
+        };
+        let out = f.front.handle(&many, &said(ME, "/sessions"), T);
+        assert_eq!(texts(&out), [title]);
+        assert_eq!(keyboard(&out, 0).len(), n.min(MAX_BUTTONS), "{n}");
+        assert_eq!(keyboard(&out, 0).last().unwrap().1, format!("t:t{}", n.min(MAX_BUTTONS) - 1), "the first ones");
+    }
+    for (n, title) in [(39, "Projects"), (40, "Projects"), (41, "Projects (first 40 of 41)")] {
+        let mut f = fixture();
+        let spaces: Vec<Value> = (0..n).map(|i| json!({"name": format!("s{i}"), "folder": format!("/p{i}")})).collect();
+        f.front.bridge.set_spaces(&serde_json::to_vec(&spaces).unwrap()).unwrap();
+        let none = |_: &str, _: Value| Ok(json!({"terminals": []}));
+        let out = f.front.handle(&none, &said(ME, "/projects"), T);
+        assert_eq!(texts(&out), [title]);
+        assert_eq!(keyboard(&out, 0).len(), n.min(MAX_BUTTONS), "{n}");
+    }
+}
+
+#[test]
+fn an_empty_stored_spaces_list_and_no_terminals_say_no_projects() {
+    let mut f = fixture();
+    assert_eq!(f.front.bridge.set_spaces(b"[]").unwrap(), 0);
+    let none = |_: &str, _: Value| Ok(json!({"terminals": []}));
+    assert_eq!(texts(&f.front.handle(&none, &said(ME, "/projects"), T)), ["No projects."]);
+    // Only finished terminals, or live ones without a folder: still none.
+    let idle = |_: &str, _: Value| {
+        Ok(json!({"terminals": [
+            {"address": "t1", "argv": ["sh"], "cwd": "/old", "state": "exited"},
+            {"address": "t2", "argv": ["sh"], "state": "live"}]}))
+    };
+    assert_eq!(texts(&f.front.handle(&idle, &said(ME, "/projects"), T)), ["No projects."]);
+}
+
+#[test]
+fn every_command_in_help_parses_and_menu_names_suit_telegram() {
+    let named: Vec<&str> = HELP
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c| matches!(c, '(' | ')' | ',' | '.')))
+        .filter(|w| w.len() > 1 && w.starts_with('/') && w[1..].bytes().all(|b| b.is_ascii_lowercase()))
+        .collect();
+    assert!(named.len() >= 14, "{named:?}");
+    for command in named {
+        assert_ne!(parse(command), Some(Ask::Usage("unknown command; send /help")), "{command} is in /help");
+    }
+    for (command, _) in MENU {
+        assert!(command.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'), "{command}");
+    }
+    let mut names: Vec<&str> = MENU.map(|(c, _)| c).to_vec();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), MENU.len(), "no command twice");
 }

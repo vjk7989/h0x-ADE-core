@@ -300,11 +300,11 @@ fn shorten(text: &str, n: usize) -> String {
 }
 
 /// A path for comparing: one kind of separator, none at the end, and on a
-/// drive path (`C:/..`) no case.
+/// Windows path (drive, UNC or `\\?\`) no case, Unicode included.
 fn normal(path: &str) -> String {
     let path = path.replace('\\', "/");
     let path = path.trim_end_matches('/');
-    if path.as_bytes().get(1) == Some(&b':') { path.to_ascii_lowercase() } else { path.into() }
+    if path.as_bytes().get(1) == Some(&b':') || path.starts_with("//") { path.to_lowercase() } else { path.into() }
 }
 
 /// Whether `path` is `folder` or inside it.
@@ -435,6 +435,8 @@ struct Frontend {
     own: String,
     /// The terminal each paired account (by user id) selected: plain text goes there.
     selected: HashMap<String, String>,
+    /// The bridge's lock counter when they were selected: a lock since ends them all.
+    selected_at_lock: u64,
 }
 
 type Core<'a> = &'a dyn Fn(&str, Value) -> Result<Value, RpcError>;
@@ -451,7 +453,9 @@ impl Frontend {
         }
         let ids = self.bridge.identities().unwrap_or_default();
         let locked = self.bridge.locked().unwrap_or(true);
-        self.selected.retain(|user, _| !locked && ids.iter().any(|i| i.transport == "telegram" && &i.user_id == user));
+        let moved = self.bridge.locks().unwrap_or(u64::MAX) != self.selected_at_lock;
+        self.selected
+            .retain(|user, _| !locked && !moved && ids.iter().any(|i| i.transport == "telegram" && &i.user_id == user));
     }
 
     /// Every terminal, through the bridge's gates; else what to tell the account instead.
@@ -496,6 +500,7 @@ impl Frontend {
             None => say("That session is gone.".into()),
             Some(s) if !s.live => say(format!("{} has finished; there is nothing to type into.", called(s))),
             Some(s) => {
+                self.selected_at_lock = self.bridge.locks().unwrap_or(u64::MAX);
                 self.selected.insert(from.user_id.clone(), s.address.clone());
                 say(format!("Selected {}. Send a message to type it there.", called(s)))
             }
@@ -549,13 +554,13 @@ impl Frontend {
             Some(Ask::Pair(_)) => unreachable!("answered above"),
             None => {
                 let to = m["reply_to_message"]["message_id"].as_i64();
-                let terminal = to.and_then(|id| self.replies.lock().unwrap().terminals.get(&(chat, id)).cloned());
-                match terminal.or_else(|| self.selected.get(&from.user_id).cloned()) {
+                let noticed = to.and_then(|id| self.replies.lock().unwrap().terminals.get(&(chat, id)).cloned());
+                match noticed.clone().or_else(|| self.selected.get(&from.user_id).cloned()) {
                     Some(terminal) => {
                         // Typed into the selection: a terminal the core no longer has ends it.
                         let reply =
                             self.bridge.execute(&core, &from, Command::Send { terminal, text: typed.into() }, now);
-                        if matches!(reply, Reply::Failed(_)) && to.is_none() {
+                        if matches!(reply, Reply::Failed(_)) && noticed.is_none() {
                             self.selected.remove(&from.user_id);
                         }
                         return replied(chat, reply, false);
@@ -764,7 +769,7 @@ pub fn run(paths: &Paths) -> Result<(), RpcError> {
         let stream = crate::client::connect_or_start(paths)?;
         crate::client::call(&stream, method, params).map_err(|e| crate::client::explain_closed(paths, e))
     };
-    let mut front = Frontend { bridge, replies, own, selected: HashMap::new() };
+    let mut front = Frontend { bridge, replies, own, selected: HashMap::new(), selected_at_lock: 0 };
     let (mut offset, mut failures) = (0, 0u32);
     eprintln!("bridge: running; stop it with ctrl+c (or kill its terminal)");
     loop {
