@@ -72,6 +72,8 @@ impl Key {
 pub enum Command {
     /// Live terminals: address, name, agent, folder, status.
     List,
+    /// Live and finished terminals, as data for a frontend's buttons.
+    Sessions,
     /// The last `lines` lines of a terminal (1-200), redacted.
     Read {
         terminal: String,
@@ -124,7 +126,7 @@ impl Command {
             | Command::Deny { terminal }
             | Command::Interrupt { terminal }
             | Command::Kill { terminal } => Some(terminal),
-            Command::List | Command::Run { .. } | Command::Lock | Command::Confirm { .. } => None,
+            Command::List | Command::Sessions | Command::Run { .. } | Command::Lock | Command::Confirm { .. } => None,
         }
     }
 
@@ -132,6 +134,7 @@ impl Command {
     fn audit(&self) -> Value {
         let word = match self {
             Command::List => "list",
+            Command::Sessions => "sessions",
             Command::Read { .. } => "read",
             Command::Send { .. } => "send",
             Command::Keys { .. } => "keys",
@@ -164,10 +167,23 @@ impl Command {
     }
 }
 
+/// One terminal as a frontend lists it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Session {
+    pub address: String,
+    pub name: String,
+    pub agent: String,
+    pub folder: String,
+    pub status: String,
+    pub live: bool,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Reply {
     /// It ran: what happened (redacted).
     Done(String),
+    /// Every terminal, live and finished (redacted).
+    Sessions(Vec<Session>),
     /// Destructive: `Command::Confirm { token }` from the same account within
     /// 2 minutes runs `what`. Single use.
     NeedsConfirm {
@@ -188,7 +204,7 @@ pub enum Reply {
 impl Reply {
     fn word(&self) -> &'static str {
         match self {
-            Reply::Done(_) => "done",
+            Reply::Done(_) | Reply::Sessions(_) => "done",
             Reply::NeedsConfirm { .. } => "needs_confirm",
             Reply::NotPaired => "not_paired",
             Reply::Locked => "locked",
@@ -346,6 +362,10 @@ impl Bridge {
                 (done(locked), None)
             }
             Command::List => (done(list(call)), None),
+            Command::Sessions => match sessions(call) {
+                Ok(all) => (Reply::Sessions(all), None),
+                Err(e) => (Reply::Failed(redact(&e.message)), None),
+            },
             Command::Read { terminal, lines } => (done(read(call, terminal, *lines)), None),
             Command::Confirm { token } => match self.take(me, locks, token, now) {
                 Some(planned) => {
@@ -409,6 +429,24 @@ fn list(call: &impl Fn(&str, Value) -> Result<Value, RpcError>) -> Result<String
         })
         .collect();
     Ok(if rows.is_empty() { "no live terminals".into() } else { rows.join("\n") })
+}
+
+fn sessions(call: &impl Fn(&str, Value) -> Result<Value, RpcError>) -> Result<Vec<Session>, RpcError> {
+    let r = call("terminal.list", json!({"all": true}))?;
+    let text = |t: &Value, key: &str| redact(t[key].as_str().unwrap_or_default());
+    Ok(r["terminals"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|t| Session {
+            address: text(t, "address"),
+            name: text(t, "name"),
+            agent: redact(&agent(t)),
+            folder: redact(cwd(t).unwrap_or_default()),
+            status: status(t).0,
+            live: t["state"] == "live",
+        })
+        .collect())
 }
 
 fn read(
@@ -499,7 +537,12 @@ fn plan(
             let what = format!("kill {address} ({} in {})", agent(&t), cwd(&t).unwrap_or("?"));
             (planned("terminal.kill", json!({"terminal": address}), what), true)
         }
-        Command::List | Command::Read { .. } | Command::Run { .. } | Command::Lock | Command::Confirm { .. } => {
+        Command::List
+        | Command::Sessions
+        | Command::Read { .. }
+        | Command::Run { .. }
+        | Command::Lock
+        | Command::Confirm { .. } => {
             unreachable!("handled before")
         }
     })

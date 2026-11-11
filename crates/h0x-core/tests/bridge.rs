@@ -98,6 +98,25 @@ fn a_paired_account_drives_real_terminals() {
     wait_until("killed", || get(&s, &shell)["state"] == "finished");
 }
 
+#[test]
+fn sessions_list_live_and_finished_real_terminals() {
+    let s = Session::new();
+    let mut b = bridge(&s);
+    let (code, _) = b.pair("telegram", now_ms()).unwrap();
+    b.pair_verify("telegram", "42", "", &code, now_ms()).unwrap();
+    let live = run(&s, &["cat"]);
+    let done = run(&s, &["true"]);
+    wait_until("true ends", || get(&s, &done)["state"] == "finished");
+    let call = core(&s);
+    let Reply::Sessions(all) = b.execute(&call, &me(), Command::Sessions, now_ms()) else { panic!() };
+    let find = |a: &str| all.iter().find(|x| x.address == a).unwrap_or_else(|| panic!("{a} in {all:?}"));
+    assert!(find(&live).live, "{all:?}");
+    assert!(!find(&live).folder.is_empty(), "{all:?}");
+    assert!(!find(&done).live, "a finished terminal is listed, not live: {all:?}");
+    let stranger = Sender { transport: "telegram".into(), user_id: "7".into() };
+    assert_eq!(b.execute(&call, &stranger, Command::Sessions, now_ms()), Reply::NotPaired);
+}
+
 const TOKEN: &str = "123456:ABCdef_ghi-JKLmnoPQRstuVWXyz0123";
 
 /// Requests a stub saw: (path, body).
