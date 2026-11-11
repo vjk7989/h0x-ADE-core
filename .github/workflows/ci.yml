@@ -160,12 +160,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
-      # The last release was built with Zig 0.16 (upgrade-test.sh uses ZIG_OLD for it);
-      # drop these two steps once a release made with 0.17 exists.
-      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
-        with:
-          version: 0.16.0
-      - run: echo "ZIG_OLD=$(command -v zig)" >> "$GITHUB_ENV"
+      # The last release (0.1.14) was built with Zig 0.17, like this checkout; set ZIG_OLD only
+      # if a future release needs an older Zig than the current one (upgrade-test.sh).
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
