@@ -46,6 +46,16 @@ pub(super) enum BridgeCmd {
         #[command(subcommand)]
         action: TelegramCmd,
     },
+    /// Store the app's saved spaces for the bot's /projects: a JSON file of
+    /// [{"name": "...", "folder": "/absolute/path"}] (at most 1000), or --clear.
+    Spaces {
+        /// Remove the stored spaces instead.
+        #[arg(long)]
+        clear: bool,
+        /// The JSON file to read.
+        #[arg(long, value_name = "PATH", required_unless_present = "clear", conflicts_with = "clear")]
+        file: Option<std::path::PathBuf>,
+    },
     /// Run the Telegram bot until stopped: answers paired accounts, sends notices.
     /// Under core: h0x-core run --bg --keep -- h0x-core bridge run
     Run,
@@ -174,6 +184,20 @@ fn read_token(file: Option<&std::path::Path>) -> Result<String, RpcError> {
     String::from_utf8(token).map_err(|_| RpcError::invalid_params("that is not a bot token"))
 }
 
+/// The bytes of a spaces file; one bigger than any valid list is refused unread.
+fn read_spaces(file: &std::path::Path) -> Result<Vec<u8>, RpcError> {
+    const MAX: u64 = 8 << 20;
+    let unreadable = |e: std::io::Error| {
+        RpcError::invalid_params(format!("cannot read the spaces file {}: {}", file.display(), e.kind()))
+    };
+    let mut bytes = Vec::new();
+    std::fs::File::open(file).and_then(|f| f.take(MAX + 1).read_to_end(&mut bytes)).map_err(unreadable)?;
+    if bytes.len() as u64 > MAX {
+        return Err(RpcError::invalid_params("the spaces file is too big"));
+    }
+    Ok(bytes)
+}
+
 /// `5m ago`, from two ms timestamps.
 fn ago(now: u64, then: u64) -> String {
     let s = now.saturating_sub(then) / 1000;
@@ -232,6 +256,15 @@ pub(super) fn bridge(paths: &Paths, action: BridgeCmd, json: bool) -> Result<Out
             let human =
                 if bridge.clear_telegram_token()? { "telegram token removed" } else { "no telegram token was set" };
             Out { json: json!({"telegram_token": "unset"}), human: human.into() }
+        }
+        BridgeCmd::Spaces { clear: true, .. } => {
+            let human = if bridge.clear_spaces()? { "spaces removed" } else { "no spaces were stored" };
+            Out { json: json!({"spaces": 0}), human: human.into() }
+        }
+        BridgeCmd::Spaces { clear: false, file } => {
+            let bytes = read_spaces(&file.unwrap_or_default())?;
+            let n = bridge.set_spaces(&bytes)?;
+            Out { json: json!({"spaces": n}), human: format!("{n} space(s) stored") }
         }
         BridgeCmd::Qr { text } => {
             Out { json: crate::bridge::web::qr_json(&text)?, human: crate::bridge::web::qr(&text) }
@@ -444,6 +477,162 @@ mod tests {
         assert_eq!(parse(&["--clear", "--file", windows]), Err(clap::error::ErrorKind::ArgumentConflict));
         assert_eq!(parse(&["--file", windows, "--clear"]), Err(clap::error::ErrorKind::ArgumentConflict));
         assert_eq!(parse(&["--file"]), Err(clap::error::ErrorKind::InvalidValue), "a path is required");
+    }
+
+    #[test]
+    fn spaces_take_a_file_or_clear_but_not_both_nor_neither() {
+        use super::BridgeCmd;
+        use clap::Parser;
+        let parse = |args: &[&str]| {
+            let cli = crate::cli::Cli::try_parse_from([&["h0x-core", "bridge", "spaces"], args].concat());
+            match cli.map_err(|e| e.kind())?.cmd {
+                Some(crate::cli::Cmd::Bridge { action: BridgeCmd::Spaces { clear, file } }) => Ok((clear, file)),
+                _ => panic!("bridge spaces"),
+            }
+        };
+        let windows = r"C:\Users\Jane Doe\spaces.json";
+        assert_eq!(parse(&["--file", windows]), Ok((false, Some(std::path::PathBuf::from(windows)))));
+        assert_eq!(parse(&["--clear"]), Ok((true, None)));
+        assert_eq!(parse(&[]), Err(clap::error::ErrorKind::MissingRequiredArgument));
+        assert_eq!(parse(&["--clear", "--file", windows]), Err(clap::error::ErrorKind::ArgumentConflict));
+        assert_eq!(parse(&["--file"]), Err(clap::error::ErrorKind::InvalidValue));
+    }
+
+    #[test]
+    fn a_spaces_file_is_validated_whole_and_nothing_is_stored_when_it_is_not() {
+        let dir = std::env::temp_dir().join(format!("h0x core spaces {}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bridge = crate::bridge::Bridge::at(dir.join("bridge"), Default::default());
+        let path = dir.join("spaces list.json");
+        let store = |content: &[u8]| {
+            std::fs::write(&path, content).unwrap();
+            super::read_spaces(&path).and_then(|bytes| bridge.set_spaces(&bytes))
+        };
+        let entry = |name: &str, folder: &str| serde_json::json!({"name": name, "folder": folder});
+        let list = |entries: Vec<serde_json::Value>| serde_json::to_vec(&entries).unwrap();
+
+        // Good lists: empty, Unix, drive, UNC, a BOM in front, the longest name and folder.
+        assert_eq!(store(b"[]").unwrap(), 0);
+        let good = list(vec![
+            entry("Work", "/home/me/work"),
+            entry("Win", r"C:\Users\Jane Doe\app"),
+            entry("Win2", "D:/code"),
+            entry("Share", r"\\server\share\app"),
+            entry(&"n".repeat(200), &format!("/{}", "f".repeat(4095))),
+        ]);
+        assert_eq!(store(&good).unwrap(), 5);
+        assert_eq!(bridge.spaces().len(), 5);
+        assert_eq!(store(&[&b"\xef\xbb\xbf"[..], b"[]"].concat()).unwrap(), 0, "a BOM from PowerShell or Notepad");
+        assert!(bridge.spaces().is_empty());
+        assert_eq!(store(&good).unwrap(), 5);
+
+        // Each bad one is invalid_params and leaves the five stored.
+        let too_many = list((0..1001).map(|n| entry(&format!("s{n}"), "/x")).collect());
+        let exactly = list((0..1000).map(|n| entry(&format!("s{n}"), "/x")).collect());
+        let bad: Vec<(Vec<u8>, &str)> = vec![
+            (b"".to_vec(), "an empty file"),
+            (b"not json".to_vec(), "not JSON"),
+            (vec![0xff, 0xfe, b'[', b']'], "not UTF-8"),
+            (b"{\"name\":\"a\",\"folder\":\"/x\"}".to_vec(), "an object, not a list"),
+            (b"[{\"name\":\"a\"}]".to_vec(), "a missing folder"),
+            (b"[{\"name\":1,\"folder\":\"/x\"}]".to_vec(), "a number for a name"),
+            (b"[\"/x\"]".to_vec(), "a string for an entry"),
+            (too_many, "1001 entries"),
+            (list(vec![entry("", "/x")]), "an empty name"),
+            (list(vec![entry(&"n".repeat(201), "/x")]), "a name of 201 characters"),
+            (list(vec![entry("a\nb", "/x")]), "a line end in the name"),
+            (list(vec![entry("a", "relative/path")]), "a relative folder"),
+            (list(vec![entry("a", "")]), "an empty folder"),
+            (list(vec![entry("a", "C:")]), "a drive without a folder"),
+            (list(vec![entry("a", "~/work")]), "a home shorthand"),
+            (list(vec![entry("a", &format!("/{}", "f".repeat(4096)))]), "a folder of 4097 characters"),
+            (list(vec![entry("a", "/x\u{7}")]), "a control character in the folder"),
+            (list(vec![entry("ok", "/x"), entry("bad", "x")]), "one good entry then a bad one"),
+        ];
+        for (content, why) in &bad {
+            let e = store(content).unwrap_err();
+            assert_eq!(e.kind, "invalid_params", "{why}");
+            assert_eq!(bridge.spaces().len(), 5, "{why}: the stored list is untouched");
+        }
+        assert_eq!(store(&exactly).unwrap(), 1000, "1000 is the limit");
+
+        // A file that is not there, a folder, and one too big to read.
+        let e = super::read_spaces(&dir.join("none.json")).unwrap_err();
+        assert_eq!(e.kind, "invalid_params");
+        assert!(e.message.starts_with("cannot read the spaces file "), "{}", e.message);
+        assert_eq!(super::read_spaces(&dir).unwrap_err().kind, "invalid_params", "a folder");
+        std::fs::write(&path, vec![b' '; (8 << 20) + 1]).unwrap();
+        assert_eq!(super::read_spaces(&path).unwrap_err().message, "the spaces file is too big");
+
+        assert!(bridge.clear_spaces().unwrap());
+        assert!(!bridge.clear_spaces().unwrap(), "nothing left to clear");
+        assert!(bridge.spaces().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spaces_keep_duplicates_and_dot_dot_folders_as_given_but_refuse_nul_and_read_exactly_8_mib() {
+        let dir = std::env::temp_dir().join(format!("h0x-core-spaces-{}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bridge = crate::bridge::Bridge::at(dir.join("bridge"), Default::default());
+        assert!(!bridge.clear_spaces().unwrap(), "--clear with nothing stored, not even the folder");
+        let entry = |name: &str, folder: &str| serde_json::json!({"name": name, "folder": folder});
+        let list = |entries: Vec<serde_json::Value>| serde_json::to_vec(&entries).unwrap();
+
+        // Absolute with `..` inside is still absolute: kept as typed, never resolved.
+        let kept = list(vec![
+            entry("Dup", "/work"),
+            entry("Dup", "/work"),
+            entry("Up", "/work/../etc"),
+            entry("WinUp", r"C:\Users\..\Windows"),
+            entry("UNC", r"\\server\share\..\other"),
+            entry("Ünïcode 项目", "/home/jäne/项目"),
+        ]);
+        assert_eq!(bridge.set_spaces(&kept).unwrap(), 6);
+        let stored = bridge.spaces();
+        assert_eq!(stored.len(), 6, "duplicates are not merged");
+        assert_eq!((stored[2].folder.as_str(), stored[3].folder.as_str()), ("/work/../etc", r"C:\Users\..\Windows"));
+        assert_eq!(stored[5].name, "Ünïcode 项目");
+
+        for (bad, why) in [
+            (list(vec![entry("a\0b", "/x")]), "a NUL in the name"),
+            (list(vec![entry("a", "/x\0/y")]), "a NUL in the folder"),
+            (list(vec![entry("a", "/x\u{1b}[31m")]), "an escape in the folder"),
+            (list(vec![entry("a\u{7f}", "/x")]), "DEL in the name"),
+            (list(vec![entry("a", "../work")]), "a relative folder with .."),
+            (list(vec![entry("a", r"\work")]), "one backslash is not UNC"),
+            (list(vec![entry("a", "C:work")]), "a drive-relative folder"),
+        ] {
+            assert_eq!(bridge.set_spaces(&bad).unwrap_err().kind, "invalid_params", "{why}");
+            assert_eq!(bridge.spaces().len(), 6, "{why}: the stored list is untouched");
+        }
+        // A verbatim path starts with two backslashes: taken like UNC.
+        assert_eq!(bridge.set_spaces(&list(vec![entry("a", r"\\?\C:\work")])).unwrap(), 1);
+        assert_eq!(bridge.set_spaces(&kept).unwrap(), 6);
+
+        // Exactly 8 MiB is read whole (then judged as JSON); one byte more is refused.
+        let path = dir.join("big.json");
+        std::fs::write(&path, vec![b' '; 8 << 20]).unwrap();
+        assert_eq!(super::read_spaces(&path).unwrap().len(), 8 << 20);
+        assert_eq!(bridge.set_spaces(&super::read_spaces(&path).unwrap()).unwrap_err().kind, "invalid_params");
+        assert_eq!(bridge.spaces().len(), 6);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_spaces_file_is_read_through_its_link() {
+        let dir = std::env::temp_dir().join(format!("h0x-core-spaces-{}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("real.json");
+        std::fs::write(&real, br#"[{"name":"a","folder":"/x"}]"#).unwrap();
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(super::read_spaces(&link).unwrap(), std::fs::read(&real).unwrap());
+        std::os::unix::fs::symlink(dir.join("gone.json"), dir.join("dangling.json")).unwrap();
+        let e = super::read_spaces(&dir.join("dangling.json")).unwrap_err();
+        assert!(e.message.starts_with("cannot read the spaces file "), "{}", e.message);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

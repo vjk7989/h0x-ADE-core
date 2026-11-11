@@ -42,6 +42,9 @@ When Telegram can't be reached, it tries again after 1, 2, 4, 8 seconds and so o
 
 ### In the chat
 
+- `/menu`: buttons for sessions, projects and help (the bot also registers its commands in Telegram's menu when it starts)
+- `/sessions`: live and finished terminals as buttons; tap one to select it
+- `/projects` (`/folders`): your saved spaces (`h0x-core bridge spaces --file <json>`; the app sends them) and the folders of live terminals, as buttons; tap one for its sessions
 - `/agents`: terminals, with their agent, folder and status
 - `/read <t> [lines]`: its last lines (default 20)
 - `/send <t> <text>`: type text and press enter
@@ -54,7 +57,7 @@ When Telegram can't be reached, it tries again after 1, 2, 4, 8 seconds and so o
 - `/help`: this list
 
 Notices come with buttons: Approve, Deny, Show and Interrupt when an agent needs you; Show for the rest.
-To type into a terminal, reply to its notice.
+To type into a terminal, reply to its notice, or select it with `/sessions` and write plain messages: they go through the same checks as `/send` (rate limit, audit log, lock, a confirmation for plain shells). The selection is per account, in memory, and ends on `/lock`, a lock or unpair at the machine, or when the terminal ends.
 A command that needs a confirmation shows Confirm and Cancel buttons. Cancel leaves the confirmation unused, and it expires in 2 minutes.
 Notices stop while the bridge is locked.
 

@@ -112,6 +112,7 @@ Commands:
   log       The last audit log entries: every remote command and pairing attempt
   qr        A QR code for some text: terminal blocks, or with --json {"size": N, "rows": ["0101...", ...]}
   telegram  The Telegram bot's settings
+  spaces    Store the app's saved spaces for the bot's /projects: a JSON file of [{"name": "...", "folder": "/absolute/path"}] (at most 1000), or --clear
   run       Run the Telegram bot until stopped: answers paired accounts, sends notices. Under core: h0x-core run --bg --keep -- h0x-core bridge run
   web       Serve the web panel until stopped: a page and a WebSocket API for paired devices. On 127.0.0.1; --lan: this machine's private network address (plain http)
   tunnel    Turn "access from anywhere" (a Cloudflare tunnel) on or off for the running web panel
@@ -209,6 +210,20 @@ Usage: h0x-core bridge run [OPTIONS]
 Options:
       --json  JSON output even in a terminal
   -h, --help  Print help
+```
+
+## h0x-core bridge spaces
+
+```text
+Store the app's saved spaces for the bot's /projects: a JSON file of [{"name": "...", "folder": "/absolute/path"}] (at most 1000), or --clear
+
+Usage: h0x-core bridge spaces [OPTIONS]
+
+Options:
+      --clear        Remove the stored spaces instead
+      --json         JSON output even in a terminal
+      --file <PATH>  The JSON file to read
+  -h, --help         Print help
 ```
 
 ## h0x-core bridge telegram
