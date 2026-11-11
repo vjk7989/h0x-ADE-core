@@ -42,7 +42,7 @@ jobs:
   # Fast formatting/advisory checks and Windows clippy from Linux
   # (zig stubbed: type-checking needs no libghostty-vt).
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER == 'gcp' && github.event_name != 'pull_request' && fromJSON('["self-hosted","gcp"]') || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -82,7 +82,7 @@ jobs:
           - { os: linux, runner: ubuntu-24.04, target: x86_64-unknown-linux-musl, threads: 4 }
           - { os: macos, runner: macos-15, target: aarch64-apple-darwin, threads: 2 }
           - { os: windows, runner: windows-2025, target: x86_64-pc-windows-msvc, threads: 2 }
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.os == 'linux' && vars.CI_RUNNER == 'gcp' && github.event_name != 'pull_request' && fromJSON('["self-hosted","gcp"]') || matrix.runner }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -149,7 +149,7 @@ jobs:
           cargo test --locked --no-fail-fast --target ${{ matrix.target }} "${only[@]}" -- --test-threads ${{ matrix.threads }}
 
   upgrade:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER == 'gcp' && github.event_name != 'pull_request' && fromJSON('["self-hosted","gcp"]') || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -220,7 +220,7 @@ jobs:
   ci-ok:
     needs: [lint, test, upgrade]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_RUNNER == 'gcp' && github.event_name != 'pull_request' && fromJSON('["self-hosted","gcp"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - run: '[ "${{ needs.lint.result }}" = success ] && [ "${{ needs.test.result }}" = success ] && [ "${{ needs.upgrade.result }}" = success ]'
