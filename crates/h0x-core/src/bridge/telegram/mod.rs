@@ -8,7 +8,7 @@ mod api;
 
 pub use api::Api;
 
-use super::{Bridge, Command, Kind, Notice, Reply, Sender};
+use super::{Bridge, Command, Kind, Notice, Reply, Sender, Session};
 use crate::paths::Paths;
 use crate::rpc::RpcError;
 use serde_json::{Value, json};
@@ -23,7 +23,25 @@ const POLL: u64 = 50;
 /// Notices remembered for replies (a reply to one types into its terminal).
 const REMEMBERED: usize = 1000;
 
+/// Buttons in one message (Telegram allows 100).
+const MAX_BUTTONS: usize = 40;
+
+/// The bot's command menu (setMyCommands).
+const MENU: [(&str, &str); 8] = [
+    ("menu", "Sessions, projects and help"),
+    ("sessions", "Pick a terminal to type into"),
+    ("projects", "Browse by folder"),
+    ("help", "All commands"),
+    ("agents", "Terminals: agent, folder, status"),
+    ("read", "Last lines of a terminal"),
+    ("send", "Type text into a terminal"),
+    ("lock", "Refuse remote commands"),
+];
+
 const HELP: &str = "Commands:
+/menu - buttons for sessions, projects and help
+/sessions - pick a terminal; then plain messages are typed into it
+/projects (/folders) - pick a folder, then one of its terminals
 /agents - terminals: agent, folder, status
 /read <t> [lines] - its last lines (default 20)
 /send <t> <text> - type text and press enter
@@ -33,7 +51,7 @@ const HELP: &str = "Commands:
 /run <folder> <command> - start an agent or command (\"quote\" a folder with spaces)
 /kill <t> - end its program
 /lock - refuse every remote command until unlocked at the machine
-Reply to a notice to type into its terminal.";
+Reply to a notice to type into its terminal, or select one with /sessions and just write.";
 
 /// The secret name of the bot token.
 const TOKEN: &str = "telegram.token";
@@ -81,6 +99,9 @@ impl Bridge {
 enum Ask {
     Pair(String),
     Help,
+    Menu,
+    Sessions,
+    Projects,
     Do(Command),
     Usage(&'static str),
 }
@@ -98,6 +119,9 @@ fn parse(text: &str) -> Option<Ask> {
     };
     Some(match word.as_str() {
         "start" | "help" => Ask::Help,
+        "menu" => Ask::Menu,
+        "sessions" => Ask::Sessions,
+        "projects" | "folders" => Ask::Projects,
         "pair" if !args.is_empty() => Ask::Pair(args.into()),
         "pair" => Ask::Usage("/pair CODE (from `h0x-core bridge pair` on the machine)"),
         "agents" => Ask::Do(Command::List),
@@ -221,7 +245,8 @@ fn replied(chat: i64, reply: Reply, pre: bool) -> Vec<Out> {
             buttons: vec![vec![button("Confirm", format!("c:{token}")), button("Cancel", "x:".into())]],
             about: None,
         }],
-        Reply::NotPaired => Vec::new(),
+        // Only a listing asks for these, and it takes them apart itself.
+        Reply::NotPaired | Reply::Sessions(_) => Vec::new(),
         Reply::Locked => say("Remote control is locked. Unlock it at the machine: h0x-core bridge unlock".into()),
         Reply::RateLimited { retry_secs } => say(format!("Too many commands; try again in {retry_secs} s.")),
         Reply::Failed(message) => say(format!("Failed: {message}")),
@@ -253,6 +278,88 @@ fn notice(n: &Notice, chat: i64) -> Out {
         Kind::Finished => vec![vec![button("Show", format!("s:{t}"))]],
     };
     Out::Send { chat, html, buttons, about: Some(t.clone()) }
+}
+
+/// The menu message: three buttons.
+fn menu(chat: i64) -> Out {
+    let row = vec![button("Sessions", "m:s".into()), button("Projects", "m:p".into()), button("Help", "m:h".into())];
+    Out::Send { chat, html: "Menu".into(), buttons: vec![row], about: None }
+}
+
+/// What a session is called: its name, else its address.
+fn called(s: &Session) -> &str {
+    if s.name.is_empty() { &s.address } else { &s.name }
+}
+
+/// `text` cut to at most `n` characters, with `…` where it was cut.
+fn shorten(text: &str, n: usize) -> String {
+    match text.char_indices().nth(n) {
+        Some((at, _)) => format!("{}…", &text[..at]),
+        None => text.into(),
+    }
+}
+
+/// A path for comparing: one kind of separator, none at the end, and on a
+/// drive path (`C:/..`) no case.
+fn normal(path: &str) -> String {
+    let path = path.replace('\\', "/");
+    let path = path.trim_end_matches('/');
+    if path.as_bytes().get(1) == Some(&b':') { path.to_ascii_lowercase() } else { path.into() }
+}
+
+/// Whether `path` is `folder` or inside it.
+fn within(path: &str, folder: &str) -> bool {
+    let (path, folder) = (normal(path), normal(folder));
+    path == folder || path.strip_prefix(&folder).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The sessions as a message with one button each (`folder`: the ones in it).
+fn sessions_out(chat: i64, folder: Option<&str>, shown: &[Session]) -> Out {
+    if shown.is_empty() {
+        let none = if folder.is_some() { "No sessions in that folder." } else { "No sessions." };
+        return text(chat, none.into());
+    }
+    let mut title = folder.map_or("Sessions".to_string(), |f| format!("Sessions in {f}"));
+    if shown.len() > MAX_BUTTONS {
+        title.push_str(&format!(" (first {MAX_BUTTONS} of {})", shown.len()));
+    }
+    let buttons = shown
+        .iter()
+        .take(MAX_BUTTONS)
+        .map(|s| {
+            let label = format!("{} · {} · {}", called(s), s.agent, s.status);
+            vec![button(&shorten(&label, 60), format!("t:{}", s.address))]
+        })
+        .collect();
+    Out::Send { chat, html: escape(&title), buttons, about: None }
+}
+
+/// The folders as a message with one button each: the spaces, then the
+/// folders of live terminals no space holds.
+fn projects_out(chat: i64, spaces: Vec<super::Space>, all: &[Session]) -> Out {
+    let mut folders: Vec<(String, String)> = spaces.into_iter().map(|s| (s.name, s.folder)).collect();
+    for s in all.iter().filter(|s| s.live && !s.folder.is_empty()) {
+        if !folders.iter().any(|(_, f)| within(&s.folder, f)) {
+            let leaf = s.folder.trim_end_matches(['/', '\\']).rsplit(['/', '\\']).next().unwrap_or_default();
+            folders.push((if leaf.is_empty() { s.folder.clone() } else { leaf.into() }, s.folder.clone()));
+        }
+    }
+    if folders.is_empty() {
+        return text(chat, "No projects.".into());
+    }
+    let mut title = "Projects".to_string();
+    if folders.len() > MAX_BUTTONS {
+        title.push_str(&format!(" (first {MAX_BUTTONS} of {})", folders.len()));
+    }
+    let buttons = folders
+        .into_iter()
+        .take(MAX_BUTTONS)
+        .map(|(name, folder)| {
+            let n = all.iter().filter(|s| within(&s.folder, &folder)).count();
+            vec![button(&shorten(&format!("{name} ({n})"), 60), format!("p:{folder}"))]
+        })
+        .collect();
+    Out::Send { chat, html: title, buttons, about: None }
 }
 
 /// What sent messages stand for, both kept for the last 1000: notice
@@ -326,6 +433,8 @@ struct Frontend {
     replies: Arc<Mutex<Replies>>,
     /// This bot's username (getMe): commands addressed to other bots are ignored.
     own: String,
+    /// The terminal each paired account (by user id) selected: plain text goes there.
+    selected: HashMap<String, String>,
 }
 
 type Core<'a> = &'a dyn Fn(&str, Value) -> Result<Value, RpcError>;
@@ -335,9 +444,68 @@ impl Frontend {
         self.bridge.identities().is_ok_and(|ids| ids.iter().any(|i| i.transport == "telegram" && i.user_id == user))
     }
 
+    /// Selections that no longer stand: every one while locked, and an unpaired account's.
+    fn forget_selections(&mut self) {
+        if self.selected.is_empty() {
+            return;
+        }
+        let ids = self.bridge.identities().unwrap_or_default();
+        let locked = self.bridge.locked().unwrap_or(true);
+        self.selected.retain(|user, _| !locked && ids.iter().any(|i| i.transport == "telegram" && &i.user_id == user));
+    }
+
+    /// Every terminal, through the bridge's gates; else what to tell the account instead.
+    /// A selected terminal that is no longer live is forgotten.
+    fn sessions(&mut self, core: Core, from: &Sender, chat: i64, now: u64) -> Result<Vec<Session>, Vec<Out>> {
+        match self.bridge.execute(&core, from, Command::Sessions, now) {
+            Reply::Sessions(all) => {
+                self.selected.retain(|_, t| all.iter().any(|s| s.live && &s.address == t));
+                Ok(all)
+            }
+            other => Err(replied(chat, other, false)),
+        }
+    }
+
+    /// The sessions (those in `folder`, if given) as buttons.
+    fn sessions_view(&mut self, core: Core, from: &Sender, chat: i64, now: u64, folder: Option<&str>) -> Vec<Out> {
+        match self.sessions(core, from, chat, now) {
+            Ok(all) => {
+                let shown: Vec<Session> =
+                    all.into_iter().filter(|s| folder.is_none_or(|f| within(&s.folder, f))).collect();
+                vec![sessions_out(chat, folder, &shown)]
+            }
+            Err(said) => said,
+        }
+    }
+
+    fn projects_view(&mut self, core: Core, from: &Sender, chat: i64, now: u64) -> Vec<Out> {
+        match self.sessions(core, from, chat, now) {
+            Ok(all) => vec![projects_out(chat, self.bridge.spaces(), &all)],
+            Err(said) => said,
+        }
+    }
+
+    /// A tap on a session: it becomes what this account's plain text goes to.
+    fn select(&mut self, core: Core, from: &Sender, chat: i64, now: u64, address: &str) -> Vec<Out> {
+        let all = match self.sessions(core, from, chat, now) {
+            Ok(all) => all,
+            Err(said) => return said,
+        };
+        let say = |line: String| vec![text(chat, escape(&line))];
+        match all.iter().find(|s| s.address == address) {
+            None => say("That session is gone.".into()),
+            Some(s) if !s.live => say(format!("{} has finished; there is nothing to type into.", called(s))),
+            Some(s) => {
+                self.selected.insert(from.user_id.clone(), s.address.clone());
+                say(format!("Selected {}. Send a message to type it there.", called(s)))
+            }
+        }
+    }
+
     /// What to tell Telegram about one update. Group chats and unpaired
     /// accounts (except `/pair`) get nothing at all.
     fn handle(&mut self, core: Core, update: &Value, now: u64) -> Vec<Out> {
+        self.forget_selections();
         if let Some(message) = update.get("message") {
             self.message(core, message, now)
         } else if let Some(query) = update.get("callback_query") {
@@ -374,13 +542,24 @@ impl Frontend {
         let command = match ask {
             Some(Ask::Do(command)) => command,
             Some(Ask::Help) => return vec![text(chat, escape(HELP))],
+            Some(Ask::Menu) => return vec![menu(chat)],
+            Some(Ask::Sessions) => return self.sessions_view(core, &from, chat, now, None),
+            Some(Ask::Projects) => return self.projects_view(core, &from, chat, now),
             Some(Ask::Usage(usage)) => return vec![text(chat, escape(&format!("Usage: {usage}")))],
             Some(Ask::Pair(_)) => unreachable!("answered above"),
             None => {
                 let to = m["reply_to_message"]["message_id"].as_i64();
                 let terminal = to.and_then(|id| self.replies.lock().unwrap().terminals.get(&(chat, id)).cloned());
-                match terminal {
-                    Some(terminal) => Command::Send { terminal, text: typed.into() },
+                match terminal.or_else(|| self.selected.get(&from.user_id).cloned()) {
+                    Some(terminal) => {
+                        // Typed into the selection: a terminal the core no longer has ends it.
+                        let reply =
+                            self.bridge.execute(&core, &from, Command::Send { terminal, text: typed.into() }, now);
+                        if matches!(reply, Reply::Failed(_)) && to.is_none() {
+                            self.selected.remove(&from.user_id);
+                        }
+                        return replied(chat, reply, false);
+                    }
                     None => {
                         return vec![text(
                             chat,
@@ -391,6 +570,9 @@ impl Frontend {
             }
         };
         let pre = matches!(command, Command::Read { .. });
+        if matches!(command, Command::Lock) {
+            self.selected.clear();
+        }
         replied(chat, self.bridge.execute(&core, &from, command, now), pre)
     }
 
@@ -414,7 +596,25 @@ impl Frontend {
         let Some(data) = self.replies.lock().unwrap().action(data) else { return out };
         let (kind, arg) = data.split_once(":").unwrap_or((data.as_str(), ""));
         let terminal = arg.to_string();
+        let from = Sender { transport: "telegram".into(), user_id: user };
         let command = match kind {
+            "t" => {
+                out.extend(self.select(core, &from, chat, now, arg));
+                return out;
+            }
+            "p" => {
+                out.extend(self.sessions_view(core, &from, chat, now, Some(arg)));
+                return out;
+            }
+            "m" => {
+                match arg {
+                    "s" => out.extend(self.sessions_view(core, &from, chat, now, None)),
+                    "p" => out.extend(self.projects_view(core, &from, chat, now)),
+                    "h" => out.push(text(chat, escape(HELP))),
+                    _ => {}
+                }
+                return out;
+            }
             "a" => Command::Approve { terminal },
             "d" => Command::Deny { terminal },
             "i" => Command::Interrupt { terminal },
@@ -428,7 +628,6 @@ impl Frontend {
         };
         let confirm = kind == "c";
         let pre = kind == "s";
-        let from = Sender { transport: "telegram".into(), user_id: user };
         let mut said = replied(chat, self.bridge.execute(&core, &from, command, now), pre);
         // A confirmation's result replaces its question (and its buttons).
         if confirm
@@ -525,6 +724,14 @@ fn notices(api: Api, replies: Arc<Mutex<Replies>>) {
     }
 }
 
+/// Tells Telegram the command menu. A failure is only logged: the bot works without it.
+fn set_menu(api: &Api) {
+    let commands: Vec<Value> = MENU.iter().map(|(c, d)| json!({"command": c, "description": d})).collect();
+    if let Err(e) = api.call("setMyCommands", &json!({"commands": commands}), 30) {
+        eprintln!("bridge: setMyCommands: {e}");
+    }
+}
+
 /// `h0x-core bridge run`: the bot, until the process is stopped.
 pub fn run(paths: &Paths) -> Result<(), RpcError> {
     let bridge = Bridge::open(paths)?;
@@ -549,6 +756,7 @@ pub fn run(paths: &Paths) -> Result<(), RpcError> {
             }
         }
     };
+    set_menu(&api);
     let replies = Arc::new(Mutex::new(Replies::default()));
     let (for_notices, shared) = (api.clone(), replies.clone());
     std::thread::spawn(move || notices(for_notices, shared));
@@ -556,7 +764,7 @@ pub fn run(paths: &Paths) -> Result<(), RpcError> {
         let stream = crate::client::connect_or_start(paths)?;
         crate::client::call(&stream, method, params).map_err(|e| crate::client::explain_closed(paths, e))
     };
-    let mut front = Frontend { bridge, replies, own };
+    let mut front = Frontend { bridge, replies, own, selected: HashMap::new() };
     let (mut offset, mut failures) = (0, 0u32);
     eprintln!("bridge: running; stop it with ctrl+c (or kill its terminal)");
     loop {

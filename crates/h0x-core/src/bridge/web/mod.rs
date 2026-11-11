@@ -358,6 +358,7 @@ fn refuse(why: &str) -> Step {
 fn reply_json(id: &Value, reply: Reply) -> Value {
     let mut data = match reply {
         Reply::Done(text) => json!({"kind": "done", "text": text}),
+        Reply::Sessions(_) => json!({"kind": "failed", "message": "not available on the web panel"}),
         Reply::NeedsConfirm { token, what } => json!({"kind": "needs_confirm", "token": token, "what": what}),
         Reply::NotPaired => json!({"kind": "not_paired"}),
         Reply::Locked => json!({"kind": "locked"}),

@@ -14,7 +14,7 @@ mod secret;
 pub mod telegram;
 pub mod web;
 
-pub use command::{Command, Key, Reply, Sender};
+pub use command::{Command, Key, Reply, Sender, Session};
 pub use notice::{Kind, Notice, Notices, watch};
 pub use redact::redact;
 
@@ -45,6 +45,24 @@ const FAILURE_WINDOW_MS: u64 = 60_000;
 const FAILURE_SOURCES: usize = 1024;
 /// No 0/O or 1/I: read off a screen and typed on a phone. 32 letters: no modulo bias.
 const ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+/// Most spaces kept.
+pub const SPACES_MAX: usize = 1000;
+
+/// One of the app's saved spaces: a name and its folder.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Space {
+    pub name: String,
+    pub folder: String,
+}
+
+/// A Unix, drive or UNC path (this machine's rules don't matter: a space may be on any).
+fn absolute(path: &str) -> bool {
+    let b = path.as_bytes();
+    path.starts_with('/')
+        || path.starts_with(r"\\")
+        || (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && matches!(b[2], b'/' | b'\\'))
+}
 
 /// A chat account allowed to control this machine.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -273,6 +291,44 @@ impl Bridge {
         }
         self.save(&st)?;
         Ok(removed)
+    }
+
+    /// Stores the app's saved spaces (`[{"name":..,"folder":..}]`, at most
+    /// 1000) in an owner-only file, replacing the last list: how many. Nothing
+    /// is stored when any entry is invalid.
+    pub fn set_spaces(&self, json: &[u8]) -> Result<usize, RpcError> {
+        let invalid = |why: String| RpcError::invalid_params(format!("the spaces list is not valid: {why}"));
+        let json = json.strip_prefix(b"\xef\xbb\xbf").unwrap_or(json);
+        let spaces: Vec<Space> = serde_json::from_slice(json).map_err(|e| invalid(e.to_string()))?;
+        if spaces.len() > SPACES_MAX {
+            return Err(invalid(format!("{} entries, at most {SPACES_MAX}", spaces.len())));
+        }
+        for (n, s) in spaces.iter().enumerate() {
+            let (name, folder) = (s.name.chars().count(), s.folder.chars().count());
+            if name == 0 || name > 200 || s.name.chars().any(char::is_control) {
+                return Err(invalid(format!("entry {n}: name must be 1 to 200 characters, no control characters")));
+            }
+            if folder > 4096 || s.folder.chars().any(char::is_control) || !absolute(&s.folder) {
+                return Err(invalid(format!("entry {n}: folder must be an absolute path of at most 4096 characters")));
+            }
+        }
+        self.write_private("spaces.json", &serde_json::to_vec(&spaces).map_err(failed)?)?;
+        Ok(spaces.len())
+    }
+
+    /// Forgets the stored spaces: whether there were any.
+    pub fn clear_spaces(&self) -> Result<bool, RpcError> {
+        match std::fs::remove_file(self.dir.join("spaces.json")) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(failed(e)),
+        }
+    }
+
+    /// The stored spaces; none when there is no usable file.
+    pub fn spaces(&self) -> Vec<Space> {
+        let read = std::fs::read(self.dir.join("spaces.json"));
+        read.ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
     }
 
     pub fn locked(&self) -> Result<bool, RpcError> {
@@ -655,6 +711,29 @@ mod tests {
         b.pair_verify("telegram", "42", "", &code, T).unwrap();
         let mode = |name: &str| std::fs::metadata(b.dir.join(name)).unwrap().permissions().mode() & 0o777;
         assert_eq!((mode("state.json"), mode("audit.jsonl"), mode(".")), (0o600, 0o600, 0o700));
+        std::fs::remove_dir_all(&b.dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_spaces_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let b = scratch();
+        b.set_spaces(br#"[{"name":"a","folder":"/x"}]"#).unwrap();
+        let mode = std::fs::metadata(b.dir.join("spaces.json")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        std::fs::remove_dir_all(&b.dir).unwrap();
+    }
+
+    #[test]
+    fn spaces_are_unset_until_stored_and_a_damaged_file_reads_as_none() {
+        let b = scratch();
+        assert!(b.spaces().is_empty());
+        std::fs::create_dir_all(&b.dir).unwrap();
+        std::fs::write(b.dir.join("spaces.json"), "{oops").unwrap();
+        assert!(b.spaces().is_empty());
+        assert_eq!(b.set_spaces(br#"[{"name":"a","folder":"/x"}]"#).unwrap(), 1);
+        assert_eq!(b.spaces(), [Space { name: "a".into(), folder: "/x".into() }]);
         std::fs::remove_dir_all(&b.dir).unwrap();
     }
 

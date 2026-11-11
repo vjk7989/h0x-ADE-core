@@ -30,7 +30,10 @@ fn fixture() -> Fixture {
     let bridge = crate::bridge::scratch();
     let (code, _) = bridge.pair("telegram", T).unwrap();
     bridge.pair_verify("telegram", &ME.to_string(), "vijay", &code, T).unwrap();
-    Fixture { front: Frontend { bridge, replies: Arc::default(), own: "h0x_bot".into() }, calls: RefCell::default() }
+    Fixture {
+        front: Frontend { bridge, replies: Arc::default(), own: "h0x_bot".into(), selected: HashMap::new() },
+        calls: RefCell::default(),
+    }
 }
 
 /// The fake core: t1 a plain shell, t2 an agent blocked on a question, t3 an agent at work.
@@ -47,6 +50,13 @@ fn fake_core(method: &str, params: &Value) -> Result<Value, RpcError> {
         ("terminal.get", "t1") => record(None),
         ("terminal.get", "t2") => record(Some("blocked")),
         ("terminal.get", _) => record(Some("working")),
+        // Everything, finished included: t1 a shell, t2 blocked, t3 working, t9 ended.
+        ("terminal.list", _) if params["all"] == true => json!({"terminals": [
+            {"address": "t1", "name": "shell", "argv": ["bash"], "cwd": "/work", "state": "live", "status": null},
+            {"address": "t2", "argv": ["claude"], "cwd": "/w", "state": "live", "status": {"state": "blocked", "app": "claude"}},
+            {"address": "t3", "name": "api", "argv": ["claude"], "cwd": "/work/api", "state": "live", "status": {"state": "working", "app": "claude"}},
+            {"address": "t9", "name": "old", "argv": ["codex"], "cwd": "C:\\Users\\me\\old", "state": "exited", "exit_code": 0},
+        ]}),
         ("terminal.list", _) => {
             json!({"terminals": [{"address": "t2", "argv": ["claude"], "cwd": "/w", "state": "live", "status": {"state": "blocked", "kind": "permission"}}]})
         }
@@ -182,7 +192,7 @@ fn a_paired_account_commands_and_gets_answers() {
     let out = f.handle(said(ME, "/read t3 5"));
     assert_eq!(texts(&out), ["<pre>a &lt; b &amp;&amp; c &gt; d\nAPI_KEY=[redacted]</pre>"], "escaped and redacted");
     assert_eq!(texts(&f.handle(said(ME, "/send t3"))), ["Usage: /send &lt;t&gt; &lt;text&gt;"]);
-    assert!(texts(&f.handle(said(ME, "/help")))[0].starts_with("Commands:\n/agents"));
+    assert!(texts(&f.handle(said(ME, "/help")))[0].starts_with("Commands:\n/menu"));
     assert!(texts(&f.handle(said(ME, "hello")))[0].contains("reply to a notice"));
     f.acted();
     f.handle(said(ME, "/send t3 go on"));
@@ -799,4 +809,286 @@ fn notices_go_to_every_paired_telegram_account_unless_locked() {
     assert_eq!(notice_chats(false, &ids), [42, -7, 9]);
     assert!(notice_chats(true, &ids).is_empty(), "locked: nothing goes out");
     assert!(notice_chats(false, &[]).is_empty());
+}
+
+/// The buttons of the `n`th message: (label, action).
+fn keyboard(out: &[Out], n: usize) -> Vec<(String, String)> {
+    match &out[n] {
+        Out::Send { buttons, .. } => buttons.iter().flatten().cloned().collect(),
+        other => panic!("not a message: {other:?}"),
+    }
+}
+
+#[test]
+fn the_new_commands_parse_and_every_menu_entry_is_known() {
+    for (text, want) in [
+        ("/menu", Ask::Menu),
+        ("/menu@h0x_bot", Ask::Menu),
+        ("/SESSIONS", Ask::Sessions),
+        ("/sessions extra words", Ask::Sessions),
+        ("/projects", Ask::Projects),
+        ("/folders", Ask::Projects),
+    ] {
+        assert_eq!(parse(text), Some(want), "{text:?}");
+    }
+    for (command, description) in MENU {
+        assert!(!matches!(parse(&format!("/{command}")), Some(Ask::Usage("unknown command; send /help"))), "{command}");
+        assert!((1..=32).contains(&command.len()) && (3..=256).contains(&description.len()), "{command}");
+        assert!(command == "help" || HELP.contains(&format!("/{command}")), "/help lists /{command}");
+    }
+    assert_eq!(MENU.map(|(c, _)| c), ["menu", "sessions", "projects", "help", "agents", "read", "send", "lock"]);
+}
+
+#[test]
+fn the_menu_has_three_buttons_that_work() {
+    let mut f = fixture();
+    let out = f.handle(said(ME, "/menu"));
+    assert_eq!(
+        keyboard(&out, 0),
+        [("Sessions".into(), "m:s".into()), ("Projects".into(), "m:p".into()), ("Help".into(), "m:h".into())]
+    );
+    assert!(f.acted().is_empty(), "the menu itself asks the core nothing");
+    let tap = f.handle(tapped(ME, "m:s"));
+    assert_eq!(tap[0], Out::Answer { callback: "q1".into() });
+    assert_eq!(keyboard(&tap, 1).len(), 4, "the sessions");
+    assert_eq!(texts(&f.handle(tapped(ME, "m:h")))[1], escape(HELP));
+    assert!(f.handle(tapped(ME, "m:p")).len() >= 2);
+    assert_eq!(f.handle(tapped(ME, "m:zzz")), [Out::Answer { callback: "q1".into() }]);
+}
+
+#[test]
+fn sessions_lists_live_and_finished_terminals_as_buttons() {
+    let mut f = fixture();
+    let out = f.handle(said(ME, "/sessions"));
+    assert_eq!(f.acted(), [("terminal.list".to_string(), json!({"all": true}))]);
+    assert_eq!(
+        keyboard(&out, 0),
+        [
+            ("shell · bash · running".into(), "t:t1".into()),
+            ("t2 · claude · blocked".into(), "t:t2".into()),
+            ("api · claude · working".into(), "t:t3".into()),
+            ("old · codex · exit 0".into(), "t:t9".into()),
+        ]
+    );
+}
+
+#[test]
+fn tapping_a_session_selects_it_and_plain_text_goes_there_through_the_gates() {
+    let mut f = fixture();
+    // No selection: today's answer, nothing reaches the core.
+    assert_eq!(
+        texts(&f.handle(said(ME, "fix the test")))[0],
+        "Send /help for commands, or reply to a notice to type into its terminal."
+    );
+    f.acted();
+    let out = f.handle(tapped(ME, "t:t3"));
+    assert_eq!(texts(&out)[1], "Selected api. Send a message to type it there.");
+    assert_eq!(f.front.selected.get(&ME.to_string()).map(String::as_str), Some("t3"));
+    f.acted();
+    let out = f.handle(said(ME, "fix the <test>"));
+    assert_eq!(texts(&out), ["done: type 14 characters into t3 and press enter"]);
+    assert_eq!(f.acted(), [("terminal.send".to_string(), json!({"terminal": "t3", "text": "fix the <test>"}))]);
+    // A command still works and keeps the selection; a reply to a notice wins over it.
+    f.handle(said(ME, "/agents"));
+    assert!(f.front.selected.contains_key(&ME.to_string()));
+    f.front.replies.lock().unwrap().remember((ME, 5), "t2".into());
+    let mut reply = said(ME, "yes");
+    reply["message"]["reply_to_message"] = json!({"message_id": 5});
+    f.acted();
+    f.handle(reply);
+    assert_eq!(f.acted()[0].1["terminal"], "t2");
+    // A message that is not a reply goes to the selection even right after.
+    f.handle(said(ME, "again"));
+    assert_eq!(f.acted()[0].1["terminal"], "t3");
+}
+
+#[test]
+fn a_selected_plain_shell_still_asks_for_confirmation() {
+    let mut f = fixture();
+    f.handle(tapped(ME, "t:t1"));
+    f.acted();
+    let out = f.handle(said(ME, "rm -rf build"));
+    assert!(f.acted().is_empty(), "nothing typed before the tap");
+    let Out::Send { buttons, .. } = &out[0] else { panic!("{out:?}") };
+    assert_eq!(buttons[0][0].0, "Confirm");
+}
+
+#[test]
+fn finished_unknown_and_unrelated_taps_select_nothing() {
+    let mut f = fixture();
+    let out = f.handle(tapped(ME, "t:t9"));
+    assert_eq!(texts(&out)[1], "old has finished; there is nothing to type into.");
+    let out = f.handle(tapped(ME, "t:t404"));
+    assert_eq!(texts(&out)[1], "That session is gone.");
+    assert!(f.front.selected.is_empty());
+    // The selection belongs to the account that tapped.
+    f.handle(tapped(ME, "t:t3"));
+    assert_eq!(f.front.selected.len(), 1);
+    assert_eq!(f.front.selected.keys().next().map(String::as_str), Some("42"));
+}
+
+#[test]
+fn lock_unpair_and_a_gone_terminal_clear_the_selection() {
+    // /lock from the chat.
+    let mut f = fixture();
+    f.handle(tapped(ME, "t:t3"));
+    f.handle(said(ME, "/lock"));
+    assert!(f.front.selected.is_empty(), "/lock clears it");
+    f.acted();
+    assert_eq!(
+        texts(&f.handle(said(ME, "hello")))[0],
+        "Send /help for commands, or reply to a notice to type into its terminal."
+    );
+    assert!(f.acted().is_empty(), "locked: nothing is typed");
+
+    // Locked at the machine: the selection is dropped and nothing is typed.
+    let mut f = fixture();
+    f.handle(tapped(ME, "t:t3"));
+    f.front.bridge.set_locked(true).unwrap();
+    f.acted();
+    f.handle(said(ME, "hello"));
+    assert!(f.front.selected.is_empty());
+    assert!(f.acted().is_empty());
+    f.front.bridge.set_locked(false).unwrap();
+    assert_eq!(
+        texts(&f.handle(said(ME, "hello")))[0],
+        "Send /help for commands, or reply to a notice to type into its terminal."
+    );
+
+    // Unpaired: dropped, and the stranger now gets nothing at all.
+    let mut f = fixture();
+    f.handle(tapped(ME, "t:t3"));
+    f.front.bridge.unpair(None).unwrap();
+    f.acted();
+    assert!(f.handle(said(ME, "hello")).is_empty());
+    assert!(f.front.selected.is_empty());
+    assert!(f.acted().is_empty());
+
+    // The terminal ended: the next listing forgets it ...
+    let mut f = fixture();
+    f.handle(tapped(ME, "t:t3"));
+    let gone = |method: &str, _: Value| match method {
+        "terminal.list" => {
+            Ok(json!({"terminals": [{"address": "t3", "argv": ["claude"], "cwd": "/work", "state": "exited"}]}))
+        }
+        _ => Ok(json!({})),
+    };
+    f.front.handle(&gone, &said(ME, "/sessions"), T);
+    assert!(f.front.selected.is_empty(), "ended terminals are not selected any more");
+
+    // ... and so does a send the core refuses.
+    let mut f = fixture();
+    f.handle(tapped(ME, "t:t3"));
+    let refuses = |_: &str, _: Value| Err(RpcError::new("not_found", "no such terminal", ""));
+    let out = f.front.handle(&refuses, &said(ME, "hello"), T);
+    assert!(texts(&out)[0].starts_with("Failed: "), "{out:?}");
+    assert!(f.front.selected.is_empty());
+}
+
+#[test]
+fn a_locked_bridge_refuses_the_session_lists_too() {
+    let mut f = fixture();
+    f.front.bridge.set_locked(true).unwrap();
+    f.acted();
+    let out = f.handle(said(ME, "/sessions"));
+    assert!(texts(&out)[0].starts_with("Remote control is locked"), "{out:?}");
+    let out = f.handle(said(ME, "/projects"));
+    assert!(texts(&out)[0].starts_with("Remote control is locked"), "{out:?}");
+    assert!(f.acted().is_empty());
+}
+
+#[test]
+fn projects_are_the_saved_spaces_plus_live_folders_and_a_tap_lists_that_folders_sessions() {
+    let mut f = fixture();
+    let spaces = r#"[{"name":"Work","folder":"/work"},{"name":"Old","folder":"C:\\Users\\me\\old"},{"name":"Empty","folder":"/nowhere"}]"#;
+    assert_eq!(f.front.bridge.set_spaces(spaces.as_bytes()).unwrap(), 3);
+    let out = f.handle(said(ME, "/folders"));
+    // t2 lives in /w, which no space holds; t1 and t3 are inside /work, t9 in Old (finished).
+    assert_eq!(
+        keyboard(&out, 0),
+        [
+            ("Work (2)".into(), "p:/work".into()),
+            ("Old (1)".into(), r"p:C:\Users\me\old".into()),
+            ("Empty (0)".into(), "p:/nowhere".into()),
+            ("w (1)".into(), "p:/w".into()),
+        ]
+    );
+    let out = f.handle(tapped(ME, "p:/work"));
+    assert_eq!(
+        keyboard(&out, 1),
+        [("shell · bash · running".into(), "t:t1".into()), ("api · claude · working".into(), "t:t3".into())],
+        "inside the folder, a subfolder too"
+    );
+    assert!(texts(&out)[1].starts_with("Sessions in /work"));
+    let out = f.handle(tapped(ME, "p:c:/USERS/me/old/"));
+    assert_eq!(
+        keyboard(&out, 1),
+        [("old · codex · exit 0".into(), "t:t9".into())],
+        "drive paths compare without case or separator"
+    );
+    assert_eq!(texts(&f.handle(tapped(ME, "p:/nowhere")))[1], "No sessions in that folder.");
+    assert!(!within("/workshop", "/work"), "a folder name that merely starts the same");
+    assert!(within("/work", "/work/") && within("/work/a/b", "/work"));
+}
+
+#[test]
+fn without_spaces_projects_are_the_folders_of_live_terminals_only() {
+    let mut f = fixture();
+    let out = f.handle(said(ME, "/projects"));
+    let labels: Vec<String> = keyboard(&out, 0).into_iter().map(|b| b.0).collect();
+    assert_eq!(labels, ["work (2)", "w (1)"], "t9 is finished, and t3 is inside t1's folder");
+    let none = |_: &str, _: Value| Ok(json!({"terminals": []}));
+    assert_eq!(texts(&f.front.handle(&none, &said(ME, "/projects"), T)), ["No projects."]);
+    assert_eq!(texts(&f.front.handle(&none, &said(ME, "/sessions"), T)), ["No sessions."]);
+}
+
+#[test]
+fn long_lists_are_cut_to_what_one_message_can_hold() {
+    let mut f = fixture();
+    let many = |_: &str, _: Value| {
+        let rows: Vec<Value> = (0..60)
+            .map(|n| json!({"address": format!("t{n}"), "name": "n".repeat(120), "argv": ["sh"], "cwd": format!("/p/{n}"), "state": "live"}))
+            .collect();
+        Ok(json!({"terminals": rows}))
+    };
+    let out = f.front.handle(&many, &said(ME, "/sessions"), T);
+    let keys = keyboard(&out, 0);
+    assert_eq!(keys.len(), MAX_BUTTONS);
+    assert!(keys.iter().all(|(label, _)| label.chars().count() <= 61));
+    assert!(texts(&out)[0].contains("first 40 of 60"));
+    let out = f.front.handle(&many, &said(ME, "/projects"), T);
+    assert_eq!(keyboard(&out, 0).len(), MAX_BUTTONS);
+}
+
+#[test]
+fn strangers_and_groups_get_nothing_from_the_new_commands() {
+    let mut f = fixture();
+    for text in ["/menu", "/sessions", "/projects", "/folders"] {
+        assert!(f.handle(said(7, text)).is_empty(), "{text}: an unpaired account");
+        let mut group = said(ME, text);
+        group["message"]["chat"]["type"] = "group".into();
+        assert!(f.handle(group).is_empty(), "{text}: a group");
+    }
+    for data in ["m:s", "m:p", "m:h", "t:t3", "p:/work"] {
+        assert!(f.handle(tapped(7, data)).is_empty(), "{data}: an unpaired tap");
+    }
+    assert!(f.acted().is_empty() && f.front.selected.is_empty());
+}
+
+#[test]
+fn the_command_menu_is_sent_once_and_a_failure_is_not_fatal() {
+    let server = stub(|_, _| json!({"ok": true, "result": true}));
+    set_menu(&Api::at(&server.url, TOKEN));
+    let seen = server.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].0, format!("/bot{TOKEN}/setMyCommands"));
+    let commands = seen[0].1["commands"].as_array().unwrap();
+    assert_eq!(commands.len(), 8);
+    assert_eq!(commands[0], json!({"command": "menu", "description": "Sessions, projects and help"}));
+    assert!(!seen[0].1.to_string().contains(TOKEN));
+    // Telegram says no, or nothing listens: logged, never a panic.
+    let refused = stub(|_, _| json!({"ok": false, "error_code": 400, "description": "Bad Request"}));
+    set_menu(&Api::at(&refused.url, TOKEN));
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap();
+    set_menu(&Api::at(&format!("http://{closed}"), TOKEN));
 }
