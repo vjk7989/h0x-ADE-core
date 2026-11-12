@@ -313,24 +313,21 @@ fn a_terminal_gone_after_the_handoff_rolls_the_update_back() {
     s.bin = dir.join("h0x-core");
     let kept = run(&s, &["sh", "-c", "echo before; while read l; do echo got-$l; done"]);
     let gone = run(&s, &["sh", "-c", "while read l; do :; done"]);
-    // Removed the moment the update has kept the previous core: no longer there for the new one.
-    let (sock, previous, addr) = (s.socket(), dir.join("previous/h0x-core"), gone.clone());
-    let remover = std::thread::spawn(move || {
-        while !previous.exists() {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        for _ in 0..500 {
-            if let Ok(stream) = h0x_core::platform::connect(&sock) {
-                let _ = h0x_core::client::call(&stream, "terminal.kill", json!({"terminal": addr}));
-                if h0x_core::client::call(&stream, "terminal.rm", json!({"terminal": addr})).is_ok() {
-                    return;
-                }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    });
-    let (code, e) = s.err(&["--json", "update", "--from", BIN]);
-    remover.join().unwrap();
+    // A new h0x-core that is the built one, except that its second `--version` run (the update's
+    // check of the staged copy: after the terminals were listed, before anything is swapped)
+    // removes the terminal through the CLI. Deterministic: the old core is idle and healthy then.
+    let count = s.root.join("count");
+    let wrapper = s.root.join("wrapper");
+    let body = format!(
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  n=$(($(cat '{c}' 2>/dev/null || echo 0) + 1)); echo $n > '{c}'\n  \
+         if [ $n -eq 2 ]; then\n    '{bin}' kill {gone} >/dev/null 2>&1\n    i=0\n    \
+         until '{bin}' rm {gone} >/dev/null 2>&1 || [ $i -ge 200 ]; do i=$((i + 1)); sleep 0.05; done\n  fi\nfi\nexec '{bin}' \"$@\"\n",
+        c = count.display(),
+        bin = BIN,
+    );
+    std::fs::write(&wrapper, body).unwrap();
+    std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let (code, e) = s.err(&["--json", "update", "--from", wrapper.to_str().unwrap()]);
     assert_eq!(code, 1, "{e}");
     let v = env!("CARGO_PKG_VERSION");
     assert_eq!(
