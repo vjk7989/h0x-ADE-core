@@ -22,7 +22,10 @@ pub struct Target {
     pub sha256: String,
 }
 
-const GITHUB: &str = "https://github.com/vjk7989/h0x-ADE-core/releases";
+/// Release sites in the order they are tried: the releases repo first, the
+/// core repo's own releases as the fallback.
+const SITES: [&str; 2] =
+    ["https://github.com/buckleson/h0x-ADE-Core-Releases/releases", "https://github.com/vjk7989/h0x-ADE-core/releases"];
 
 /// The public half of the key CI signs every release asset with (key id 29957E064EAB76C4).
 const PUBLIC_KEY: &str = "RWTEdqtOBn6VKQ/x9x3qWk/gIWUb/I1OlZXsTlHyrkp9Yq30qBki+tdt";
@@ -42,8 +45,9 @@ fn overridden() -> Option<String> {
     None
 }
 
-fn base() -> String {
-    overridden().unwrap_or_else(|| GITHUB.into())
+/// The sites to read the release list from: only the test site when one is set.
+fn bases() -> Vec<String> {
+    overridden().map_or_else(|| SITES.iter().map(|s| (*s).into()).collect(), |o| vec![o])
 }
 
 /// Refuses a download link that is not https on GitHub.
@@ -205,14 +209,35 @@ pub fn from_file(from: &Path, sig: Option<&Path>, scratch: &Path) -> Result<Path
 
 /// The latest release's list, or one version's.
 pub fn manifest(version: Option<&str>, scratch: &Path) -> Result<Manifest, RpcError> {
-    let url = match version {
-        Some(v) => format!("{}/download/v{v}/manifest.json", base()),
-        None => format!("{}/latest/download/latest.json", base()),
-    };
-    let file = scratch.join("manifest.json");
-    curl_signed(&url, &file)?;
-    let bytes = std::fs::read(&file).map_err(|e| unavailable(e.to_string()))?;
-    parse(&bytes, version, &url)
+    manifest_from(&bases(), version, |url| {
+        let file = scratch.join("manifest.json");
+        curl_signed(url, &file)?;
+        std::fs::read(&file).map_err(|e| unavailable(e.to_string()))
+    })
+}
+
+/// Tries each site in order with `get` (download, verify, read) and parses its
+/// list; the first site that gives a good list wins, and if every site fails
+/// the first site's error is returned.
+fn manifest_from(
+    bases: &[String],
+    version: Option<&str>,
+    mut get: impl FnMut(&str) -> Result<Vec<u8>, RpcError>,
+) -> Result<Manifest, RpcError> {
+    let mut first_err = None;
+    for base in bases {
+        let url = match version {
+            Some(v) => format!("{base}/download/v{v}/manifest.json"),
+            None => format!("{base}/latest/download/latest.json"),
+        };
+        match get(&url).and_then(|bytes| parse(&bytes, version, &url)) {
+            Ok(m) => return Ok(m),
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    Err(first_err.unwrap_or_else(|| unavailable("no release site to read".into())))
 }
 
 /// Reads the list from `url`; one asked for by `version` must be that
@@ -338,14 +363,81 @@ pub fn this_target() -> String {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn the_release_base_drops_a_trailing_slash_and_defaults_to_github() {
+    fn the_release_sites_are_the_override_alone_or_the_releases_repo_then_the_core_repo() {
         // Only this test reads H0X_CORE_RELEASES_URL inside the unit-test binary.
+        let defaults = vec![
+            "https://github.com/buckleson/h0x-ADE-Core-Releases/releases".to_string(),
+            "https://github.com/vjk7989/h0x-ADE-core/releases".to_string(),
+        ];
         unsafe { std::env::set_var("H0X_CORE_RELEASES_URL", "https://mirror.example/releases/") };
-        assert_eq!(super::base(), "https://mirror.example/releases");
+        assert_eq!(super::bases(), vec!["https://mirror.example/releases".to_string()], "override only, no fallback");
         unsafe { std::env::set_var("H0X_CORE_RELEASES_URL", " ") };
-        assert_eq!(super::base(), "https://github.com/vjk7989/h0x-ADE-core/releases", "empty counts as unset");
+        assert_eq!(super::bases(), defaults, "empty counts as unset");
         unsafe { std::env::remove_var("H0X_CORE_RELEASES_URL") };
-        assert_eq!(super::base(), "https://github.com/vjk7989/h0x-ADE-core/releases");
+        assert_eq!(super::bases(), defaults);
+    }
+
+    fn list(version: &str) -> Vec<u8> {
+        format!(r#"{{"version":"{version}","generation":1,"targets":{{}}}}"#).into_bytes()
+    }
+
+    fn sites() -> Vec<String> {
+        vec!["https://a.example/r".into(), "https://b.example/r".into()]
+    }
+
+    #[test]
+    fn the_first_site_that_gives_a_list_wins_and_the_second_is_not_asked() {
+        let mut asked = vec![];
+        let m = super::manifest_from(&sites(), None, |url| {
+            asked.push(url.to_string());
+            Ok(list("0.2.0"))
+        })
+        .unwrap();
+        assert_eq!(m.version, "0.2.0");
+        assert_eq!(asked, ["https://a.example/r/latest/download/latest.json"]);
+    }
+
+    #[test]
+    fn a_failed_download_or_a_bad_list_falls_back_to_the_next_site() {
+        let mut asked = vec![];
+        let m = super::manifest_from(&sites(), Some("0.2.0"), |url| {
+            asked.push(url.to_string());
+            if url.starts_with("https://a.") { Err(super::unavailable("down".into())) } else { Ok(list("0.2.0")) }
+        })
+        .unwrap();
+        assert_eq!(m.version, "0.2.0");
+        assert_eq!(asked.len(), 2);
+        assert_eq!(asked[1], "https://b.example/r/download/v0.2.0/manifest.json");
+        // A list that is not a list, or is for another version, also falls back.
+        for bad in [b"junk".to_vec(), list("0.1.0")] {
+            let m = super::manifest_from(&sites(), Some("0.2.0"), |url| {
+                Ok(if url.starts_with("https://a.") { bad.clone() } else { list("0.2.0") })
+            })
+            .unwrap();
+            assert_eq!(m.version, "0.2.0");
+        }
+    }
+
+    #[test]
+    fn when_every_site_fails_the_first_error_is_returned() {
+        let err =
+            super::manifest_from(&sites(), None, |url| Err(super::unavailable(format!("failed {url}")))).err().unwrap();
+        assert_eq!(err.message, "failed https://a.example/r/latest/download/latest.json");
+        let err = super::manifest_from(&[], None, |_| Ok(list("0.2.0"))).err().unwrap();
+        assert_eq!(err.kind, "unavailable");
+    }
+
+    #[test]
+    fn a_single_site_is_asked_once() {
+        let mut n = 0;
+        let one = vec!["https://mirror.example/releases".to_string()];
+        let err = super::manifest_from(&one, None, |_| {
+            n += 1;
+            Err(super::unavailable("down".into()))
+        })
+        .err()
+        .unwrap();
+        assert_eq!((n, err.kind.as_str()), (1, "unavailable"));
     }
 
     #[test]

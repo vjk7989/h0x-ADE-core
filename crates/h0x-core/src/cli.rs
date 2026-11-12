@@ -257,6 +257,8 @@ fn print(out: &Out, json: bool) {
 fn fail(err: &RpcError, json: bool) -> i32 {
     if err.kind == "cancelled" {
         // Esc in the picker: nothing to report.
+    } else if json && err.kind == "rolled_back" {
+        eprintln!("{}", rolled_back_body(&err.message));
     } else if json {
         let body = json!({"error": {"kind": err.kind, "message": err.message, "hint": err.hint}});
         eprintln!("{body}");
@@ -950,6 +952,13 @@ mod tests {
 
     fn parsed(args: &[&str]) -> Cmd {
         Cli::try_parse_from([&["h0x-core"], args].concat()).unwrap().cmd.unwrap()
+    }
+
+    #[test]
+    fn a_rolled_back_update_exits_non_zero_with_or_without_json() {
+        let err = RpcError::new("rolled_back", "Update to h0x-core 0.2.0 failed, went back to h0x-core 0.1.0: x", "");
+        assert_eq!(fail(&err, true), 1);
+        assert_eq!(fail(&err, false), 1);
     }
 
     #[test]
