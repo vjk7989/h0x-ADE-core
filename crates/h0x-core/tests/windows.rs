@@ -316,6 +316,62 @@ fn an_update_that_cannot_finish_puts_everything_back() {
 }
 
 #[test]
+fn an_update_in_a_folder_with_spaces_keeps_the_previous_exe_and_records_last_good() {
+    let s = Session::new();
+    let exe = release(&s.root.join(r"Hyper Ox\my bin"), "old-build");
+    let dir = exe.parent().unwrap().to_path_buf();
+    assert!(!dir.join("last-good.json").exists());
+    let new = release(&s.root.join("new build"), "new-build");
+    let out = hc_at(&s, &exe, &["--json", "update", "--from", new.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let r: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(r["rolled_back"], false, "{r}");
+    assert!(marked(&exe, "new-build"), "h0x-core.exe swapped");
+    assert!(marked(&dir.join("previous/h0x-core.exe"), "old-build"), "the replaced exe is kept beside it");
+    assert!(!dir.join("h0x-core.previous.exe").exists(), "it is kept in the previous folder, not as a file beside it");
+    let good: Value = serde_json::from_slice(&std::fs::read(dir.join("last-good.json")).unwrap()).unwrap();
+    assert_eq!(good, json!({"version": env!("CARGO_PKG_VERSION")}));
+}
+
+#[test]
+fn a_terminal_gone_after_the_handoff_puts_the_previous_exe_back() {
+    let s = Session::new();
+    let exe = release(&s.root.join(r"Hyper Ox\my bin"), "old-build");
+    let previous = exe.with_file_name("previous").join("h0x-core.exe");
+    let run = hc_at(&s, &exe, &["run", "--bg", "ping", "-n", "120", "127.0.0.1"]);
+    let t = serde_json::from_slice::<Value>(&run.stdout).unwrap()["address"].as_str().unwrap().to_string();
+    // A scanner reads the last file for a while, so the swap waits there after keeping the
+    // previous exe: time to remove the terminal before the new core is checked.
+    let held = std::os::windows::fs::OpenOptionsExt::share_mode(std::fs::OpenOptions::new().read(true), 1)
+        .open(exe.with_file_name(r"conpty\x64\OpenConsole.exe"))
+        .unwrap();
+    // Removed once the update has kept the previous exe: no longer there for the new one.
+    let (name, root, at, addr) = (s.name.clone(), s.root.clone(), exe.clone(), t.clone());
+    let remover = std::thread::spawn(move || {
+        while !previous.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for _ in 0..500 {
+            let _ = cmd_at(&at, &name, &root).args(["kill", &addr]).output();
+            if cmd_at(&at, &name, &root).args(["rm", &addr]).output().is_ok_and(|o| o.status.success()) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        drop(held);
+    });
+    let new = release(&s.root.join("new build"), "new-build");
+    let out = hc_at(&s, &exe, &["--json", "update", "--from", new.to_str().unwrap()]);
+    remover.join().unwrap();
+    assert!(!out.status.success(), "the update should have been rolled back: {}", String::from_utf8_lossy(&out.stdout));
+    let e: Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(e["rolled_back"], true, "{e}");
+    assert!(e["error"].as_str().unwrap().ends_with(&format!("terminal {t} is gone")), "{e}");
+    assert!(marked(&exe, "old-build"), "the previous h0x-core.exe is back");
+    assert!(!exe.with_file_name("last-good.json").exists(), "a rollback writes no last good");
+}
+
+#[test]
 fn attach_types_non_ascii_text_unchanged() {
     // The console attach runs in reads keys in its code page (437 here).
     let s = Session::new();
