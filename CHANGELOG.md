@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.1.16] - 2026-11-13
+
+Safer updates.
+
+### Changed
+- `h0x-core update` keeps the previous release (with its Windows console files) in a `previous` folder, checks the new core after handing your terminals over, and goes back to the previous one automatically if it doesn't come up, reports the wrong version, or loses a terminal. `--json` reports `rolled_back`.
+- Updates are looked up in the new release repository first (github.com/buckleson/h0x-ADE-Core-Releases), then here.
+
 ## [0.1.15] - 2026-11-11
 
 Telegram you can navigate.
