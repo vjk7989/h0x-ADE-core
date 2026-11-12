@@ -127,7 +127,10 @@ impl Session {
     pub fn err(&self, args: &[&str]) -> (i32, Value) {
         let out = self.core(args);
         assert!(!out.status.success(), "h0x-core {args:?} unexpectedly succeeded");
-        let err = serde_json::from_slice(&out.stderr).unwrap_or_else(|e| {
+        // The JSON error is the last line; warnings (e.g. macOS launchd fallbacks) may come first.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let last = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+        let err = serde_json::from_str(last).unwrap_or_else(|e| {
             panic!("h0x-core {args:?}: bad json error ({e}): {}", String::from_utf8_lossy(&out.stderr))
         });
         (out.status.code().unwrap_or(-1), err)
