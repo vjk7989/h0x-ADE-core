@@ -70,6 +70,12 @@ pub(super) fn update(paths: &Paths, from: &std::path::Path, force: bool) -> Resu
     if older(&now, &was) && !force {
         return Err(refused(format!("{now} is older than this {was}"), "--force to go back anyway"));
     }
+    // The running h0x-core's terminals, to check they all survive the handoff.
+    let before = client::connect_existing(paths).map(|s| terminals_of(&s)).transpose()?;
+    // The binary being replaced stays beside it until the next update.
+    let previous = dest.with_file_name(if cfg!(windows) { "h0x-core.previous.exe" } else { "h0x-core.previous" });
+    std::fs::copy(&dest, &previous)
+        .map_err(|e| RpcError::internal(format!("cannot keep {shown} as {}: {e}", previous.display())))?;
     // Staged beside it, checked, then swapped in: never a half-written h0x-core.
     crate::platform::swap_in(from, &dest, |staged| version_of(staged).as_deref() == Some(now.as_str())).map_err(
         |e| match e.kind() {
@@ -77,20 +83,80 @@ pub(super) fn update(paths: &Paths, from: &std::path::Path, force: bool) -> Resu
             _ => RpcError::internal(format!("cannot replace {shown}: {e}")),
         },
     )?;
-    let restarted = match client::connect_existing(paths) {
-        Some(stream) => {
+    let restarted = before.is_some();
+    let healthy = if restarted {
+        restart_and_check(paths, &now, before.as_deref().unwrap_or_default())
+    } else {
+        version_of(&dest)
+            .filter(|v| *v == now)
+            .map(|_| ())
+            .ok_or_else(|| format!("{shown} stopped answering --version"))
+    };
+    if let Err(why) = healthy {
+        crate::platform::swap_in(&previous, &dest, |p| version_of(p).as_deref() == Some(was.as_str()))
+            .map_err(|e| RpcError::internal(format!("update failed ({why}) and {was} could not be put back: {e}")))?;
+        if let Some(stream) = client::connect_existing(paths) {
             client::call(&stream, "server.restart", json!({}))?;
             wait_closed(&stream);
-            true
         }
-        None => false,
-    };
+        call(paths, "server.status", json!({}))?;
+        return Err(RpcError::new("rolled_back", format!("Update to {now} failed, went back to {was}: {why}"), ""));
+    }
     let status = call(paths, "server.status", json!({}))?;
+    let version = now.strip_prefix("h0x-core ").unwrap_or(&now);
+    std::fs::write(dest.with_file_name("last-good.json"), json!({"version": version}).to_string())
+        .map_err(|e| RpcError::internal(format!("cannot write last-good.json: {e}")))?;
     let human = format!("{shown}: {was} -> {now}; core running again (pid {}), terminals kept", status["pid"]);
     Ok(Out {
-        json: json!({"path": shown, "was": was, "now": now, "restarted": restarted, "pid": status["pid"]}),
+        json: json!({
+            "path": shown, "was": was, "now": now, "restarted": restarted, "pid": status["pid"], "rolled_back": false,
+        }),
         human,
     })
+}
+
+/// The addresses of the terminals a core has.
+fn terminals_of(stream: &crate::platform::Stream) -> Result<Vec<String>, RpcError> {
+    let list = client::call(stream, "terminal.list", json!({}))?;
+    Ok(list["terminals"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t["address"].as_str().map(Into::into))
+        .collect())
+}
+
+/// Hands the running core over to the binary now installed, then waits up to 30 s
+/// for it to report `now` with every terminal in `before` still there.
+fn restart_and_check(paths: &Paths, now: &str, before: &[String]) -> Result<(), String> {
+    if let Some(stream) = client::connect_existing(paths) {
+        client::call(&stream, "server.restart", json!({})).map_err(|e| e.message)?;
+        wait_closed(&stream);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut last = "no core answered".to_string();
+    while std::time::Instant::now() < deadline {
+        if let Some(stream) = client::connect_existing(paths) {
+            let checked = client::call(&stream, "server.status", json!({})).and_then(|s| {
+                let running = format!("h0x-core {}", s["version"].as_str().unwrap_or_default());
+                if running != now {
+                    return Ok(Err(format!("the core still reports {running}")));
+                }
+                let have = terminals_of(&stream)?;
+                Ok(match before.iter().find(|t| !have.contains(t)) {
+                    Some(lost) => Err(format!("terminal {lost} is gone")),
+                    None => Ok(()),
+                })
+            });
+            match checked {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(why)) => last = why,
+                Err(e) => last = e.message,
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    Err(last)
 }
 
 #[cfg(test)]

@@ -118,6 +118,10 @@ fn update_from_a_file_swaps_hc_and_keeps_everything_running() {
         "{r}"
     );
     assert_eq!(r["restarted"], true);
+    assert_eq!(r["rolled_back"], false);
+    assert!(dir.join("h0x-core.previous").is_file(), "the replaced binary is kept");
+    let good: Value = serde_json::from_slice(&std::fs::read(dir.join("last-good.json")).unwrap()).unwrap();
+    assert_eq!(good["version"], env!("CARGO_PKG_VERSION"));
     assert_ne!(s.json(&["server", "status"])["pid"], pid, "a new core runs");
     assert!(dir.join("h0x-core-link").is_symlink(), "the link stays a link");
     s.json(&["send", &t, "after"]);
@@ -179,4 +183,29 @@ fn a_package_manager_install_is_sent_to_the_github_release_except_nix() {
         );
         assert_eq!(error["error"]["hint"], hint, "{error}");
     }
+}
+
+#[test]
+fn a_new_core_that_does_not_come_up_is_rolled_back_with_its_terminals() {
+    let mut s = Session::new();
+    let dir = s.root.join("bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(BIN, dir.join("h0x-core")).unwrap();
+    s.bin = dir.join("h0x-core");
+    let t = run(&s, &["sh", "-c", "echo before; while read l; do echo got-$l; done"]);
+    s.json(&["server", "status"]);
+    // Says it is a newer h0x-core, but cannot be one.
+    let broken = s.root.join("broken");
+    std::fs::write(&broken, "#!/bin/sh\necho 'h0x-core 99.0.0'\n").unwrap();
+    std::fs::set_permissions(&broken, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let (code, e) = s.err(&["--json", "update", "--from", broken.to_str().unwrap()]);
+    assert_ne!(code, 0);
+    assert_eq!(e["rolled_back"], true, "{e}");
+    assert!(e["error"].as_str().unwrap().contains("went back to h0x-core"), "{e}");
+    let version = std::process::Command::new(&s.bin).arg("--version").output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&version.stdout).trim(), format!("h0x-core {}", env!("CARGO_PKG_VERSION")));
+    assert!(!dir.join("last-good.json").exists(), "only a healthy update is last good");
+    assert_eq!(s.json(&["server", "status"])["version"], env!("CARGO_PKG_VERSION"));
+    s.json(&["send", &t, "after"]);
+    wait_until("the terminal still answers", || text(&s, &t).contains("got-after"));
 }

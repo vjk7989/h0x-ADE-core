@@ -257,6 +257,8 @@ fn print(out: &Out, json: bool) {
 fn fail(err: &RpcError, json: bool) -> i32 {
     if err.kind == "cancelled" {
         // Esc in the picker: nothing to report.
+    } else if json && err.kind == "rolled_back" {
+        eprintln!("{}", json!({"rolled_back": true, "error": err.message}));
     } else if json {
         let body = json!({"error": {"kind": err.kind, "message": err.message, "hint": err.hint}});
         eprintln!("{body}");
