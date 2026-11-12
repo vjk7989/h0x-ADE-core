@@ -70,87 +70,158 @@ pub(super) fn update(paths: &Paths, from: &std::path::Path, force: bool) -> Resu
     if older(&now, &was) && !force {
         return Err(refused(format!("{now} is older than this {was}"), "--force to go back anyway"));
     }
-    // The running h0x-core's terminals, to check they all survive the handoff.
+    // The running h0x-core's terminals (finished ones too), to check they all survive the handoff.
     let before = client::connect_existing(paths).map(|s| terminals_of(&s)).transpose()?;
-    // The binary being replaced stays beside it until the next update.
-    let previous = dest.with_file_name(if cfg!(windows) { "h0x-core.previous.exe" } else { "h0x-core.previous" });
-    std::fs::copy(&dest, &previous)
-        .map_err(|e| RpcError::internal(format!("cannot keep {shown} as {}: {e}", previous.display())))?;
-    // Staged beside it, checked, then swapped in: never a half-written h0x-core.
-    crate::platform::swap_in(from, &dest, |staged| version_of(staged).as_deref() == Some(now.as_str())).map_err(
-        |e| match e.kind() {
-            std::io::ErrorKind::InvalidData => refused(format!("the copy of {} does not run", from.display()), ""),
-            _ => RpcError::internal(format!("cannot replace {shown}: {e}")),
-        },
-    )?;
+    let kept = std::cell::RefCell::new(None);
+    // Staged beside it, checked, then (only then) the binary being replaced is kept, then swapped in:
+    // never a half-written h0x-core, and a refused update leaves the old `previous` alone.
+    crate::platform::swap_in(from, &dest, |staged| {
+        if version_of(staged).as_deref() != Some(now.as_str()) {
+            return false;
+        }
+        *kept.borrow_mut() = keep_previous(&dest).err();
+        kept.borrow().is_none()
+    })
+    .map_err(|e| match (kept.take(), e.kind()) {
+        (Some(why), _) => {
+            RpcError::internal(format!("cannot keep {shown} as {}: {why}", previous_dir(&dest).display()))
+        }
+        (None, std::io::ErrorKind::InvalidData) => refused(format!("the copy of {} does not run", from.display()), ""),
+        _ => RpcError::internal(format!("cannot replace {shown}: {e}")),
+    })?;
     let restarted = before.is_some();
-    let healthy = if restarted {
-        restart_and_check(paths, &now, before.as_deref().unwrap_or_default())
-    } else {
-        version_of(&dest)
-            .filter(|v| *v == now)
-            .map(|_| ())
-            .ok_or_else(|| format!("{shown} stopped answering --version"))
+    let healthy = match &before {
+        Some(ids) => restart_and_check(paths, &now, ids),
+        // No core runs: none is started, the binary is all there is to check.
+        None => binary_says(&dest, &now),
     };
     if let Err(why) = healthy {
-        crate::platform::swap_in(&previous, &dest, |p| version_of(p).as_deref() == Some(was.as_str()))
+        crate::platform::swap_in(&previous_exe(&dest), &dest, |p| version_of(p).as_deref() == Some(was.as_str()))
             .map_err(|e| RpcError::internal(format!("update failed ({why}) and {was} could not be put back: {e}")))?;
-        if let Some(stream) = client::connect_existing(paths) {
-            client::call(&stream, "server.restart", json!({}))?;
-            wait_closed(&stream);
+        let mut message = format!("Update to {now} failed, went back to {was}: {why}");
+        let handed = if restarted {
+            hand_off(paths).and_then(|_| call(paths, "server.status", json!({})))
+        } else {
+            Ok(json!({}))
+        };
+        match handed {
+            Err(e) => message.push_str(&format!(" (the core needs a restart: {})", e.message)),
+            Ok(_) if !restarted => {
+                if let Err(why) = binary_says(&dest, &was) {
+                    message.push_str(&format!(" ({why})"));
+                }
+            }
+            Ok(_) => {}
         }
-        call(paths, "server.status", json!({}))?;
-        return Err(RpcError::new("rolled_back", format!("Update to {now} failed, went back to {was}: {why}"), ""));
+        return Err(RpcError::new("rolled_back", message, ""));
     }
-    let status = call(paths, "server.status", json!({}))?;
+    let pid = if restarted { call(paths, "server.status", json!({}))?["pid"].clone() } else { Value::Null };
     let version = now.strip_prefix("h0x-core ").unwrap_or(&now);
-    std::fs::write(dest.with_file_name("last-good.json"), json!({"version": version}).to_string())
+    std::fs::write(last_good_path(&dest), json!({"version": version}).to_string())
         .map_err(|e| RpcError::internal(format!("cannot write last-good.json: {e}")))?;
-    let human = format!("{shown}: {was} -> {now}; core running again (pid {}), terminals kept", status["pid"]);
+    let human = if restarted {
+        format!("{shown}: {was} -> {now}; core running again (pid {pid}), terminals kept")
+    } else {
+        format!("{shown}: {was} -> {now}; no core was running")
+    };
     Ok(Out {
-        json: json!({
-            "path": shown, "was": was, "now": now, "restarted": restarted, "pid": status["pid"], "rolled_back": false,
-        }),
+        json: json!({"path": shown, "was": was, "now": now, "restarted": restarted, "pid": pid, "rolled_back": false}),
         human,
     })
 }
 
-/// The addresses of the terminals a core has.
-fn terminals_of(stream: &crate::platform::Stream) -> Result<Vec<String>, RpcError> {
-    let list = client::call(stream, "terminal.list", json!({}))?;
-    Ok(list["terminals"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|t| t["address"].as_str().map(Into::into))
-        .collect())
+/// Where the replaced h0x-core (and, on Windows, its ConPTY files) is kept: a folder beside the install.
+fn previous_dir(dest: &std::path::Path) -> std::path::PathBuf {
+    dest.with_file_name("previous")
 }
 
-/// Hands the running core over to the binary now installed, then waits up to 30 s
-/// for it to report `now` with every terminal in `before` still there.
-fn restart_and_check(paths: &Paths, now: &str, before: &[String]) -> Result<(), String> {
+/// The h0x-core inside `previous_dir`: what a rollback installs.
+fn previous_exe(dest: &std::path::Path) -> std::path::PathBuf {
+    previous_dir(dest).join(dest.file_name().unwrap_or_default())
+}
+
+/// Written beside the install once an update's core passed its health check.
+fn last_good_path(dest: &std::path::Path) -> std::path::PathBuf {
+    dest.with_file_name("last-good.json")
+}
+
+/// What `--json` prints when an update was rolled back.
+pub(super) fn rolled_back_body(message: &str) -> Value {
+    json!({"rolled_back": true, "error": message})
+}
+
+/// Replaces `previous_dir` with a copy of the live release: the h0x-core and, on Windows, its ConPTY files.
+fn keep_previous(dest: &std::path::Path) -> std::io::Result<()> {
+    let (dir, src) = (previous_dir(dest), dest.parent().unwrap_or(dest));
+    let _ = std::fs::remove_dir_all(&dir);
+    let exe = dest.file_name().unwrap_or_default();
+    let conpty = ["conpty/conpty.dll", "conpty/x64/OpenConsole.exe"].into_iter().filter(|_| cfg!(windows));
+    for rel in std::iter::once(std::path::Path::new(exe)).chain(conpty.map(std::path::Path::new)) {
+        let from = src.join(rel);
+        if from.is_file() {
+            let to = dir.join(rel);
+            std::fs::create_dir_all(to.parent().unwrap_or(&dir))?;
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// A binary that runs and says it is `release`.
+fn binary_says(path: &std::path::Path, release: &str) -> Result<(), String> {
+    match version_of(path) {
+        Some(v) if v == release => Ok(()),
+        _ => Err(format!("{} stopped answering --version", path.display())),
+    }
+}
+
+/// The planned handoff: the running core starts the installed binary and keeps every terminal.
+fn hand_off(paths: &Paths) -> Result<(), RpcError> {
     if let Some(stream) = client::connect_existing(paths) {
-        client::call(&stream, "server.restart", json!({})).map_err(|e| e.message)?;
+        client::call(&stream, "server.restart", json!({}))?;
         wait_closed(&stream);
     }
+    Ok(())
+}
+
+/// This core's own terminals (finished ones too; other machines' carry `machine/` in front).
+fn local_terminals(list: &Value) -> Vec<String> {
+    let all = list["terminals"].as_array().into_iter().flatten();
+    all.filter_map(|t| t["address"].as_str()).filter(|a| !a.contains('/')).map(Into::into).collect()
+}
+
+fn terminals_of(stream: &crate::platform::Stream) -> Result<Vec<String>, RpcError> {
+    Ok(local_terminals(&client::call(stream, "terminal.list", json!({"all": true}))?))
+}
+
+/// Hands the running core over to the binary now installed, then waits (30 s for a core to answer)
+/// for it to report `now`: a wrong version fails at once, a missing terminal after 5 s.
+fn restart_and_check(paths: &Paths, now: &str, before: &[String]) -> Result<(), String> {
+    hand_off(paths).map_err(|e| e.message)?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut missing_since: Option<std::time::Instant> = None;
     let mut last = "no core answered".to_string();
     while std::time::Instant::now() < deadline {
-        if let Some(stream) = client::connect_existing(paths) {
-            let checked = client::call(&stream, "server.status", json!({})).and_then(|s| {
+        // A core that stopped for the handoff and has nobody to start it is started here, as `update` always did.
+        if let Ok(stream) = client::connect_or_start(paths) {
+            let answer = client::call(&stream, "server.status", json!({})).and_then(|s| {
                 let running = format!("h0x-core {}", s["version"].as_str().unwrap_or_default());
                 if running != now {
-                    return Ok(Err(format!("the core still reports {running}")));
+                    return Ok(Err(Ok(format!("the core reports {running}"))));
                 }
                 let have = terminals_of(&stream)?;
-                Ok(match before.iter().find(|t| !have.contains(t)) {
-                    Some(lost) => Err(format!("terminal {lost} is gone")),
-                    None => Ok(()),
-                })
+                Ok(before.iter().find(|t| !have.contains(t)).cloned().map_or(Ok(()), |lost| Err(Err(lost))))
             });
-            match checked {
+            match answer {
                 Ok(Ok(())) => return Ok(()),
-                Ok(Err(why)) => last = why,
+                Ok(Err(Ok(wrong))) => return Err(wrong),
+                Ok(Err(Err(lost))) => {
+                    let since = *missing_since.get_or_insert_with(std::time::Instant::now);
+                    last = format!("terminal {lost} is gone");
+                    if since.elapsed() >= std::time::Duration::from_secs(5) {
+                        return Err(last);
+                    }
+                }
                 Err(e) => last = e.message,
             }
         }
@@ -161,7 +232,11 @@ fn restart_and_check(paths: &Paths, now: &str, before: &[String]) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    use super::{older, release_version};
+    use super::{
+        last_good_path, local_terminals, older, previous_dir, previous_exe, release_version, rolled_back_body,
+    };
+    use serde_json::json;
+    use std::path::Path;
 
     #[test]
     fn a_release_name_is_three_numbers_with_no_v() {
@@ -177,5 +252,32 @@ mod tests {
         assert!(!older("h0x-core 0.2.0", "h0x-core 0.2.0"));
         assert!(!older("hc 0.1.0", "h0x-core 0.2.0"), "the old name is not a version at all");
         assert!(!older("h0x-core 0.1.0", "h0x-core x.y.z"));
+    }
+
+    #[test]
+    fn the_previous_release_and_last_good_sit_beside_the_install_even_in_a_folder_with_spaces() {
+        let dest = Path::new("C:/Program Files/H0X Core/h0x-core.exe");
+        assert_eq!(previous_dir(dest), Path::new("C:/Program Files/H0X Core/previous"));
+        assert_eq!(previous_exe(dest), Path::new("C:/Program Files/H0X Core/previous/h0x-core.exe"));
+        assert_eq!(last_good_path(dest), Path::new("C:/Program Files/H0X Core/last-good.json"));
+        let unix = Path::new("/opt/h0x/h0x-core");
+        assert_eq!(previous_exe(unix), Path::new("/opt/h0x/previous/h0x-core"));
+    }
+
+    #[test]
+    fn a_rolled_back_update_says_so_in_json() {
+        assert_eq!(rolled_back_body("x failed"), json!({"rolled_back": true, "error": "x failed"}));
+    }
+
+    #[test]
+    fn only_this_cores_own_terminals_count_finished_ones_included() {
+        let list = json!({"terminals": [
+            {"address": "t1", "state": "live"},
+            {"address": "t2", "state": "finished"},
+            {"address": "box/t1", "state": "live"},
+            {"state": "live"},
+        ]});
+        assert_eq!(local_terminals(&list), ["t1", "t2"]);
+        assert!(local_terminals(&json!({})).is_empty());
     }
 }

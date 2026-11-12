@@ -119,7 +119,7 @@ fn update_from_a_file_swaps_hc_and_keeps_everything_running() {
     );
     assert_eq!(r["restarted"], true);
     assert_eq!(r["rolled_back"], false);
-    assert!(dir.join("h0x-core.previous").is_file(), "the replaced binary is kept");
+    assert!(dir.join("previous/h0x-core").is_file(), "the replaced binary is kept");
     let good: Value = serde_json::from_slice(&std::fs::read(dir.join("last-good.json")).unwrap()).unwrap();
     assert_eq!(good["version"], env!("CARGO_PKG_VERSION"));
     assert_ne!(s.json(&["server", "status"])["pid"], pid, "a new core runs");
@@ -208,4 +208,139 @@ fn a_new_core_that_does_not_come_up_is_rolled_back_with_its_terminals() {
     assert_eq!(s.json(&["server", "status"])["version"], env!("CARGO_PKG_VERSION"));
     s.json(&["send", &t, "after"]);
     wait_until("the terminal still answers", || text(&s, &t).contains("got-after"));
+}
+
+/// A program that says `h0x-core 99.0.0` while it is checked and staged (its first
+/// two runs), then, from its third run (installed), runs `third` and says 98.0.0.
+fn right_then_wrong(s: &Session, third: &str) -> std::path::PathBuf {
+    let count = s.root.join("count");
+    let flaky = s.root.join("flaky");
+    let body = format!(
+        "#!/bin/sh\nn=$(($(cat '{c}' 2>/dev/null || echo 0) + 1))\necho $n > '{c}'\n\
+         if [ $n -le 2 ]; then echo 'h0x-core 99.0.0'; else {third} echo 'h0x-core 98.0.0'; fi\n",
+        c = count.display()
+    );
+    std::fs::write(&flaky, body).unwrap();
+    std::fs::set_permissions(&flaky, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    flaky
+}
+
+#[test]
+fn a_wrong_version_with_no_core_running_is_put_back_from_a_folder_with_spaces() {
+    let mut s = Session::new();
+    let dir = s.root.join("my bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(BIN, dir.join("h0x-core")).unwrap();
+    s.bin = dir.join("h0x-core");
+    let flaky = right_then_wrong(&s, "");
+    let (code, e) = s.err(&["--json", "update", "--from", flaky.to_str().unwrap()]);
+    assert_eq!(code, 1, "{e}");
+    let v = env!("CARGO_PKG_VERSION");
+    let shown = dir.join("h0x-core").canonicalize().unwrap().display().to_string();
+    assert_eq!(
+        e,
+        json!({
+            "rolled_back": true,
+            "error": format!("Update to h0x-core 99.0.0 failed, went back to h0x-core {v}: {shown} stopped answering --version"),
+        })
+    );
+    let version = std::process::Command::new(&s.bin).arg("--version").output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&version.stdout).trim(), format!("h0x-core {v}"), "the previous one is back");
+    assert!(dir.join("previous/h0x-core").is_file());
+    assert!(!dir.join("last-good.json").exists(), "a rollback writes no last good");
+}
+
+#[test]
+fn a_rollback_that_cannot_put_the_previous_back_names_both_failures() {
+    let mut s = Session::new();
+    let dir = s.root.join("bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(BIN, dir.join("h0x-core")).unwrap();
+    s.bin = dir.join("h0x-core");
+    let previous = dir.join("previous/h0x-core");
+    let flaky = right_then_wrong(&s, &format!("rm -f '{}';", previous.display()));
+    let (code, e) = s.err(&["--json", "update", "--from", flaky.to_str().unwrap()]);
+    assert_eq!(code, 1, "{e}");
+    assert_eq!(e["error"]["kind"], "internal", "{e}");
+    let message = e["error"]["message"].as_str().unwrap();
+    assert!(message.contains("stopped answering --version"), "the update's failure: {e}");
+    assert!(
+        message.contains(&format!("and h0x-core {} could not be put back", env!("CARGO_PKG_VERSION"))),
+        "the put-back's failure: {e}"
+    );
+    assert!(!previous.exists());
+    assert!(!dir.join("last-good.json").exists());
+    assert!(
+        std::fs::read_dir(&dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().contains(".new")),
+        "no leftovers"
+    );
+    s.bin = BIN.into(); // the installed one is the flaky script now
+}
+
+#[test]
+fn each_update_overwrites_the_previous_core_and_the_first_success_writes_last_good() {
+    let mut s = Session::new();
+    let dir = s.root.join("bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(BIN, dir.join("h0x-core")).unwrap();
+    s.bin = dir.join("h0x-core");
+    let previous = dir.join("previous/h0x-core");
+    let good = dir.join("last-good.json");
+    let built = std::fs::read(BIN).unwrap();
+    std::fs::create_dir_all(previous.parent().unwrap()).unwrap();
+    std::fs::write(&previous, "from an older update").unwrap();
+    assert!(!good.exists());
+    let r = s.json(&["update", "--from", BIN]);
+    assert_eq!((r["restarted"].clone(), r["rolled_back"].clone()), (json!(false), json!(false)), "no core ran: {r}");
+    assert_eq!(std::fs::read(&previous).unwrap(), built, "overwritten with the replaced binary");
+    let v = env!("CARGO_PKG_VERSION");
+    assert_eq!(serde_json::from_slice::<Value>(&std::fs::read(&good).unwrap()).unwrap(), json!({"version": v}));
+    std::fs::create_dir_all(previous.parent().unwrap()).unwrap();
+    std::fs::write(&previous, "from an older update").unwrap();
+    std::fs::write(&good, "{}").unwrap();
+    let r = s.json(&["update", "--from", BIN]);
+    assert_eq!(r["rolled_back"], false, "{r}");
+    assert_eq!(std::fs::read(&previous).unwrap(), built, "the second update overwrites it again");
+    assert_eq!(serde_json::from_slice::<Value>(&std::fs::read(&good).unwrap()).unwrap(), json!({"version": v}));
+}
+
+#[test]
+fn a_terminal_gone_after_the_handoff_rolls_the_update_back() {
+    let mut s = Session::new();
+    let dir = s.root.join("bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(BIN, dir.join("h0x-core")).unwrap();
+    s.bin = dir.join("h0x-core");
+    let kept = run(&s, &["sh", "-c", "echo before; while read l; do echo got-$l; done"]);
+    let gone = run(&s, &["sh", "-c", "while read l; do :; done"]);
+    // Removed the moment the update has kept the previous core: no longer there for the new one.
+    let (sock, previous, addr) = (s.socket(), dir.join("previous/h0x-core"), gone.clone());
+    let remover = std::thread::spawn(move || {
+        while !previous.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        for _ in 0..500 {
+            if let Ok(stream) = h0x_core::platform::connect(&sock) {
+                let _ = h0x_core::client::call(&stream, "terminal.kill", json!({"terminal": addr}));
+                if h0x_core::client::call(&stream, "terminal.rm", json!({"terminal": addr})).is_ok() {
+                    return;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
+    let (code, e) = s.err(&["--json", "update", "--from", BIN]);
+    remover.join().unwrap();
+    assert_eq!(code, 1, "{e}");
+    let v = env!("CARGO_PKG_VERSION");
+    assert_eq!(
+        e,
+        json!({
+            "rolled_back": true,
+            "error": format!("Update to h0x-core {v} failed, went back to h0x-core {v}: terminal {gone} is gone"),
+        })
+    );
+    assert!(!dir.join("last-good.json").exists(), "a rollback writes no last good");
+    s.json(&["send", &kept, "after"]);
+    wait_until("the kept terminal still answers", || text(&s, &kept).contains("got-after"));
 }
