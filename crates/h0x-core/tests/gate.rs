@@ -234,3 +234,225 @@ fn a_terminals_saved_label_is_a_running_total_and_gate_stats_reports_the_counter
     assert_eq!(s["outputs"], 2);
     assert_eq!(s["tokens_saved"].as_u64().unwrap(), saved_by(&one) + saved_by(&two));
 }
+
+#[test]
+fn a_counter_at_the_u64_limit_saturates_and_one_past_it_restarts_from_zero() {
+    let name = "gt-max";
+    let _core = Core(name.into());
+    let max = u64::MAX;
+    std::fs::create_dir_all(counter(name).parent().unwrap()).unwrap();
+    let top = json!({"tokens_saved": max - 1, "outputs": max, "bytes_in": max - 2, "bytes_shown": max});
+    std::fs::write(counter(name), top.to_string()).unwrap();
+    quiet(&gate_as(name, big_event().as_bytes(), &[]), "at the top");
+    assert_eq!(stats(name), json!({"tokens_saved": max, "outputs": max, "bytes_in": max, "bytes_shown": max}));
+    // 2^64 is no u64: the file is broken, so it counts again from zero.
+    std::fs::write(counter(name), b"{\"outputs\": 18446744073709551616, \"tokens_saved\": 5}").unwrap();
+    let out = gate_as(name, big_event().as_bytes(), &[]);
+    quiet(&out, "past the top");
+    assert_eq!(stats(name)["outputs"], 1);
+    assert_eq!(stats(name)["tokens_saved"], saved_by(&out));
+}
+
+#[test]
+fn a_state_folder_that_cannot_be_made_still_gets_the_whole_answer_and_exit_0() {
+    let name = "gt-nostate";
+    let _core = Core(name.into());
+    // The state home's parent is a file: no folder can be made under it.
+    let blocker = scratch(name).join("not a folder");
+    std::fs::write(&blocker, b"x").unwrap();
+    let state = blocker.join("state");
+    let blocked = gate_as(name, big_event().as_bytes(), &[("XDG_STATE_HOME", state.to_str().unwrap())]);
+    quiet(&blocked, "blocked");
+    assert!(std::fs::metadata(&blocker).unwrap().is_file(), "nothing was written there");
+    let normal = gate_as(name, big_event().as_bytes(), &[]);
+    quiet(&normal, "normal");
+    assert!(!blocked.stdout.is_empty());
+    assert_eq!(blocked.stdout, normal.stdout, "the answer does not depend on the bookkeeping");
+    assert_eq!(stats(name)["outputs"], 1, "only the normal run was booked");
+}
+
+#[test]
+fn a_session_and_state_path_with_spaces_book_the_counter_there() {
+    let name = "gt spaced";
+    let _core = Core(name.into());
+    let state = scratch(name).join("Program Data").join("h0x state");
+    let out = gate_as(name, big_event().as_bytes(), &[("XDG_STATE_HOME", state.to_str().unwrap())]);
+    quiet(&out, "spaces");
+    let file = state.join("h0x-core").join(name).join("token-saver.json");
+    let s: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(s["outputs"], 1);
+    assert_eq!(s["tokens_saved"], saved_by(&out));
+    assert!(!counter(name).exists(), "the default state home was left alone");
+}
+
+/// Starts session `name`'s core with one long-lived terminal and returns its address.
+fn core_with_terminal(name: &str) -> String {
+    let started = core_cmd(name, &["server", "start"]).output().unwrap();
+    assert!(started.status.success(), "{}", String::from_utf8_lossy(&started.stderr));
+    let program: &[&str] = if cfg!(windows) { &["cmd", "/c", "ping -n 60 127.0.0.1 >nul"] } else { &["sleep", "60"] };
+    let started = core_cmd(name, &[&["--json", "run", "--bg"], program].concat()).output().unwrap();
+    assert!(started.status.success(), "{}", String::from_utf8_lossy(&started.stderr));
+    serde_json::from_slice::<Value>(&started.stdout).unwrap()["address"].as_str().unwrap().to_string()
+}
+
+/// The `h0x.saved` label of `address` in session `name`.
+fn saved_label(name: &str, address: &str) -> Option<String> {
+    let out = core_cmd(name, &["--json", "get", address]).output().unwrap();
+    let t: Value = serde_json::from_slice(&out.stdout).unwrap();
+    t["labels"]["h0x.saved"].as_str().map(str::to_string)
+}
+
+#[test]
+fn a_saved_label_that_is_not_a_count_is_overwritten_and_the_top_stays_the_top() {
+    let name = "gt-badlabel";
+    let _core = Core(name.into());
+    let address = core_with_terminal(name);
+    for junk in ["abc", "-5", "1e3", "", "12abc"] {
+        let set = core_cmd(name, &["label", &address, &format!("h0x.saved={junk}")]).output().unwrap();
+        assert!(set.status.success(), "{junk:?}: {}", String::from_utf8_lossy(&set.stderr));
+        let out = gate_as(name, big_event().as_bytes(), &[("H0X_TERMINAL_ID", &address)]);
+        quiet(&out, junk);
+        assert_eq!(saved_label(name, &address), Some(saved_by(&out).to_string()), "{junk:?} counts as 0");
+    }
+    let top = u64::MAX.to_string();
+    core_cmd(name, &["label", &address, &format!("h0x.saved={top}")]).output().unwrap();
+    quiet(&gate_as(name, big_event().as_bytes(), &[("H0X_TERMINAL_ID", &address)]), "top");
+    assert_eq!(saved_label(name, &address), Some(top), "saturates, no wrap");
+}
+
+#[test]
+fn an_empty_terminal_id_labels_nothing_but_still_counts() {
+    let name = "gt-emptyid";
+    let _core = Core(name.into());
+    let address = core_with_terminal(name);
+    let out = gate_as(name, big_event().as_bytes(), &[("H0X_TERMINAL_ID", "")]);
+    quiet(&out, "empty id");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+    assert_eq!(stats(name)["outputs"], 1);
+    assert_eq!(saved_label(name, &address), None, "no terminal was guessed");
+}
+
+#[test]
+fn a_core_that_never_answers_holds_the_gate_well_under_a_second_after_the_answer() {
+    let name = "gt-hang";
+    let _core = Core(name.into());
+    let socket = if cfg!(windows) {
+        std::path::PathBuf::from(format!(r"\\.\pipe\h0x-gt-{}-hang", std::process::id()))
+    } else {
+        scratch(name).join("hang.sock")
+    };
+    // Accepts, reads the request, never answers and never hangs up.
+    let listener = h0x_core::platform::listen(&socket).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { return };
+            let mut line = String::new();
+            let _ = std::io::BufRead::read_line(&mut std::io::BufReader::new(&stream), &mut line);
+            let _ = tx.send(line);
+            std::mem::forget(stream);
+        }
+    });
+    let mut child = core_cmd(name, &["gate"])
+        .env("H0X_CORE_SOCKET", &socket)
+        .env("H0X_TERMINAL_ID", "t1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    child.stdin.take().unwrap().write_all(big_event().as_bytes()).unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut got = Vec::new();
+    let answer: Value = loop {
+        let mut buf = [0u8; 4096];
+        let n = std::io::Read::read(&mut stdout, &mut buf).unwrap();
+        assert!(n > 0, "stdout closed before a whole answer: {}", String::from_utf8_lossy(&got));
+        got.extend_from_slice(&buf[..n]);
+        if let Ok(v) = serde_json::from_slice(&got) {
+            break v;
+        }
+    };
+    assert!(child.try_wait().unwrap().is_none(), "the answer is out before the label update gives up");
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(5) {
+            let _ = child.kill();
+            panic!("the gate waited on a silent core");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    let took = started.elapsed();
+    assert_eq!(status.code(), Some(0));
+    assert!(took < std::time::Duration::from_secs(1), "took {took:?}");
+    let request: Value = serde_json::from_str(&rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap()).unwrap();
+    assert_eq!(request["method"], "terminal.get", "the fake core was really asked");
+    assert_eq!(answer["hookSpecificOutput"]["hookEventName"], "PostToolUse");
+    assert_eq!(stats(name)["outputs"], 1);
+}
+
+#[test]
+fn gate_stats_reads_a_broken_counter_as_zeros_not_an_error() {
+    let name = "gt-rpcbroken";
+    let _core = Core(name.into());
+    let started = core_cmd(name, &["server", "start"]).output().unwrap();
+    assert!(started.status.success(), "{}", String::from_utf8_lossy(&started.stderr));
+    let reply = || -> Value {
+        let req = json!({"jsonrpc": "2.0", "id": 1, "method": "gate.stats", "params": {}}).to_string() + "\n";
+        let mut child = core_cmd(name, &["connect"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(req.as_bytes()).unwrap();
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.take().unwrap()), &mut line).unwrap();
+        drop(stdin);
+        let _ = child.kill();
+        let _ = child.wait();
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line:?}"))
+    };
+    let zeros = json!({"tokens_saved": 0, "outputs": 0, "bytes_in": 0, "bytes_shown": 0});
+    let file = counter(name);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let cases: [(&str, &[u8]); 5] = [
+        ("garbage", b"{\"tokens_saved\": 12,"),
+        ("not utf-8", b"\xff\xfe"),
+        ("an array", b"[1, 2]"),
+        ("a string count", b"{\"outputs\": \"7\"}"),
+        ("empty", b""),
+    ];
+    for (what, junk) in cases {
+        std::fs::write(&file, junk).unwrap();
+        let r = reply();
+        assert!(r.get("error").is_none(), "{what}: {r}");
+        assert_eq!(r["result"], zeros, "{what}");
+    }
+    // A folder where the file should be.
+    std::fs::remove_file(&file).unwrap();
+    std::fs::create_dir(&file).unwrap();
+    assert_eq!(reply()["result"], zeros, "a folder");
+    std::fs::remove_dir(&file).unwrap();
+    // Read live, and a missing field is 0.
+    std::fs::write(&file, b"{\"outputs\": 3}").unwrap();
+    assert_eq!(reply()["result"], json!({"tokens_saved": 0, "outputs": 3, "bytes_in": 0, "bytes_shown": 0}));
+}
+
+#[test]
+fn the_schema_has_gate_stats_with_its_four_counters_and_no_params() {
+    let schema = h0x_core::api::openrpc();
+    let methods = schema["methods"].as_array().unwrap();
+    let method = methods.iter().find(|m| m["name"] == "gate.stats").expect("gate.stats in the schema");
+    assert_eq!(method["params"], json!([]));
+    let reference = method["result"]["schema"]["$ref"].as_str().unwrap();
+    let def = reference.strip_prefix("#/components/schemas/").unwrap();
+    let props = schema["components"]["schemas"][def]["properties"].as_object().unwrap();
+    let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["bytes_in", "bytes_shown", "outputs", "tokens_saved"]);
+    for (key, prop) in props {
+        assert_eq!(prop["type"], "integer", "{key}");
+        assert_eq!(prop["minimum"], 0, "{key}");
+    }
+}
