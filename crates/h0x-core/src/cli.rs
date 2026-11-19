@@ -195,6 +195,8 @@ pub fn main() -> i32 {
             print!("{HELP}");
             return 0;
         }
+        // A hook, not a command: no help entry, no session or paths, and it must always exit 0.
+        [Some("gate")] => return crate::gate::run(),
         [Some("--skill")] => {
             print!("{SKILL}");
             return 0;

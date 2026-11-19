@@ -233,6 +233,9 @@ pub(crate) fn terminal_env(
     mut env: BTreeMap<String, String>,
 ) -> (BTreeMap<String, String>, String) {
     env.insert("H0X_TERMINAL_ID".into(), crate::terminals::address(id));
+    if let Some(exe) = crate::client::own_exe() {
+        env.insert("H0X_CORE_EXE".into(), exe.to_string_lossy().into_owned()); // the Token Saver hook's command
+    }
     env.insert("H0X_TERMINAL_SOCKET".into(), core.paths.socket.display().to_string());
     let scope = crate::sweep::token();
     env.insert(crate::sweep::VAR.into(), scope.clone());
@@ -248,7 +251,7 @@ pub(crate) fn child_env(base: BTreeMap<String, String>, extra: BTreeMap<String, 
         .into_iter()
         .filter(|(k, _)| {
             !IDENTITY_VARS.contains(&k.as_str())
-                && !["H0X_TERMINAL_ID", crate::sweep::VAR, crate::sweep::RUNTIME].contains(&k.as_str())
+                && !["H0X_TERMINAL_ID", "H0X_CORE_EXE", crate::sweep::VAR, crate::sweep::RUNTIME].contains(&k.as_str())
         })
         .collect();
     crate::platform::merge_env(&mut env, extra);
@@ -302,6 +305,7 @@ mod tests {
         };
         let core = base(&[
             ("H0X_TERMINAL_ID", "t1"),
+            ("H0X_CORE_EXE", "/old/h0x-core"),
             ("H0X_SCOPE", "1-abc"),
             ("H0X_RUNTIME", "1"),
             ("TERM_PROGRAM", "h0x"),
@@ -309,7 +313,7 @@ mod tests {
             ("PATH", "/usr/bin"),
         ]);
         let env = super::child_env(core.clone(), base(&[("TERM_PROGRAM", "WezTerm"), ("TERM_PROGRAM_VERSION", "1")]));
-        for stale in ["H0X_TERMINAL_ID", "H0X_SCOPE", "H0X_RUNTIME"] {
+        for stale in ["H0X_TERMINAL_ID", "H0X_CORE_EXE", "H0X_SCOPE", "H0X_RUNTIME"] {
             assert!(!env.contains_key(stale), "{stale} leaked from the core");
         }
         assert_eq!(env["TERM_PROGRAM"], "WezTerm", "another terminal is left alone");
