@@ -477,3 +477,45 @@ fn racing_gates_never_leave_a_torn_counter() {
     let left: Vec<_> = std::fs::read_dir(counter(name).parent().unwrap()).unwrap().flatten().collect();
     assert!(left.iter().all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")), "temp files left: {left:?}");
 }
+
+fn stats_cli(name: &str, args: &[&str]) -> Output {
+    core_cmd(name, &[&["gate", "stats"], args].concat()).stdin(Stdio::null()).output().unwrap()
+}
+
+#[test]
+fn gate_stats_shows_the_counter_with_or_without_a_core() {
+    let name = "gt-statscli";
+    let _core = Core(name.into());
+    let zeros = json!({"tokens_saved": 0, "outputs": 0, "bytes_in": 0, "bytes_shown": 0});
+    // No core runs: it reads the file (here: none yet) and does not start one.
+    let out = stats_cli(name, &["--json"]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(serde_json::from_slice::<Value>(&out.stdout).unwrap(), zeros);
+    let first = gate_as(name, big_event().as_bytes(), &[]);
+    let second = gate_as(name, big_event().as_bytes(), &[]);
+    let want = saved_by(&first) + saved_by(&second);
+    let read = |args: &[&str]| serde_json::from_slice::<Value>(&stats_cli(name, args).stdout).unwrap();
+    let file = read(&["--json"]);
+    assert_eq!((file["outputs"].as_u64(), file["tokens_saved"].as_u64()), (Some(2), Some(want)));
+    // With a core it asks the core, and the answer is the same.
+    let started = core_cmd(name, &["server", "start"]).output().unwrap();
+    assert!(started.status.success(), "{}", String::from_utf8_lossy(&started.stderr));
+    assert_eq!(read(&["--json"]), file);
+    let human = stats_cli(name, &[]);
+    assert!(human.status.success());
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(text.contains(&format!("{want} tokens saved (2 outputs")) || text.trim_start().starts_with('{'), "{text}");
+}
+
+#[test]
+fn gate_stats_rejects_bad_arguments_without_panicking() {
+    let name = "gt-statsbad";
+    let _core = Core(name.into());
+    for args in [&["--bogus"][..], &["extra"]] {
+        let out = stats_cli(name, args);
+        assert_ne!(out.status.code(), Some(0), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!err.contains("panicked") && !err.is_empty(), "{args:?}: {err}");
+    }
+    assert!(!String::from_utf8_lossy(&core_cmd(name, &["--help"]).output().unwrap().stdout).contains("gate"));
+}

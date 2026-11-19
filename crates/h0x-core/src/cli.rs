@@ -128,11 +128,23 @@ enum Cmd {
     },
     #[command(hide = true)]
     Serve,
+    /// The Token Saver hook (bare `gate` reads a hook event on stdin); `gate stats` shows its savings.
+    #[command(hide = true)]
+    Gate {
+        #[command(subcommand)]
+        action: Option<GateAction>,
+    },
     #[command(hide = true)]
     Hold {
         #[arg(long)]
         socket: std::path::PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum GateAction {
+    /// Tokens saved so far on this machine.
+    Stats,
 }
 
 #[derive(Subcommand)]
@@ -400,6 +412,23 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             crate::platform::prepare_core();
             crate::server::serve().map_err(|e| RpcError::internal(e.to_string()))?;
             return Ok(None);
+        }
+        Cmd::Gate { action: None } => std::process::exit(crate::gate::run()),
+        Cmd::Gate { action: Some(GateAction::Stats) } => {
+            // Never starts a core: without one the counter file says the same.
+            let json = match client::connect_existing(&paths) {
+                Some(stream) => client::call(&stream, "gate.stats", json!({}))?,
+                None => serde_json::to_value(crate::gate::read_stats(&paths.state)).unwrap_or_default(),
+            };
+            let n = |k: &str| json[k].as_u64().unwrap_or(0);
+            let human = format!(
+                "Token Saver: {} tokens saved ({} outputs, {} bytes in, {} shown)",
+                n("tokens_saved"),
+                n("outputs"),
+                n("bytes_in"),
+                n("bytes_shown")
+            );
+            Out { json, human }
         }
         Cmd::Hold { socket } => {
             crate::holder::run(socket).map_err(|e| RpcError::internal(e.to_string()))?;
@@ -933,6 +962,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("session trash", "session.trash"),
     ("events", "events.subscribe"),
     ("templates", "templates.list"),
+    ("gate stats", "gate.stats"),
     ("schema", "rpc.discover"),
     ("server start", "server.status"),
     ("server status", "server.status"),
@@ -944,8 +974,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("machine rename", "machine.rename"),
     ("machine rm", "machine.rm"),
 ];
-/// Client-only methods: handshake, opaque document storage and the Token Saver counter.
-pub const API_ONLY: &[&str] = &["hello", "doc.get", "doc.set", "gate.stats"];
+/// Client-only methods: handshake and opaque document storage.
+pub const API_ONLY: &[&str] = &["hello", "doc.get", "doc.set"];
 
 #[cfg(test)]
 mod tests {
