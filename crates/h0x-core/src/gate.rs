@@ -3,7 +3,7 @@
 //! (the output stays as it was). It never fails: any problem is a pass-through with exit 0.
 
 use serde_json::{Map, Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 
 /// Outputs up to this many bytes pass through untouched.
@@ -21,6 +21,7 @@ pub fn run() -> i32 {
     if std::io::stdin().read_to_end(&mut raw).is_err() {
         return 0;
     }
+    std::panic::set_hook(Box::new(|_| {})); // a hook never talks to the agent: pass through quietly
     let out = std::panic::catch_unwind(|| String::from_utf8(raw).ok().and_then(|s| process(&s)));
     if let Ok(Some(text)) = out {
         let mut stdout = std::io::stdout().lock();
@@ -61,7 +62,7 @@ fn text_of(resp: &Value) -> Option<String> {
             } else if let Some(c) = resp["content"].as_str() {
                 c.to_string()
             } else {
-                resp.to_string()
+                return None; // an image, a notebook, a file list: nothing to rewrite
             }
         }
     })
@@ -96,7 +97,7 @@ fn shrink(ev: &Value, text: &str, bytes: usize) -> Option<String> {
     {
         let (t, tsv) = reencode(v);
         if t.len() < bytes && t.len() <= LIMIT {
-            let how = if tsv { "TSV; empty cell = key absent" } else { "compact JSON" };
+            let how = if tsv { "TSV; empty cell = key absent, \"quoted\" cell = JSON string" } else { "compact JSON" };
             return Some(format!("[HyperOx Token Saver: JSON re-encoded losslessly as {how}]\n{t}"));
         }
     }
@@ -136,56 +137,80 @@ fn shrink(ev: &Value, text: &str, bytes: usize) -> Option<String> {
 fn reencode(v: &Value) -> (String, bool) {
     let rows = |a: &Value| a.as_array().is_some_and(|a| a.len() > 1 && a.iter().all(Value::is_object));
     if rows(v) {
-        return (tsv(v), true);
-    }
-    if let Value::Object(m) = v
+        if let Some(t) = tsv(v) {
+            return (t, true);
+        }
+    } else if let Value::Object(m) = v
         && let Some(k) = m.keys().find(|k| rows(&m[*k]))
+        && let Some(t) = tsv(&m[k])
     {
         let mut rest = m.clone();
         rest.remove(k);
-        return (format!("{}\n{k} (TSV):\n{}", Value::Object(rest), tsv(&m[k])), true);
+        return (format!("{}\n{k} (TSV):\n{t}", Value::Object(rest)), true);
     }
     (v.to_string(), false)
 }
 
-fn flat(prefix: &str, m: &Map<String, Value>, out: &mut Vec<(String, String)>) {
+/// One cell: numbers, bools, null and arrays as JSON; a string as it is unless a reader could
+/// take it for something else (empty, a JSON scalar, an object or array, a tab or newline), then
+/// JSON-quoted. So 1 and "1", null and "null", {} and "{}", "" and an absent key all differ.
+fn cell(v: &Value) -> String {
+    let Value::String(s) = v else { return v.to_string() };
+    let scalar = || serde_json::from_str::<Value>(s).is_ok_and(|p| !p.is_object() && !p.is_array());
+    if s.is_empty() || s.starts_with(['{', '[']) || s.contains(['\t', '\n', '\r']) || scalar() {
+        v.to_string()
+    } else {
+        s.clone()
+    }
+}
+
+/// Cells of one row as (column name, key path, cell); nested objects get dotted names.
+fn flat(prefix: &str, path: &str, m: &Map<String, Value>, out: &mut Vec<(String, String, String)>) {
     for (k, v) in m {
         let key = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+        let at = format!("{path}\u{0}{k}");
         match v {
-            Value::Object(o) if !o.is_empty() => flat(&key, o, out),
-            Value::String(s) if s.contains(['\t', '\n', '\r']) => out.push((key, v.to_string())),
-            Value::String(s) => out.push((key, s.clone())),
-            _ => out.push((key, v.to_string())),
+            Value::Object(o) if !o.is_empty() => flat(&key, &at, o, out),
+            _ => out.push((key, at, cell(v))),
         }
     }
 }
 
 /// Rows of objects as a header and one tab-separated line each; nested objects get dotted
-/// keys, arrays stay JSON, a missing key is an empty cell.
-fn tsv(rows: &Value) -> String {
-    let rows: Vec<Vec<(String, String)>> = rows
-        .as_array()
-        .into_iter()
-        .flatten()
+/// names, arrays stay JSON, a missing key is an empty cell. None when two keys would share a
+/// column (`a.b`, and `a` holding `b`) or a column name could not be written.
+fn tsv(rows: &Value) -> Option<String> {
+    let rows: Vec<Vec<(String, String, String)>> = rows
+        .as_array()?
+        .iter()
         .filter_map(Value::as_object)
         .map(|m| {
             let mut cells = Vec::new();
-            flat("", m, &mut cells);
+            flat("", "", m, &mut cells);
             cells
         })
         .collect();
     let mut cols: Vec<&str> = Vec::new();
-    for (k, _) in rows.iter().flatten() {
-        if !cols.contains(&k.as_str()) {
-            cols.push(k);
+    let mut paths: HashMap<&str, &str> = HashMap::new();
+    for (name, path, _) in rows.iter().flatten() {
+        if name.contains(['\t', '\n', '\r']) {
+            return None;
+        }
+        match paths.get(name.as_str()) {
+            Some(p) if p != path => return None,
+            Some(_) => {}
+            None => {
+                paths.insert(name, path);
+                cols.push(name);
+            }
         }
     }
     let mut lines = vec![cols.join("\t")];
     for row in &rows {
-        let cell = |c: &&str| row.iter().find(|(k, _)| k == c).map_or("", |(_, v)| v.as_str());
-        lines.push(cols.iter().map(cell).collect::<Vec<_>>().join("\t"));
+        let by: HashMap<&str, &str> = row.iter().map(|(k, _, v)| (k.as_str(), v.as_str())).collect();
+        lines.push(cols.iter().map(|c| by.get(c).copied().unwrap_or("")).collect::<Vec<_>>().join("\t"));
     }
-    lines.join("\n")
+    Some(lines.join("\n"))
 }
 
 /// Declaration lines of a code file as `L<n>: <line>`, at most 3000 chars.
@@ -272,27 +297,31 @@ fn ws(s: &str) -> String {
     lines.join("\n")
 }
 
-/// Replaces each run of chars matching `pred` that is at least `min` long with `#`.
-fn hash_runs(s: &str, pred: fn(char) -> bool, min: usize) -> String {
-    let mut out = String::new();
-    let mut run = String::new();
-    let flush = |run: &mut String, out: &mut String| {
-        if run.chars().count() >= min {
+/// Replaces each run of chars matching `pred` that is at least `min` long (and, with `digit`,
+/// holds a digit) with `#`.
+fn hash_runs(s: &str, pred: fn(char) -> bool, min: usize, digit: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    let flush = |out: &mut String, run: &str| {
+        if run.chars().count() >= min && (!digit || run.bytes().any(|b| b.is_ascii_digit())) {
             out.push('#');
         } else {
             out.push_str(run);
         }
-        run.clear();
     };
-    for c in s.chars() {
+    let mut start = None;
+    for (i, c) in s.char_indices() {
         if pred(c) {
-            run.push(c);
+            start.get_or_insert(i);
         } else {
-            flush(&mut run, &mut out);
+            if let Some(st) = start.take() {
+                flush(&mut out, &s[st..i]);
+            }
             out.push(c);
         }
     }
-    flush(&mut run, &mut out);
+    if let Some(st) = start {
+        flush(&mut out, &s[st..]);
+    }
     out
 }
 
@@ -338,17 +367,46 @@ fn qualified_names(s: &str) -> String {
 /// A line without its numbers and hex ids: lines alike except for those share a skeleton.
 /// Paths keep their words, so `/api/users/1` and `/api/cart/2` stay apart.
 fn skel(line: &str) -> String {
-    let s = qualified_names(line);
-    let s = hash_runs(&s, |c| c.is_ascii_hexdigit(), 7);
-    let s = hash_runs(&s, |c| c.is_ascii_digit(), 1);
+    let s = qualified_names(&uuids(line));
+    let s = hash_runs(&s, |c| c.is_ascii_hexdigit(), 7, true);
+    let s = hash_runs(&s, |c| c.is_ascii_digit(), 1, false);
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Each 8-4-4-4-12 hex UUID becomes `#`.
+fn uuids(s: &str) -> String {
+    const DASHES: [usize; 4] = [8, 13, 18, 23];
+    let b = s.as_bytes();
+    let at = |i: usize| {
+        i + 36 <= b.len()
+            && (0..36).all(|k| if DASHES.contains(&k) { b[i + k] == b'-' } else { b[i + k].is_ascii_hexdigit() })
+    };
+    let mut out = String::with_capacity(s.len());
+    let (mut last, mut i) = (0, 0);
+    while i < b.len() {
+        if b[i].is_ascii_hexdigit() && at(i) {
+            out.push_str(&s[last..i]);
+            out.push('#');
+            i += 36;
+            last = i;
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&s[last..]);
+    out
+}
+
+/// Whether `word` occurs not preceded by a word char and followed by one of `ends` and then a
+/// non-word char (one pass; a match is only looked at when its start is a boundary).
 fn has_word(hay: &str, word: &str, ends: &[&str]) -> bool {
     hay.match_indices(word).any(|(i, _)| {
-        let before = hay[..i].chars().next_back();
-        let after: String = hay[i + word.len()..].chars().take_while(|c| is_word(*c)).collect();
-        !before.is_some_and(is_word) && ends.contains(&after.as_str())
+        if hay[..i].chars().next_back().is_some_and(is_word) {
+            return false;
+        }
+        let rest = &hay[i + word.len()..];
+        let end = rest.find(|c| !is_word(c)).unwrap_or(rest.len());
+        ends.contains(&&rest[..end])
     })
 }
 
@@ -459,15 +517,14 @@ fn sections(s: &str) -> Vec<Section<'_>> {
 }
 
 /// Groups line positions by skeleton.
-fn groups(body: &[&str]) -> (Vec<String>, HashMap<String, Vec<usize>>) {
-    let skels: Vec<String> = body.iter().map(|l| skel(l)).collect();
-    let mut g: HashMap<String, Vec<usize>> = HashMap::new();
+fn groups(skels: &[String]) -> HashMap<&str, Vec<usize>> {
+    let mut g: HashMap<&str, Vec<usize>> = HashMap::new();
     for (i, k) in skels.iter().enumerate() {
         if !k.is_empty() {
-            g.entry(k.clone()).or_default().push(i);
+            g.entry(k).or_default().push(i);
         }
     }
-    (skels, g)
+    g
 }
 
 /// Lines alike except for numbers are shown once with `[xN alike]`; key lines fold only from
@@ -476,14 +533,15 @@ fn fold_keep(s: &str) -> String {
     let parts: Vec<String> = sections(s)
         .into_iter()
         .map(|Section { head, body }| {
-            let (skels, g) = groups(&body);
+            let skels: Vec<String> = body.iter().map(|l| skel(l)).collect();
+            let g = groups(&skels);
             let mut out: Vec<String> = Vec::new();
             for (i, l) in body.iter().enumerate() {
                 if skels[i].is_empty() {
                     continue;
                 }
-                let g = &g[&skels[i]];
-                let key = is_key(l);
+                let g = &g[skels[i].as_str()];
+                let key = g.len() >= 3 && is_key(l); // under 3 alike nothing folds: skip the test
                 if g.len() < if key { 5 } else { 3 } {
                     out.push((*l).to_string());
                 } else if g[0] == i {
@@ -509,33 +567,40 @@ fn section_summary(s: &str) -> String {
     let parts: Vec<String> = secs
         .iter()
         .map(|Section { head, body }| {
-            let (skels, g) = groups(body);
-            let mut folded: Vec<String> = Vec::new();
+            let skels: Vec<String> = body.iter().map(|l| skel(l)).collect();
+            let g = groups(&skels);
+            // The key lines of the folded text, in order.
+            let mut keys: Vec<String> = Vec::new();
+            let mut size = 0;
             for (i, l) in body.iter().enumerate() {
-                if skels[i].is_empty() {
+                if size > per || skels[i].is_empty() || !is_summary_key(l) {
                     continue;
                 }
-                let g = &g[&skels[i]];
+                let g = &g[skels[i].as_str()];
                 if g.len() < 3 {
-                    folded.push((*l).to_string());
+                    keys.push(cut(l));
                 } else if g[0] == i {
-                    folded.push(format!("{l}  [x{} alike]", g.len()));
+                    keys.push(cut(&format!("{l}  [x{} alike]", g.len())));
+                } else {
+                    continue;
                 }
+                size += keys[keys.len() - 1].len() + 1;
             }
             let tail: Vec<&&str> = body.iter().filter(|l| !l.trim().is_empty()).collect();
             let tail = &tail[tail.len().saturating_sub(4)..];
+            let mut seen: HashSet<String> = HashSet::new();
             let mut txt: Vec<String> = Vec::new();
             let all = std::iter::once(head.to_string())
-                .chain(folded.iter().filter(|l| is_summary_key(l)).map(|l| cut(l)))
+                .chain(keys)
                 .chain(std::iter::once("…last lines:".to_string()))
                 .chain(tail.iter().map(|l| cut(l)));
             for l in all.filter(|l| !l.is_empty()) {
-                if !txt.contains(&l) {
+                if seen.insert(l.clone()) {
                     txt.push(l);
                 }
             }
             let joined = txt.join("\n");
-            if joined.chars().count() > per { format!("{}…", cut_chars(&joined, per)) } else { joined }
+            if joined.len() > per { format!("{}…", cut_bytes(&joined, per - 3)) } else { joined }
         })
         .collect();
     parts.join("\n")
@@ -704,7 +769,10 @@ mod tests {
         assert!(pretty.len() > 1024);
         let out = shown(process(&bash(&pretty)));
         let (note, tsv) = out.split_once('\n').unwrap();
-        assert_eq!(note, "[HyperOx Token Saver: JSON re-encoded losslessly as TSV; empty cell = key absent]");
+        assert_eq!(
+            note,
+            "[HyperOx Token Saver: JSON re-encoded losslessly as TSV; empty cell = key absent, \"quoted\" cell = JSON string]"
+        );
         let lines: Vec<&str> = tsv.split('\n').collect();
         assert_eq!(lines.len(), 41);
         let mut cols: Vec<&str> = lines[0].split('\t').collect();
@@ -874,5 +942,432 @@ mod tests {
         assert_eq!(sections("a\n== x\nb\n== y\nc").len(), 1);
         assert_eq!(sections("## a\n### b\n# c\n#### d").len(), 3);
         assert_eq!(sections("[a]\n[b]\n[c]\n").len(), 3);
+    }
+
+    /// `f` on its own thread; fails if it panics or takes longer than `secs`.
+    fn within<T: Send + 'static>(secs: u64, what: &str, f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || drop(tx.send(f())));
+        let out = rx.recv_timeout(std::time::Duration::from_secs(secs));
+        out.unwrap_or_else(|e| panic!("{what}: not done within {secs} s, or panicked ({e})"))
+    }
+
+    /// Six non-hex letters per number, so lines built from it never fold.
+    fn letters(i: usize) -> String {
+        (0..6u32).map(|k| (b'g' + (i / 20usize.pow(k) % 20) as u8) as char).collect()
+    }
+
+    #[test]
+    fn exactly_90_percent_passes_through_and_one_byte_more_is_replaced() {
+        let note = "[HyperOx Token Saver: JSON re-encoded losslessly as compact JSON]\n";
+        let mut fill = 900;
+        let compact = loop {
+            let c = json!({"k": "a".repeat(fill)}).to_string();
+            if (note.len() + c.len()).is_multiple_of(9) {
+                break c;
+            }
+            fill += 1;
+        };
+        let replacement = note.len() + compact.len();
+        let at = replacement * 10 / 9;
+        assert!(at > JSON_MIN && at <= LIMIT);
+        let padded = |n: usize| format!("{compact}{}", " ".repeat(n - compact.len()));
+        assert_eq!(process(&bash(&padded(at))), None, "a replacement of exactly 90% is not worth it");
+        assert_eq!(shown(process(&bash(&padded(at + 1)))), format!("{note}{compact}"));
+    }
+
+    #[test]
+    fn json_is_reencoded_only_above_1024_bytes() {
+        let doc = json!({"name": "x".repeat(200), "list": [1, 2, 3]}).to_string();
+        let padded = |n: usize| format!("{doc}{}", " ".repeat(n - doc.len()));
+        assert_eq!(process(&bash(&padded(1024))), None);
+        let want = format!("[HyperOx Token Saver: JSON re-encoded losslessly as compact JSON]\n{doc}");
+        assert_eq!(shown(process(&bash(&padded(1025)))), want);
+        let leading = format!("{}{doc}", " \r\n".repeat(400));
+        assert_eq!(shown(process(&bash(&leading))), want, "leading blank lines do not hide the JSON");
+        let rows: Vec<Value> = (0..2).map(|i| json!({"id": i, "pad": "p".repeat(200)})).collect();
+        let rows = json!(rows).to_string();
+        assert_eq!(process(&bash(&format!("{rows}{}", " ".repeat(1024 - rows.len())))), None, "rows too");
+    }
+
+    #[test]
+    fn arrays_that_are_not_rows_stay_lossless_compact_json() {
+        let big = "y".repeat(300);
+        for v in [
+            json!([{"a": 1, "s": big}, 2, "three", null, {"b": [big]}]),
+            json!([[1, 2, big], [3, 4, big], [5, 6, big]]),
+            json!([{"only": big, "row": {"n": 1, "s": big}}]),
+            json!({"items": [{"a": big}], "more": big}),
+            json!([{}, {}]),
+            json!([]),
+        ] {
+            let pretty = serde_json::to_string_pretty(&v).unwrap();
+            let doc = format!("{pretty}{}", " ".repeat(4000 - pretty.len()));
+            let out = shown(process(&bash(&doc)));
+            let (note, body) = out.split_once('\n').unwrap();
+            if note.contains("TSV") {
+                assert_eq!(v, json!([{}, {}]), "only rows become TSV: {out}");
+                continue;
+            }
+            assert_eq!(note, "[HyperOx Token Saver: JSON re-encoded losslessly as compact JSON]", "{v}");
+            assert_eq!(serde_json::from_str::<Value>(body).unwrap(), v, "lossless");
+        }
+    }
+
+    #[test]
+    fn tsv_does_not_read_an_empty_string_as_an_absent_key() {
+        let rows: Vec<Value> =
+            (0..40).map(|i| if i % 2 == 0 { json!({"name": "x", "note": ""}) } else { json!({"name": "x"}) }).collect();
+        let doc = serde_json::to_string_pretty(&rows).unwrap();
+        let out = shown(process(&bash(&doc)));
+        let (note, body) = out.split_once('\n').unwrap();
+        if note.contains("TSV") {
+            let lines: Vec<&str> = body.split('\n').collect();
+            assert_ne!(lines[1], lines[2], "{{\"note\":\"\"}} and no note read the same:\n{body}");
+        } else {
+            assert_eq!(serde_json::from_str::<Value>(body).unwrap(), json!(rows));
+        }
+    }
+
+    #[test]
+    fn tsv_does_not_drop_a_dotted_key_that_matches_a_nested_one() {
+        let rows: Vec<Value> =
+            (0..40).map(|i| json!({"id": i, "a.b": format!("flat{i}"), "a": {"b": format!("nested{i}")}})).collect();
+        let doc = serde_json::to_string_pretty(&rows).unwrap();
+        let out = shown(process(&bash(&doc)));
+        for i in 0..40 {
+            assert!(
+                out.contains(&format!("flat{i}")) && out.contains(&format!("nested{i}")),
+                "row {i} lost a value:\n{out}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_response_that_is_a_number_bool_or_null_passes_through() {
+        for resp in [json!(42), json!(-1.5e300), json!(true), Value::Null, json!(""), json!({}), json!([])] {
+            assert_eq!(process(&event("Bash", json!({}), resp.clone())), None, "{resp}");
+        }
+        assert_eq!(process(&json!({"tool_name": "Bash", "tool_input": {}}).to_string()), None, "no response");
+        assert_eq!(process(&json!({"tool_name": 7, "tool_response": ticks(9000)}).to_string()), None);
+        assert_eq!(process("null"), None);
+        assert_eq!(process(&json!([ticks(9000)]).to_string()), None, "an event that is not an object");
+    }
+
+    #[test]
+    fn a_read_whose_content_is_not_a_string_is_left_alone() {
+        for file in [json!({"content": null}), json!({"content": 7}), json!({"content": ["a"]}), json!(7), Value::Null]
+        {
+            let ev = event("Read", json!({"file_path": "/a/b.rs"}), json!({"type": "text", "file": file}));
+            assert_eq!(process(&ev), None, "{file}");
+        }
+    }
+
+    #[test]
+    fn a_response_without_a_text_field_keeps_its_shape_or_passes_through() {
+        let lines: Vec<String> = (0..600).map(|i| format!("src/module_{i}/file.rs")).collect();
+        let cases = [
+            ("Read", json!({"type": "image", "file": {"base64": "A".repeat(20_000), "type": "image/png"}})),
+            ("Read", json!({"type": "text", "file": {"filePath": "/a/b.rs", "content": lines}})),
+            ("Grep", json!({"mode": "files_with_matches", "numFiles": 600, "filenames": lines})),
+            ("Bash", json!({"stdout": null, "stderr": lines.join("\n")})),
+        ];
+        for (tool, resp) in cases {
+            let Some(out) = process(&event(tool, json!({"file_path": "/a/b.png"}), resp.clone())) else { continue };
+            let v = reply(Some(out));
+            let u = &v["hookSpecificOutput"]["updatedToolOutput"];
+            assert!(u.is_object(), "{tool} {}: an object became {u}", resp["type"]);
+            for key in resp.as_object().unwrap().keys() {
+                assert!(u.get(key).is_some(), "{tool}: {key} dropped");
+            }
+        }
+    }
+
+    #[test]
+    fn stdout_without_stderr_gets_an_empty_stderr() {
+        let tool = |resp: Value| {
+            let v = reply(process(&event("Bash", json!({}), resp)));
+            v["hookSpecificOutput"]["updatedToolOutput"].clone()
+        };
+        let u = tool(json!({"stdout": ticks(9000)}));
+        assert!(u["stdout"].as_str().unwrap().contains("tick 0 done ok  [x"), "{u}");
+        assert_eq!(u["stderr"], "");
+        let u = tool(json!({"stdout": ticks(9000), "stderr": 5}));
+        assert!(u["stdout"].as_str().unwrap().contains("tick 0 done ok  [x"), "{u}");
+        assert_eq!(u["stderr"], "");
+        let u = tool(json!({"stdout": "", "stderr": ticks(9000)}));
+        assert!(u["stdout"].as_str().unwrap().contains("tick 0 done ok  [x"), "only stderr is big: {u}");
+        assert_eq!(u["stderr"], "");
+    }
+
+    #[test]
+    fn a_huge_single_line_is_cut_quickly() {
+        for line in [
+            "word ".repeat(200_000),
+            "日".repeat(350_000),
+            "a::".repeat(300_000),
+            "7".repeat(1_000_000),
+            format!("{{{}", "x".repeat(1_000_000)),
+            "fail".repeat(250_000),
+        ] {
+            let what = format!("a 1 MB line of {:?}", cut_chars(&line, 4));
+            let out = within(20, &what, move || process(&bash(&line)));
+            let out = shown(out);
+            let (note, body) = out.split_once('\n').unwrap();
+            assert!(note.starts_with("[HyperOx Token Saver: output "), "{what}: {note}");
+            assert!(body.len() <= BUDGET, "{what}: {} bytes", body.len());
+        }
+    }
+
+    #[test]
+    fn whitespace_only_lines_do_not_count_or_break_folding() {
+        let blank = " \t \n\n   \r\n\t\t\n\u{3000}\n".repeat(1200);
+        assert!(blank.len() > LIMIT);
+        if let Some(out) = process(&bash(&blank)) {
+            let out = shown(Some(out));
+            let (_, body) = out.split_once('\n').unwrap();
+            assert!(body.trim().is_empty(), "{body:?}");
+        }
+        let mut log = String::new();
+        for i in 0..600 {
+            log.push_str(&format!("tick {i} done ok\n   \n\t\r\n"));
+        }
+        let out = shown(process(&bash(&log)));
+        assert!(out.contains("\ntick 0 done ok  [x600 alike]"), "{out}");
+        assert_eq!(out.split('\n').count(), 2, "{out}");
+    }
+
+    #[test]
+    fn a_cut_at_160_chars_keeps_emoji_and_cjk_whole() {
+        let wide = "😀日".repeat(100);
+        let mut log = String::new();
+        for i in 0..6 {
+            log.push_str(&format!("ERROR job {i} {wide}\n"));
+        }
+        log.push_str(&ticks(9000));
+        let out = shown(process(&bash(&log)));
+        let last = out.split("; last: ").nth(1).and_then(|r| r.split(']').next()).unwrap();
+        assert_eq!(last.chars().count(), 160, "{last}");
+        assert!(last.starts_with("ERROR job 5 😀日"), "{last}");
+
+        let src = format!("pub fn f() -> &'static str {{ \"{}\" }}\n", "👍🏽語".repeat(100)).repeat(60);
+        let ev = event("Read", json!({"file_path": "/w/a.rs"}), json!({"file": {"content": src}}));
+        let out = shown(process(&ev));
+        let first = out.split('\n').nth(1).unwrap();
+        assert_eq!(first.strip_prefix("L1: ").unwrap().chars().count(), 160, "{first}");
+        assert!(out.split_once('\n').unwrap().1.len() <= 3000);
+    }
+
+    #[test]
+    fn a_windows_path_with_spaces_still_picks_the_file_kind() {
+        let src = rust_file(20_000);
+        let read = |path: &str| {
+            let ev = event("Read", json!({"file_path": path}), json!({"file": {"filePath": path, "content": src}}));
+            shown(process(&ev))
+        };
+        for code in [
+            "C:\\Program Files\\My App\\src\\main.rs",
+            "C:\\Users\\Jane Doe\\proj v1.2\\lib.Rs",
+            "\\\\?\\D:\\with space\\x.RS",
+            "\\\\server\\share name\\a b.py",
+        ] {
+            assert!(read(code).contains("declaration outline"), "{code}");
+        }
+        for text in [
+            "C:\\Program Files\\My App.rs\\README",
+            "C:\\dir with.dots\\file.",
+            "C:\\x y\\a.rs.txt",
+            "C:\\x y\\a.rs ",
+            "",
+        ] {
+            assert!(!read(text).contains("declaration outline"), "{text}");
+        }
+    }
+
+    #[test]
+    fn grep_content_lines_fold_per_match_and_keep_files_apart() {
+        let mut content = String::new();
+        for i in 1..=200 {
+            content.push_str(&format!("src/alpha.rs:{i}:    let value = compute(input);\n"));
+            content.push_str(&format!("C:\\work dir\\beta.rs:{i}:    let value = compute(input);\n"));
+        }
+        let ev = event(
+            "Grep",
+            json!({"pattern": "compute", "output_mode": "content", "-n": true}),
+            json!({"mode": "content", "numFiles": 2, "filenames": [], "content": content, "numLines": 400}),
+        );
+        let v = reply(process(&ev));
+        let u = &v["hookSpecificOutput"]["updatedToolOutput"];
+        assert_eq!(u["mode"], "content");
+        assert_eq!(u["numFiles"], 2);
+        let c = u["content"].as_str().unwrap();
+        assert!(c.contains("\nsrc/alpha.rs:1: let value = compute(input);  [x200 alike]"), "{c}");
+        assert!(c.contains("\nC:\\work dir\\beta.rs:1: let value = compute(input);  [x200 alike]"), "{c}");
+    }
+
+    #[test]
+    fn deeply_nested_json_neither_overflows_nor_panics() {
+        within(60, "10k levels of nesting", || {
+            let arrays = format!("{}{}", "[".repeat(10_000), "]".repeat(10_000));
+            let objects = format!("{}1{}", "{\"a\":".repeat(10_000), "}".repeat(10_000));
+            for deep in [arrays, objects] {
+                let whole = format!("{{\"tool_name\":\"Bash\",\"tool_input\":{{}},\"tool_response\":{deep}}}");
+                assert_eq!(process(&whole), None, "an event too deep to parse passes through");
+                let out = shown(process(&bash(&deep)));
+                assert!(out.starts_with("[HyperOx Token Saver: output "), "{out}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_20_mb_output_finishes_in_bounded_time() {
+        let started = std::time::Instant::now();
+        let out = within(180, "20 MB of alike lines", || process(&bash(&ticks(20 << 20))));
+        assert!(shown(out).contains("tick 0 done ok  [x"));
+        // Distinct lines that are all summary keys: only the section summary can shrink them.
+        let out = within(180, "20 MB of distinct summary-key lines", || {
+            let mut text = String::new();
+            let mut i = 0;
+            while text.len() < 20 << 20 {
+                text.push_str(&format!("status of {} left unchanged\n", letters(i)));
+                i += 1;
+            }
+            process(&bash(&text))
+        });
+        assert!(shown(out).contains("summary per section"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(240), "{:?}", started.elapsed());
+    }
+
+    #[test]
+    fn an_output_of_only_key_lines_folds_from_five_and_not_from_four() {
+        let mut log = String::new();
+        for i in 0..400 {
+            log.push_str(&format!("ERROR request {i} timed out after {}ms\n", i * 2));
+        }
+        for i in 0..4 {
+            log.push_str(&format!("WARN disk {i} at 9{i} percent\n"));
+        }
+        for i in 0..5 {
+            log.push_str(&format!("FATAL node {i} lost\n"));
+        }
+        let out = shown(process(&bash(&log)));
+        assert!(
+            out.contains(
+                "\nERROR request 0 timed out after 0ms  [x400 alike; last: ERROR request 399 timed out after 798ms]"
+            ),
+            "{out}"
+        );
+        for i in 0..4 {
+            assert!(out.contains(&format!("\nWARN disk {i} at 9{i} percent\n")), "4 alike key lines stay: {out}");
+        }
+        assert!(out.ends_with("\nFATAL node 0 lost  [x5 alike; last: FATAL node 4 lost]"), "{out}");
+
+        let mut log = ticks(9000);
+        log.push_str("\ncopied 0 files\ncopied 1 files\nmoved 0 files\nmoved 1 files\nmoved 2 files\n");
+        let out = shown(process(&bash(&log)));
+        assert!(out.contains("\ncopied 0 files\ncopied 1 files\n"), "2 alike stay: {out}");
+        assert!(out.ends_with("\nmoved 0 files  [x3 alike]"), "{out}");
+    }
+
+    #[test]
+    fn the_same_id_on_two_paths_stays_apart_and_hex_ids_fold() {
+        assert_ne!(skel("GET /api/users/17"), skel("GET /api/cart/17"));
+        assert_eq!(skel("commit 3f2a9c1 merged"), skel("commit a1b2c3d merged"));
+        assert_eq!(skel("id DEADBEEF00 ok"), skel("id 0badf00d11 ok"));
+        assert_ne!(skel("tag abcdef ok"), skel("tag fedcba ok"), "six hex letters can be a word");
+        let mut log = String::new();
+        for i in 0..150u64 {
+            log.push_str(&format!("GET /api/users/17 200 in {i}ms\n"));
+            log.push_str(&format!("GET /api/cart/17 200 in {i}ms\n"));
+            log.push_str(&format!("stored object {:010x} in bucket main\n", i * 2_654_435_761));
+        }
+        let out = shown(process(&bash(&log)));
+        assert!(out.contains("\nGET /api/users/17 200 in 0ms  [x150 alike]"), "{out}");
+        assert!(out.contains("\nGET /api/cart/17 200 in 0ms  [x150 alike]"), "{out}");
+        assert!(out.contains("\nstored object 0000000000 in bucket main  [x150 alike]"), "{out}");
+    }
+
+    #[test]
+    fn uuids_are_hex_ids_and_fold() {
+        assert_eq!(
+            skel("req f47ac10b-58cc-4372-a567-0e02b2c3d479 ok"),
+            skel("req 550e8400-e29b-41d4-a716-446655440000 ok")
+        );
+    }
+
+    #[test]
+    fn words_made_of_hex_letters_are_not_ids() {
+        assert_ne!(skel("file defaced here"), skel("file effaced here"));
+        assert_eq!(skel("file defaced here"), "file defaced here");
+        assert_eq!(skel("id deadbeef01 x"), skel("id cafebabe99 x"), "ids with a digit fold");
+        assert_eq!(skel("id deadbeef01 x"), "id # x");
+        let mut log = String::new();
+        for i in 0..80 {
+            log.push_str(&format!("blob {:08x}{i} stored on disk node number\n", 0xabcdef12u32 + i));
+            log.push_str("object defaced rebuilt on disk node number\nobject effaced rebuilt on disk node number\n");
+        }
+        let out = shown(process(&bash(&log)));
+        assert!(out.contains("blob abcdef120 stored on disk node number  [x80 alike]"), "{out}");
+        assert!(out.contains("object defaced rebuilt on disk node number  [x80 alike]"), "{out}");
+        assert!(out.contains("object effaced rebuilt on disk node number  [x80 alike]"), "{out}");
+    }
+
+    #[test]
+    fn a_wide_character_summary_stays_inside_the_budget_in_bytes() {
+        for unit in ["日本語のエラー状態", "🙂status🙂"] {
+            let mut text = String::new();
+            for i in 0..3000 {
+                text.push_str(&format!("{unit}{} status {}\n", letters(i), unit.repeat(8)));
+            }
+            let out = shown(process(&bash(&text)));
+            let (note, body) = out.split_once('\n').unwrap();
+            assert!(note.contains("summary per section"), "{note}");
+            assert!(body.len() <= BUDGET, "{unit}: {} bytes", body.len());
+        }
+    }
+
+    /// Reads a TSV cell back: a quoted cell is a JSON string, an empty one is an absent key.
+    fn untsv(cell: &str) -> Option<Value> {
+        if cell.is_empty() {
+            return None;
+        }
+        match serde_json::from_str::<Value>(cell) {
+            Ok(v) if !v.is_string() || cell.starts_with('"') => Some(v),
+            _ => Some(json!(cell)),
+        }
+    }
+
+    #[test]
+    fn tsv_keeps_one_and_a_string_one_apart() {
+        let values = [
+            json!(1),
+            json!("1"),
+            Value::Null,
+            json!("null"),
+            json!({}),
+            json!("{}"),
+            json!(""),
+            json!("true"),
+            json!("plain"),
+            json!([1, "a"]),
+            json!("[1]"),
+            json!("a\tb"),
+            json!(false),
+            json!("\"q\""),
+        ];
+        let mut rows: Vec<Value> =
+            values.iter().enumerate().map(|(i, v)| json!({"id": i, "pad": "padding ".repeat(8), "v": v})).collect();
+        rows.push(json!({"id": 99, "pad": "padding ".repeat(8)}));
+        let doc = serde_json::to_string_pretty(&rows).unwrap();
+        let out = shown(process(&bash(&doc)));
+        let (note, body) = out.split_once('\n').unwrap();
+        assert!(note.contains("TSV; empty cell = key absent, \"quoted\" cell = JSON string"), "{note}");
+        let lines: Vec<&str> = body.split('\n').collect();
+        let col = lines[0].split('\t').position(|c| c == "v").unwrap();
+        for (i, want) in values.iter().enumerate() {
+            let cell = lines[i + 1].split('\t').nth(col).unwrap();
+            assert_eq!(untsv(cell).as_ref(), Some(want), "row {i}: cell {cell:?}");
+        }
+        assert_eq!(untsv(lines[values.len() + 1].split('\t').nth(col).unwrap()), None, "absent key");
     }
 }
