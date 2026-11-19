@@ -456,3 +456,24 @@ fn the_schema_has_gate_stats_with_its_four_counters_and_no_params() {
         assert_eq!(prop["minimum"], 0, "{key}");
     }
 }
+
+#[test]
+fn racing_gates_never_leave_a_torn_counter() {
+    let name = "gt-race";
+    let _core = Core(name.into());
+    let event = big_event();
+    let runs: Vec<_> = (0..8)
+        .map(|_| {
+            let event = event.clone();
+            std::thread::spawn(move || gate_as(name, event.as_bytes(), &[]))
+        })
+        .collect();
+    for run in runs {
+        quiet(&run.join().unwrap(), "racing gate");
+    }
+    let s = stats(name);
+    let outputs = s["outputs"].as_u64().unwrap();
+    assert!((1..=8).contains(&outputs), "{s}");
+    let left: Vec<_> = std::fs::read_dir(counter(name).parent().unwrap()).unwrap().flatten().collect();
+    assert!(left.iter().all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")), "temp files left: {left:?}");
+}

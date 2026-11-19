@@ -57,7 +57,19 @@ fn add_stats(state: &Path, bytes_in: usize, shown: usize) {
     s.bytes_in = s.bytes_in.saturating_add(bytes_in as u64);
     s.bytes_shown = s.bytes_shown.saturating_add(shown as u64);
     let _ = std::fs::create_dir_all(state);
-    let _ = crate::paths::write_atomic(&state.join(STATS_FILE), &serde_json::to_vec(&s).unwrap_or_default());
+    let _ = write_unique(&state.join(STATS_FILE), &serde_json::to_vec(&s).unwrap_or_default());
+}
+
+/// Swaps `bytes` in whole through a temp file no other process shares, so racing hooks never
+/// rename each other's half-written file.
+fn write_unique(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let tmp = path.with_extension(format!("{}.{nanos}.tmp", std::process::id()));
+    let written = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Raises the terminal's `h0x.saved` label by `saved`; nothing happens when no core listens.
@@ -74,7 +86,7 @@ fn raise_label(paths: &Paths, terminal: &str, saved: u64) -> Option<()> {
 fn book(bytes_in: usize, shown: usize) {
     let Ok(paths) = Paths::from_env() else { return };
     add_stats(&paths.state, bytes_in, shown);
-    let Some(terminal) = crate::client::terminal_id() else { return };
+    let Some(terminal) = crate::client::terminal_id().filter(|t| !t.is_empty()) else { return };
     let saved = (bytes_in.saturating_sub(shown) / 4) as u64;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
