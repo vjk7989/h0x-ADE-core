@@ -303,6 +303,40 @@
         ],
         "type": "object"
       },
+      "GateStats": {
+        "description": "What the Token Saver has saved on this machine (this session's state folder), for good.",
+        "properties": {
+          "bytes_in": {
+            "default": 0,
+            "description": "Bytes the tools produced for those outputs.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bytes_shown": {
+            "default": 0,
+            "description": "Bytes shown to the agent instead.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "outputs": {
+            "default": 0,
+            "description": "Outputs replaced.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tokens_saved": {
+            "default": 0,
+            "description": "Tokens saved: (bytes in - bytes shown) / 4, summed per replaced output.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
       "HelloResult": {
         "properties": {
           "core": {
@@ -1956,6 +1990,19 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/TemplatesResult"
+        }
+      }
+    },
+    {
+      "description": "What the Token Saver has saved on this machine: tokens, replaced outputs, bytes in and bytes shown (zeros when it never ran).",
+      "errors": [],
+      "name": "gate.stats",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/GateStats"
         }
       }
     },

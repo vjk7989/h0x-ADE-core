@@ -1,10 +1,17 @@
 //! `h0x-core gate`: the Token Saver, a Claude Code PostToolUse hook. It reads the hook event on
 //! stdin and prints a smaller `updatedToolOutput` for a big Bash/Read/Grep result, or nothing
 //! (the output stays as it was). It never fails: any problem is a pass-through with exit 0.
+//! After the answer is printed it books the saving: a lifetime counter in the state folder and
+//! the calling terminal's `h0x.saved` label, both best effort and bounded.
 
+use crate::paths::Paths;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
+use std::path::Path;
+use std::time::Duration;
 
 /// Outputs up to this many bytes pass through untouched.
 const LIMIT: usize = 8192;
@@ -14,6 +21,67 @@ const BUDGET: usize = 6000;
 const JSON_MIN: usize = 1024;
 const CODE_EXTS: [&str; 17] =
     ["rs", "ts", "tsx", "js", "mjs", "py", "go", "java", "c", "cc", "cpp", "h", "hpp", "cs", "rb", "kt", "swift"];
+/// The lifetime counter, in the core's state folder.
+const STATS_FILE: &str = "token-saver.json";
+/// A terminal's running total of saved tokens.
+const SAVED_LABEL: &str = "h0x.saved";
+/// The most the label update may delay the hook's exit.
+const LABEL_WAIT: Duration = Duration::from_millis(200);
+
+/// What the Token Saver has saved on this machine (this session's state folder), for good.
+#[derive(Serialize, Deserialize, JsonSchema, Default, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct GateStats {
+    /// Tokens saved: (bytes in - bytes shown) / 4, summed per replaced output.
+    pub tokens_saved: u64,
+    /// Outputs replaced.
+    pub outputs: u64,
+    /// Bytes the tools produced for those outputs.
+    pub bytes_in: u64,
+    /// Bytes shown to the agent instead.
+    pub bytes_shown: u64,
+}
+
+/// The counter: zeros when the file is missing or broken.
+pub fn read_stats(state: &Path) -> GateStats {
+    let read = std::fs::read(state.join(STATS_FILE)).ok();
+    let object = read.and_then(|b| serde_json::from_slice::<Value>(&b).ok()).filter(Value::is_object);
+    object.and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default()
+}
+
+/// Adds one replaced output. Two hooks racing may lose an update; that is accepted over a lock.
+fn add_stats(state: &Path, bytes_in: usize, shown: usize) {
+    let mut s = read_stats(state);
+    s.tokens_saved = s.tokens_saved.saturating_add((bytes_in.saturating_sub(shown) / 4) as u64);
+    s.outputs = s.outputs.saturating_add(1);
+    s.bytes_in = s.bytes_in.saturating_add(bytes_in as u64);
+    s.bytes_shown = s.bytes_shown.saturating_add(shown as u64);
+    let _ = std::fs::create_dir_all(state);
+    let _ = crate::paths::write_atomic(&state.join(STATS_FILE), &serde_json::to_vec(&s).unwrap_or_default());
+}
+
+/// Raises the terminal's `h0x.saved` label by `saved`; nothing happens when no core listens.
+fn raise_label(paths: &Paths, terminal: &str, saved: u64) -> Option<()> {
+    let stream = crate::client::connect_existing(paths)?;
+    let now = crate::client::call(&stream, "terminal.get", json!({"terminal": terminal})).ok()?;
+    let total = now["labels"][SAVED_LABEL].as_str().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let labels = json!({(SAVED_LABEL): total.saturating_add(saved).to_string()});
+    crate::client::call(&stream, "terminal.label", json!({"terminal": terminal, "labels": labels})).ok()?;
+    Some(())
+}
+
+/// Books a replaced output after its answer is out.
+fn book(bytes_in: usize, shown: usize) {
+    let Ok(paths) = Paths::from_env() else { return };
+    add_stats(&paths.state, bytes_in, shown);
+    let Some(terminal) = crate::client::terminal_id() else { return };
+    let saved = (bytes_in.saturating_sub(shown) / 4) as u64;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(raise_label(&paths, &terminal, saved));
+    });
+    let _ = rx.recv_timeout(LABEL_WAIT); // a stuck core must not hold the agent's tool call
+}
 
 /// The hook: stdin in, the replacement (if any) on stdout. Always 0.
 pub fn run() -> i32 {
@@ -22,17 +90,25 @@ pub fn run() -> i32 {
         return 0;
     }
     std::panic::set_hook(Box::new(|_| {})); // a hook never talks to the agent: pass through quietly
-    let out = std::panic::catch_unwind(|| String::from_utf8(raw).ok().and_then(|s| process(&s)));
-    if let Ok(Some(text)) = out {
+    let out = std::panic::catch_unwind(|| String::from_utf8(raw).ok().and_then(|s| replace(&s)));
+    if let Ok(Some((text, bytes_in, shown))) = out {
         let mut stdout = std::io::stdout().lock();
         let _ = stdout.write_all(text.as_bytes());
         let _ = stdout.flush();
+        drop(stdout);
+        let _ = std::panic::catch_unwind(|| book(bytes_in, shown));
     }
     0
 }
 
 /// The hook's stdout for one event, or None to leave the tool output alone.
+#[cfg(test)]
 fn process(input: &str) -> Option<String> {
+    replace(input).map(|(text, _, _)| text)
+}
+
+/// The hook's stdout, the bytes the tool produced and the bytes shown instead.
+fn replace(input: &str) -> Option<(String, usize, usize)> {
     let ev: Value = serde_json::from_str(input).ok()?;
     if !matches!(ev["tool_name"].as_str(), Some("Bash" | "Read" | "Grep")) {
         return None;
@@ -45,8 +121,10 @@ fn process(input: &str) -> Option<String> {
     if shown.len() * 10 >= bytes * 9 {
         return None;
     }
+    let size = shown.len();
     let updated = replace_text(resp, shown);
-    Some(json!({"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": updated}}).to_string())
+    let out = json!({"hookSpecificOutput": {"hookEventName": "PostToolUse", "updatedToolOutput": updated}});
+    Some((out.to_string(), bytes, size))
 }
 
 /// The text of a tool response: a string, a file's content, stdout and stderr, or `content`.

@@ -10,7 +10,7 @@ pub mod events;
 pub mod exec;
 pub mod files;
 pub mod foreground;
-mod gate;
+pub mod gate;
 pub mod holder;
 pub mod holder_proto;
 pub mod input;
