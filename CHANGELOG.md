@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-11-20
+
+Token Saver.
+
+### Added
+- `h0x-core gate`: a hook for Claude Code that shrinks big tool outputs (over 8 KB) before the agent reads them: an outline for code files, repeated lines folded with `[xN alike]`, a per-section summary for long logs, and JSON re-encoded losslessly as a table. Small, unknown or non-text outputs pass through unchanged. HyperOx turns it on from Settings → 0x Modes → Token Saver.
+- `h0x-core gate stats` and the `gate.stats` method report the tokens saved; each terminal shows its own total in the `h0x.saved` label.
+- Terminals get `H0X_CORE_EXE`, the path of the core that started them.
+
 ## [0.1.16] - 2026-11-13
 
 Safer updates.
