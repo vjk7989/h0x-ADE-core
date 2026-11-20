@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-11-20
+
+Token Saver fixes.
+
+### Changed
+- Token Saver leaves JSON outputs of 8 KB or less alone. Bigger JSON is re-encoded with a note saying the command printed JSON, so agents do not misread the real output.
+- Big code files get an outline of their start and end with a line naming the skipped declarations, so the whole file is covered. A code file without declarations gets the normal text summary instead.
+
 ## [0.1.17] - 2026-11-20
 
 Token Saver.
