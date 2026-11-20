@@ -201,8 +201,9 @@ fn shrink(ev: &Value, text: &str, bytes: usize) -> Option<String> {
     let file = ev["tool_input"]["file_path"].as_str().unwrap_or_default();
     let code = ev["tool_name"] == "Read"
         && file.rsplit_once('.').is_some_and(|(_, ext)| CODE_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext)));
-    let (body, how) = if code {
-        (outline(text), "declaration outline with line numbers")
+    let outlined = Some(outline(text)).filter(|o| code && !o.is_empty());
+    let (body, how) = if let Some(o) = outlined {
+        (o, "declaration outline with line numbers")
     } else if parsed.is_some() {
         let lines: Vec<&str> = text.split('\n').collect();
         let joined = if lines.len() > 50 {
@@ -949,6 +950,18 @@ mod tests {
             3001 + 2 * (299 - t)
         );
         assert_eq!(lines[skip], want);
+    }
+
+    #[test]
+    fn a_code_file_without_declarations_falls_back_to_the_text_summary() {
+        let src = "let x = 1;\n".repeat(1000);
+        let content = read_of("/work/src/a.rs", &src);
+        let (note, body) = content.split_once('\n').unwrap();
+        assert!(!note.contains("declaration outline"), "{note}");
+        assert!(note.contains("[xN alike]"), "{note}");
+        assert!(!body.trim().is_empty(), "the body shows something");
+        let with = format!("{src}pub fn last() {{}}\n");
+        assert!(read_of("/work/src/a.rs", &with).contains("declaration outline"));
     }
 
     #[test]
