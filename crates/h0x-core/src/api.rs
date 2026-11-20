@@ -72,6 +72,9 @@ methods! { Ctx<'_>;
     "templates.list" => templates_list, Empty => TemplatesResult,
         "Templates by name and description, so you can pick a role without knowing its command.",
         errors [];
+    "gate.stats" => gate_stats, Empty => crate::gate::GateStats,
+        "What the Token Saver has saved on this machine: tokens, replaced outputs, bytes in and bytes shown (zeros when it never ran).",
+        errors [];
     "terminal.list" => terminal_list, ListParams => ListResult,
         "Live terminals (all with `all`), optionally filtered by labels.",
         errors [];
@@ -243,6 +246,10 @@ async fn server_restart(core: Ctx<'_>, _: Empty) -> Result<StopResult, RpcError>
 
 async fn templates_list(core: Ctx<'_>, _: Empty) -> Result<TemplatesResult, RpcError> {
     Ok(TemplatesResult { templates: crate::templates::list(&core.paths) })
+}
+
+async fn gate_stats(core: Ctx<'_>, _: Empty) -> Result<crate::gate::GateStats, RpcError> {
+    Ok(crate::gate::read_stats(&core.paths.state))
 }
 
 async fn terminal_list(core: Ctx<'_>, p: ListParams) -> Result<ListResult, RpcError> {

@@ -81,7 +81,7 @@ fn env(
     token: &str,
     cwd: &str,
 ) -> BTreeMap<String, String> {
-    let hc_own = ["H0X_TERMINAL_ID", crate::sweep::VAR, crate::sweep::RUNTIME];
+    let hc_own = ["H0X_TERMINAL_ID", "H0X_CORE_EXE", crate::sweep::VAR, crate::sweep::RUNTIME];
     let mut env: BTreeMap<String, String> = base
         .into_iter()
         .filter(|(k, _)| !crate::api::IDENTITY_VARS.contains(&k.as_str()) && !hc_own.contains(&k.as_str()))
@@ -92,6 +92,9 @@ fn env(
     env.insert("PWD".into(), cwd.into());
     env.extend(extra);
     env.insert(crate::sweep::VAR.into(), token.into());
+    if let Some(exe) = crate::client::own_exe() {
+        env.insert("H0X_CORE_EXE".into(), exe.to_string_lossy().into_owned());
+    }
     env
 }
 

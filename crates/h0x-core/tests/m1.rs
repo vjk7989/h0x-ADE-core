@@ -192,6 +192,22 @@ fn child_gets_core_env_caller_identity_cwd_and_its_own_address() {
 }
 
 #[test]
+fn a_terminal_gets_this_cores_exe_and_never_a_stale_one() {
+    let s = Session::new();
+    let out = s.cmd().env("H0X_CORE_EXE", "/stale/core/h0x-core").args(["server", "start"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = s
+        .cmd()
+        .env("H0X_CORE_EXE", "/stale/caller/h0x-core")
+        .args(["exec", "printf '%s' \"$H0X_CORE_EXE\""])
+        .output()
+        .unwrap();
+    let exe = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(!exe.contains("stale"), "{exe}");
+    assert_eq!(std::fs::canonicalize(&exe).unwrap(), std::fs::canonicalize(BIN).unwrap(), "{exe}");
+}
+
+#[test]
 fn spawn_failure_is_reported_and_leaves_nothing_running() {
     let s = Session::new();
     let (code, err) = s.err(&["run", "--bg", "/no/such/program"]);
