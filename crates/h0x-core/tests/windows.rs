@@ -493,6 +493,23 @@ fn new_terminals_refresh_windows_settings_without_losing_runtime_variables() {
 }
 
 #[test]
+fn a_terminal_gets_this_cores_exe_and_never_a_stale_one() {
+    let s = Session::new();
+    let out = cmd(&s.name, &s.root)
+        .env("H0X_CORE_EXE", r"C:\stale dir\h0x-core.exe")
+        .args(["server", "start"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let (code, output) = s.out(&["run", "--timeout", "20", "cmd", "/c", "echo [%H0X_CORE_EXE%]"]);
+    assert_eq!(code, 0, "{output}");
+    let joined = output.replace(['\r', '\n'], "");
+    let exe = joined.split('[').nth(1).and_then(|r| r.split(']').next()).unwrap_or_default();
+    assert!(!exe.contains("stale"), "{output}");
+    assert_eq!(Path::new(exe).canonicalize().ok(), Path::new(BIN).canonicalize().ok(), "{output}");
+}
+
+#[test]
 fn an_ssh_client_uses_an_existing_core_instead_of_starting_another() {
     let s = Session::new();
     let first = s.json(&["server", "start"]);
