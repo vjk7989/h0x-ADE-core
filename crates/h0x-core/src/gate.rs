@@ -17,8 +17,9 @@ use std::time::Duration;
 const LIMIT: usize = 8192;
 /// A shown text over this many bytes is cut or summarized.
 const BUDGET: usize = 6000;
-/// A JSON output over this many bytes is a candidate for a lossless re-encode.
-const JSON_MIN: usize = 1024;
+/// The declaration outline of a code file: most bytes, head share in percent.
+const OUTLINE: usize = 3000;
+const OUTLINE_HEAD: usize = 60;
 const CODE_EXTS: [&str; 17] =
     ["rs", "ts", "tsx", "js", "mjs", "py", "go", "java", "c", "cc", "cpp", "h", "hpp", "cs", "rb", "kt", "swift"];
 /// The lifetime counter, in the core's state folder.
@@ -182,13 +183,16 @@ fn shrink(ev: &Value, text: &str, bytes: usize) -> Option<String> {
         Some('[' | '{') => serde_json::from_str::<Value>(text).ok(),
         _ => None,
     };
-    if bytes > JSON_MIN
+    if bytes > LIMIT
         && let Some(v) = &parsed
     {
         let (t, tsv) = reencode(v);
         if t.len() < bytes && t.len() <= LIMIT {
             let how = if tsv { "TSV; empty cell = key absent, \"quoted\" cell = JSON string" } else { "compact JSON" };
-            return Some(format!("[HyperOx Token Saver: JSON re-encoded losslessly as {how}]\n{t}"));
+            let kb = bytes as f64 / 1024.0;
+            return Some(format!(
+                "[HyperOx Token Saver: this command printed JSON ({kb:.1} KB); shown re-encoded losslessly as {how}]\n{t}"
+            ));
         }
     }
     if bytes <= LIMIT {
@@ -303,23 +307,43 @@ fn tsv(rows: &Value) -> Option<String> {
     Some(lines.join("\n"))
 }
 
-/// Declaration lines of a code file as `L<n>: <line>`, at most 3000 chars.
+/// Declaration lines of a code file as `L<n>: <line>`, at most `OUTLINE` bytes: all of them, or
+/// the head and the tail with one line naming the skipped range.
 fn outline(text: &str) -> String {
-    let mut out = String::new();
-    for (i, line) in text.split('\n').enumerate() {
-        if !is_decl(line) {
-            continue;
-        }
-        let l = format!("L{}: {}", i + 1, cut_chars(line.trim(), 160));
-        if out.len() + l.len() + 1 > 3000 {
-            break;
-        }
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&l);
+    let decls: Vec<(usize, String)> = text
+        .split('\n')
+        .enumerate()
+        .filter(|(_, line)| is_decl(line))
+        .map(|(i, line)| (i + 1, format!("L{}: {}", i + 1, cut_chars(line.trim(), 160))))
+        .collect();
+    let total: usize = decls.iter().map(|(_, l)| l.len() + 1).sum();
+    if total <= OUTLINE + 1 {
+        return decls.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
     }
-    out
+    // The skip line takes up to 100 bytes of the budget.
+    let room = OUTLINE - 100;
+    let head_room = room * OUTLINE_HEAD / 100;
+    let (mut head, mut used) = (0, 0);
+    while head < decls.len() && used + decls[head].1.len() < head_room {
+        used += decls[head].1.len() + 1;
+        head += 1;
+    }
+    let (mut tail, mut used) = (decls.len(), 0);
+    while tail > head && used + decls[tail - 1].1.len() < room - head_room {
+        used += decls[tail - 1].1.len() + 1;
+        tail -= 1;
+    }
+    let mut lines: Vec<String> = decls[..head].iter().map(|(_, l)| l.clone()).collect();
+    if tail > head {
+        lines.push(format!(
+            "[… {} declarations skipped, lines L{}–L{}; Read with offset/limit …]",
+            tail - head,
+            decls[head].0,
+            decls[tail - 1].0
+        ));
+    }
+    lines.extend(decls[tail..].iter().map(|(_, l)| l.clone()));
+    lines.join("\n")
 }
 
 fn is_decl(line: &str) -> bool {
@@ -788,6 +812,70 @@ mod tests {
         assert_eq!(v["hookSpecificOutput"]["updatedToolOutput"]["type"], "text");
     }
 
+    fn read_of(path: &str, src: &str) -> String {
+        let ev = event("Read", json!({"file_path": path}), json!({"file": {"content": src}}));
+        reply(process(&ev))["hookSpecificOutput"]["updatedToolOutput"]["file"]["content"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn the_outline_of_a_2000_line_file_shows_head_tail_and_the_skipped_range() {
+        let src: String = (0..400)
+            .map(|i| {
+                format!(
+                    "pub fn item_{i}(x: u32) -> u32 {{\n    let y = x + {i}; // padding padding padding\n    y\n}}\n\n"
+                )
+            })
+            .collect();
+        assert_eq!(src.split('\n').count(), 2001);
+        let content = read_of("/work/src/big.rs", &src);
+        let body = content.split_once('\n').unwrap().1;
+        assert!(body.len() <= OUTLINE, "{}", body.len());
+        let lines: Vec<&str> = body.split('\n').collect();
+        let skip = lines.iter().position(|l| l.starts_with("[… ")).expect("a skip line");
+        assert_eq!(lines[0], "L1: pub fn item_0(x: u32) -> u32 {");
+        assert_eq!(*lines.last().unwrap(), "L1996: pub fn item_399(x: u32) -> u32 {", "the last declaration is shown");
+        let (head, tail) = (skip, lines.len() - skip - 1);
+        assert!(head > tail && tail > 0, "head {head}, tail {tail}");
+        let (from, to) = (5 * head + 1, 5 * (399 - tail) + 1);
+        let want =
+            format!("[… {} declarations skipped, lines L{from}–L{to}; Read with offset/limit …]", 400 - head - tail);
+        assert_eq!(lines[skip], want);
+        assert_eq!(lines[skip - 1], format!("L{}: pub fn item_{}(x: u32) -> u32 {{", from - 5, head - 1));
+        assert_eq!(lines[skip + 1], format!("L{}: pub fn item_{}(x: u32) -> u32 {{", to + 5, 400 - tail));
+        let head_bytes: usize = lines[..skip].iter().map(|l| l.len() + 1).sum();
+        let tail_bytes: usize = lines[skip + 1..].iter().map(|l| l.len() + 1).sum();
+        assert!(head_bytes * 2 > tail_bytes * 3 - 200, "about 60/40: {head_bytes}/{tail_bytes}");
+    }
+
+    #[test]
+    fn an_outline_whose_declarations_all_fit_has_no_skip_line() {
+        let src: String = (0..30).map(|i| format!("pub fn item_{i}() {{\n    // {}\n}}\n", "p".repeat(300))).collect();
+        assert!(src.len() > LIMIT);
+        let content = read_of("/work/src/small.rs", &src);
+        let body = content.split_once('\n').unwrap().1;
+        assert_eq!(body.split('\n').count(), 30);
+        assert!(!body.contains("skipped"), "{body}");
+        assert!(body.ends_with("L88: pub fn item_29() {"), "{body}");
+    }
+
+    #[test]
+    fn a_cjk_declaration_at_the_cut_point_is_never_split() {
+        let name = "日".repeat(120);
+        let src: String = (0..40).map(|i| format!("pub fn {name}{i}() {{\n    body\n}}\n")).collect();
+        let content = read_of("/work/src/cjk.rs", &src);
+        let body = content.split_once('\n').unwrap().1;
+        assert!(body.len() <= OUTLINE, "{}", body.len());
+        let lines: Vec<&str> = body.split('\n').collect();
+        assert_eq!(lines.iter().filter(|l| l.starts_with("[… ")).count(), 1, "{body}");
+        for l in lines.iter().filter(|l| !l.starts_with("[… ")) {
+            assert!(l.ends_with("() {"), "a declaration was cut: {l}");
+        }
+        assert!(lines[0].starts_with("L1: pub fn 日") && lines.last().unwrap().starts_with("L118: "), "{body}");
+        let long = format!("pub fn {}() {{", "日".repeat(400));
+        assert_eq!(cut_chars(&long, 160).chars().count(), 160, "a long line is cut on a character");
+        assert!(outline(&format!("{long}\nx\n")).starts_with("L1: pub fn 日"));
+    }
+
     #[test]
     fn a_repeated_log_folds_and_keeps_key_lines() {
         let mut log = String::new();
@@ -846,7 +934,7 @@ mod tests {
 
     #[test]
     fn json_rows_become_tsv() {
-        let rows: Vec<Value> = (0..40)
+        let rows: Vec<Value> = (0..100)
             .map(|i| {
                 let mut o = json!({"id": i, "name": format!("user {i}"), "meta": {"role": "dev", "tags": ["a", "b"]}});
                 if i % 2 == 0 {
@@ -856,15 +944,18 @@ mod tests {
             })
             .collect();
         let pretty = serde_json::to_string_pretty(&rows).unwrap();
-        assert!(pretty.len() > 1024);
+        assert!(pretty.len() > LIMIT);
         let out = shown(process(&bash(&pretty)));
         let (note, tsv) = out.split_once('\n').unwrap();
+        let kb = pretty.len() as f64 / 1024.0;
         assert_eq!(
             note,
-            "[HyperOx Token Saver: JSON re-encoded losslessly as TSV; empty cell = key absent, \"quoted\" cell = JSON string]"
+            format!(
+                "[HyperOx Token Saver: this command printed JSON ({kb:.1} KB); shown re-encoded losslessly as TSV; empty cell = key absent, \"quoted\" cell = JSON string]"
+            )
         );
         let lines: Vec<&str> = tsv.split('\n').collect();
-        assert_eq!(lines.len(), 41);
+        assert_eq!(lines.len(), 101);
         let mut cols: Vec<&str> = lines[0].split('\t').collect();
         cols.sort_unstable();
         assert_eq!(cols, ["id", "meta.role", "meta.tags", "name", "note"]);
@@ -878,17 +969,18 @@ mod tests {
 
     #[test]
     fn an_object_holding_rows_keeps_the_rest_as_compact_json() {
-        let rows: Vec<Value> = (0..60).map(|i| json!({"n": i, "label": format!("row number {i}")})).collect();
-        let doc = serde_json::to_string_pretty(&json!({"total": 60, "items": rows})).unwrap();
+        let rows: Vec<Value> = (0..200).map(|i| json!({"n": i, "label": format!("row number {i}")})).collect();
+        let doc = serde_json::to_string_pretty(&json!({"total": 200, "items": rows})).unwrap();
         let out = shown(process(&bash(&doc)));
-        assert!(out.contains("\n{\"total\":60}\nitems (TSV):\n"), "{out}");
+        assert!(out.contains("\n{\"total\":200}\nitems (TSV):\n"), "{out}");
     }
 
     #[test]
     fn other_json_is_compacted_when_small_enough() {
-        let doc = serde_json::to_string_pretty(&json!({"a": vec![1; 400], "b": {"c": "d"}})).unwrap();
+        let doc = serde_json::to_string_pretty(&json!({"a": vec![1; 4000], "b": {"c": "d"}})).unwrap();
         let out = shown(process(&bash(&doc)));
-        assert!(out.starts_with("[HyperOx Token Saver: JSON re-encoded losslessly as compact JSON]\n{"), "{out}");
+        assert!(out.starts_with("[HyperOx Token Saver: this command printed JSON ("), "{out}");
+        assert!(out.contains("); shown re-encoded losslessly as compact JSON]\n{"), "{out}");
     }
 
     #[test]
@@ -1047,37 +1139,56 @@ mod tests {
         (0..6u32).map(|k| (b'g' + (i / 20usize.pow(k) % 20) as u8) as char).collect()
     }
 
+    fn json_note(bytes: usize, how: &str) -> String {
+        let kb = bytes as f64 / 1024.0;
+        format!("[HyperOx Token Saver: this command printed JSON ({kb:.1} KB); shown re-encoded losslessly as {how}]\n")
+    }
+
     #[test]
     fn exactly_90_percent_passes_through_and_one_byte_more_is_replaced() {
-        let note = "[HyperOx Token Saver: JSON re-encoded losslessly as compact JSON]\n";
-        let mut fill = 900;
+        let mut fill = 7300;
         let compact = loop {
             let c = json!({"k": "a".repeat(fill)}).to_string();
-            if (note.len() + c.len()).is_multiple_of(9) {
+            if (json_note(LIMIT + 1, "compact JSON").len() + c.len()).is_multiple_of(9) {
                 break c;
             }
             fill += 1;
         };
-        let replacement = note.len() + compact.len();
+        let replacement = json_note(LIMIT + 1, "compact JSON").len() + compact.len();
         let at = replacement * 10 / 9;
-        assert!(at > JSON_MIN && at <= LIMIT);
+        assert!(at > LIMIT && at < 10 * 1024, "the note keeps one length in this range");
         let padded = |n: usize| format!("{compact}{}", " ".repeat(n - compact.len()));
         assert_eq!(process(&bash(&padded(at))), None, "a replacement of exactly 90% is not worth it");
-        assert_eq!(shown(process(&bash(&padded(at + 1)))), format!("{note}{compact}"));
+        let want = format!("{}{compact}", json_note(at + 1, "compact JSON"));
+        assert_eq!(shown(process(&bash(&padded(at + 1)))), want);
     }
 
     #[test]
-    fn json_is_reencoded_only_above_1024_bytes() {
+    fn json_is_reencoded_only_above_8192_bytes() {
         let doc = json!({"name": "x".repeat(200), "list": [1, 2, 3]}).to_string();
         let padded = |n: usize| format!("{doc}{}", " ".repeat(n - doc.len()));
-        assert_eq!(process(&bash(&padded(1024))), None);
-        let want = format!("[HyperOx Token Saver: JSON re-encoded losslessly as compact JSON]\n{doc}");
-        assert_eq!(shown(process(&bash(&padded(1025)))), want);
-        let leading = format!("{}{doc}", " \r\n".repeat(400));
+        for n in [1025, LIMIT] {
+            assert_eq!(process(&bash(&padded(n))), None, "{n} bytes of JSON stay as they are");
+        }
+        let want = format!("{}{doc}", json_note(LIMIT + 1, "compact JSON"));
+        assert_eq!(shown(process(&bash(&padded(LIMIT + 1)))), want);
+        let leading = format!("{}{doc}", " \r\n".repeat(3000));
+        let want = format!("{}{doc}", json_note(leading.len(), "compact JSON"));
         assert_eq!(shown(process(&bash(&leading))), want, "leading blank lines do not hide the JSON");
         let rows: Vec<Value> = (0..2).map(|i| json!({"id": i, "pad": "p".repeat(200)})).collect();
         let rows = json!(rows).to_string();
-        assert_eq!(process(&bash(&format!("{rows}{}", " ".repeat(1024 - rows.len())))), None, "rows too");
+        assert_eq!(process(&bash(&format!("{rows}{}", " ".repeat(LIMIT - rows.len())))), None, "rows too");
+    }
+
+    #[test]
+    fn the_json_note_says_what_the_command_printed() {
+        let rows: Vec<Value> = (0..400).map(|i| json!({"id": i, "name": format!("user {i}")})).collect();
+        let doc = serde_json::to_string_pretty(&rows).unwrap();
+        assert!(doc.len() > LIMIT);
+        let out = shown(process(&bash(&doc)));
+        let (note, _) = out.split_once('\n').unwrap();
+        assert!(note.starts_with("[HyperOx Token Saver: this command printed JSON ("), "{note}");
+        assert!(note.contains(" KB); shown re-encoded losslessly as TSV;"), "{note}");
     }
 
     #[test]
@@ -1092,22 +1203,23 @@ mod tests {
             json!([]),
         ] {
             let pretty = serde_json::to_string_pretty(&v).unwrap();
-            let doc = format!("{pretty}{}", " ".repeat(4000 - pretty.len()));
+            let doc = format!("{pretty}{}", " ".repeat(9000 - pretty.len()));
             let out = shown(process(&bash(&doc)));
             let (note, body) = out.split_once('\n').unwrap();
             if note.contains("TSV") {
                 assert_eq!(v, json!([{}, {}]), "only rows become TSV: {out}");
                 continue;
             }
-            assert_eq!(note, "[HyperOx Token Saver: JSON re-encoded losslessly as compact JSON]", "{v}");
+            assert_eq!(note, json_note(9000, "compact JSON").trim_end(), "{v}");
             assert_eq!(serde_json::from_str::<Value>(body).unwrap(), v, "lossless");
         }
     }
 
     #[test]
     fn tsv_does_not_read_an_empty_string_as_an_absent_key() {
-        let rows: Vec<Value> =
-            (0..40).map(|i| if i % 2 == 0 { json!({"name": "x", "note": ""}) } else { json!({"name": "x"}) }).collect();
+        let rows: Vec<Value> = (0..300)
+            .map(|i| if i % 2 == 0 { json!({"name": "x", "note": ""}) } else { json!({"name": "x"}) })
+            .collect();
         let doc = serde_json::to_string_pretty(&rows).unwrap();
         let out = shown(process(&bash(&doc)));
         let (note, body) = out.split_once('\n').unwrap();
@@ -1122,10 +1234,10 @@ mod tests {
     #[test]
     fn tsv_does_not_drop_a_dotted_key_that_matches_a_nested_one() {
         let rows: Vec<Value> =
-            (0..40).map(|i| json!({"id": i, "a.b": format!("flat{i}"), "a": {"b": format!("nested{i}")}})).collect();
+            (0..120).map(|i| json!({"id": i, "a.b": format!("flat{i}"), "a": {"b": format!("nested{i}")}})).collect();
         let doc = serde_json::to_string_pretty(&rows).unwrap();
         let out = shown(process(&bash(&doc)));
-        for i in 0..40 {
+        for i in 0..120 {
             assert!(
                 out.contains(&format!("flat{i}")) && out.contains(&format!("nested{i}")),
                 "row {i} lost a value:\n{out}"
@@ -1446,8 +1558,9 @@ mod tests {
             json!("\"q\""),
         ];
         let mut rows: Vec<Value> =
-            values.iter().enumerate().map(|(i, v)| json!({"id": i, "pad": "padding ".repeat(8), "v": v})).collect();
-        rows.push(json!({"id": 99, "pad": "padding ".repeat(8)}));
+            values.iter().enumerate().map(|(i, v)| json!({"id": i, "pad": vec![0; 80], "v": v})).collect();
+        rows.push(json!({"id": 99, "pad": vec![0; 80]}));
+        assert!(serde_json::to_string_pretty(&rows).unwrap().len() > LIMIT);
         let doc = serde_json::to_string_pretty(&rows).unwrap();
         let out = shown(process(&bash(&doc)));
         let (note, body) = out.split_once('\n').unwrap();
