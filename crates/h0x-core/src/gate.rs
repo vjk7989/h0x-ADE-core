@@ -877,6 +877,81 @@ mod tests {
     }
 
     #[test]
+    fn an_outline_of_exactly_the_budget_has_no_skip_line_and_one_byte_more_has_one() {
+        let text = |lens: &[usize]| lens.iter().map(|&n| format!("fn {}\n", "a".repeat(n))).collect::<String>();
+        let mut lens = vec![130; 21];
+        let mut k = 0;
+        while outline(&text(&lens)).len() < OUTLINE {
+            lens[k % 21] += 1;
+            k += 1;
+        }
+        let at = outline(&text(&lens));
+        assert_eq!(at.len(), OUTLINE);
+        assert_eq!(at.split('\n').count(), 21);
+        assert!(!at.contains("skipped"), "{at}");
+        lens[0] += 1;
+        let over = outline(&text(&lens));
+        assert!(over.len() <= OUTLINE, "{}", over.len());
+        let lines: Vec<&str> = over.split('\n').collect();
+        assert_eq!(lines.iter().filter(|l| l.starts_with("[… ")).count(), 1, "{over}");
+        let skip = lines.iter().position(|l| l.starts_with("[… ")).unwrap();
+        let tail = lines.len() - skip - 1;
+        assert!(skip > 0 && tail > 0, "{over}");
+        let want = format!(
+            "[… {} declarations skipped, lines L{}–L{}; Read with offset/limit …]",
+            21 - skip - tail,
+            skip + 1,
+            21 - tail
+        );
+        assert_eq!(lines[skip], want);
+    }
+
+    #[test]
+    fn an_outline_of_no_or_one_declaration_is_empty_or_that_line() {
+        assert_eq!(outline(""), "");
+        assert_eq!(outline("let x = 1;\n// fn in a comment\n"), "");
+        assert_eq!(outline("\n\n  pub fn only() {}\n"), "L3: pub fn only() {}");
+    }
+
+    #[test]
+    fn a_very_long_declaration_line_is_cut_to_160_characters() {
+        let long = format!("    pub fn {}(x: u32) {{", "x".repeat(500));
+        assert_eq!(outline(&long), format!("L1: {}", &long.trim()[..160]));
+    }
+
+    #[test]
+    fn a_crlf_file_with_all_declarations_at_its_end_names_the_skipped_lines_exactly() {
+        let mut src = "// filler line without declarations\r\n".repeat(3000);
+        for i in 0..300 {
+            src.push_str(&format!("pub fn tail_item_{i}() {{}}\r\n\r\n"));
+        }
+        let content = read_of("C:\\Work Dir\\src\\Tail.RS", &src);
+        let body = content.split_once('\n').unwrap().1;
+        assert!(body.len() <= OUTLINE && !body.contains('\r'), "{body}");
+        let lines: Vec<&str> = body.split('\n').collect();
+        let skip = lines.iter().position(|l| l.starts_with("[… ")).expect("a skip line");
+        let item = |l: &str| -> usize {
+            let (n, rest) = l.strip_prefix('L').unwrap().split_once(": pub fn tail_item_").unwrap();
+            let i: usize = rest.strip_suffix("() {}").unwrap().parse().unwrap();
+            assert_eq!(n.parse::<usize>().unwrap(), 3001 + 2 * i, "{l}");
+            i
+        };
+        let head: Vec<usize> = lines[..skip].iter().copied().map(&item).collect();
+        let tail: Vec<usize> = lines[skip + 1..].iter().copied().map(&item).collect();
+        let (h, t) = (head.len(), tail.len());
+        assert!(h > t && t > 0, "head {h}, tail {t}");
+        assert_eq!(head, (0..h).collect::<Vec<_>>(), "the head is the first declarations, once each");
+        assert_eq!(tail, (300 - t..300).collect::<Vec<_>>(), "the tail is the last declarations, once each");
+        let want = format!(
+            "[… {} declarations skipped, lines L{}–L{}; Read with offset/limit …]",
+            300 - h - t,
+            3001 + 2 * h,
+            3001 + 2 * (299 - t)
+        );
+        assert_eq!(lines[skip], want);
+    }
+
+    #[test]
     fn a_repeated_log_folds_and_keeps_key_lines() {
         let mut log = String::new();
         for i in 0..400 {
@@ -1189,6 +1264,61 @@ mod tests {
         let (note, _) = out.split_once('\n').unwrap();
         assert!(note.starts_with("[HyperOx Token Saver: this command printed JSON ("), "{note}");
         assert!(note.contains(" KB); shown re-encoded losslessly as TSV;"), "{note}");
+    }
+
+    #[test]
+    fn the_json_limit_counts_crlf_bytes_as_printed() {
+        let doc = serde_json::to_string_pretty(&json!({"name": "x".repeat(200), "list": [1, 2, 3]}))
+            .unwrap()
+            .replace('\n', "\r\n");
+        let padded = |n: usize| {
+            let pad = n - doc.len();
+            format!("{doc}{}{}", "\r\n".repeat(pad / 2), " ".repeat(pad % 2))
+        };
+        assert_eq!(padded(LIMIT).len(), LIMIT);
+        assert_eq!(process(&bash(&padded(LIMIT))), None, "8192 bytes with CRLF stay as they are");
+        let compact = serde_json::from_str::<Value>(&doc).unwrap().to_string();
+        let want = format!(
+            "[HyperOx Token Saver: this command printed JSON (8.0 KB); shown re-encoded losslessly as compact JSON]\n{compact}"
+        );
+        assert_eq!(shown(process(&bash(&padded(LIMIT + 1)))), want);
+    }
+
+    #[test]
+    fn the_json_kb_figure_has_one_decimal_at_the_kilobyte_boundaries() {
+        let doc = json!({"name": "x".repeat(200), "list": [1, 2, 3]}).to_string();
+        for (n, kb) in [
+            (8193, "8.0"),
+            (9215, "9.0"),
+            (9216, "9.0"),
+            (9676, "9.4"),
+            (9677, "9.5"),
+            (10239, "10.0"),
+            (10240, "10.0"),
+        ] {
+            let out = shown(process(&bash(&format!("{doc}{}", " ".repeat(n - doc.len())))));
+            let want = format!("[HyperOx Token Saver: this command printed JSON ({kb} KB); shown re-encoded");
+            assert!(out.starts_with(&want), "{n}: {out}");
+        }
+    }
+
+    #[test]
+    fn json_over_the_limit_whose_reencode_saves_under_10_percent_passes_through() {
+        let doc = json!({"k": "a".repeat(8000)}).to_string();
+        assert!(doc.len() < LIMIT);
+        for n in [LIMIT + 1, 8900] {
+            assert_eq!(process(&bash(&format!("{doc}{}", " ".repeat(n - doc.len())))), None, "{n}");
+        }
+    }
+
+    #[test]
+    fn broken_json_over_the_limit_takes_the_text_path() {
+        for open in ["{", "[", "{\"a\": 1} trailing"] {
+            let text = format!("{open}\n{}", ticks(9000));
+            let out = shown(process(&bash(&text)));
+            assert!(out.starts_with("[HyperOx Token Saver: output "), "{out}");
+            assert!(!out.contains("printed JSON") && out.contains("[x"), "{out}");
+        }
     }
 
     #[test]
