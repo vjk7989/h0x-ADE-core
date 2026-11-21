@@ -134,6 +134,9 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<GateAction>,
     },
+    /// Classify a session start: `{cwd?, prompt}` JSON on stdin, the decision as JSON on stdout.
+    #[command(hide = true)]
+    Route,
     #[command(hide = true)]
     Hold {
         #[arg(long)]
@@ -209,6 +212,7 @@ pub fn main() -> i32 {
         }
         // A hook, not a command: no help entry, no session or paths, and it must always exit 0.
         [Some("gate")] => return crate::gate::run(),
+        [Some("route")] => return crate::route::run(),
         [Some("--skill")] => {
             print!("{SKILL}");
             return 0;
@@ -414,6 +418,7 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             return Ok(None);
         }
         Cmd::Gate { action: None } => std::process::exit(crate::gate::run()),
+        Cmd::Route => std::process::exit(crate::route::run()),
         Cmd::Gate { action: Some(GateAction::Stats) } => {
             // Never starts a core: without one the counter file says the same.
             let json = match client::connect_existing(&paths) {
@@ -974,8 +979,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("machine rename", "machine.rename"),
     ("machine rm", "machine.rm"),
 ];
-/// Client-only methods: handshake and opaque document storage.
-pub const API_ONLY: &[&str] = &["hello", "doc.get", "doc.set"];
+/// Client-only methods: handshake, opaque document storage, and the rules-only `route` (its hidden command reads stdin, not a request).
+pub const API_ONLY: &[&str] = &["hello", "doc.get", "doc.set", "route"];
 
 #[cfg(test)]
 mod tests {

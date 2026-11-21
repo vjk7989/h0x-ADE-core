@@ -75,6 +75,9 @@ methods! { Ctx<'_>;
     "gate.stats" => gate_stats, Empty => crate::gate::GateStats,
         "What the Token Saver has saved on this machine: tokens, replaced outputs, bytes in and bytes shown (zeros when it never ran).",
         errors [];
+    "route" => route, crate::route::RouteParams => crate::route::RouteResult,
+        "Classify a session start from its working directory and first prompt, with rules only: the session kind, the tools it needs, whether a code map helps and whether the cheap model is enough. Without `cwd` (a remote machine) there is no code map and no model change; an empty prompt or an unreadable directory gives the edit profile.",
+        errors [];
     "terminal.list" => terminal_list, ListParams => ListResult,
         "Live terminals (all with `all`), optionally filtered by labels.",
         errors [];
@@ -246,6 +249,10 @@ async fn server_restart(core: Ctx<'_>, _: Empty) -> Result<StopResult, RpcError>
 
 async fn templates_list(core: Ctx<'_>, _: Empty) -> Result<TemplatesResult, RpcError> {
     Ok(TemplatesResult { templates: crate::templates::list(&core.paths) })
+}
+
+async fn route(_: Ctx<'_>, params: crate::route::RouteParams) -> Result<crate::route::RouteResult, RpcError> {
+    Ok(crate::route::route(&params))
 }
 
 async fn gate_stats(core: Ctx<'_>, _: Empty) -> Result<crate::gate::GateStats, RpcError> {
