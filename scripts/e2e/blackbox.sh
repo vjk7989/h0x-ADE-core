@@ -193,6 +193,9 @@ out=$("$HX" commands 2>&1); case $out in "["*) pass "app commands lists JSON" ;;
 if [ -n "${E2E_SANDBOX:-}" ]; then
   skip "app headless launch" "no display inside the sandbox"
 else
+  # A fresh app home shows the first-start sign-in screen and the control socket stays closed behind it;
+  # the app's own "done" marker (<app home>/signin-done) is what Skip writes, so seed it for this scratch home.
+  mkdir -p "$H0X_ADE_HOME" && echo 1 >"$H0X_ADE_HOME/signin-done"
   # Headless: Linux under xvfb; Windows and macOS runners may refuse a window, so a failure there is a WARN.
   if [ "$os" = linux ]; then
     if command -v xvfb-run >/dev/null 2>&1; then xvfb-run -a "$HX" >"$E2E_ROOT/app.log" 2>&1 & app_pid=$!; else app_pid=; fi
