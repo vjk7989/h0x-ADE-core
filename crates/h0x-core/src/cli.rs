@@ -236,6 +236,7 @@ pub fn main() -> i32 {
         // A hook, not a command: no help entry, no session or paths, and it must always exit 0.
         [Some("gate")] => return crate::gate::run(),
         [Some("route")] => return crate::route::run(),
+        [Some("handoff")] => return crate::handoff::run(),
         [Some("--skill")] => {
             print!("{SKILL}");
             return 0;

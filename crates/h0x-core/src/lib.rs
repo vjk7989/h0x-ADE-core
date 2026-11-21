@@ -11,6 +11,7 @@ pub mod exec;
 pub mod files;
 pub mod foreground;
 pub mod gate;
+pub mod handoff;
 pub mod holder;
 pub mod holder_proto;
 pub mod input;
