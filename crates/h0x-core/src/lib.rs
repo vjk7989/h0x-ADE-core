@@ -18,6 +18,7 @@ mod kept;
 pub mod keys;
 pub mod locale;
 pub mod machines;
+pub mod map;
 pub mod notes;
 pub mod paths;
 pub mod picker;

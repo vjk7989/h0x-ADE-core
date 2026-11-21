@@ -11,7 +11,8 @@ use std::path::Path;
 
 const MANIFESTS: [&str; 7] =
     ["Cargo.toml", "package.json", "pyproject.toml", "setup.py", "go.mod", "pom.xml", "build.gradle"];
-const SRC_EXTS: [&str; 14] = ["rs", "js", "ts", "tsx", "py", "go", "java", "kt", "c", "cc", "cpp", "h", "rb", "cs"];
+pub(crate) const SRC_EXTS: [&str; 14] =
+    ["rs", "js", "ts", "tsx", "py", "go", "java", "kt", "c", "cc", "cpp", "h", "rb", "cs"];
 const SRC_DIRS: [&str; 3] = ["src", "lib", "crates"];
 /// Source files that make a manifest-less directory a code repo.
 const SRC_MIN: usize = 3;

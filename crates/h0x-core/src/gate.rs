@@ -347,7 +347,7 @@ fn outline(text: &str) -> String {
     lines.join("\n")
 }
 
-fn is_decl(line: &str) -> bool {
+pub(crate) fn is_decl(line: &str) -> bool {
     const KW: [&str; 12] =
         ["fn", "struct", "enum", "trait", "impl", "mod", "const", "static", "type", "class", "def", "function"];
     const KW2: [&str; 2] = ["export", "interface"];
@@ -514,7 +514,7 @@ fn uuids(s: &str) -> String {
 
 /// Whether `word` occurs not preceded by a word char and followed by one of `ends` and then a
 /// non-word char (one pass; a match is only looked at when its start is a boundary).
-fn has_word(hay: &str, word: &str, ends: &[&str]) -> bool {
+pub(crate) fn has_word(hay: &str, word: &str, ends: &[&str]) -> bool {
     hay.match_indices(word).any(|(i, _)| {
         if hay[..i].chars().next_back().is_some_and(is_word) {
             return false;
