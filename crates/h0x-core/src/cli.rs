@@ -134,10 +134,36 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<GateAction>,
     },
+    /// Classify a session start: `{cwd?, prompt}` JSON on stdin, the decision as JSON on stdout.
+    #[command(hide = true)]
+    Route,
+    /// A lexical code map of the current folder: `map callers <symbol>`, `map grep <word>`.
+    #[command(hide = true)]
+    Map {
+        #[command(subcommand)]
+        action: MapAction,
+    },
     #[command(hide = true)]
     Hold {
         #[arg(long)]
         socket: std::path::PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum MapAction {
+    /// Every whole-word use of a symbol, with the declaration it sits in.
+    Callers {
+        symbol: String,
+        /// The folder to search (default: the current one).
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
+    /// Every line with a whole-word match.
+    Grep {
+        word: String,
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
     },
 }
 
@@ -209,6 +235,8 @@ pub fn main() -> i32 {
         }
         // A hook, not a command: no help entry, no session or paths, and it must always exit 0.
         [Some("gate")] => return crate::gate::run(),
+        [Some("route")] => return crate::route::run(),
+        [Some("handoff")] => return crate::handoff::run(),
         [Some("--skill")] => {
             print!("{SKILL}");
             return 0;
@@ -226,6 +254,14 @@ pub fn main() -> i32 {
         Err(e) if !e.use_stderr() || !(piped || args.iter().any(|a| a == "--json")) => e.exit(),
         Err(e) => return fail(&RpcError::new("usage", usage_message(&e), "see `h0x-core --help`"), true),
     };
+    // A tool, not a core command: no session, no paths.
+    if let Some(Cmd::Map { action }) = &cli.cmd {
+        let (mode, word, dir) = match action {
+            MapAction::Callers { symbol, dir } => (crate::map::Mode::Callers, symbol, dir),
+            MapAction::Grep { word, dir } => (crate::map::Mode::Grep, word, dir),
+        };
+        return crate::map::run(mode, word, dir.as_deref());
+    }
     // A template's trailing flags may include --json: parse them before choosing how to print.
     let (cmd, asked) = match cli.cmd {
         Some(Cmd::Run(p)) => match Paths::from_env().and_then(|paths| flags_after_task(&paths, p)) {
@@ -414,6 +450,8 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             return Ok(None);
         }
         Cmd::Gate { action: None } => std::process::exit(crate::gate::run()),
+        Cmd::Route => std::process::exit(crate::route::run()),
+        Cmd::Map { .. } => unreachable!("`map` is dispatched before the session is read"),
         Cmd::Gate { action: Some(GateAction::Stats) } => {
             // Never starts a core: without one the counter file says the same.
             let json = match client::connect_existing(&paths) {
@@ -974,8 +1012,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("machine rename", "machine.rename"),
     ("machine rm", "machine.rm"),
 ];
-/// Client-only methods: handshake and opaque document storage.
-pub const API_ONLY: &[&str] = &["hello", "doc.get", "doc.set"];
+/// Client-only methods: handshake, opaque document storage, and the rules-only `route` (its hidden command reads stdin, not a request).
+pub const API_ONLY: &[&str] = &["hello", "doc.get", "doc.set", "route"];
 
 #[cfg(test)]
 mod tests {
