@@ -1012,8 +1012,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("machine rename", "machine.rename"),
     ("machine rm", "machine.rm"),
 ];
-/// Client-only methods: handshake, opaque document storage, and the rules-only `route` (its hidden command reads stdin, not a request).
-pub const API_ONLY: &[&str] = &["hello", "doc.get", "doc.set", "route"];
+/// Client-only methods: handshake, opaque document storage, the rules-only `route` (its hidden command reads stdin, not a request) and `text.redact`.
+pub const API_ONLY: &[&str] = &["hello", "doc.get", "doc.set", "route", "text.redact"];
 
 #[cfg(test)]
 mod tests {
@@ -1139,6 +1139,16 @@ mod tests {
             for word in command.split(' ') {
                 cmd = cmd.find_subcommand(word).unwrap_or_else(|| panic!("no command `{command}`")).clone();
             }
+        }
+    }
+
+    #[test]
+    fn text_redact_is_an_api_only_method_with_no_command() {
+        assert!(crate::api::METHOD_NAMES.contains(&"text.redact"));
+        assert!(API_ONLY.contains(&"text.redact"));
+        assert!(!COMMANDS.iter().any(|(_, m)| *m == "text.redact"), "text.redact has a command");
+        for word in ["text", "redact"] {
+            assert!(Cli::command().find_subcommand(word).is_none(), "a `{word}` command exists");
         }
     }
 

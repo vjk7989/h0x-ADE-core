@@ -5,12 +5,47 @@
 //! One pass, left to right: after a cut the scan resumes at its end, and a
 //! pattern that fails looks only a bounded distance ahead, so the time is
 //! linear in the text, whatever it repeats.
+//!
+//! Known limit: a secret wrapped across a line break is only cut where it is
+//! recognized on each line; the part after the break may stay.
+
+use crate::rpc::RpcError;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 const MARK: &str = "[redacted]";
 /// How far a key name, the gap after `Bearer`, or a key block's header line may reach.
 const NAME: usize = 64;
 const GAP: usize = 8;
 const HEADER: usize = 80;
+
+/// The longest text the `text.redact` method takes, in bytes.
+pub const MAX_RPC_TEXT: usize = 64 * 1024;
+
+#[derive(Serialize, Deserialize, JsonSchema, Default, Debug)]
+#[serde(default)]
+pub struct RedactParams {
+    /// The text to clean, at most 64 KB.
+    pub text: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, PartialEq, Debug)]
+pub struct RedactResult {
+    /// The text with secrets replaced by `[redacted]`.
+    pub text: String,
+}
+
+/// `redact` for the `text.redact` method: refuses more than 64 KB, never returns part of it.
+pub fn redact_rpc(params: &RedactParams) -> Result<RedactResult, RpcError> {
+    if params.text.len() > MAX_RPC_TEXT {
+        return Err(RpcError::new(
+            "too_large",
+            format!("text is {} bytes, the limit is {MAX_RPC_TEXT}", params.text.len()),
+            "send the text in pieces of at most 64 KB",
+        ));
+    }
+    Ok(RedactResult { text: redact(&params.text) })
+}
 
 /// `text` with API keys, tokens, private keys and `password=...` values replaced.
 pub fn redact(text: &str) -> String {
@@ -49,7 +84,11 @@ fn prefixed(b: &[u8], i: usize) -> Option<usize> {
     let rest = &b[i..];
     let dashed = |c: u8| is_word(c) || c == b'-';
     let upper = |c: u8| c.is_ascii_uppercase() || c.is_ascii_digit();
+    if rest.starts_with(b"eyJ") {
+        return jwt(rest).map(|n| i + n);
+    }
     let github = [b"ghp_".as_slice(), b"gho_", b"ghu_", b"ghs_", b"ghr_", b"github_pat_"];
+    let stripe = [b"sk_live_".as_slice(), b"sk_test_", b"rk_live_", b"rk_test_"];
     let (skip, min, ok): (usize, usize, &dyn Fn(u8) -> bool) = if rest.starts_with(b"sk-") {
         (3, 16, &dashed)
     } else if let Some(p) = github.iter().find(|p| rest.starts_with(p)) {
@@ -61,12 +100,40 @@ fn prefixed(b: &[u8], i: usize) -> Option<usize> {
         (5, 10, &dashed)
     } else if rest.starts_with(b"AKIA") {
         (4, 16, &upper)
+    } else if rest.starts_with(b"AIza") {
+        (4, 35, &dashed)
+    } else if let Some(p) = stripe.iter().find(|p| rest.starts_with(p)) {
+        (p.len(), 8, &is_word)
     } else {
         return None;
     };
     // A run shorter than `min` fails within `min` bytes; a longer one is cut and skipped.
     let run = rest[skip..].iter().take_while(|c| ok(**c)).count();
     (run >= min).then_some(i + skip + run)
+}
+
+/// A bare JWT at the start of `rest` (`eyJ...` header, `eyJ...` payload, signature): its length.
+fn jwt(rest: &[u8]) -> Option<usize> {
+    let part = |c: &u8| is_word(*c) || *c == b'-';
+    let mut at = 0;
+    for (n, head) in [b"eyJ".as_slice(), b"eyJ", b""].into_iter().enumerate() {
+        if !rest[at..].starts_with(head) {
+            return None;
+        }
+        at += head.len();
+        let run = rest[at..].iter().take_while(|c| part(c)).count();
+        if run < 8 {
+            return None;
+        }
+        at += run;
+        if n < 2 {
+            if rest.get(at) != Some(&b'.') {
+                return None;
+            }
+            at += 1;
+        }
+    }
+    Some(at)
 }
 
 /// `Bearer <token>` at `i`: the token (the word stays readable). Any
@@ -85,19 +152,41 @@ fn bearer(text: &str, i: usize) -> Option<(usize, usize)> {
     (gap > 0 && token).then_some((start, start + run.len()))
 }
 
-/// The value after `api_key=`, `"token": "..."`, `PASSWORD=` and the like, at
-/// the `=` or `:` at `i`.
+/// The value after `api_key=`, `"token": "..."`, `PASSWORD = ...` and the like,
+/// at the `=` or `:` at `i`: all of it, up to whitespace, a closing quote
+/// (escaped or not), `,`, `;` or `}`. Spaces and tabs may surround the separator.
 fn assigned(b: &[u8], i: usize) -> Option<(usize, usize)> {
-    let end = if i > 0 && matches!(b[i - 1], b'"' | b'\'') { i - 1 } else { i };
+    let blank = |c: &&u8| matches!(c, b' ' | b'\t');
+    let mut end = i - b[i.saturating_sub(GAP)..i].iter().rev().take_while(blank).count();
+    if end > 0 && matches!(b[end - 1], b'"' | b'\'') {
+        end -= 1;
+        if end > 0 && b[end - 1] == b'\\' {
+            end -= 1;
+        }
+    }
     let from = end.saturating_sub(NAME);
     let start = b[from..end].iter().rposition(|c| !(is_word(*c) || *c == b'-')).map_or(from, |p| from + p + 1);
     let name = b[start..end].to_ascii_lowercase();
     if !["token", "secret", "password", "key"].iter().any(|k| name.ends_with(k.as_bytes())) {
         return None;
     }
-    let at = i + 1 + b[i + 1..].iter().take(GAP).take_while(|c| matches!(c, b' ' | b'"' | b'\'')).count();
-    let run = b[at..].iter().take_while(|c| is_secret(**c)).count();
-    (run >= 8).then_some((at, at + run))
+    // A quote, or a backslash that escapes one (the text is JSON inside JSON).
+    let quote = |k: usize| match b[k] {
+        b'"' | b'\'' => 1,
+        b'\\' if matches!(b.get(k + 1), Some(b'"' | b'\'')) => 2,
+        _ => 0,
+    };
+    let mut at = i + 1;
+    while at < b.len() && at < i + 1 + GAP {
+        let step = if matches!(b[at], b' ' | b'\t') { 1 } else { quote(at) };
+        if step == 0 {
+            break;
+        }
+        at += step;
+    }
+    let ends = |k: usize| b[k].is_ascii_whitespace() || b",;}".contains(&b[k]) || quote(k) > 0;
+    let run = (at..b.len()).take_while(|k| !ends(*k)).count();
+    (run > 0).then_some((at, at + run))
 }
 
 /// A `-----BEGIN ... KEY-----` block at `i`, through its END line (or the
@@ -123,7 +212,46 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::redact;
+    use super::{MAX_RPC_TEXT, RedactParams, redact, redact_rpc};
+
+    fn rpc(text: String) -> Result<String, String> {
+        redact_rpc(&RedactParams { text }).map(|r| r.text).map_err(|e| e.kind)
+    }
+
+    #[test]
+    fn the_rpc_redacts_and_keeps_empty_empty() {
+        assert_eq!(rpc(String::new()), Ok(String::new()));
+        assert_eq!(rpc("key ghp_ABCDEFGHIJKLMNOPQRSTuvwx ✓ naïve".into()), Ok("key [redacted] ✓ naïve".into()));
+    }
+
+    #[test]
+    fn the_rpc_takes_exactly_64_kb_and_refuses_more() {
+        assert_eq!(rpc("a".repeat(MAX_RPC_TEXT)).map(|t| t.len()), Ok(MAX_RPC_TEXT));
+        assert_eq!(rpc("a".repeat(MAX_RPC_TEXT + 1)), Err("too_large".to_string()));
+        // The limit is in bytes: 3-byte characters count as 3.
+        assert_eq!(rpc("✓".repeat(MAX_RPC_TEXT / 3 + 1)), Err("too_large".to_string()));
+    }
+
+    #[test]
+    fn the_schema_has_text_redact_with_an_optional_text_and_too_large() {
+        let schema = crate::api::openrpc();
+        let methods = schema["methods"].as_array().unwrap();
+        let method = methods.iter().find(|m| m["name"] == "text.redact").expect("text.redact in the schema");
+        let params = method["params"].as_array().unwrap();
+        let names: Vec<&str> = params.iter().filter_map(|p| p["name"].as_str()).collect();
+        assert_eq!(names, ["text"], "{params:?}");
+        assert_ne!(params[0]["required"], true, "a missing text is an empty one");
+        assert_eq!(params[0]["schema"]["type"], "string");
+        let errors: Vec<&str> =
+            method["errors"].as_array().unwrap().iter().filter_map(|e| e["data"]["kind"].as_str()).collect();
+        assert_eq!(errors, ["too_large"]);
+        let reference = method["result"]["schema"]["$ref"].as_str().unwrap();
+        let def = reference.strip_prefix("#/components/schemas/").unwrap();
+        let result = &schema["components"]["schemas"][def];
+        let keys: Vec<&String> = result["properties"].as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["text"]);
+        assert_eq!(result["required"], serde_json::json!(["text"]));
+    }
 
     #[test]
     fn common_token_shapes_are_redacted() {
@@ -160,8 +288,10 @@ mod tests {
             "task-1234567890abcdefghij is not an sk- key",
             "sk-short",
             "Bearer authentication is used",
-            "the key = value pair",
-            "password=short",
+            "the pair = value",
+            "password=",
+            "token: ",
+            r#"{"key": ""}"#,
             "AKIA lowercase akiaiosfodnn7example",
             "naïve café ✓ sk-",
             "https://example.com:8080/path",
@@ -182,7 +312,8 @@ mod tests {
             ("xoxb-1234567890", "[redacted]"),
             ("xoxb-123456789", "xoxb-123456789"),
             ("token=abcdefgh", "token=[redacted]"),
-            ("token=abcdefg", "token=abcdefg"),
+            ("token=abcdefg", "token=[redacted]"),
+            ("token=a", "token=[redacted]"),
             ("Bearer abcdefg1", "Bearer [redacted]"),
             ("Bearer abcdef1", "Bearer abcdef1"),
             ("Bearer abcdefghijklmnopqrs", "Bearer abcdefghijklmnopqrs"),
@@ -210,7 +341,7 @@ mod tests {
             ("API_KEY=abcd1234efgh5678\r\nnext", "API_KEY=[redacted]\r\nnext"),
             ("one\ntoken=abcdef0123456789\nthree", "one\ntoken=[redacted]\nthree"),
             ("→sk-abcdefghijklmnop←", "→[redacted]←"),
-            ("token=abcdef0123456789é", "token=[redacted]é"),
+            ("token=abcdef0123456789é", "token=[redacted]"),
             ("密码 password: hunter22hunter 完成", "密码 password: [redacted] 完成"),
             ("ghp_ABCDEFGHIJKLMNOPQRSTUVWX🎉", "[redacted]🎉"),
             (
