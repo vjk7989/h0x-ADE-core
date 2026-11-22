@@ -100,6 +100,19 @@ fn names(step: &Step) -> Vec<&str> {
 }
 
 #[test]
+fn tailscale_mode_binds_only_a_tailnet_address() {
+    let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
+    for ok in ["100.64.0.0", "100.64.0.1", "100.100.100.100", "100.127.255.255"] {
+        assert_eq!(tailscale_address(ip(ok)), Ok(ok.parse().unwrap()), "{ok}");
+    }
+    for bad in ["100.63.255.255", "100.128.0.0", "192.168.1.20", "10.0.0.5", "127.0.0.1", "fd7a:115c:a1e0::1", "::1"] {
+        let err = tailscale_address(ip(bad)).unwrap_err();
+        assert!(err.contains("Tailscale isn't connected"), "{bad}");
+    }
+    assert!(tailscale_address(None).unwrap_err().contains("choose Same Wi-Fi"));
+}
+
+#[test]
 fn lan_mode_binds_only_a_private_ipv4_address() {
     let ip = |s: &str| Some(s.parse::<IpAddr>().unwrap());
     for ok in ["192.168.1.20", "10.0.0.5", "172.16.0.1", "172.31.255.254", "100.64.0.1", "100.127.255.1"] {

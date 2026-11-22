@@ -60,11 +60,15 @@ pub(super) enum BridgeCmd {
     /// Under core: h0x-core run --bg --keep -- h0x-core bridge run
     Run,
     /// Serve the web panel until stopped: a page and a WebSocket API for paired devices.
-    /// On 127.0.0.1; --lan: this machine's private network address (plain http).
+    /// On 127.0.0.1; --lan: this machine's private network address (plain http);
+    /// --tailscale: its Tailscale address.
     Web {
         /// Listen on this machine's private LAN address instead of 127.0.0.1.
         #[arg(long)]
         lan: bool,
+        /// Listen on this machine's Tailscale address, so a phone on your tailnet reaches it from anywhere.
+        #[arg(long, conflicts_with_all = ["lan", "via"])]
+        tailscale: bool,
         /// The port (0: any free one).
         #[arg(long, default_value_t = crate::bridge::web::PORT)]
         port: u16,
@@ -275,7 +279,7 @@ pub(super) fn bridge(paths: &Paths, action: BridgeCmd, json: bool) -> Result<Out
                 if Bridge::secrets_in_file() { " (no usable OS secret store: kept in an owner-only file)" } else { "" };
             Out { json: json!({"telegram_token": "set"}), human: format!("telegram token stored{note}") }
         }
-        BridgeCmd::Web { lan, port, via, public_host, remote_port, tunnel, how } => {
+        BridgeCmd::Web { lan, tailscale, port, via, public_host, remote_port, tunnel, how } => {
             let via = match (via, public_host) {
                 (Some(machine), Some(host)) => {
                     Some(crate::bridge::web::vps::plan(paths, &machine, &host, remote_port)?)
@@ -285,7 +289,7 @@ pub(super) fn bridge(paths: &Paths, action: BridgeCmd, json: bool) -> Result<Out
             if tunnel {
                 cloudflared(how.yes)?;
             }
-            crate::bridge::web::run(paths, lan, port, via, tunnel.then_some(how.minutes), json)?;
+            crate::bridge::web::run(paths, lan, tailscale, port, via, tunnel.then_some(how.minutes), json)?;
             Out { json: Value::Null, human: String::new() }
         }
         BridgeCmd::Tunnel { action: TunnelCmd::On { how } } => {

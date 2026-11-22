@@ -114,7 +114,7 @@ Commands:
   telegram  The Telegram bot's settings
   spaces    Store the app's saved spaces for the bot's /projects: a JSON file of [{"name": "...", "folder": "/absolute/path"}] (at most 1000), or --clear
   run       Run the Telegram bot until stopped: answers paired accounts, sends notices. Under core: h0x-core run --bg --keep -- h0x-core bridge run
-  web       Serve the web panel until stopped: a page and a WebSocket API for paired devices. On 127.0.0.1; --lan: this machine's private network address (plain http)
+  web       Serve the web panel until stopped: a page and a WebSocket API for paired devices. On 127.0.0.1; --lan: this machine's private network address (plain http); --tailscale: its Tailscale address
   tunnel    Turn "access from anywhere" (a Cloudflare tunnel) on or off for the running web panel
   help      Print this message or the help of the given subcommand(s)
 
@@ -330,13 +330,14 @@ Options:
 ## h0x-core bridge web
 
 ```text
-Serve the web panel until stopped: a page and a WebSocket API for paired devices. On 127.0.0.1; --lan: this machine's private network address (plain http)
+Serve the web panel until stopped: a page and a WebSocket API for paired devices. On 127.0.0.1; --lan: this machine's private network address (plain http); --tailscale: its Tailscale address
 
 Usage: h0x-core bridge web [OPTIONS]
 
 Options:
       --json                       JSON output even in a terminal
       --lan                        Listen on this machine's private LAN address instead of 127.0.0.1
+      --tailscale                  Listen on this machine's Tailscale address, so a phone on your tailnet reaches it from anywhere
       --port <PORT>                The port (0: any free one) [default: 8377]
       --via <MACHINE>              Reach it through your VPS: the name of an ssh machine (`machine add`). Opens a reverse port on the server's loopback; your HTTPS proxy there serves it
       --public-host <PUBLIC_HOST>  The DNS name your HTTPS proxy serves, for the pairing link
