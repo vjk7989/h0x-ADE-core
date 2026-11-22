@@ -77,6 +77,7 @@ The desktop app's Settings page drives the same commands; they all print JSON wi
 h0x-core bridge web          # on 127.0.0.1:8377, this machine only
 h0x-core bridge web --lan    # on this machine's private network address, for a phone on the same Wi-Fi
 h0x-core run --bg --keep -- h0x-core bridge web --lan   # under core, so it keeps running
+h0x-core bridge web --tailscale   # on this machine's Tailscale address, for a phone on your tailnet from anywhere
 ```
 
 When it starts, it prints the panel's address and a one-time pairing link, as text and as a QR code to scan.
