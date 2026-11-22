@@ -1,6 +1,7 @@
 //! `h0x-core handoff`: a Claude Code SessionStart hook for `/clear`. It reads the hook event on
 //! stdin, finds the session that was just cleared (the newest other transcript beside the new
-//! one, written before the new one began), and prints a compact package of what that session did as extra context: no model call.
+//! one, written before the new one began), and prints a compact package of what that session did
+//! as extra context: no model call.
 //! It never fails: any problem is no output with exit 0.
 
 use serde_json::{Value, json};
