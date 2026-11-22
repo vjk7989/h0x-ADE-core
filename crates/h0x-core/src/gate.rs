@@ -1778,7 +1778,7 @@ mod tests {
 
     /// A pretty JSON document over the limit built around `fields`, padded with array items.
     fn big_json(fields: &str) -> String {
-        format!("{{{fields}, \"pad\": [{}]}}", vec!["1"; 4500].join(", "))
+        format!("{{{fields}, \"pad\": [{}]}}", vec!["1"; 3500].join(", "))
     }
 
     #[test]
