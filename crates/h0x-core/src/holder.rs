@@ -190,11 +190,39 @@ impl Holder {
 
     /// Writes one core's frames in order; a failed write means that core is gone.
     fn write_to_core(&self, generation: u64, mut stream: Stream, frames: Receiver<Vec<u8>>, backlog: Arc<Backlog>) {
-        for frame in frames {
-            if stream.write_all(&frame).is_err() {
+        const BATCH_BYTES: usize = 64 * 1024;
+        let mut batch = Vec::new();
+        let mut next = frames.recv().ok();
+        while let Some(frame) = next.take() {
+            // Frames of BATCH_BYTES or more are never copied; a lone frame is written as is.
+            let second = if frame.len() >= BATCH_BYTES { None } else { frames.try_recv().ok() };
+            let out: &[u8] = match second {
+                None => &frame,
+                Some(mut more) => {
+                    batch.clear();
+                    batch.extend_from_slice(&frame);
+                    loop {
+                        if more.len() >= BATCH_BYTES || batch.len() >= BATCH_BYTES {
+                            next = Some(more);
+                            break;
+                        }
+                        batch.extend_from_slice(&more);
+                        match frames.try_recv() {
+                            Ok(f) => more = f,
+                            Err(_) => break,
+                        }
+                    }
+                    &batch
+                }
+            };
+            if stream.write_all(out).is_err() {
                 break;
             }
-            backlog.update(|b| *b = b.map(|n| n.saturating_sub(frame.len())));
+            let written = out.len();
+            backlog.update(|b| *b = b.map(|n| n.saturating_sub(written)));
+            if next.is_none() {
+                next = frames.recv().ok();
+            }
         }
         backlog.update(|b| *b = None);
         let mut st = self.lock();
@@ -592,5 +620,248 @@ mod tests {
                 });
             }
         }
+    }
+
+    const BATCH: usize = 64 * 1024;
+
+    /// A connected (writer, reader) pair: a named pipe on Windows, a socket pair on Unix.
+    fn linked() -> (Stream, Stream) {
+        #[cfg(unix)]
+        {
+            std::os::unix::net::UnixStream::pair().unwrap()
+        }
+        #[cfg(windows)]
+        {
+            let socket = std::path::PathBuf::from(format!(r"\\.\pipe\h0x-core-test-{}", crate::platform::random_hex()));
+            let listener = platform::listen(&socket).unwrap();
+            let writer = platform::connect(&socket).unwrap();
+            let reader = listener.incoming().next().unwrap().unwrap();
+            (writer, reader)
+        }
+    }
+
+    fn backlog(bytes: Option<usize>) -> Arc<Backlog> {
+        Arc::new(Backlog { bytes: Mutex::new(bytes), changed: Condvar::new() })
+    }
+
+    fn queued(backlog: &Backlog) -> Option<usize> {
+        *backlog.bytes.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn test_holder(generation: u64, core: Option<Core>) -> Arc<Holder> {
+        let none = std::path::PathBuf::new();
+        Arc::new(Holder {
+            state: Mutex::new(State {
+                terms: HashMap::new(),
+                core,
+                generation,
+                previous: "",
+                core_left: Instant::now(),
+                restarts: Vec::new(),
+            }),
+            changed: Condvar::new(),
+            instance: "test".into(),
+            grace: Duration::ZERO,
+            paths: Paths {
+                socket: none.clone(),
+                holder_socket: none.clone(),
+                state: none.clone(),
+                config: none.clone(),
+            },
+            socket: none,
+            draining: std::sync::atomic::AtomicBool::new(false),
+            sweeps: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// `len` bytes whose pattern depends on `seed`, so a swapped or cut frame shows.
+    fn patterned(len: usize, seed: u8) -> Vec<u8> {
+        (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+    }
+
+    /// Queues `frames` through `to_core` (on top of `extra` bytes owed elsewhere)
+    /// before the writer starts, so it has to batch them. Returns everything the
+    /// reader got until the writer closed, and the backlog once it settled at `extra`.
+    fn deliver(frames: &[Vec<u8>], extra: usize) -> (Vec<u8>, Option<usize>) {
+        let (writer, mut reader) = linked();
+        let (sender, frames_rx) = std::sync::mpsc::channel();
+        let owed = backlog(Some(extra));
+        let core = Core { generation: 1, frames: sender, backlog: owed.clone(), stream: writer.try_clone().unwrap() };
+        let holder = test_holder(1, Some(core));
+        {
+            let mut st = holder.lock();
+            for frame in frames {
+                holder.to_core(&mut st, frame.clone());
+            }
+        }
+        let reading = std::thread::spawn(move || {
+            let mut got = Vec::new();
+            reader.read_to_end(&mut got).map(|_| got)
+        });
+        let (writing_holder, written) = (holder.clone(), owed.clone());
+        let writing = std::thread::spawn(move || writing_holder.write_to_core(1, writer, frames_rx, written));
+        owed.wait(extra, Duration::from_secs(30));
+        let left = queued(&owed);
+        // Closing the sender ends the writer, which closes the link for the reader.
+        drop(holder.lock().core.take());
+        writing.join().unwrap();
+        (reading.join().unwrap().unwrap(), left)
+    }
+
+    #[test]
+    fn batched_frames_of_mixed_sizes_reach_the_core_byte_for_byte_in_order() {
+        let mut frames = vec![Vec::new(), patterned(1, 1), patterned(3, 2), Vec::new()];
+        frames.extend((0..5000).map(|i| patterned(1 + i % 7, i as u8)));
+        frames.extend([
+            patterned(BATCH - 1, 3),
+            patterned(2, 4),
+            patterned(BATCH * 3 + 5, 5),
+            Vec::new(),
+            patterned(9, 6),
+        ]);
+        let (got, left) = deliver(&frames, 3);
+        assert_eq!(got.len(), frames.iter().map(Vec::len).sum::<usize>());
+        assert!(got == frames.concat(), "the core got the frames out of order or altered");
+        assert_eq!(left, Some(3), "the backlog must drop by exactly what was written");
+    }
+
+    #[test]
+    fn frames_on_the_batch_boundary_are_neither_split_nor_reordered() {
+        let frames = [
+            patterned(BATCH, 1),
+            patterned(1, 2),
+            patterned(BATCH + 1, 3),
+            patterned(1, 4),
+            patterned(BATCH - 1, 5),
+            patterned(1, 6),
+            patterned(1, 7),
+        ];
+        let (got, left) = deliver(&frames, 1);
+        assert!(got == frames.concat(), "frames around 64 KiB arrived altered");
+        assert_eq!(left, Some(1));
+    }
+
+    #[test]
+    fn a_single_frame_far_over_the_batch_size_goes_out_whole() {
+        let frames = [patterned(BACKLOG_BYTES + 1, 9), patterned(2, 1)];
+        let (got, left) = deliver(&frames, 0);
+        assert!(got == frames.concat(), "a huge frame was cut or reordered");
+        assert_eq!(left, Some(0));
+    }
+
+    #[test]
+    fn only_empty_frames_write_nothing_and_leave_the_backlog_as_it_was() {
+        let (got, left) = deliver(&[Vec::new(), Vec::new(), Vec::new()], 2);
+        assert!(got.is_empty());
+        assert_eq!(left, Some(2));
+    }
+
+    #[test]
+    fn the_shutdown_wait_sees_the_backlog_drain_to_zero() {
+        let mut frames: Vec<Vec<u8>> = (0..200).map(|i| patterned(700 + i, i as u8)).collect();
+        frames.push(proto::frame(proto::BYE, 0, &[]));
+        let (got, left) = deliver(&frames, 0);
+        assert_eq!(left, Some(0), "backlog.wait(0) before a shutdown must see zero");
+        assert!(got.ends_with(&proto::frame(proto::BYE, 0, &[])), "BYE must arrive last");
+        assert!(got == frames.concat());
+    }
+
+    #[test]
+    fn a_lone_frame_is_written_without_waiting_for_more() {
+        let (writer, mut reader) = linked();
+        let (sender, frames_rx) = std::sync::mpsc::channel();
+        let owed = backlog(Some(0));
+        let core = Core { generation: 1, frames: sender, backlog: owed.clone(), stream: writer.try_clone().unwrap() };
+        let holder = test_holder(1, Some(core));
+        let (writing_holder, written) = (holder.clone(), owed.clone());
+        let writing = std::thread::spawn(move || writing_holder.write_to_core(1, writer, frames_rx, written));
+        // The writer is already waiting on an empty queue when the frame comes.
+        std::thread::sleep(Duration::from_millis(50));
+        holder.to_core(&mut holder.lock(), patterned(5, 1));
+        let (got_tx, got_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut got = [0u8; 5];
+            let _ = got_tx.send(reader.read_exact(&mut got).map(|_| got));
+        });
+        let got = got_rx.recv_timeout(Duration::from_secs(10)).expect("a lone frame must go out at once").unwrap();
+        assert_eq!(got.to_vec(), patterned(5, 1));
+        owed.wait(0, Duration::from_secs(10));
+        assert_eq!(queued(&owed), Some(0));
+        drop(holder.lock().core.take());
+        writing.join().unwrap();
+    }
+
+    #[test]
+    fn a_failed_write_drops_the_backlog_and_runs_the_crash_path() {
+        let (writer, reader) = linked();
+        drop(reader);
+        let (sender, frames_rx) = std::sync::mpsc::channel();
+        let owed = backlog(Some(0));
+        let core = Core { generation: 1, frames: sender, backlog: owed.clone(), stream: writer.try_clone().unwrap() };
+        let holder = test_holder(1, Some(core));
+        {
+            let mut st = holder.lock();
+            for (i, len) in [10, BATCH, 1, BATCH + 1, 3].into_iter().enumerate() {
+                holder.to_core(&mut st, patterned(len, i as u8));
+            }
+        }
+        let (writing_holder, written) = (holder.clone(), owed.clone());
+        // The sender stays open in the core: only the failed write can end the writer.
+        let writing = std::thread::spawn(move || writing_holder.write_to_core(1, writer, frames_rx, written));
+        owed.wait(0, Duration::from_secs(10));
+        assert_eq!(queued(&owed), None, "a failed write must stop counting the backlog");
+        writing.join().unwrap();
+        let st = holder.lock();
+        assert!(st.core.is_none(), "the core whose write failed must be gone");
+        assert_eq!(st.previous, "crash");
+    }
+
+    #[test]
+    fn a_stale_writer_failing_leaves_the_newer_core_alone() {
+        let (writer, reader) = linked();
+        drop(reader);
+        let (newer_tx, _newer_rx) = std::sync::mpsc::channel();
+        let (newer_stream, _newer_reader) = linked();
+        let newer = Core { generation: 2, frames: newer_tx, backlog: backlog(Some(0)), stream: newer_stream };
+        let holder = test_holder(2, Some(newer));
+        let (stale_tx, stale_rx) = std::sync::mpsc::channel();
+        stale_tx.send(patterned(BATCH + 1, 1)).unwrap();
+        let owed = backlog(Some(BATCH + 1));
+        let (writing_holder, written) = (holder.clone(), owed.clone());
+        let writing = std::thread::spawn(move || writing_holder.write_to_core(1, writer, stale_rx, written));
+        owed.wait(0, Duration::from_secs(10));
+        assert_eq!(queued(&owed), None);
+        writing.join().unwrap();
+        let st = holder.lock();
+        assert_eq!(st.core.as_ref().map(|c| c.generation), Some(2));
+        assert_eq!(st.previous, "");
+        drop(stale_tx);
+    }
+
+    #[test]
+    fn frames_queued_before_a_handover_are_all_written() {
+        let (writer, mut reader) = linked();
+        let (sender, frames_rx) = std::sync::mpsc::channel();
+        let owed = backlog(Some(0));
+        let core = Core { generation: 1, frames: sender, backlog: owed.clone(), stream: writer.try_clone().unwrap() };
+        let holder = test_holder(1, Some(core));
+        let mut frames: Vec<Vec<u8>> = (0..300).map(|i| patterned(1 + i * 37 % 2000, i as u8)).collect();
+        frames.extend([Vec::new(), patterned(BATCH + 7, 7), proto::frame(proto::BYE, 0, &[])]);
+        {
+            let mut st = holder.lock();
+            for frame in &frames {
+                holder.to_core(&mut st, frame.clone());
+            }
+            // Drops the core's sender: everything is queued before the writer even starts.
+            holder.core_gone(&mut st, "handover");
+        }
+        assert_eq!(queued(&owed), None, "a handover no longer holds programs back");
+        let (writing_holder, written) = (holder.clone(), owed);
+        let writing = std::thread::spawn(move || writing_holder.write_to_core(1, writer, frames_rx, written));
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+        writing.join().unwrap();
+        assert!(got == frames.concat(), "frames queued before the handover were lost or reordered");
+        assert_eq!(holder.lock().previous, "handover", "a clean end must not count as a crash");
     }
 }
