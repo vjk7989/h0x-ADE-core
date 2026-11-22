@@ -71,11 +71,20 @@ pub fn lan_address(found: Option<IpAddr>) -> Result<Ipv4Addr, String> {
     }
 }
 
-/// The address this machine would reach the internet from. A UDP "connect"
+/// The address `--tailscale` binds: the one the OS routes Tailscale's service IP
+/// (100.100.100.100) from, only if it is in Tailscale's 100.64.0.0/10 range.
+pub fn tailscale_address(found: Option<IpAddr>) -> Result<Ipv4Addr, String> {
+    match found {
+        Some(IpAddr::V4(ip)) if ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64 => Ok(ip),
+        _ => Err("Tailscale isn't connected on this computer; start Tailscale or choose Same Wi-Fi".into()),
+    }
+}
+
+/// The address this machine would reach `target` from. A UDP "connect"
 /// sends nothing; it only picks the route.
-fn outbound_ip() -> Option<IpAddr> {
+fn outbound_ip(target: &str) -> Option<IpAddr> {
     let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("192.0.2.1:9").ok()?;
+    socket.connect(target).ok()?;
     Some(socket.local_addr().ok()?.ip())
 }
 
@@ -790,13 +799,20 @@ async fn serve(listener: tokio::net::TcpListener, web: Arc<Web>) {
 pub fn run(
     paths: &Paths,
     lan: bool,
+    tailscale: bool,
     port: u16,
     via: Option<vps::Vps>,
     tunnel: Option<u64>,
     json: bool,
 ) -> Result<(), RpcError> {
     let failed = |e: String| RpcError::new("bridge", e, "see docs/bridge.md, Web panel");
-    let ip = if lan { lan_address(outbound_ip()).map_err(failed)? } else { Ipv4Addr::LOCALHOST };
+    let ip = if lan {
+        lan_address(outbound_ip("192.0.2.1:9")).map_err(failed)?
+    } else if tailscale {
+        tailscale_address(outbound_ip("100.100.100.100:9")).map_err(failed)?
+    } else {
+        Ipv4Addr::LOCALHOST
+    };
     let bridge = Bridge::open(paths)?;
     let key = server_key(&bridge)?;
     let listener = std::net::TcpListener::bind((ip, port)).map_err(|e| failed(format!("{ip}:{port}: {e}")))?;
