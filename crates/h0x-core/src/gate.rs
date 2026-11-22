@@ -185,13 +185,14 @@ fn shrink(ev: &Value, text: &str, bytes: usize) -> Option<String> {
     };
     if bytes > LIMIT
         && let Some(v) = &parsed
+        && !reencode_lossy(text)
     {
         let (t, tsv) = reencode(v);
         if t.len() < bytes && t.len() <= LIMIT {
             let how = if tsv { "TSV; empty cell = key absent, \"quoted\" cell = JSON string" } else { "compact JSON" };
             let kb = bytes as f64 / 1024.0;
             return Some(format!(
-                "[HyperOx Token Saver: this command printed JSON ({kb:.1} KB); shown re-encoded losslessly as {how}]\n{t}"
+                "[HyperOx Token Saver: this command printed JSON ({kb:.1} KB); shown re-encoded as {how}; keys sorted]\n{t}"
             ));
         }
     }
@@ -226,6 +227,62 @@ fn shrink(ev: &Value, text: &str, bytes: usize) -> Option<String> {
         text.split('\n').count()
     );
     Some(format!("{note}\n{body}"))
+}
+
+/// Whether re-encoding `text` through serde_json would change it beyond key order: a number with
+/// more than 15 significant digits (rounded to an f64) or an object with a repeated key (merged).
+fn reencode_lossy(text: &str) -> bool {
+    let b = text.as_bytes();
+    let mut keys: Vec<Vec<String>> = Vec::new(); // one key list per open object; None-like for arrays
+    let mut is_obj: Vec<bool> = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'"' => {
+                let start = i;
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+                let after = text[i.min(b.len())..].trim_start().as_bytes().first().copied();
+                if after == Some(b':')
+                    && is_obj.last() == Some(&true)
+                    && let Some(k) = text.get(start..i).and_then(|raw| serde_json::from_str::<String>(raw).ok())
+                {
+                    let seen = keys.last_mut().expect("object is open");
+                    if seen.contains(&k) {
+                        return true;
+                    }
+                    seen.push(k);
+                }
+                continue;
+            }
+            b'{' | b'[' => {
+                is_obj.push(b[i] == b'{');
+                keys.push(Vec::new());
+            }
+            b'}' | b']' => {
+                is_obj.pop();
+                keys.pop();
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                while i < b.len() && matches!(b[i], b'-' | b'+' | b'.' | b'0'..=b'9' | b'e' | b'E') {
+                    i += 1;
+                }
+                let mantissa = text[start..i].split(['e', 'E']).next().unwrap_or_default();
+                let digits = mantissa.bytes().filter(u8::is_ascii_digit).skip_while(|d| *d == b'0').count();
+                if digits > 15 {
+                    return true;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 /// JSON as TSV (an array of objects, or an object holding one), else compact JSON.
@@ -1039,7 +1096,7 @@ mod tests {
         assert_eq!(
             note,
             format!(
-                "[HyperOx Token Saver: this command printed JSON ({kb:.1} KB); shown re-encoded losslessly as TSV; empty cell = key absent, \"quoted\" cell = JSON string]"
+                "[HyperOx Token Saver: this command printed JSON ({kb:.1} KB); shown re-encoded as TSV; empty cell = key absent, \"quoted\" cell = JSON string; keys sorted]"
             )
         );
         let lines: Vec<&str> = tsv.split('\n').collect();
@@ -1068,7 +1125,7 @@ mod tests {
         let doc = serde_json::to_string_pretty(&json!({"a": vec![1; 4000], "b": {"c": "d"}})).unwrap();
         let out = shown(process(&bash(&doc)));
         assert!(out.starts_with("[HyperOx Token Saver: this command printed JSON ("), "{out}");
-        assert!(out.contains("); shown re-encoded losslessly as compact JSON]\n{"), "{out}");
+        assert!(out.contains("); shown re-encoded as compact JSON; keys sorted]\n{"), "{out}");
     }
 
     #[test]
@@ -1229,7 +1286,9 @@ mod tests {
 
     fn json_note(bytes: usize, how: &str) -> String {
         let kb = bytes as f64 / 1024.0;
-        format!("[HyperOx Token Saver: this command printed JSON ({kb:.1} KB); shown re-encoded losslessly as {how}]\n")
+        format!(
+            "[HyperOx Token Saver: this command printed JSON ({kb:.1} KB); shown re-encoded as {how}; keys sorted]\n"
+        )
     }
 
     #[test]
@@ -1276,7 +1335,7 @@ mod tests {
         let out = shown(process(&bash(&doc)));
         let (note, _) = out.split_once('\n').unwrap();
         assert!(note.starts_with("[HyperOx Token Saver: this command printed JSON ("), "{note}");
-        assert!(note.contains(" KB); shown re-encoded losslessly as TSV;"), "{note}");
+        assert!(note.contains(" KB); shown re-encoded as TSV;"), "{note}");
     }
 
     #[test]
@@ -1292,7 +1351,7 @@ mod tests {
         assert_eq!(process(&bash(&padded(LIMIT))), None, "8192 bytes with CRLF stay as they are");
         let compact = serde_json::from_str::<Value>(&doc).unwrap().to_string();
         let want = format!(
-            "[HyperOx Token Saver: this command printed JSON (8.0 KB); shown re-encoded losslessly as compact JSON]\n{compact}"
+            "[HyperOx Token Saver: this command printed JSON (8.0 KB); shown re-encoded as compact JSON; keys sorted]\n{compact}"
         );
         assert_eq!(shown(process(&bash(&padded(LIMIT + 1)))), want);
     }
@@ -1715,5 +1774,54 @@ mod tests {
             assert_eq!(untsv(cell).as_ref(), Some(want), "row {i}: cell {cell:?}");
         }
         assert_eq!(untsv(lines[values.len() + 1].split('\t').nth(col).unwrap()), None, "absent key");
+    }
+
+    /// A pretty JSON document over the limit built around `fields`, padded with array items.
+    fn big_json(fields: &str) -> String {
+        format!("{{{fields}, \"pad\": [{}]}}", vec!["1"; 3500].join(", "))
+    }
+
+    #[test]
+    fn json_with_a_big_integer_is_not_re_encoded() {
+        let doc = big_json("\"id\": 1000000000000000000001");
+        assert!(doc.len() > LIMIT);
+        let out = shown(process(&bash(&doc)));
+        assert!(!out.contains("re-encoded"), "{out}");
+        assert!(out.contains("JSON head and tail"), "{out}");
+    }
+
+    #[test]
+    fn json_with_a_long_decimal_is_not_re_encoded() {
+        let doc = big_json("\"x\": 0.1234567890123456789");
+        assert!(!shown(process(&bash(&doc))).contains("re-encoded"));
+    }
+
+    #[test]
+    fn json_with_a_15_digit_number_is_still_re_encoded() {
+        let doc = big_json("\"id\": 123456789012345, \"f\": 0.00123456789012345, \"e\": 1.5e300");
+        let out = shown(process(&bash(&doc)));
+        assert!(out.contains("shown re-encoded as compact JSON; keys sorted]"), "{out}");
+    }
+
+    #[test]
+    fn digits_inside_strings_do_not_block_re_encoding() {
+        let doc = big_json("\"s\": \"1000000000000000000001 \\\" 22222222222222222\"");
+        assert!(shown(process(&bash(&doc))).contains("shown re-encoded as"));
+    }
+
+    #[test]
+    fn json_with_duplicate_keys_is_not_re_encoded() {
+        let doc = big_json("\"a\": 1, \"b\": 2, \"a\": 3");
+        assert!(!shown(process(&bash(&doc))).contains("re-encoded"));
+        let nested = big_json("\"o\": {\"k\": 1, \"k\": 2}");
+        assert!(!shown(process(&bash(&nested))).contains("re-encoded"));
+    }
+
+    #[test]
+    fn the_same_key_in_different_objects_is_not_a_duplicate() {
+        let doc = big_json("\"a\": {\"k\": 1}, \"b\": {\"k\": 2}, \"c\": [{\"k\": 1}, {\"k\": 2}]");
+        assert!(shown(process(&bash(&doc))).contains("shown re-encoded as"));
+        assert!(!reencode_lossy("{\"a\": \"x\", \"a\\u0062\": 1}"));
+        assert!(reencode_lossy("{\"b\": 1, \"\\u0062\": 1}"));
     }
 }

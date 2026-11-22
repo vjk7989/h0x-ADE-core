@@ -1,11 +1,13 @@
 //! `h0x-core handoff`: a Claude Code SessionStart hook for `/clear`. It reads the hook event on
 //! stdin, finds the session that was just cleared (the newest other transcript beside the new
-//! one), and prints a compact package of what that session did as extra context: no model call.
+//! one, written before the new one began), and prints a compact package of what that session did
+//! as extra context: no model call.
 //! It never fails: any problem is no output with exit 0.
 
 use serde_json::{Value, json};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 /// The package, in bytes.
 const MAX_PACKAGE: usize = 3000;
@@ -44,13 +46,24 @@ fn output(event: &[u8]) -> Option<String> {
     if current.is_dir() {
         return None;
     }
-    let previous = previous_transcript(current, ev["session_id"].as_str())?;
+    let previous = previous_transcript(current, ev["session_id"].as_str(), started(current))?;
     let package = package(&read_tail(&previous)?)?;
     Some(json!({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": package}}).to_string())
 }
 
-/// The newest `*.jsonl` beside `current`, other than the current session's own file.
-fn previous_transcript(current: &Path, session_id: Option<&str>) -> Option<PathBuf> {
+/// When the new session's transcript was created (else last written); a little ago when it does
+/// not exist yet.
+fn started(current: &Path) -> SystemTime {
+    let meta = std::fs::metadata(current);
+    meta.as_ref()
+        .ok()
+        .and_then(|m| m.created().or_else(|_| m.modified()).ok())
+        .unwrap_or_else(|| SystemTime::now() - Duration::from_secs(2))
+}
+
+/// The newest `*.jsonl` beside `current` that was last written before `started`, other than the
+/// current session's own file: a session still running in the same folder is not the cleared one.
+fn previous_transcript(current: &Path, session_id: Option<&str>, started: SystemTime) -> Option<PathBuf> {
     let dir = current.parent()?;
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
@@ -60,6 +73,9 @@ fn previous_transcript(current: &Path, session_id: Option<&str>) -> Option<PathB
             continue;
         }
         let Ok(modified) = entry.metadata().and_then(|m| m.modified()) else { continue };
+        if modified >= started {
+            continue;
+        }
         if best.as_ref().is_none_or(|(t, p)| (modified, &path) > (*t, p)) {
             best = Some((modified, path));
         }
@@ -501,5 +517,62 @@ mod tests {
         }
         assert_eq!(output(b""), None);
         assert_eq!(output(b"{not json"), None);
+    }
+
+    /// A folder with the given transcripts (name, seconds before `now` they were last written).
+    fn project(tag: &str, files: &[(&str, u64)], now: SystemTime) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("h0x-handoff-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, ago) in files {
+            let f = std::fs::File::create(dir.join(name)).unwrap();
+            f.set_modified(now - Duration::from_secs(*ago)).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn the_newest_transcript_written_before_the_new_one_began_is_the_previous() {
+        let now = SystemTime::now();
+        let dir = project("older", &[("new.jsonl", 0), ("a.jsonl", 100), ("b.jsonl", 50), ("c.jsonl", 200)], now);
+        let got = previous_transcript(&dir.join("new.jsonl"), Some("new"), now - Duration::from_secs(10));
+        assert_eq!(got, Some(dir.join("b.jsonl")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_transcript_modified_after_the_new_one_began_is_a_running_session_not_the_previous() {
+        let now = SystemTime::now();
+        let dir = project("running", &[("new.jsonl", 0), ("live.jsonl", 1), ("old.jsonl", 100)], now);
+        let start = now - Duration::from_secs(10);
+        assert_eq!(previous_transcript(&dir.join("new.jsonl"), Some("new"), start), Some(dir.join("old.jsonl")));
+        // The moment the new one began is itself not "before".
+        let dir2 = project("equal", &[("new.jsonl", 0), ("x.jsonl", 10)], now);
+        assert_eq!(previous_transcript(&dir2.join("new.jsonl"), Some("new"), start), None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn no_older_transcript_gives_nothing() {
+        let now = SystemTime::now();
+        let dir = project("none", &[("new.jsonl", 0), ("live.jsonl", 2), ("notes.txt", 100)], now);
+        let start = now - Duration::from_secs(10);
+        assert_eq!(previous_transcript(&dir.join("new.jsonl"), Some("new"), start), None);
+        let ev =
+            json!({"source": "clear", "transcript_path": dir.join("new.jsonl").to_string_lossy(), "session_id": "new"});
+        assert_eq!(output(ev.to_string().as_bytes()), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_new_transcript_starts_a_moment_ago() {
+        let now = SystemTime::now();
+        let dir = project("missing", &[("old.jsonl", 100), ("live.jsonl", 0)], now);
+        let current = dir.join("new.jsonl");
+        let start = started(&current);
+        assert!(start < SystemTime::now() && start > now - Duration::from_secs(60));
+        assert_eq!(previous_transcript(&current, Some("new"), start), Some(dir.join("old.jsonl")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -153,7 +153,7 @@ pub(super) fn rolled_back_body(message: &str) -> Value {
 /// Replaces `previous_dir` with a copy of the live release: the h0x-core and, on Windows, its ConPTY files.
 fn keep_previous(dest: &std::path::Path) -> std::io::Result<()> {
     let (dir, src) = (previous_dir(dest), dest.parent().unwrap_or(dest));
-    let _ = std::fs::remove_dir_all(&dir);
+    clear_previous(&dir)?;
     let exe = dest.file_name().unwrap_or_default();
     let conpty = ["conpty/conpty.dll", "conpty/x64/OpenConsole.exe"].into_iter().filter(|_| cfg!(windows));
     for rel in std::iter::once(std::path::Path::new(exe)).chain(conpty.map(std::path::Path::new)) {
@@ -165,6 +165,34 @@ fn keep_previous(dest: &std::path::Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Removes an earlier `previous` folder, but only one that holds nothing except what is put there
+/// (h0x-core / h0x-core.exe and a `conpty` folder): the install folder may be shared (`~/.local/bin`),
+/// and a foreign folder named `previous` is left alone with an error.
+fn clear_previous(dir: &std::path::Path) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        let ours = match name.to_str() {
+            Some("h0x-core" | "h0x-core.exe") => entry.file_type()?.is_file(),
+            Some("conpty") => entry.file_type()?.is_dir(),
+            _ => false,
+        };
+        if !ours {
+            return Err(std::io::Error::other(format!(
+                "{} holds {}, which h0x-core did not put there; move or remove that folder",
+                dir.display(),
+                name.to_string_lossy()
+            )));
+        }
+    }
+    std::fs::remove_dir_all(dir)
 }
 
 /// A binary that runs and says it is `release`.
@@ -233,7 +261,8 @@ fn restart_and_check(paths: &Paths, now: &str, before: &[String]) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::{
-        last_good_path, local_terminals, older, previous_dir, previous_exe, release_version, rolled_back_body,
+        clear_previous, keep_previous, last_good_path, local_terminals, older, previous_dir, previous_exe,
+        release_version, rolled_back_body,
     };
     use serde_json::json;
     use std::path::Path;
@@ -279,5 +308,69 @@ mod tests {
         ]});
         assert_eq!(local_terminals(&list), ["t1", "t2"]);
         assert!(local_terminals(&json!({})).is_empty());
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("h0x-update-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_missing_or_empty_previous_folder_is_fine() {
+        let dir = scratch("empty");
+        assert!(clear_previous(&dir.join("previous")).is_ok());
+        std::fs::create_dir(dir.join("previous")).unwrap();
+        assert!(clear_previous(&dir.join("previous")).is_ok());
+        assert!(!dir.join("previous").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_previous_folder_with_only_our_files_is_replaced() {
+        let dir = scratch("ours");
+        let prev = dir.join("previous");
+        std::fs::create_dir_all(prev.join("conpty/x64")).unwrap();
+        std::fs::write(prev.join("h0x-core"), "old").unwrap();
+        std::fs::write(prev.join("h0x-core.exe"), "old").unwrap();
+        std::fs::write(prev.join("conpty/conpty.dll"), "old").unwrap();
+        std::fs::write(dir.join("h0x-core"), "live").unwrap();
+        keep_previous(&dir.join("h0x-core")).unwrap();
+        assert_eq!(std::fs::read_to_string(prev.join("h0x-core")).unwrap(), "live");
+        assert!(!prev.join("h0x-core.exe").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_foreign_previous_folder_is_refused_and_left_alone() {
+        for foreign in ["notes.txt", "h0x-core.bak", "other/deep.txt"] {
+            let dir = scratch("foreign");
+            let prev = dir.join("previous");
+            std::fs::create_dir_all(prev.join("conpty")).unwrap();
+            std::fs::write(prev.join("h0x-core"), "old").unwrap();
+            let file = prev.join(foreign);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "mine").unwrap();
+            std::fs::write(dir.join("h0x-core"), "live").unwrap();
+            let err = keep_previous(&dir.join("h0x-core")).unwrap_err();
+            assert!(err.to_string().contains("did not put there"), "{foreign}: {err}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "mine", "{foreign}");
+            assert_eq!(std::fs::read_to_string(prev.join("h0x-core")).unwrap(), "old", "{foreign}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_previous_that_is_a_file_or_a_folder_named_like_our_binary_is_refused() {
+        let dir = scratch("odd");
+        std::fs::write(dir.join("previous"), "a file").unwrap();
+        assert!(clear_previous(&dir.join("previous")).is_err());
+        assert!(dir.join("previous").is_file());
+        std::fs::remove_file(dir.join("previous")).unwrap();
+        std::fs::create_dir_all(dir.join("previous/h0x-core")).unwrap();
+        assert!(clear_previous(&dir.join("previous")).is_err());
+        assert!(dir.join("previous/h0x-core").is_dir());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
