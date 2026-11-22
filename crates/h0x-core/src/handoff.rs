@@ -559,7 +559,8 @@ mod tests {
         let dir = project("none", &[("new.jsonl", 0), ("live.jsonl", 2), ("notes.txt", 100)], now);
         let start = now - Duration::from_secs(10);
         assert_eq!(previous_transcript(&dir.join("new.jsonl"), Some("new"), start), None);
-        let ev = json!({"source": "clear", "transcript_path": dir.join("new.jsonl").to_string_lossy(), "session_id": "new"});
+        let ev =
+            json!({"source": "clear", "transcript_path": dir.join("new.jsonl").to_string_lossy(), "session_id": "new"});
         assert_eq!(output(ev.to_string().as_bytes()), None);
         let _ = std::fs::remove_dir_all(&dir);
     }

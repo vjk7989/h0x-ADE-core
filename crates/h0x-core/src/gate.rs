@@ -1286,7 +1286,9 @@ mod tests {
 
     fn json_note(bytes: usize, how: &str) -> String {
         let kb = bytes as f64 / 1024.0;
-        format!("[HyperOx Token Saver: this command printed JSON ({kb:.1} KB); shown re-encoded as {how}; keys sorted]\n")
+        format!(
+            "[HyperOx Token Saver: this command printed JSON ({kb:.1} KB); shown re-encoded as {how}; keys sorted]\n"
+        )
     }
 
     #[test]
@@ -1776,10 +1778,7 @@ mod tests {
 
     /// A pretty JSON document over the limit built around `fields`, padded with array items.
     fn big_json(fields: &str) -> String {
-        format!("{{
-  {fields},
-  \"pad\": [{}]
-}}", vec!["1"; 4500].join(", "))
+        format!("{{{fields}, \"pad\": [{}]}}", vec!["1"; 4500].join(", "))
     }
 
     #[test]
