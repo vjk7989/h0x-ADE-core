@@ -785,6 +785,20 @@ async fn read_frame(rd: &mut tokio::net::tcp::OwnedReadHalf) -> (u8, Vec<u8>) {
     (b0 & 0x0f, payload)
 }
 
+/// Waits for `fut` without ever idling the runtime. An idle paused runtime jumps its clock
+/// ahead, and the server's auth runs on a blocking thread, so on a slow machine the clock would
+/// move (heartbeats, deadlines) before the work being waited on returns.
+async fn spinning<T>(fut: impl std::future::Future<Output = T>) -> T {
+    let mut fut = Box::pin(fut);
+    loop {
+        tokio::select! {
+            biased;
+            out = &mut fut => break out,
+            () = tokio::task::yield_now() => {}
+        }
+    }
+}
+
 /// Like [`on_a_paused_clock`], with a device that says hello and then `first`
 /// sealed, as the page does. What the server said after its hello, each sealed
 /// message opened, and how much (virtual) time that took.
@@ -806,22 +820,28 @@ fn on_a_paused_clock_secure(
         server.readable().await.unwrap();
         let start = tokio::time::Instant::now();
         let served = tokio::spawn(connection(server, f.web.clone()));
-        let mut head = Vec::new();
-        while !head.ends_with(b"\r\n\r\n") {
-            head.push(rd.read_u8().await.unwrap());
-        }
-        let (opcode, hello) = read_frame(&mut rd).await;
+        // The handshake and the server's first answer arrive with the clock held, so the
+        // measured wait starts where the server's deadline does.
+        let (opcode, hello) = spinning(async {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(rd.read_u8().await.unwrap());
+            }
+            read_frame(&mut rd).await
+        })
+        .await;
         assert_eq!(opcode, 1);
         let mut chan = pending.finish(&hello, &f.web.key.fp()).unwrap();
         let sealed = chan.seal(first.to_string().as_bytes()).unwrap();
         wr.write_all(&http::client_frame(2, &sealed)).await.unwrap();
+        let answer = spinning(read_frame(&mut rd)).await;
         let mut heard = Vec::new();
         rd.read_to_end(&mut heard).await.unwrap();
         let took = start.elapsed();
         served.await.unwrap();
         drop(wr);
-        let frames = frames_from(&heard)
-            .into_iter()
+        let frames = std::iter::once(answer)
+            .chain(frames_from(&heard))
             .map(|(op, payload)| if op == 2 { (op, chan.open(&payload).unwrap()) } else { (op, payload) })
             .collect();
         (frames, took)
@@ -1850,25 +1870,21 @@ fn an_open_socket_closes_at_the_next_heartbeat_once_its_session_turns_thirty_day
         server.readable().await.unwrap();
         let start = tokio::time::Instant::now();
         let served = tokio::spawn(connection(server, f.web.clone()));
-        let mut head = Vec::new();
-        while !head.ends_with(b"\r\n\r\n") {
-            head.push(rd.read_u8().await.unwrap());
-        }
-        let (_, hello) = read_frame(&mut rd).await;
+        let (_, hello) = spinning(async {
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(rd.read_u8().await.unwrap());
+            }
+            read_frame(&mut rd).await
+        })
+        .await;
         let mut chan = pending.finish(&hello, &f.web.key.fp()).unwrap();
         wr.write_all(&http::client_frame(2, &chan.seal(auth.to_string().as_bytes()).unwrap())).await.unwrap();
         // Authenticated: the snapshot has arrived. The wait spins instead of idling: an idle
         // paused runtime jumps the clock ahead, and the server would run its heartbeats before
         // the session below is aged.
         loop {
-            let mut next = Box::pin(read_frame(&mut rd));
-            let (op, payload) = loop {
-                tokio::select! {
-                    biased;
-                    frame = &mut next => break frame,
-                    () = tokio::task::yield_now() => {}
-                }
-            };
+            let (op, payload) = spinning(read_frame(&mut rd)).await;
             assert_eq!(op, 2);
             let msg: Value = serde_json::from_slice(&chan.open(&payload).unwrap()).unwrap();
             if msg["name"] == "snapshot" {
