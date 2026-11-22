@@ -11,8 +11,10 @@ use std::path::{Path, PathBuf};
 const MAX_PACKAGE: usize = 3000;
 /// How much of the end of a transcript is read.
 const TAIL: u64 = 2 * 1024 * 1024;
-/// The most requests shown in the objective and findings (fewer when the package would not fit).
+/// The most requests shown in the objective and findings: the first and the latest ones.
 const TURNS: usize = 8;
+/// The characters kept of each answer, from its end; the next is tried while the package is over.
+const SHARES: [usize; 6] = [400, 300, 200, 150, 100, 60];
 const FILES: usize = 15;
 const COMMANDS: usize = 10;
 /// The most hook input read; larger is bad input.
@@ -123,37 +125,43 @@ fn package(transcript: &[u8]) -> Option<String> {
         return None;
     }
     let none = |s: String| if s.is_empty() { "none".to_string() } else { s };
-    let tail = format!(
-        "Files referenced: {}\nCommands run: {}\nTests run: {}\nPending work: continue with the next request below.",
+    let lists = format!(
+        "Files referenced: {}\nCommands run: {}\nTests run: {}",
         none(files.iter().take(FILES).cloned().collect::<Vec<_>>().join(", ")),
         none(quote(commands.iter())),
         none(quote(commands.iter().filter(|c| c.contains("test") || c.contains("unittest") || c.contains("pytest")))),
     );
-    // The latest requests that leave room for every section; the cut is the last resort.
-    let mut text = String::new();
-    for count in (1..=turns.len().min(TURNS)).rev() {
-        let first = turns.len() - count;
+    let no_lists = "Files referenced: none\nCommands run: none\nTests run: none";
+    // The first request and the latest ones; a number is the request's place in the session.
+    let shown: Vec<usize> = if turns.len() <= TURNS {
+        (0..turns.len()).collect()
+    } else {
+        std::iter::once(0).chain(turns.len() - (TURNS - 1)..turns.len()).collect()
+    };
+    let render = |lists: &str, share: usize| {
+        let objective =
+            shown.iter().map(|&i| format!("({}) {}", i + 1, take(&turns[i].prompt, 110))).collect::<Vec<_>>().join(" ");
         let mut lines = vec![
             "## Context handoff from the previous session (compact; trust it, do not redo this work)".to_string(),
-            format!(
-                "Objective so far: {}",
-                turns[first..]
-                    .iter()
-                    .enumerate()
-                    .map(|(k, t)| format!("({}) {}", first + k + 1, take(&t.prompt, 110)))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            ),
+            format!("Objective so far: {objective}"),
             "Findings / decisions (the answers already given):".to_string(),
         ];
-        for (k, t) in turns[first..].iter().enumerate() {
-            let answer = t.answer.as_deref().map_or("(no answer)".to_string(), |a| take(a, 400));
-            lines.push(format!("- step {}: {answer}", first + k + 1));
+        for &i in &shown {
+            let answer = turns[i].answer.as_deref().map_or("(no answer)".to_string(), |a| take_end(a, share));
+            lines.push(format!("- step {}: {answer}", i + 1));
         }
-        lines.push(tail.clone());
-        text = lines.join("\n");
-        if text.len() <= MAX_PACKAGE {
-            break;
+        lines.push(lists.to_string());
+        lines.push("Pending work: continue with the next request below.".to_string());
+        lines.join("\n")
+    };
+    // Over the limit: the lists go first, then every answer shrinks; requests are never dropped.
+    let mut text = render(&lists, SHARES[0]);
+    if text.len() > MAX_PACKAGE {
+        for share in SHARES {
+            text = render(no_lists, share);
+            if text.len() <= MAX_PACKAGE {
+                break;
+            }
         }
     }
     Some(cut_bytes(&text, MAX_PACKAGE).to_string())
@@ -208,6 +216,15 @@ fn squash(s: &str) -> String {
 
 fn take(s: &str, chars: usize) -> String {
     s.chars().take(chars).collect()
+}
+
+/// `s`, or "…" and its last `chars` characters when it is longer: conclusions sit at the end.
+fn take_end(s: &str, chars: usize) -> String {
+    let len = s.chars().count();
+    if len <= chars {
+        return s.to_string();
+    }
+    std::iter::once('…').chain(s.chars().skip(len - chars)).collect()
 }
 
 /// At most `max` bytes, cut on a char boundary.
@@ -322,8 +339,48 @@ mod tests {
     fn only_the_latest_turns_are_shown_with_their_numbers() {
         let lines: Vec<String> = (1..=12).flat_map(|i| [user(&format!("req{i}")), text(&format!("ans{i}"))]).collect();
         let p = package(&make(&lines)).unwrap();
-        assert!(p.contains("(5) req5 (6) req6") && p.contains("(12) req12") && !p.contains("(4)"), "{p}");
-        assert!(p.contains("- step 5: ans5") && p.contains("- step 12: ans12") && !p.contains("step 4"));
+        // The first request, then the latest TURNS - 1 (6..=12); nothing in between.
+        assert!(p.contains("(1) req1 (6) req6 (7) req7") && p.contains("(12) req12") && !p.contains("(5)"), "{p}");
+        assert!(
+            p.contains("- step 1: ans1\n- step 6: ans6\n") && p.contains("- step 12: ans12") && !p.contains("step 5")
+        );
+        assert_eq!(p.matches("- step ").count(), TURNS);
+    }
+
+    #[test]
+    fn up_to_turns_requests_are_all_shown_once() {
+        for n in [1, TURNS - 1, TURNS] {
+            let lines: Vec<String> =
+                (1..=n).flat_map(|i| [user(&format!("req{i}")), text(&format!("ans{i}"))]).collect();
+            let p = package(&make(&lines)).unwrap();
+            assert_eq!(p.matches("- step ").count(), n, "{p}");
+            assert!(p.contains("- step 1: ans1\n") && p.matches("(1) req1").count() == 1, "{p}");
+        }
+    }
+
+    #[test]
+    fn an_answer_keeps_its_end() {
+        assert_eq!(take_end("abcdef", 3), "…def");
+        assert_eq!(take_end("abc", 3), "abc");
+        assert_eq!(take_end("", 3), "");
+        assert_eq!(take_end("a\u{1f600}b\u{1f600}", 2), "…b\u{1f600}");
+        let answer = format!("{}CONCLUSION", "x".repeat(600));
+        let p = package(&make(&[user("go"), text(&answer)])).unwrap();
+        assert!(p.contains(&format!("- step 1: …{}CONCLUSION\n", "x".repeat(390))), "{p}");
+    }
+
+    #[test]
+    fn a_big_session_keeps_turn_one_and_shrinks_the_answers_evenly() {
+        let lines: Vec<String> = (1..=12)
+            .flat_map(|i| [user(&format!("req{i}")), text(&format!("{}END{i}", "z".repeat(500)))])
+            .chain([tool("Read", json!({"file_path": "src/a.rs"}))])
+            .collect();
+        let p = package(&make(&lines)).unwrap();
+        assert!(p.len() <= MAX_PACKAGE, "{}", p.len());
+        // 8 answers of 400 chars do not fit with the lists: the lists are "none", the answers 300.
+        assert!(p.contains("Files referenced: none\nCommands run: none\nTests run: none\n"), "{p}");
+        assert!(p.contains("(1) req1 (6) req6") && p.contains(&format!("- step 1: …{}END1\n", "z".repeat(296))), "{p}");
+        assert!(p.contains(&format!("- step 12: …{}END12\n", "z".repeat(295))), "{p}");
     }
 
     #[test]
@@ -343,13 +400,11 @@ mod tests {
     #[test]
     fn the_cut_never_splits_a_character() {
         // Four-byte characters, shifted by 0-3 ASCII bytes so the 3000-byte mark lands on every
-        // position inside a character.
+        // position inside a character. Eight requests of 110 such characters exceed the limit
+        // alone, so only the cut is left.
         for shift in 0..4 {
-            let lines: Vec<String> = std::iter::once(user("go"))
-                .chain((0..10).map(|_| {
-                    tool("Bash", json!({"command": format!("test{}{}", "a".repeat(shift), "\u{1f600}".repeat(100))}))
-                }))
-                .collect();
+            let lines: Vec<String> =
+                (0..8).map(|_| user(&format!("{}{}", "a".repeat(shift), "\u{1f600}".repeat(200)))).collect();
             let p = package(&make(&lines)).unwrap();
             assert!(p.len() <= MAX_PACKAGE && p.len() > MAX_PACKAGE - 4, "{shift}: {}", p.len());
         }
@@ -359,7 +414,7 @@ mod tests {
     }
 
     #[test]
-    fn every_section_after_the_requests_is_kept_at_3000_and_3001_bytes() {
+    fn the_lists_go_first_when_over_3000_bytes() {
         let build = |pad: usize| {
             let mut lines = vec![user("first"), text("one"), user("second")];
             for i in 0..15 {
@@ -380,11 +435,15 @@ mod tests {
         let fits = build(pad);
         assert_eq!(fits.len(), MAX_PACKAGE);
         assert!(fits.contains("Objective so far: (1) first (2) second") && fits.ends_with(&tail), "{fits}");
-        // One byte more: the oldest request goes, the sections stay whole.
+        // One byte more: both requests stay; the lists go ("none"), the answers stay whole.
         let over = build(pad + 1);
         assert!(over.len() < MAX_PACKAGE, "{}", over.len());
-        assert!(over.contains("Objective so far: (2) second\n") && !over.contains("(1) first"), "{over}");
-        assert!(over.contains(&format!("- step 2: two{}\n", "y".repeat(pad + 1))) && over.ends_with(&tail));
+        assert!(over.contains("Objective so far: (1) first (2) second\n"), "{over}");
+        assert!(over.contains("- step 1: one\n") && over.contains(&format!("- step 2: two{}\n", "y".repeat(pad + 1))));
+        assert!(
+            over.contains("Files referenced: none\nCommands run: none\nTests run: none\n") && !over.contains("file00")
+        );
+        assert!(over.ends_with("Pending work: continue with the next request below."), "{over}");
     }
 
     #[test]

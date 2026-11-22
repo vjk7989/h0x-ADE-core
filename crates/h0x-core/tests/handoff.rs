@@ -59,6 +59,20 @@ fn event(source: &str, current: &Path, id: &str) -> Vec<u8> {
         .into_bytes()
 }
 
+/// Transcript lines: a request, an answer, a tool call.
+fn user(text: &str) -> String {
+    format!("{}\n", json!({"type": "user", "message": {"content": text}}))
+}
+
+fn said(text: &str) -> String {
+    format!("{}\n", json!({"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}))
+}
+
+fn tool(name: &str, input: Value) -> String {
+    let block = json!([{"type": "tool_use", "name": name, "input": input}]);
+    format!("{}\n", json!({"type": "assistant", "message": {"content": block}}))
+}
+
 /// The package from a stdout that must be one JSON line of the documented shape.
 fn context(out: &str) -> String {
     let line = out.strip_suffix('\n').unwrap_or_else(|| panic!("no newline: {out:?}"));
@@ -79,15 +93,23 @@ fn a_cleared_session_hands_its_work_to_the_next() {
     let ctx = context(&handoff("happy", &event("clear", &current, "new-session")));
     let at = |s: &str| ctx.find(s).unwrap_or_else(|| panic!("{s} missing in {ctx}"));
     assert!(ctx.starts_with("## Context handoff from the previous session"));
-    assert!(at("Objective so far: (8) Earlier, another session") < at("Findings / decisions"));
+    // Ten requests: the first one, then the latest seven (4..=10), each with its own number.
+    assert!(at("Objective so far: (1) The file build/test-run.log") < at("(4) data/orders.json"));
+    assert!(at("(4) data/orders.json") < at("(10) Earlier, another session"));
+    assert!(at("(10) Earlier, another session") < at("Findings / decisions"));
+    assert!(!ctx.contains("(2) data/fleet.json") && !ctx.contains("(3) logs/app.log"), "{ctx}");
+    assert!(at("- step 1: ") < at("- step 4: ") && at("- step 4: ") < at("- step 10: "));
+    assert!(!ctx.contains("- step 2: ") && !ctx.contains("- step 3: "), "{ctx}");
+    assert_eq!(ctx.matches("- step ").count(), 8, "{ctx}");
     assert!(at("Findings / decisions") < at("Files referenced:"));
     assert!(at("Files referenced:") < at("Commands run:"));
     assert!(at("Commands run:") < at("Tests run:"));
     assert!(at("Tests run:") < at("Pending work: continue with the next request below."));
     assert!(ctx.contains("deploy-canary-17"));
-    assert!(ctx.contains("deploy-canary-17"));
-    let files = ctx.lines().find(|l| l.starts_with("Files referenced: ")).unwrap();
-    assert!(files.contains("/work/runs/") && !files.contains('\\'), "paths use forward slashes: {files}");
+    // Eight answers do not fit beside the lists: the lists go before any request does (the
+    // slashes in a Windows path are checked where the lists fit, below).
+    assert!(ctx.contains("\nFiles referenced: none\nCommands run: none\nTests run: none\n"), "{ctx}");
+    assert!(!ctx.contains("C:\\work"), "{ctx}");
 }
 
 #[test]
@@ -188,15 +210,19 @@ fn a_fifty_megabyte_transcript_is_read_from_its_end_and_fast() {
 fn the_package_is_at_most_3000_bytes_even_with_wide_characters() {
     let dir = scratch("wide");
     let current = put(&dir, "cur.jsonl", "", 0);
-    let mut lines = format!("{}\n", json!({"type": "user", "message": {"content": "go"}}));
+    // Eight requests of 110 three-byte characters are 2640 bytes, and eight answers of at least
+    // 60 such characters push it past 3000 even with the lists gone: only the cut is left.
+    let mut lines = String::new();
     for i in 0..10 {
-        let command = format!("test{i}{}", "\u{4e2d}".repeat(100));
-        let block = json!([{"type": "tool_use", "name": "Bash", "input": {"command": command}}]);
-        lines += &format!("{}\n", json!({"type": "assistant", "message": {"content": block}}));
+        lines += &user(&format!("{i}{}", "\u{4e2d}".repeat(200)));
+        lines += &said(&"\u{6587}".repeat(500));
+        lines += &tool("Bash", json!({"command": format!("test{i}{}", "\u{4e2d}".repeat(100))}));
     }
     put(&dir, "old.jsonl", lines, 100);
     let ctx = context(&handoff("wide", &event("clear", &current, "cur")));
     assert!(ctx.len() > 2996, "cut at the limit, on a character: {}", ctx.len());
+    assert!(ctx.contains(&format!("Objective so far: (1) 0{} (4) 3", "\u{4e2d}".repeat(109))), "{ctx}");
+    assert!(!ctx.contains("Pending work"), "the cut is reached: {ctx}");
 }
 
 #[test]
@@ -358,6 +384,104 @@ fn the_new_transcript_need_not_exist_yet() {
     assert!(!current.exists());
     let ctx = context(&handoff("unborn", &event("clear", &current, "new-session")));
     assert!(ctx.contains("deploy-canary-17"));
+}
+
+#[test]
+fn the_end_of_the_first_answer_survives_an_over_budget_session() {
+    let dir = scratch("factend");
+    let current = put(&dir, "cur.jsonl", "", 0);
+    let mut lines = String::new();
+    for i in 1..=12 {
+        lines += &user(&format!("req{i}"));
+        // The fact sits only in the last characters of a long answer.
+        lines += &said(&format!("{}FACT-{i}-END", "y".repeat(1000)));
+        lines += &tool("Read", json!({"file_path": format!("src/file{i}.rs")}));
+    }
+    put(&dir, "old.jsonl", lines, 100);
+    let ctx = context(&handoff("factend", &event("clear", &current, "cur")));
+    // Eight answers of 400 do not fit: the lists go first, then every answer keeps its last 300.
+    assert!(ctx.contains("Files referenced: none\nCommands run: none\nTests run: none\n"), "{ctx}");
+    assert!(ctx.contains(&format!("- step 1: …{}FACT-1-END\n- step 6: …", "y".repeat(290))), "{ctx}");
+    assert!(ctx.contains(&format!("- step 12: …{}FACT-12-END\n", "y".repeat(289))), "{ctx}");
+    assert!(ctx.ends_with("Pending work: continue with the next request below."), "{ctx}");
+}
+
+#[test]
+fn one_turn_more_than_shown_keeps_turn_one_with_the_real_numbers() {
+    let dir = scratch("nine");
+    let current = put(&dir, "cur.jsonl", "", 0);
+    let lines: String = (1..=9).map(|i| user(&format!("req{i}")) + &said(&format!("ans{i}"))).collect();
+    put(&dir, "old.jsonl", lines, 100);
+    let ctx = context(&handoff("nine", &event("clear", &current, "cur")));
+    assert!(ctx.contains("Objective so far: (1) req1 (3) req3 (4) req4"), "{ctx}");
+    assert!(ctx.contains("(9) req9\n") && !ctx.contains("req2"), "{ctx}");
+    assert!(ctx.contains("- step 1: ans1\n- step 3: ans3\n") && ctx.contains("- step 9: ans9\n"), "{ctx}");
+    assert!(!ctx.contains("ans2") && ctx.matches("- step ").count() == 8, "{ctx}");
+}
+
+#[test]
+fn an_empty_or_whitespace_answer_is_no_answer() {
+    let dir = scratch("noans");
+    let current = put(&dir, "cur.jsonl", "", 0);
+    let lines =
+        [user("a"), said(""), user("b"), said(" \r\n\t "), user("c"), user("d"), said("real"), said("   ")].concat();
+    put(&dir, "old.jsonl", lines, 100);
+    let ctx = context(&handoff("noans", &event("clear", &current, "cur")));
+    let steps = "- step 1: (no answer)\n- step 2: (no answer)\n- step 3: (no answer)\n- step 4: real\n";
+    assert!(ctx.contains(steps), "{ctx}");
+    assert!(!ctx.contains('…'), "{ctx}");
+}
+
+#[test]
+fn an_answer_of_exactly_the_share_is_shown_whole() {
+    let dir = scratch("share");
+    let current = put(&dir, "cur.jsonl", "", 0);
+    // 400 characters, three bytes each: counted in characters, not bytes.
+    let exact = format!("{}Z", "\u{4e2d}".repeat(399));
+    put(&dir, "old.jsonl", user("go") + &said(&exact), 100);
+    let ctx = context(&handoff("share", &event("clear", &current, "cur")));
+    assert!(ctx.contains(&format!("- step 1: {exact}\n")) && !ctx.contains('…'), "{ctx}");
+    // One character more: "…" and the last 400.
+    put(&dir, "old.jsonl", user("go") + &said(&format!("X{exact}")), 100);
+    let ctx = context(&handoff("share", &event("clear", &current, "cur")));
+    assert!(ctx.contains(&format!("- step 1: …{exact}\n")) && !ctx.contains('X'), "{ctx}");
+}
+
+#[test]
+fn a_single_huge_turn_stays_within_3000_bytes() {
+    let dir = scratch("oneturn");
+    let current = put(&dir, "cur.jsonl", "", 0);
+    let mut lines = user(&"\u{4e2d}".repeat(50_000));
+    for i in 0..30 {
+        lines += &tool("Bash", json!({"command": format!("cargo test {i} {}", "c".repeat(500))}));
+        lines += &tool("Read", json!({"file_path": format!("src/{i}/{}.rs", "f".repeat(200))}));
+    }
+    lines += &said(&format!("{}\u{1b}[0mEND", "a".repeat(100_000)));
+    put(&dir, "old.jsonl", lines, 100);
+    let out = handoff("oneturn", &event("clear", &current, "cur"));
+    let ctx = context(&out);
+    // The request is still its first 110 characters; the answer keeps its end, escape removed.
+    assert!(ctx.contains(&format!("Objective so far: (1) {}\n", "\u{4e2d}".repeat(110))), "{ctx}");
+    assert!(ctx.contains("[0mEND\n") && !ctx.contains('\u{1b}'), "{ctx}");
+    assert!(ctx.contains("- step 1: …") && ctx.matches("- step ").count() == 1, "{ctx}");
+    assert!(ctx.chars().all(|c| c == '\n' || !c.is_control()), "{ctx:?}");
+}
+
+#[test]
+fn a_windows_path_in_a_tool_call_shows_with_slashes_while_the_lists_fit() {
+    let dir = scratch("winpath");
+    let current = put(&dir, "cur.jsonl", "", 0);
+    let read = tool("Read", json!({"file_path": "\\\\server\\share\\dir with space\\a.rs"}));
+    let edit = tool("Edit", json!({"file_path": "D:\\proj\\src\\main.rs"}));
+    put(&dir, "old.jsonl", user("fix it") + &read + &edit + &said("fixed"), 100);
+    let ctx = context(&handoff("winpath", &event("clear", &current, "cur")));
+    assert!(ctx.contains("Files referenced: //server/share/dir with space/a.rs, D:/proj/src/main.rs\n"), "{ctx}");
+    assert!(!ctx.contains('\\'), "{ctx}");
+    // The same calls in a session over the limit: the lists go, the path with them.
+    let big: String = (1..=12).map(|i| user(&format!("req{i}")) + &said(&"w".repeat(1000))).collect();
+    put(&dir, "old.jsonl", user("fix it") + &read + &edit + &big, 100);
+    let ctx = context(&handoff("winpath", &event("clear", &current, "cur")));
+    assert!(ctx.contains("Files referenced: none\n") && !ctx.contains("server"), "{ctx}");
 }
 
 #[test]
