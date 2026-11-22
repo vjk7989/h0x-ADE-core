@@ -39,6 +39,23 @@ struct Pipe {
     handle: OwnedHandle,
 }
 
+/// One manual-reset event per thread, reused by every overlapped op on it.
+/// Safe because `Pipe::io` never returns while its op is still pending, so a
+/// thread has at most one op using the event at a time.
+struct ThreadEvent(std::cell::Cell<HANDLE>);
+
+impl Drop for ThreadEvent {
+    fn drop(&mut self) {
+        if !self.0.get().is_null() {
+            unsafe { CloseHandle(self.0.get()) };
+        }
+    }
+}
+
+thread_local! {
+    static THREAD_EVENT: ThreadEvent = const { ThreadEvent(std::cell::Cell::new(null_mut())) };
+}
+
 impl Pipe {
     fn raw(&self) -> HANDLE {
         self.handle.as_raw_handle() as HANDLE
@@ -47,13 +64,33 @@ impl Pipe {
     /// One overlapped operation, waited for.
     fn io(&self, op: impl FnOnce(HANDLE, *mut OVERLAPPED) -> BOOL) -> io::Result<usize> {
         unsafe {
-            let event = CreateEventW(null(), 1, 0, null());
+            // During thread-local teardown the cache is gone: use a one-op event.
+            let mut _one_op = None;
+            let cached = THREAD_EVENT.try_with(|e| {
+                if e.0.get().is_null() {
+                    e.0.set(CreateEventW(null(), 1, 0, null()));
+                }
+                e.0.get()
+            });
+            let event = match cached {
+                Ok(event) => event,
+                Err(_) => {
+                    let event = CreateEventW(null(), 1, 0, null());
+                    if !event.is_null() {
+                        _one_op = Some(OwnedHandle::from_raw_handle(event as RawHandle));
+                    }
+                    event
+                }
+            };
             if event.is_null() {
                 return Err(io::Error::last_os_error());
             }
-            let event = OwnedHandle::from_raw_handle(event as RawHandle);
+            // Reset before the op: even one that completes at once signals it.
+            if ResetEvent(event) == 0 {
+                return Err(io::Error::last_os_error());
+            }
             let mut ov: OVERLAPPED = zeroed();
-            ov.hEvent = event.as_raw_handle() as HANDLE;
+            ov.hEvent = event;
             if op(self.raw(), &mut ov) == 0 {
                 let err = GetLastError();
                 if err != ERROR_IO_PENDING {
@@ -1338,7 +1375,9 @@ pub mod console {
 #[cfg(test)]
 mod tests {
     use super::{RELEASE, endpoints, ensure_pipe_salt, read_pipe_salt, unsalted};
+    use std::io::{Read, Write};
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     #[test]
     fn a_pipe_we_create_is_one_we_may_connect_to() {
@@ -1576,5 +1615,200 @@ mod tests {
         let _taken = super::connect(&wanted).unwrap();
         let busy = super::connect(&wanted).map(|_| ()).unwrap_err();
         assert_eq!(busy.kind(), std::io::ErrorKind::TimedOut, "{busy}");
+    }
+
+    /// The pipe io tests count handles and time reads: one at a time.
+    static PIPE_IO: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A connected (server, client) pair on a fresh pipe name.
+    fn pipe_pair() -> (super::Stream, super::Stream) {
+        let name = format!(r"\\.\pipe\h0x-core-io-{}", crate::platform::random_hex());
+        let listener = super::listen(Path::new(&name)).unwrap();
+        let client = super::connect(Path::new(&name)).unwrap();
+        let server = listener.incoming().next().unwrap().unwrap();
+        (server, client)
+    }
+
+    #[test]
+    fn a_read_blocked_on_a_pipe_returns_zero_once_the_pipe_is_shut_down() {
+        let _serial = PIPE_IO.lock().unwrap_or_else(|p| p.into_inner());
+        let (jobs, job) = std::sync::mpsc::channel::<(super::Stream, bool)>();
+        let (done, results) = std::sync::mpsc::channel();
+        // One reader thread for every round: its event is reused after each cancel.
+        let reader = std::thread::spawn(move || {
+            for (stream, write_first) in job {
+                if write_first {
+                    // Completes at once and signals the thread's event before the read.
+                    let _ = (&stream).write_all(b"x");
+                }
+                let mut buf = [0u8; 64];
+                if done.send((&stream).read(&mut buf).map_err(|e| e.to_string())).is_err() {
+                    break;
+                }
+            }
+        });
+        for round in 0..1000 {
+            let (server, client) = pipe_pair();
+            jobs.send((server.clone(), round % 2 == 1)).unwrap();
+            if round % 10 == 0 {
+                // Nothing was written to the server: its read may not return yet.
+                std::thread::sleep(Duration::from_millis(5));
+                assert!(results.try_recv().is_err(), "round {round}: the read returned before shutdown");
+            }
+            std::thread::scope(|s| {
+                if round % 3 == 0 {
+                    // A write racing the shutdown on the same pipe: it may fail, never hang.
+                    s.spawn(|| {
+                        let _ = (&server).write_all(&[7u8; 512]);
+                    });
+                }
+                server.shutdown(std::net::Shutdown::Both).unwrap();
+            });
+            let got = results
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap_or_else(|e| panic!("round {round}: the blocked read did not wake: {e}"));
+            assert_eq!(got, Ok(0), "round {round}");
+            drop(client);
+        }
+        drop(jobs);
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn sequential_reads_and_writes_of_every_size_round_trip_byte_for_byte() {
+        let _serial = PIPE_IO.lock().unwrap_or_else(|p| p.into_inner());
+        let (server, client) = pipe_pair();
+        let payload = |round: usize, len: usize| -> Vec<u8> { (0..len).map(|i| (i * 31 + round) as u8).collect() };
+        // One thread, both ends, both ways: sizes that fit the 64 KiB pipe buffer.
+        for round in 0..200 {
+            for len in [1, 16 * 1024] {
+                let sent = payload(round, len);
+                let (mut from, mut to) = if round % 2 == 0 { (&client, &server) } else { (&server, &client) };
+                from.write_all(&sent).unwrap();
+                let mut got = vec![0u8; len];
+                to.read_exact(&mut got).unwrap();
+                assert!(got == sent, "round {round}, {len} bytes");
+            }
+        }
+        // Past the pipe buffer (64 KiB + 1) the write waits for the reader on another thread.
+        let sizes = [1, 16 * 1024, 64 * 1024 + 1];
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut w = &client;
+                for round in 0..60 {
+                    w.write_all(&payload(round, sizes[round % 3])).unwrap();
+                }
+                assert_eq!(w.write(&[]).unwrap(), 0, "an empty write writes nothing");
+            });
+            let mut r = &server;
+            for round in 0..60 {
+                let mut got = vec![0u8; sizes[round % 3]];
+                r.read_exact(&mut got).unwrap();
+                assert!(got == payload(round, sizes[round % 3]), "round {round}, {} bytes", sizes[round % 3]);
+            }
+        });
+        drop(client);
+        let mut rest = Vec::new();
+        (&server).read_to_end(&mut rest).unwrap();
+        assert!(rest.is_empty(), "{} bytes after the last payload", rest.len());
+    }
+
+    #[test]
+    fn two_threads_on_two_pipes_never_see_each_others_bytes() {
+        let _serial = PIPE_IO.lock().unwrap_or_else(|p| p.into_inner());
+        let start = std::sync::Barrier::new(2);
+        std::thread::scope(|s| {
+            for tag in [0xA5u8, 0x5A] {
+                let start = &start;
+                s.spawn(move || {
+                    let (server, client) = pipe_pair();
+                    start.wait();
+                    for round in 0..2000usize {
+                        let len = 1 + (round * 977) % (16 * 1024);
+                        let sent: Vec<u8> = (0..len).map(|i| tag ^ (i + round) as u8).collect();
+                        let (mut from, mut to) = if round % 2 == 0 { (&client, &server) } else { (&server, &client) };
+                        from.write_all(&sent).unwrap();
+                        let mut got = vec![0u8; len];
+                        to.read_exact(&mut got).unwrap();
+                        assert!(got == sent, "thread {tag:#x}, round {round}, {len} bytes");
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn pipe_io_leaks_no_handle_per_op_or_per_thread() {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+        let _serial = PIPE_IO.lock().unwrap_or_else(|p| p.into_inner());
+        let handles = || {
+            let mut n = 0u32;
+            assert_ne!(unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut n) }, 0);
+            i64::from(n)
+        };
+        // Other tests run alongside: a small margin, and time for theirs to close.
+        let settles_near = |start: i64, what: &str| {
+            let mut now = handles();
+            for _ in 0..50 {
+                if now <= start + 32 {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+                now = handles();
+            }
+            panic!("{what}: {start} handles before, {now} after");
+        };
+        let start = handles();
+        std::thread::spawn(|| {
+            let (server, client) = pipe_pair();
+            let mut buf = [0u8; 16];
+            for _ in 0..5000 {
+                (&client).write_all(b"0123456789abcdef").unwrap();
+                (&server).read_exact(&mut buf).unwrap();
+            }
+        })
+        .join()
+        .unwrap();
+        settles_near(start, "10,000 ops on one thread");
+        let start = handles();
+        for _ in 0..256 {
+            std::thread::spawn(|| {
+                let (server, client) = pipe_pair();
+                (&client).write_all(b"x").unwrap();
+                let mut buf = [0u8; 1];
+                (&server).read_exact(&mut buf).unwrap();
+            })
+            .join()
+            .unwrap();
+        }
+        settles_near(start, "256 threads that each did pipe io and exited");
+    }
+
+    #[test]
+    fn an_accept_that_waits_for_its_client_and_one_whose_client_came_first_both_connect() {
+        let _serial = PIPE_IO.lock().unwrap_or_else(|p| p.into_inner());
+        let name = format!(r"\\.\pipe\h0x-core-accept-{}", crate::platform::random_hex());
+        let listener = super::listen(Path::new(&name)).unwrap();
+        let round_trip = |mut server: &super::Stream, mut client: &super::Stream| {
+            let mut got = [0u8; 4];
+            client.write_all(b"ping").unwrap();
+            server.read_exact(&mut got).unwrap();
+            assert_eq!(&got, b"ping");
+            server.write_all(b"pong").unwrap();
+            client.read_exact(&mut got).unwrap();
+            assert_eq!(&got, b"pong");
+        };
+        // The server waits first: ConnectNamedPipe goes pending until the client comes.
+        std::thread::scope(|s| {
+            let accepted = s.spawn(|| listener.incoming().next().unwrap().unwrap());
+            std::thread::sleep(Duration::from_millis(50));
+            let client = super::connect(Path::new(&name)).unwrap();
+            let server = accepted.join().unwrap();
+            round_trip(&server, &client);
+        });
+        // The client comes first: the accept finds it connected already.
+        let client = super::connect(Path::new(&name)).unwrap();
+        let server = listener.incoming().next().unwrap().unwrap();
+        round_trip(&server, &client);
     }
 }
