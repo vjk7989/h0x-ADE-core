@@ -97,6 +97,7 @@ In every mode but localhost the panel prints (and `--json` carries in `warning`)
 The panel then listens on 127.0.0.1 only, and a foreground `tailscale serve --https=<port>` child fronts it as `https://<machine>.<tailnet>.ts.net:<port>/`, the link in the QR code. HTTPS is a secure context, so the page can show notifications and uses the browser's own crypto. The child ends with the panel (Ctrl+C, an error, a normal exit), and Tailscale removes its serve config with it. It never runs `tailscale set`, and never opens Funnel.
 - One-time step: turn on HTTPS for the tailnet in the Tailscale admin console (DNS, Enable HTTPS). If it is off, or serve does not come up within 8 seconds, the panel says so (`warning` in `--json`) and falls back to plain http on the 100.x address, as when Tailscale's CLI is not installed.
 - The machine's name goes into the public Certificate Transparency logs when its certificate is issued; use a machine name you are fine with being public.
+- If the panel is force-killed, the serve child is ended with it on Windows and Linux. On macOS it can stay behind and the tailnet port then answers 502: stop it with `tailscale serve reset` or by killing the stray `tailscale serve` process.
 - Tip: add a Tailscale grant (access rule) that limits `tcp:<port>` (8377 by default) to your own user, so other people and devices on the tailnet cannot reach the panel.
 
 A web session lasts 30 days from pairing; after that the device pairs again. A session saved before this limit existed counts from the first time it is used.

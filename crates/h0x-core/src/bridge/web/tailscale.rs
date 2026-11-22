@@ -80,6 +80,10 @@ pub fn machine_name(cli: &Path) -> Option<String> {
 /// A running `tailscale serve --https=<port>` for this panel; killed on drop.
 pub struct Serve {
     child: Child,
+    /// Kill-on-close job holding the child: if this process dies without running `Drop`
+    /// (TerminateProcess, a crash) the OS ends the child with it.
+    #[cfg(windows)]
+    _job: Option<std::os::windows::io::OwnedHandle>,
     /// The Host (and Origin) the proxy forwards: `<name>:<port>`.
     pub host: String,
 }
@@ -88,7 +92,26 @@ impl Serve {
     /// Starts serving `http://127.0.0.1:<port>` as `https://<name>:<port>` on `tailnet`, and
     /// waits for the proxy to listen. Killed again if it exits or is not up in time.
     pub fn start(cli: &Path, tailnet: Ipv4Addr, port: u16, name: &str) -> Result<Serve, String> {
-        let child = command(cli)
+        let mut cmd = command(cli);
+        // If this process is killed outright, the child must not outlive it: tailscaled would
+        // keep answering on the tailnet port (502) until someone kills it.
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::process::CommandExt;
+            let parent = std::process::id() as libc::pid_t;
+            // SAFETY: prctl, getppid and _exit are async-signal-safe.
+            unsafe {
+                cmd.pre_exec(move || {
+                    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                    // The parent may have died between fork and prctl.
+                    if libc::getppid() != parent {
+                        libc::_exit(1);
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let child = cmd
             .arg("serve")
             .arg(format!("--https={port}"))
             .arg(format!("http://127.0.0.1:{port}"))
@@ -97,7 +120,14 @@ impl Serve {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("tailscale serve: {e}"))?;
-        let mut serve = Serve { child, host: format!("{name}:{port}") };
+        #[cfg(windows)]
+        let _job = kill_on_close(&child);
+        let mut serve = Serve {
+            child,
+            #[cfg(windows)]
+            _job,
+            host: format!("{name}:{port}"),
+        };
         let deadline = Instant::now() + READY;
         let target = SocketAddr::new(IpAddr::V4(tailnet), port);
         while Instant::now() < deadline {
@@ -110,6 +140,32 @@ impl Serve {
             std::thread::sleep(Duration::from_millis(200));
         }
         Err(HTTPS_OFF.into())
+    }
+}
+
+/// A job that kills what is in it when its last handle closes, with `child` in it. None if
+/// Windows refuses (the explicit kill on drop still applies).
+#[cfg(windows)]
+fn kill_on_close(child: &Child) -> Option<std::os::windows::io::OwnedHandle> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
+    use windows_sys::Win32::System::JobObjects::*;
+    // SAFETY: the job handle is owned at once; the limits struct is zeroed plain data.
+    unsafe {
+        let raw = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if raw.is_null() {
+            return None;
+        }
+        let job = OwnedHandle::from_raw_handle(raw as RawHandle);
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let set = SetInformationJobObject(
+            raw,
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        let assigned = set != 0 && AssignProcessToJobObject(raw, child.as_raw_handle() as _) != 0;
+        assigned.then_some(job)
     }
 }
 
@@ -544,5 +600,59 @@ mod tests {
             let spoofed = req(other, "X-Forwarded-For: 100.64.0.7");
             assert_eq!(seen(&spoofed, "127.0.0.1"), ip("127.0.0.1"), "{other}: not the serve host");
         }
+    }
+
+    /// Run as the "panel" of `a_killed_panel_takes_its_serve_child_with_it`: starts `Serve`
+    /// against the fake CLI in `root`, says so, and idles until it is killed.
+    fn killed_panel(root: &Path) {
+        let up = fake(
+            root,
+            &format!("while :; do echo x >> '{}'; sleep 1; done", root.join("beat").display()),
+            &format!(
+                ":l
+>>\"{}\" echo x
+ping -n 2 127.0.0.1 >nul
+goto l",
+                root.join("beat").display()
+            ),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let _serve = Serve::start(&up, Ipv4Addr::LOCALHOST, port, "box.ts.net").unwrap();
+        std::fs::write(root.join("ready"), b"").unwrap();
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn a_killed_panel_takes_its_serve_child_with_it() {
+        const ROOT: &str = "H0X_TEST_TS_KILLED_PANEL";
+        if let Some(root) = std::env::var_os(ROOT) {
+            return killed_panel(Path::new(&root));
+        }
+        let root = std::env::temp_dir().join(format!("h0x-ts-orphan-{}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&root).unwrap();
+        let name = "bridge::web::tailscale::tests::a_killed_panel_takes_its_serve_child_with_it";
+        let mut panel = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--test-threads", "1"])
+            .env(ROOT, &root)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let began = Instant::now();
+        let up = || root.join("ready").exists() && root.join("beat").exists();
+        while !up() && began.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(up(), "the panel started its serve and the fake CLI is running");
+        // No Drop runs: TerminateProcess / SIGKILL.
+        panel.kill().unwrap();
+        panel.wait().unwrap();
+        std::thread::sleep(Duration::from_millis(2500));
+        let beats = std::fs::metadata(root.join("beat")).unwrap().len();
+        std::thread::sleep(Duration::from_millis(2500));
+        assert_eq!(std::fs::metadata(root.join("beat")).unwrap().len(), beats, "the serve child kept running");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
