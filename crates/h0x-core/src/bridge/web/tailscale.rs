@@ -602,6 +602,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(windows, target_os = "linux"))]
     /// Run as the "panel" of `a_killed_panel_takes_its_serve_child_with_it`: starts `Serve`
     /// against the fake CLI in `root`, says so, and idles until it is killed.
     fn killed_panel(root: &Path) {
