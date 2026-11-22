@@ -13,6 +13,7 @@
 mod e2e;
 mod http;
 mod sha;
+mod tailscale;
 pub mod tunnel;
 pub mod vps;
 
@@ -258,6 +259,8 @@ pub(crate) struct Web {
     notices: tokio::sync::broadcast::Sender<Notice>,
     /// The vps's public host while `--via` is on: requests for it come through the reverse forward.
     public: Option<String>,
+    /// `<name>:<port>` while `tailscale serve` fronts this panel with https; its requests come from loopback.
+    serve: Option<String>,
     /// Connections each source holds before it authenticated.
     unauthenticated: Arc<Sources>,
     /// Failed `auth`s per source address.
@@ -591,6 +594,9 @@ async fn connection(mut stream: tokio::net::TcpStream, web: Arc<Web>) {
         true => Ok((req, true)),
         false => {
             vps::https_origin_as_http(&mut req, &web.hosts);
+            if let Some(host) = &web.serve {
+                tailscale::origin_as_http(&mut req, host);
+            }
             http::allowed(&req, &web.hosts).map(|()| (req, false))
         }
     });
@@ -606,7 +612,12 @@ async fn connection(mut stream: tokio::net::TcpStream, web: Arc<Web>) {
         "/noble.js" => page(NOBLE, "text/javascript; charset=utf-8"),
         "/ws" => match http::upgrade(&req) {
             Ok(head) => {
-                let client = tunnel::client(&req, peer, via_tunnel, web.public.as_deref());
+                let client = tunnel::client(
+                    &req,
+                    peer,
+                    via_tunnel,
+                    web.public.as_deref().or(web.serve.as_deref().map(tailscale::bare)),
+                );
                 if let Some(ip) = client.filter(|ip| Some(*ip) != peer) {
                     match web.unauthenticated.take(ip) {
                         Some(place) => held.push(place),
@@ -806,20 +817,58 @@ pub fn run(
     json: bool,
 ) -> Result<(), RpcError> {
     let failed = |e: String| RpcError::new("bridge", e, "see docs/bridge.md, Web panel");
-    let ip = if lan {
+    let cli = if tailscale { tailscale::system_cli() } else { None };
+    let tailnet = if lan {
         lan_address(outbound_ip("192.0.2.1:9")).map_err(failed)?
     } else if tailscale {
-        tailscale_address(outbound_ip("100.100.100.100:9")).map_err(failed)?
+        tailscale::address(cli.as_deref(), outbound_ip("100.100.100.100:9")).map_err(failed)?
     } else {
         Ipv4Addr::LOCALHOST
     };
     let bridge = Bridge::open(paths)?;
     let key = server_key(&bridge)?;
-    let listener = std::net::TcpListener::bind((ip, port)).map_err(|e| failed(format!("{ip}:{port}: {e}")))?;
-    let port = listener.local_addr().map_err(|e| failed(e.to_string()))?.port();
+    let bind = |ip: Ipv4Addr, port: u16| {
+        let listener = std::net::TcpListener::bind((ip, port)).map_err(|e| failed(format!("{ip}:{port}: {e}")))?;
+        Ok::<_, RpcError>((listener.local_addr().map_err(|e| failed(e.to_string()))?.port(), listener))
+    };
+    // With the CLI and a MagicDNS name, the panel listens on loopback and `tailscale serve`
+    // fronts it with https on the tailnet address. If serve does not come up: plain http there.
+    // Dropping `proxy` (every way out of here) kills it.
+    let mut proxy = None;
+    let mut https_off = None;
+    let mut ip = tailnet;
+    let name = cli.as_deref().and_then(tailscale::machine_name);
+    let (port, listener) = match (cli.as_deref(), name) {
+        (Some(cli), Some(name)) => {
+            let (port, backend) = bind(Ipv4Addr::LOCALHOST, port)?;
+            match tailscale::Serve::start(cli, tailnet, port, &name) {
+                Ok(started) => {
+                    proxy = Some(started);
+                    ip = Ipv4Addr::LOCALHOST;
+                    (port, backend)
+                }
+                Err(why) => {
+                    drop(backend);
+                    https_off = Some(why);
+                    bind(tailnet, port)?
+                }
+            }
+        }
+        _ => bind(tailnet, port)?,
+    };
     let public = via.as_ref().map(|v| v.public_host.as_str());
-    let hosts = vps::with_public(hosts(ip, port), public);
-    let local = format!("http://{}", hosts[0]);
+    let serve_host = proxy.as_ref().map(|s| s.host.clone());
+    let mut hosts = vps::with_public(hosts(ip, port), public);
+    hosts.extend(serve_host.clone());
+    // Browsers write an https host on 443 without its port.
+    hosts.extend(
+        serve_host
+            .as_deref()
+            .map(tailscale::bare)
+            .filter(|bare| Some(*bare) != serve_host.as_deref())
+            .map(String::from),
+    );
+    let local = serve_host.as_ref().map_or_else(|| format!("http://{}", hosts[0]), |host| format!("https://{host}"));
     let base = public.map_or_else(|| local.clone(), |host| format!("https://{host}"));
     let mut pair = None;
     if !json {
@@ -842,13 +891,13 @@ pub fn run(
         pair = Some(link);
     }
     let url = format!("{local}/");
-    let warning = integrity_warning(lan, tunnel.is_some(), via.is_some());
+    let warning = integrity_warning(lan, tunnel.is_some(), via.is_some()).or(https_off.clone());
     let ready = (json && tunnel.is_some()).then(|| (url.clone(), public.map(String::from), warning.clone()));
     if json && tunnel.is_none() {
         emit(&ready_line(&url, pair.as_deref(), None, public, warning.as_deref()));
     }
     // A tunnel prints its own warning when it opens.
-    if !json && let Some(why) = integrity_warning(lan, false, via.is_some()) {
+    if !json && let Some(why) = integrity_warning(lan, false, via.is_some()).or(https_off) {
         println!("warning: {why}");
     }
     let ssh = via.as_ref().map(|plan| {
@@ -889,6 +938,7 @@ pub fn run(
         key,
         notices,
         public: public.map(String::from),
+        serve: serve_host,
         unauthenticated: Default::default(),
         strikes: Default::default(),
         pair_strikes: Default::default(),
@@ -906,7 +956,8 @@ pub fn run(
             }
             Ok(())
         })
-        // The vps tunnel is stopped (ssh killed) as it drops here, on every way out.
+        // The vps tunnel is stopped (ssh killed) as it drops here, on every way out;
+        // `proxy` is killed as it drops at the end of this function.
         .inspect(|()| drop(ssh))
 }
 

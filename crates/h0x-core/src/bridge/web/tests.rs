@@ -48,6 +48,7 @@ fn fixture_via(hosts: Vec<String>, public: Option<&str>) -> Fixture {
         key: e2e::ServerKey::generate(),
         notices,
         public: public.map(String::from),
+        serve: None,
         unauthenticated: Default::default(),
         strikes: Default::default(),
         pair_strikes: Default::default(),
@@ -1734,6 +1735,53 @@ fn one_source_cannot_hold_every_slot_before_it_authenticates() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert!(served, "a closed connection gives its place back");
+}
+
+#[test]
+fn behind_tailscale_serve_its_https_origin_is_served_and_sources_come_from_its_forward() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let serve_host = format!("box.tail1234.ts.net:{}", addr.port());
+    let mut allowed = hosts(Ipv4Addr::LOCALHOST, addr.port());
+    allowed.push(serve_host.clone());
+    let mut f = fixture(allowed);
+    Arc::get_mut(&mut f.web).unwrap().serve = Some(serve_host.clone());
+    let web = f.web.clone();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async move { serve(tokio::net::TcpListener::from_std(listener).unwrap(), web).await });
+    });
+    let ws = |origin: &str, visitor: &str| {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let head = format!(
+            "GET /ws HTTP/1.1\r\nHost: {serve_host}\r\nOrigin: {origin}\r\nX-Forwarded-For: 6.6.6.6, {visitor}\r\n\
+             Upgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        let mut answer = Vec::new();
+        let mut byte = [0u8];
+        while !answer.ends_with(b"\r\n\r\n") && stream.read_exact(&mut byte).is_ok() {
+            answer.push(byte[0]);
+        }
+        (String::from_utf8_lossy(&answer).into_owned(), stream)
+    };
+    let ours = format!("https://{serve_host}");
+    let wrong_port = format!("https://box.tail1234.ts.net:{}", addr.port() as u32 + 1);
+    for bad in [wrong_port.as_str(), "https://evil.example", "https://127.0.0.1", "https://box.tail1234.ts.net"] {
+        let (head, _) = ws(bad, "100.64.0.7");
+        assert!(head.starts_with("HTTP/1.1 403 "), "{bad}: {head}");
+    }
+    // Each visitor behind serve has its own share of unauthenticated places.
+    let (a, b) = ("100.64.0.7", "100.64.0.8");
+    let open: Vec<_> = (0..MAX_UNAUTHENTICATED_PER_SOURCE).map(|_| ws(&ours, a)).collect();
+    assert!(open.iter().all(|(head, _)| head.starts_with("HTTP/1.1 101 ")), "the serve origin is served");
+    let (refused, _) = ws(&ours, a);
+    assert!(refused.starts_with("HTTP/1.1 503 "), "that visitor is full: {refused}");
+    let (other, _keep) = ws(&ours, b);
+    assert!(other.starts_with("HTTP/1.1 101 "), "another visitor is still served: {other}");
 }
 
 #[test]
