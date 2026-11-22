@@ -622,6 +622,265 @@ fn a_session_token_matches_only_exactly() {
 }
 
 #[test]
+fn sessions_command_replies_with_structured_rows_and_obeys_auth_and_lock() {
+    let f = fixture(Vec::new());
+    assert!(f.say(&mut phone(), "command", json!({"cmd": "sessions"}), T).close, "pair or auth first");
+    let (mut conn, _) = f.paired();
+    let step = f.say(&mut conn, "command", json!({"cmd": "sessions", "id": 7}), T);
+    assert_eq!(
+        step.out[0]["data"],
+        json!({"kind": "done", "id": 7, "sessions": [{"address": "t2", "name": "", "agent": "claude", "folder": "/w",
+            "status": "blocked", "live": true, "kind": "permission", "msg": ""}]})
+    );
+    f.web.bridge.lock().unwrap().set_locked(true).unwrap();
+    let locked = f.say(&mut conn, "command", json!({"cmd": "sessions", "id": 8}), T);
+    assert_eq!(locked.out[0]["data"], json!({"kind": "locked", "id": 8}));
+}
+
+/// A fixture whose core answers with `core` instead of the fake one.
+fn fixture_core(core: impl Fn(&str, Value) -> Result<Value, RpcError> + Send + Sync + 'static) -> Fixture {
+    let mut f = fixture(Vec::new());
+    Arc::get_mut(&mut f.web).unwrap().core = Box::new(core);
+    f
+}
+
+/// The `sessions` reply's data for `terminals`, from a paired device.
+fn sessions_reply(terminals: Value) -> Value {
+    let f = fixture_core(move |_, params| {
+        Ok(if params["all"] == true { json!({"terminals": terminals.clone()}) } else { json!({"terminals": []}) })
+    });
+    let (mut conn, _) = f.paired();
+    let step = f.say(&mut conn, "command", json!({"cmd": "sessions", "id": 1}), T);
+    assert!(!step.close, "{step:?}");
+    step.out[0]["data"].clone()
+}
+
+#[test]
+fn sessions_rows_carry_exactly_the_mobile_keys_and_finished_terminals_too() {
+    let data = sessions_reply(json!([
+        {"address": "t1", "name": "web", "argv": ["/bin/sh"], "cwd": "/w", "state": "live"},
+        {"address": "t2", "argv": ["claude"], "cwd": "/w", "state": "live",
+         "status": {"state": "blocked", "kind": "question", "msg": "Pick one"}},
+        {"address": "t3", "argv": ["codex"], "state": "exited", "exit_code": 0},
+        {"address": "t4", "argv": ["codex"], "state": "exited", "exit_code": -1},
+        {"address": "t5", "argv": ["codex"], "state": "exited", "signal": 9},
+        {"address": "t6", "state": "exited"},
+    ]));
+    let row = |address: &str, name: &str, agent: &str, folder: &str, status: &str, live: bool| {
+        json!({"address": address, "name": name, "agent": agent, "folder": folder, "status": status,
+               "live": live, "kind": null, "msg": ""})
+    };
+    let mut blocked = row("t2", "", "claude", "/w", "blocked", true);
+    (blocked["kind"], blocked["msg"]) = (json!("question"), json!("Pick one"));
+    assert_eq!(
+        data,
+        json!({"kind": "done", "id": 1, "sessions": [
+            row("t1", "web", "sh", "/w", "running", true),
+            blocked,
+            row("t3", "", "codex", "", "exit 0", false),
+            row("t4", "", "codex", "", "exit -1", false),
+            row("t5", "", "codex", "", "signal 9", false),
+            row("t6", "", "", "", "ended", false),
+        ]})
+    );
+    assert!(data.get("text").is_none(), "rows, not text: {data}");
+}
+
+#[test]
+fn no_terminals_or_an_odd_core_answer_is_an_empty_session_list() {
+    for terminals in [json!([]), json!(null), json!({}), json!("t1"), json!(5)] {
+        assert_eq!(sessions_reply(terminals.clone()), json!({"kind": "done", "id": 1, "sessions": []}), "{terminals}");
+    }
+    let rows = sessions_reply(json!([{}, null, 7]));
+    let empty = json!({"address": "", "name": "", "agent": "", "folder": "", "status": "ended", "live": false,
+                       "kind": null, "msg": ""});
+    assert_eq!(rows["sessions"], json!([empty, empty, empty]), "rows with nothing in them still have every key");
+}
+
+#[test]
+fn a_failing_core_is_a_failed_sessions_reply_with_its_secret_redacted() {
+    let f = fixture_core(|_, params| match params["all"] == true {
+        true => Err(RpcError::invalid_params("no core: token=abcdef0123456789")),
+        false => Ok(json!({"terminals": []})),
+    });
+    let (mut conn, _) = f.paired();
+    let step = f.say(&mut conn, "command", json!({"cmd": "sessions", "id": 4}), T);
+    assert_eq!(step.out[0]["data"], json!({"kind": "failed", "id": 4, "message": "no core: token=[redacted]"}));
+    assert!(!step.close);
+}
+
+#[test]
+fn a_session_kind_is_null_unless_the_program_is_blocked() {
+    let data = sessions_reply(json!([
+        {"address": "t1", "state": "live", "status": {"state": "working", "kind": "permission"}},
+        {"address": "t2", "state": "exited", "exit_code": 0, "status": {"state": "blocked", "kind": "permission"}},
+        {"address": "t3", "state": "live", "status": {"state": "blocked", "kind": "permission"}},
+        {"address": "t4", "state": "live", "status": {"state": "blocked"}},
+        {"address": "t5", "state": "live", "status": {"state": "blocked", "kind": 5}},
+    ]));
+    let kinds: Vec<&Value> = data["sessions"].as_array().unwrap().iter().map(|s| &s["kind"]).collect();
+    assert_eq!(
+        kinds,
+        [&json!(null), &json!(null), &json!("permission"), &json!(null), &json!(null)],
+        "a working program, or a finished one, waits on nothing: {data}"
+    );
+}
+
+#[test]
+fn every_text_field_of_a_session_is_redacted_like_list() {
+    let secrets = [
+        "sk-proj-abcdefghijklmnop1234",
+        "ghp_ABCDEFGHIJKLMNOPQRSTuvwx",
+        "abcd1234efgh5678",
+        "hunter22hunter",
+        "c2VjcmV0c2VjcmV0",
+        "0123456789abcdef",
+        "eyJhbGciOiJIUzI1NiJ9",
+    ];
+    let data = sessions_reply(json!([{
+        "address": "t1 sk-proj-abcdefghijklmnop1234",
+        "name": "deploy ghp_ABCDEFGHIJKLMNOPQRSTuvwx",
+        "argv": ["/usr/bin/run"],
+        "cwd": "/home/x/OPENAI_API_KEY=abcd1234efgh5678",
+        "state": "live",
+        "status": {"state": "blocked", "app": "PASSWORD='hunter22hunter'", "kind": "client_secret: c2VjcmV0c2VjcmV0",
+                   "msg": "paste {\"auth_token\": \"0123456789abcdef\"} and Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.e30.x"},
+    }]));
+    let text = data.to_string();
+    for secret in secrets {
+        assert!(!text.contains(secret), "{secret} leaked: {text}");
+    }
+    let row = &data["sessions"][0];
+    assert_eq!(row["address"], "t1 [redacted]");
+    assert_eq!(row["name"], "deploy [redacted]");
+    assert_eq!(row["agent"], "PASSWORD='[redacted]'");
+    assert_eq!(row["folder"], "/home/x/OPENAI_API_KEY=[redacted]");
+    assert_eq!(row["kind"], "client_secret: [redacted]");
+    assert_eq!(row["msg"], "paste {\"auth_token\": \"[redacted]\"} and Authorization: Bearer [redacted]");
+}
+
+#[test]
+fn a_session_status_word_is_redacted_like_list() {
+    // `list` redacts its whole text; the program's own status word must not slip through `sessions`.
+    let data = sessions_reply(json!([
+        {"address": "t1", "state": "live", "status": {"state": "token=abcdef0123456789"}},
+    ]));
+    assert_eq!(data["sessions"][0]["status"], "token=[redacted]", "{data}");
+}
+
+#[test]
+fn unicode_quotes_newlines_and_windows_paths_come_through_a_session_unchanged() {
+    let name = "项目 🚀 \"quoted\" 'single' back\\slash\nsecond line\ttab";
+    let data = sessions_reply(json!([
+        {"address": "t1", "name": name, "argv": [r"C:\Program Files\Claude\claude.exe"], "cwd": r"C:\Users\x\proj",
+         "state": "live", "status": {"state": "blocked", "msg": "Ünïcode ✓\n\"why?\""}},
+        {"address": "t2", "argv": [r"\\server\share\bin\codex.exe"], "cwd": r"\\server\share\proj",
+         "foreground": {"cwd": r"\\server\share\proj\sub dir"}, "state": "exited", "exit_code": 3},
+        {"address": "t3", "argv": ["sh"], "cwd": "/home/jane doe/项目 🚀", "state": "live"},
+    ]));
+    let rows = &data["sessions"];
+    assert_eq!(
+        (&rows[0]["name"], &rows[0]["agent"], &rows[0]["folder"]),
+        (&json!(name), &json!("claude"), &json!(r"C:\Users\x\proj"))
+    );
+    assert_eq!(rows[0]["msg"], "Ünïcode ✓\n\"why?\"");
+    assert_eq!(
+        (&rows[1]["agent"], &rows[1]["folder"]),
+        (&json!("codex"), &json!(r"\\server\share\proj\sub dir")),
+        "current folder first"
+    );
+    assert_eq!((&rows[1]["status"], &rows[1]["live"]), (&json!("exit 3"), &json!(false)));
+    assert_eq!(rows[2]["folder"], "/home/jane doe/项目 🚀");
+    let wire = message("reply", data.clone()).to_string();
+    assert_eq!(serde_json::from_str::<Value>(&wire).unwrap()["data"], data, "the frame round-trips");
+}
+
+#[test]
+fn sessions_ids_echo_as_given_and_extra_fields_are_ignored() {
+    let f = fixture(Vec::new());
+    let (mut conn, _) = f.paired();
+    for id in [json!(u64::MAX), json!(i64::MIN), json!(1e300), json!(0), json!("7"), json!([1, 2]), json!(null)] {
+        let step = f.say(&mut conn, "command", json!({"cmd": "sessions", "id": id}), T);
+        let data = &step.out[0]["data"];
+        assert_eq!((&data["kind"], &data["id"], step.close), (&json!("done"), &id, false), "{id}");
+        assert!(data["sessions"].is_array(), "{data}");
+    }
+    let missing = f.say(&mut conn, "command", json!({"cmd": "sessions"}), T);
+    assert_eq!((&missing.out[0]["data"]["id"], &missing.out[0]["data"]["kind"]), (&Value::Null, &json!("done")));
+    let extra = json!({"cmd": "sessions", "id": 2, "terminal": "t9", "lines": 5, "all": false, "zzz": [{"a": 1}]});
+    let step = f.say(&mut conn, "command", extra, T);
+    assert_eq!(step.out[0]["data"]["sessions"][0]["address"], "t2", "{step:?}");
+    for odd in ["Sessions", "SESSIONS", " sessions", "sessions "] {
+        let step = f.say(&mut conn, "command", json!({"cmd": odd, "id": 3}), T);
+        assert_eq!(step.out[0]["data"]["kind"], "failed", "{odd:?}");
+    }
+}
+
+#[test]
+fn sessions_are_gated_like_list_before_auth_when_limited_and_after_unpairing_and_are_audited() {
+    let f = fixture(Vec::new());
+    let mut stranger = phone();
+    let refused = f.say(&mut stranger, "command", json!({"cmd": "sessions", "id": 1}), T);
+    assert!(refused.close && refused.out.iter().all(|m| m["data"].get("sessions").is_none()), "{refused:?}");
+
+    let (mut conn, _) = f.paired();
+    let replies: Vec<Value> = (0..40)
+        .map(|n| f.say(&mut conn, "command", json!({"cmd": "sessions", "id": n}), T).out[0]["data"].clone())
+        .collect();
+    let limited =
+        replies.iter().position(|r| r["kind"] == "rate_limited").expect("30 a minute, the pair's snapshot included");
+    assert!(replies[..limited].iter().all(|r| r["kind"] == "done"), "{replies:?}");
+    assert!(replies[limited..].iter().all(|r| r["kind"] == "rate_limited" && r.get("sessions").is_none()));
+    let log = std::fs::read_to_string(f.dir.join("audit.jsonl")).unwrap();
+    assert_eq!(log.matches("\"command\":\"sessions\"").count(), limited, "each answered one, once: {log}");
+
+    let later = T + 61_000;
+    f.web.bridge.lock().unwrap().set_locked(true).unwrap();
+    let locked = f.say(&mut conn, "command", json!({"cmd": "sessions", "id": 50}), later);
+    assert_eq!((&locked.out[0]["data"], locked.close), (&json!({"kind": "locked", "id": 50}), false));
+    f.web.bridge.lock().unwrap().set_locked(false).unwrap();
+    assert_eq!(f.say(&mut conn, "command", json!({"cmd": "sessions", "id": 51}), later).out[0]["data"]["kind"], "done");
+
+    f.web.bridge.lock().unwrap().unpair(None).unwrap();
+    let gone = f.say(&mut conn, "command", json!({"cmd": "sessions", "id": 52}), later);
+    assert_eq!((&gone.out[0]["data"], gone.close), (&json!({"kind": "not_paired", "id": 52}), true));
+}
+
+#[test]
+fn other_commands_keep_their_text_replies() {
+    let f = fixture(Vec::new());
+    let (mut conn, _) = f.paired();
+    let list = f.say(&mut conn, "command", json!({"cmd": "list", "id": 1}), T);
+    let data = &list.out[0]["data"];
+    assert_eq!((&data["kind"], data["text"].is_string(), data.get("sessions")), (&json!("done"), true, None), "{data}");
+    let read = f.say(&mut conn, "command", json!({"cmd": "read", "terminal": "t2", "id": 2}), T);
+    assert_eq!(read.out[0]["data"].get("sessions"), None, "{read:?}");
+}
+
+#[test]
+fn a_large_sessions_reply_is_one_whole_frame() {
+    // About 300 bytes a row: 150 rows stay under the inbound cap, 400 go well over it; outbound frames are not capped.
+    for n in [1usize, 150, 400] {
+        let rows: Vec<Value> = (0..n)
+            .map(|i| {
+                json!({"address": format!("t{i}"), "name": "n".repeat(200), "argv": ["claude"], "cwd": "/w",
+                            "state": "live"})
+            })
+            .collect();
+        let data = sessions_reply(json!(rows));
+        assert_eq!(data["kind"], "done", "{n} rows");
+        let wire = message("reply", data).to_string();
+        if n <= 150 {
+            assert!(wire.len() <= http::MAX_FRAME, "{n} rows make {} bytes", wire.len());
+        }
+        let back: Value = serde_json::from_str(&wire).expect("one well-formed message");
+        let got = back["data"]["sessions"].as_array().unwrap();
+        assert_eq!(got.len(), n, "every row");
+        assert_eq!(got[n - 1]["address"], format!("t{}", n - 1));
+    }
+}
+
+#[test]
 fn command_ids_echo_as_given_and_odd_data_is_a_failed_reply() {
     let f = fixture(Vec::new());
     let (mut conn, _) = f.paired();
