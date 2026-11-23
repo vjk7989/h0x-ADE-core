@@ -19,7 +19,7 @@ fn initial_size_is_optional_and_applies_before_the_program_starts() {
     let s = Session::new();
     s.json(&["server", "start"]);
     let mut conn = s.connect();
-    for (id, size, expected) in [(1, Value::Null, "120 200"), (2, json!({"cols": 73, "rows": 19}), "19 73")] {
+    for (id, size, expected) in [(1, Value::Null, "50 160"), (2, json!({"cols": 73, "rows": 19}), "19 73")] {
         let mut params = json!({"argv": ["sh", "-c", "stty size"], "wait": true});
         if !size.is_null() {
             params["size"] = size;
