@@ -836,3 +836,218 @@ async fn a_turn_that_ended_done_and_restarted_in_one_chunk_still_says_done() {
     drop(core);
     remove_root(&root);
 }
+
+// `text.redact` as a client calls it: through `api::dispatch`, params as JSON.
+// Tokens are split with `concat!` so no whole secret shape sits in the source.
+
+/// The reply's `text` (the only key in the result), or the method's error.
+async fn text_redact(params: serde_json::Value) -> Result<String, crate::rpc::RpcError> {
+    let (core, root) = test_core();
+    let call = crate::api::Call { core: &core, conn: None, plain: None };
+    let reply = crate::api::dispatch(&call, "text.redact", params).await;
+    drop(core);
+    remove_root(&root);
+    reply.map(|v| {
+        let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["text"], "{v}");
+        v["text"].as_str().unwrap().to_string()
+    })
+}
+
+async fn redacted(text: &str) -> String {
+    text_redact(json!({"text": text})).await.unwrap_or_else(|e| panic!("{}: {}", e.kind, e.message))
+}
+
+#[tokio::test]
+async fn text_redact_rpc_hides_the_common_secret_shapes() {
+    let cases = [
+        (
+            concat!(
+                "use sk-ant-api03-",
+                "Xq9vB2mN7pL4kR8tW1yZ3cF6hJ0dS5gA-_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789-AbCdEfAA now"
+            ),
+            "use [redacted] now",
+        ),
+        (
+            concat!("OPENAI sk-proj-", "Ab12Cd34Ef56Gh78Ij90Kl12Mn34Op56Qr78St90Uv12Wx34Yz56_T3BlbkFJ."),
+            "OPENAI [redacted].",
+        ),
+        (concat!("sk-", "aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789aBcDeFgHiJkL"), "[redacted]"),
+        (
+            concat!("git clone https://gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789@github.com/o/r"),
+            "git clone https://[redacted]@github.com/o/r",
+        ),
+        (
+            concat!("github", "_pat_11ABCDEFG0aBcDeFgHiJkLmN_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789aBcDeFgHiJkLmNoPq"),
+            "[redacted]",
+        ),
+        (concat!("id AKIA", "IOSFODNN7EXAMPLE end"), "id [redacted] end"),
+        (
+            concat!("AWS_SECRET_ACCESS_KEY=", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+            "AWS_SECRET_ACCESS_KEY=[redacted]",
+        ),
+        (concat!("slack xo", "xb-2048123456789-2048123456789-AbCdEfGhIjKlMnOpQrStUvWx"), "slack [redacted]"),
+        (
+            "before\n-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA1x\nq2Zr+abc/def==\n-----END RSA PRIVATE KEY-----\nafter",
+            "before\n[redacted]\nafter",
+        ),
+        ("password=correcthorsebattery", "password=[redacted]"),
+        (
+            concat!("Authorization: Bearer ", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJlMTIz"),
+            "Authorization: Bearer [redacted]",
+        ),
+        (r#"api_key: "abcd1234efgh5678ijkl""#, r#"api_key: "[redacted]""#),
+        // A prefixed token inside once-escaped JSON (a log line holding a JSON body).
+        (
+            concat!(r#"{"body":"{\"token\":\"gh"#, r#"p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789\"}"}"#),
+            r#"{"body":"{\"token\":\"[redacted]\"}"}"#,
+        ),
+    ];
+    for (text, want) in cases {
+        assert_eq!(redacted(text).await, want, "{text}");
+    }
+}
+
+#[tokio::test]
+async fn text_redact_rpc_hides_a_bare_jwt() {
+    let jwt = concat!(
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+        ".eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+    );
+    assert_eq!(redacted(&format!("session {jwt} expired")).await, "session [redacted] expired");
+}
+
+#[tokio::test]
+async fn text_redact_rpc_hides_a_google_api_key() {
+    let out = redacted(concat!("GOOGLE AI", "zaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY")).await;
+    assert_eq!(out, "GOOGLE [redacted]");
+}
+
+#[tokio::test]
+async fn text_redact_rpc_hides_a_stripe_live_key() {
+    let out = redacted(concat!("stripe sk_", "live_4eC39HqLyjWDarjtT1zdp7dc")).await;
+    assert_eq!(out, "stripe [redacted]");
+}
+
+#[tokio::test]
+async fn text_redact_rpc_hides_the_secret_line_of_an_aws_credentials_file() {
+    // ~/.aws/credentials writes `name = value`, with spaces around the `=`.
+    let file = concat!(
+        "[default]\naws_access_key_id = AKIA",
+        "IOSFODNN7EXAMPLE\naws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n"
+    );
+    let out = redacted(file).await;
+    assert_eq!(out, "[default]\naws_access_key_id = [redacted]\naws_secret_access_key = [redacted]\n");
+}
+
+#[tokio::test]
+async fn text_redact_rpc_hides_all_of_a_password_with_symbols() {
+    let out = redacted("password=Sup3r!Secret#99 then").await;
+    assert!(!out.contains("Secret#99"), "{out}");
+    assert_eq!(out, "password=[redacted] then");
+}
+
+#[tokio::test]
+async fn text_redact_rpc_finds_a_key_name_inside_escaped_json() {
+    // The name has no known prefix: only `api_key` says the value is a secret.
+    let out = redacted(r#"{"body":"{\"api_key\":\"abcd1234efgh5678\"}"}"#).await;
+    assert_eq!(out, r#"{"body":"{\"api_key\":\"[redacted]\"}"}"#);
+}
+
+#[tokio::test]
+async fn text_redact_rpc_missing_null_or_empty_text_is_empty() {
+    for params in [json!({}), serde_json::Value::Null, json!({"text": ""})] {
+        assert_eq!(text_redact(params.clone()).await.map_err(|e| e.kind), Ok(String::new()), "{params}");
+    }
+}
+
+#[tokio::test]
+async fn text_redact_rpc_rejects_a_text_that_is_not_a_string_without_echoing_it() {
+    let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+    for params in [json!({"text": 42}), json!({"text": [token]}), json!({"text": {"inner": token}})] {
+        let err = text_redact(params.clone()).await.unwrap_err();
+        assert_eq!(err.kind, "invalid_params", "{params}");
+        assert!(!err.message.contains(token) && !err.hint.contains(token), "{}", err.message);
+    }
+}
+
+#[tokio::test]
+async fn text_redact_rpc_redacts_a_secret_ending_exactly_at_64_kb_and_refuses_one_byte_more() {
+    let max = 65_536;
+    let token = concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789");
+    let pad = "x".repeat(max - token.len() - 1);
+    let text = format!("{pad} {token}");
+    assert_eq!(text.len(), max);
+    assert_eq!(redacted(&text).await, format!("{pad} [redacted]"));
+    // One byte more: an error and no text at all, not even a redacted part.
+    let err = text_redact(json!({"text": format!("x{text}")})).await.unwrap_err();
+    assert_eq!((err.kind.as_str(), err.code), ("too_large", -32000));
+    assert!(
+        !err.message.contains(token) && !err.hint.contains(token) && !err.message.contains("xxxx"),
+        "{}",
+        err.message
+    );
+}
+
+#[tokio::test]
+async fn text_redact_rpc_redacts_a_key_split_across_a_line_break() {
+    // A Bearer token on the next line is still the token.
+    let out = redacted(concat!("Authorization: Bearer\r\n", "eyJhbGciOiJIUzI1NiJ9.e30.c2lnbmF0dXJl1")).await;
+    assert_eq!(out, "Authorization: Bearer\r\n[redacted]");
+    // A long key wrapped by a terminal: the part before the break goes, the break stays.
+    let out = redacted(concat!("key sk-ant-api03-", "ABCDEFGHIJKLMNOPQRST\r\nUVWXYZ0123456789abcd end")).await;
+    assert!(out.starts_with("key [redacted]\r\n"), "{out}");
+    assert!(!out.contains("ABCDEFGHIJ"), "{out}");
+}
+
+#[tokio::test]
+async fn text_redact_rpc_redacts_many_secrets_in_one_text() {
+    let shapes = [
+        concat!("sk-proj-", "aBcDeFgHiJkLmNoPqRsT"),
+        concat!("gh", "p_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789"),
+        concat!("xo", "xb-2048123456789-AbCdEfGh"),
+        concat!("AKIA", "IOSFODNN7EXAMPLE"),
+    ];
+    let text: String = (0..400).map(|i| format!("line {i}: {} ok\n", shapes[i % shapes.len()])).collect();
+    let want: String = (0..400).map(|i| format!("line {i}: [redacted] ok\n")).collect();
+    assert_eq!(redacted(&text).await, want);
+}
+
+#[tokio::test]
+async fn text_redact_rpc_keeps_unicode_cjk_and_emoji_intact() {
+    let token = concat!("sk-proj-", "aBcDeFgHiJkLmNoPqRsT");
+    let text = format!("日本語 {token} 🔑 naïve café ✓ — 中文\n鍵{token}🔑 👩‍💻 ok");
+    assert_eq!(redacted(&text).await, "日本語 [redacted] 🔑 naïve café ✓ — 中文\n鍵[redacted]🔑 👩‍💻 ok");
+    let plain = "提示：请修复 bug 🐛 in état été — Ünïcödé ✓ 🇮🇳";
+    assert_eq!(redacted(plain).await, plain);
+}
+
+#[tokio::test]
+async fn text_redact_rpc_leaves_windows_paths_alone() {
+    for path in [
+        r"C:\Users\x\proj",
+        r"C:\Users\x\proj\src\main.rs",
+        r"cd C:\Program Files\HyperOx\bin && dir",
+        r"\\server\share\team-project\build-output",
+        r"\\?\C:\Users\x\AppData\Local\Temp\h0x-1234567890abcdef",
+        r"C:\Users\x\.ssh\id_ed25519.pub",
+        r#"{"cwd":"C:\\Users\\x\\proj"}"#,
+    ] {
+        assert_eq!(redacted(path).await, path);
+    }
+}
+
+#[tokio::test]
+async fn text_redact_rpc_handles_a_64_kb_line_without_spaces_quickly() {
+    let blob = "QUJDRA".repeat(10_900);
+    let text = format!("{blob}&token=abcdefgh12345678");
+    assert!(text.len() <= 65_536);
+    let started = Instant::now();
+    assert_eq!(redacted(&text).await, format!("{blob}&token=[redacted]"));
+    // Shapes that start a match at every byte but never finish one.
+    for unit in ["-----BEGIN ", "Bearer\t", "key:", "sk-x"] {
+        let text = unit.repeat(65_536 / unit.len());
+        assert!(text_redact(json!({"text": text})).await.is_ok(), "{unit}");
+    }
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+}
