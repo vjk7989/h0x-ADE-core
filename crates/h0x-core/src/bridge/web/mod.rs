@@ -370,7 +370,16 @@ fn refuse(why: &str) -> Step {
 fn reply_json(id: &Value, reply: Reply) -> Value {
     let mut data = match reply {
         Reply::Done(text) => json!({"kind": "done", "text": text}),
-        Reply::Sessions(_) => json!({"kind": "failed", "message": "not available on the web panel"}),
+        Reply::Sessions(all) => {
+            let rows: Vec<Value> = all
+                .into_iter()
+                .map(|s| {
+                    json!({"address": s.address, "name": s.name, "agent": s.agent, "folder": s.folder,
+                           "status": s.status, "live": s.live, "kind": s.kind, "msg": s.msg})
+                })
+                .collect();
+            json!({"kind": "done", "sessions": rows})
+        }
         Reply::NeedsConfirm { token, what } => json!({"kind": "needs_confirm", "token": token, "what": what}),
         Reply::NotPaired => json!({"kind": "not_paired"}),
         Reply::Locked => json!({"kind": "locked"}),
@@ -387,6 +396,7 @@ fn command(data: &Value) -> Result<Command, String> {
     let terminal = || text("terminal");
     Ok(match data["cmd"].as_str().unwrap_or_default() {
         "list" => Command::List,
+        "sessions" => Command::Sessions,
         "read" => Command::Read {
             terminal: terminal()?,
             lines: data["lines"].as_u64().map_or(20, |n| usize::try_from(n).unwrap_or(usize::MAX)),

@@ -680,6 +680,18 @@
         ],
         "type": "object"
       },
+      "RedactResult": {
+        "properties": {
+          "text": {
+            "description": "The text with secrets replaced by `[redacted]`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      },
       "RemoveResult": {
         "properties": {
           "removed": {
@@ -2087,6 +2099,38 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/RouteResult"
+        }
+      }
+    },
+    {
+      "description": "Replace API keys, tokens, private keys and `password=...` values in a text with `[redacted]`. A pattern list, not a guarantee. Refuses more than 64 KB (`too_large`), with no partial answer. Empty in, empty out. No network.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "too_large"
+          },
+          "message": "too_large"
+        }
+      ],
+      "name": "text.redact",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The text to clean, at most 64 KB.",
+          "name": "text",
+          "required": false,
+          "schema": {
+            "default": "",
+            "description": "The text to clean, at most 64 KB.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/RedactResult"
         }
       }
     },
