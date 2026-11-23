@@ -217,7 +217,7 @@ impl Core {
     }
 
     pub fn headless(&self) -> (u16, u16) {
-        self.settings().headless().unwrap_or((200, 120))
+        self.settings().headless().unwrap_or((160, 50))
     }
 
     pub fn history_bytes(&self) -> usize {

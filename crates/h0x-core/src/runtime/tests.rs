@@ -1204,3 +1204,37 @@ async fn text_redact_rpc_handles_a_64_kb_line_without_spaces_quickly() {
     }
     assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
 }
+
+#[tokio::test]
+async fn the_runtime_size_fallback_and_history_match_the_config_defaults() {
+    let (core, root) = test_core();
+    let defaults = crate::config::Config::default();
+    let config = core.paths.config.clone();
+    let mut seen = Vec::new();
+    // Missing file, empty file, broken TOML, unusable headless: all give the defaults,
+    // so the runtime fallback cannot drift from `Config::headless`.
+    for text in [None, Some(""), Some("headless = "), Some("headless = \"wide\"\n"), Some("headless = \"0x0\"\n")] {
+        if let Some(text) = text {
+            std::fs::write(&config, text).unwrap();
+        }
+        seen.push((text, core.headless()));
+    }
+    let expected = defaults.headless().unwrap();
+    assert_eq!(expected, (160, 50));
+    for (text, size) in &seen {
+        assert_eq!(*size, expected, "{text:?}");
+    }
+    std::fs::remove_file(&config).unwrap();
+    assert_eq!(core.history_bytes(), defaults.history_bytes());
+    assert_eq!(core.history_bytes(), (3.6 * 1024.0 * 1024.0) as usize);
+
+    std::fs::write(&config, "headless = \"200x120\"\nhistory_mb = 0.0\n").unwrap();
+    assert_eq!((core.headless(), core.history_bytes()), ((200, 120), 0), "explicit values still win");
+    std::fs::write(&config, "headless = \"1x1\"\nhistory_mb = -4.0\n").unwrap();
+    assert_eq!((core.headless(), core.history_bytes()), ((1, 1), 0));
+    // A broken file drops every setting back to the defaults, not just the broken one.
+    std::fs::write(&config, "headless = \"200x120\"\nhistory_mb = \n").unwrap();
+    assert_eq!((core.headless(), core.history_bytes()), ((160, 50), defaults.history_bytes()));
+    drop(core);
+    remove_root(&root);
+}
