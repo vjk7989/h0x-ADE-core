@@ -41,11 +41,16 @@ pub(crate) fn prepare(core: &Core) -> io::Result<()> {
 }
 
 fn save(paths: &Paths) -> io::Result<()> {
+    let mut vars: Vec<_> = std::env::vars_os().filter(|(key, _)| !key.as_encoded_bytes().starts_with(b"=")).collect();
+    // The successor keeps our launch folder as its terminals' default; it removes this on start.
+    if let Some(dir) = crate::exec::LAUNCH_DIR.get() {
+        vars.push((crate::exec::LAUNCH_DIR_VAR.into(), dir.into()));
+    }
     let env = Environment {
         machine_id: crate::platform::machine_id(),
         boot_id: crate::platform::boot_id()?,
         written_ms: now_ms()?,
-        vars: std::env::vars_os().filter(|(key, _)| !key.as_encoded_bytes().starts_with(b"=")).collect(),
+        vars,
     };
     let tmp = paths.state.join("restart-env.tmp");
     let mut file = crate::platform::private_file(&tmp)?;
@@ -199,6 +204,27 @@ mod tests {
     fn load(paths: &Paths, bytes: &[u8]) -> std::io::Result<Option<Vec<(OsString, OsString)>>> {
         std::fs::write(paths.state.join(ENVIRONMENT), bytes).unwrap();
         super::load(paths)
+    }
+
+    #[test]
+    fn the_note_hands_over_the_launch_folder_and_the_successor_keeps_it() {
+        use std::ffi::OsStr;
+        let var = crate::exec::LAUNCH_DIR_VAR;
+        let (paths, root) = state();
+        // Tests never move this process's cwd, so this launch folder changes nothing for other tests.
+        let launch = crate::exec::LAUNCH_DIR.get_or_init(|| std::env::current_dir().unwrap()).clone();
+        super::save(&paths).unwrap();
+        let vars = super::load(&paths).unwrap().expect("a fresh note");
+        let handed: Vec<_> = vars.iter().filter(|(key, _)| key.as_os_str() == OsStr::new(var)).collect();
+        assert_eq!(handed.len(), 1, "handed over exactly once");
+        assert_eq!(handed[0].1.as_os_str(), launch.as_os_str());
+        // The successor starts in our state folder; its own value never replaces the note's.
+        let current = [(OsString::from(var), paths.state.clone().into_os_string())];
+        let restored = crate::platform::restored_environment(vars, current);
+        let got = restored.get(OsStr::new(var)).map(|v| v.as_os_str());
+        assert_eq!(got, Some(launch.as_os_str()));
+        assert_ne!(got, Some(paths.state.as_os_str()), "not the state folder");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
