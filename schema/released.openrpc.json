@@ -680,6 +680,18 @@
         ],
         "type": "object"
       },
+      "RedactResult": {
+        "properties": {
+          "text": {
+            "description": "The text with secrets replaced by `[redacted]`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      },
       "RemoveResult": {
         "properties": {
           "removed": {
@@ -688,6 +700,53 @@
         },
         "required": [
           "removed"
+        ],
+        "type": "object"
+      },
+      "RouteResult": {
+        "properties": {
+          "code": {
+            "description": "The directory is a code repo.",
+            "type": "boolean"
+          },
+          "graft": {
+            "description": "A code map is worth adding: a code repo, read-only, navigation-shaped.",
+            "type": "boolean"
+          },
+          "kind": {
+            "description": "`edit`, `code-nav`, `code-read` or `logs-data-general`.",
+            "type": "string"
+          },
+          "model": {
+            "description": "`haiku` for a read-only logs, data or general session, else null (keep the chosen model).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "nav": {
+            "description": "The prompt asks about callers, users or definitions.",
+            "type": "boolean"
+          },
+          "read_only": {
+            "description": "The prompt forbids changes.",
+            "type": "boolean"
+          },
+          "tools": {
+            "description": "The tools the session needs.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "kind",
+          "code",
+          "read_only",
+          "nav",
+          "graft",
+          "tools"
         ],
         "type": "object"
       },
@@ -1554,7 +1613,7 @@
       "name": "Apache-2.0"
     },
     "title": "h0x-core",
-    "version": "0.1.18"
+    "version": "0.1.19"
   },
   "methods": [
     {
@@ -2003,6 +2062,75 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/GateStats"
+        }
+      }
+    },
+    {
+      "description": "Classify a session start from its working directory and first prompt, with rules only: the session kind, the tools it needs, whether a code map helps and whether the cheap model is enough. Without `cwd` (a remote machine) there is no code map and no model change; an empty prompt or an unreadable directory gives the edit profile.",
+      "errors": [],
+      "name": "route",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The session's working directory. Absent on a remote machine: no repo is looked up.",
+          "name": "cwd",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "The session's working directory. Absent on a remote machine: no repo is looked up.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "The first prompt of the session.",
+          "name": "prompt",
+          "required": false,
+          "schema": {
+            "default": "",
+            "description": "The first prompt of the session.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/RouteResult"
+        }
+      }
+    },
+    {
+      "description": "Replace API keys, tokens, private keys and `password=...` values in a text with `[redacted]`. A pattern list, not a guarantee. Refuses more than 64 KB (`too_large`), with no partial answer. Empty in, empty out. No network.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "too_large"
+          },
+          "message": "too_large"
+        }
+      ],
+      "name": "text.redact",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The text to clean, at most 64 KB.",
+          "name": "text",
+          "required": false,
+          "schema": {
+            "default": "",
+            "description": "The text to clean, at most 64 KB.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/RedactResult"
         }
       }
     },
