@@ -11,6 +11,7 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -231,7 +232,7 @@ pub fn start_all(core: &Arc<Core>) {
 }
 
 /// Dials the machine, holds the line, and dials again after a drop (backing
-/// off to 30 s) until the machine is removed.
+/// off to 30 s, or more slowly when a login is needed) until it is removed.
 pub fn keep_up(core: &Arc<Core>, id: String) {
     let mut st = core.lock();
     st.lines.insert(id.clone(), LineState::Connecting);
@@ -260,8 +261,19 @@ pub fn forget(core: &Core, st: &mut State, id: &str) {
     }
 }
 
+/// How long to wait before dialing again after the `attempt`th (from 0) failed login:
+/// 2 minutes, then 5, then 10 for good.
+fn login_backoff(attempt: u32) -> Duration {
+    Duration::from_secs(match attempt {
+        0 => 120,
+        1 => 300,
+        _ => 600,
+    })
+}
+
 async fn supervise(core: Arc<Core>, id: String) {
     let mut backoff = Duration::from_millis(250);
+    let mut login_failures = 0u32;
     loop {
         let Some(m) = core.lock().machines.iter().find(|m| m.id == id).cloned() else { return };
         let down = |st: &mut State, why: String| {
@@ -288,6 +300,7 @@ async fn supervise(core: Arc<Core>, id: String) {
             }
             Ok(d) => {
                 backoff = Duration::from_millis(250);
+                login_failures = 0;
                 // It may have been updated since it was added.
                 if let Some(v) = d.hello["version"].as_str().filter(|v| *v != m.version) {
                     let mut st = core.lock();
@@ -303,7 +316,15 @@ async fn supervise(core: Arc<Core>, id: String) {
                 core.changed.notify_waiters();
                 continue;
             }
-            Err(e) if e.kind == "needs_login" => down(&mut core.lock(), "needs_login".into()),
+            Err(e) if e.kind == "needs_login" => {
+                down(&mut core.lock(), "needs_login".into());
+                // Slow enough that a failing key doesn't get the person banned (fail2ban, CrowdSec),
+                // but an ssh-agent unlocked later still reconnects on its own.
+                let wait = login_backoff(login_failures);
+                login_failures = login_failures.saturating_add(1);
+                tokio::time::sleep(wait).await;
+                continue;
+            }
             Err(e) if e.kind == "incompatible" => down(&mut core.lock(), "needs_update".into()),
             Err(e) => down(&mut core.lock(), e.message),
         }
@@ -354,7 +375,7 @@ async fn hold(core: &Arc<Core>, m: &Machine, mut d: crate::machines::Dialed) {
                 _ => break,
             },
             () = heard.silent_for(silence) => {
-                eprintln!("core: {} sent nothing for {} s: line given up", m.name, silence.as_secs());
+                let _ = writeln!(io::stderr(), "core: {} sent nothing for {} s: line given up", m.name, silence.as_secs());
                 break;
             }
         };
@@ -422,7 +443,7 @@ async fn hold(core: &Arc<Core>, m: &Machine, mut d: crate::machines::Dialed) {
     line.close();
     // Viewers here hear that the line is gone and stay open; the programs keep
     // running there, and the viewers get them back with the line.
-    let notice = format!("\r\n[line to {} lost; reconnecting...]\r\n", m.name);
+    let notice = lost_notice(&m.name);
     for (_, (conn, here)) in lock(&line.streams).drain() {
         conn.with(|out| {
             out.data(here, notice.as_bytes());
@@ -431,6 +452,11 @@ async fn hold(core: &Arc<Core>, m: &Machine, mut d: crate::machines::Dialed) {
     // Killed, not waited for: a Mac core once never heard the old ssh had
     // died and stayed "connecting" for good. It is reaped in the background.
     let _ = d.child.start_kill();
+}
+
+/// CAN first: the line may have dropped mid-sequence, which would swallow this.
+fn lost_notice(machine: &str) -> String {
+    format!("\x18\r\n[line to {machine} lost; reconnecting...]\r\n")
 }
 
 /// A machine's terminals now (after a connect, or after it says we missed
@@ -626,7 +652,7 @@ pub struct Peer {
 fn save_peers(core: &Core, st: &State) {
     let bytes = serde_json::to_vec(&st.peers).expect("peers serialize");
     if let Err(e) = crate::paths::write_atomic(&core.paths.state.join("peers.json"), &bytes) {
-        eprintln!("core: cannot save peers: {e}");
+        let _ = writeln!(io::stderr(), "core: cannot save peers: {e}");
     }
 }
 
@@ -1003,6 +1029,88 @@ pub async fn forward(core: &Core, m: &Machine, method: &str, params: Value) -> R
     }
 }
 
+/// A new grant is shared by concurrent runs until each launch has an outcome.
+/// Cancellation or a lost reply may hide a started child, so retain by default.
+struct RunGrant<'a> {
+    core: &'a Core,
+    key: (u32, String),
+    keep: bool,
+}
+
+impl<'a> RunGrant<'a> {
+    fn start(core: &'a Core, m: &Machine, method: &str, params: &Value) -> Option<Self> {
+        // An explicit parent is resolved on the destination, not on this core.
+        if method != "terminal.run" || params["no_parent"] == true || !params["parent"].is_null() {
+            return None;
+        }
+        // The terminal here that asked (`route` sent it by our id): the only one
+        // its child there may call back.
+        let parent = params["caller"]
+            .as_str()
+            .and_then(|c| c.strip_prefix(&format!("{}/", core.info.id)))
+            .and_then(crate::terminals::parse_id)?;
+        let key = (parent, m.id.clone());
+        let mut st = core.lock();
+        let t = st.reg.terminals.get(&parent)?;
+        if t.afar.contains(&m.id) && !st.afar_runs.contains_key(&key) {
+            return None; // A previous launch already made this grant permanent.
+        }
+        st.afar_runs.entry(key.clone()).or_default().0 += 1;
+        st.reg.terminals.get_mut(&parent)?.afar.insert(m.id.clone());
+        core.save(&st);
+        Some(Self { core, key, keep: true })
+    }
+
+    fn answered(mut self, result: &Result<Value, RpcError>) {
+        match result {
+            Err(e) => self.keep = !not_started(e),
+            // The grant is ours, for the terminal that asked. A reply naming any other
+            // parent (a lie, or a terminal that never called it) keeps nothing.
+            Ok(reply) => {
+                if let Some(parent) = reply["parent"].as_str() {
+                    let ours =
+                        parent.strip_prefix(&format!("{}/", self.core.info.id)).and_then(crate::terminals::parse_id);
+                    self.keep = ours == Some(self.key.0);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for RunGrant<'_> {
+    fn drop(&mut self) {
+        let mut st = self.core.lock();
+        let Some((pending, keep)) = st.afar_runs.get_mut(&self.key) else { return };
+        *keep |= self.keep;
+        *pending -= 1;
+        if *pending != 0 {
+            return;
+        }
+        let keep = *keep;
+        st.afar_runs.remove(&self.key);
+        if !keep && let Some(t) = st.reg.terminals.get_mut(&self.key.0) {
+            t.afar.remove(&self.key.1);
+            self.core.save(&st);
+        }
+    }
+}
+
+/// Only errors that prove no child started permit revoking a new grant.
+/// In particular, spawn timeouts and persistence errors can follow a real spawn.
+fn not_started(e: &RpcError) -> bool {
+    match e.kind.as_str() {
+        "invalid_params" | "invalid_template" | "config" | "name_taken" | "not_found" | "machine_unknown"
+        | "unknown_method" => true,
+        "spawn_failed" => e.message != "the holder did not answer",
+        "unavailable" => {
+            e.message == "the core is stopping"
+                || e.message.starts_with("no holder:")
+                || e.message == "this core has used every terminal id"
+        }
+        _ => false,
+    }
+}
+
 async fn forward_once(core: &Core, m: &Machine, method: &str, mut params: Value) -> Result<Value, RpcError> {
     if method == "terminal.run" {
         // An older core ends a child with its parent only when asked to.
@@ -1019,13 +1127,12 @@ async fn forward_once(core: &Core, m: &Machine, method: &str, mut params: Value)
             format!("h0x-core machine update {}", m.name),
         ));
     }
-    // The terminal here that asked (`route` sent it by our id): the only one
-    // its child there may call back, whatever parent the machine answers with.
-    let caller = params["caller"]
-        .as_str()
-        .and_then(|c| c.strip_prefix(&format!("{}/", core.info.id)))
-        .and_then(crate::terminals::parse_id);
-    let reply = line.call(&m.name, method, params, deadline).await.map_err(|e| match e.kind.as_str() {
+    let grant = RunGrant::start(core, m, method, &params);
+    let result = line.call(&m.name, method, params, deadline).await;
+    if let Some(grant) = grant {
+        grant.answered(&result);
+    }
+    let reply = result.map_err(|e| match e.kind.as_str() {
         "unknown_method" => RpcError::new(
             "needs_update",
             format!("{}'s h0x-core is older and has no {method}", m.name),
@@ -1034,19 +1141,7 @@ async fn forward_once(core: &Core, m: &Machine, method: &str, mut params: Value)
         _ => e,
     })?;
     // Document contents are opaque: address-shaped keys belong to the client.
-    let reply = if method.starts_with("doc.") { reply } else { localize(core, &m.name, &[], reply) };
-    // It started work there: its child may now call back and send it notes.
-    if method == "terminal.run"
-        && let Some(parent) = reply["parent"].as_str().and_then(crate::terminals::parse_id)
-        && caller == Some(parent)
-    {
-        let mut st = core.lock();
-        if let Some(t) = st.reg.terminals.get_mut(&parent) {
-            t.afar.insert(m.id.clone());
-            core.save(&st);
-        }
-    }
-    Ok(reply)
+    Ok(if method.starts_with("doc.") { reply } else { localize(core, &m.name, &[], reply) })
 }
 
 pub async fn forward_to(core: &Core, to: &To, method: &str, params: Value) -> Result<Value, RpcError> {

@@ -8,12 +8,26 @@ mod unix;
 pub use unix::*;
 
 #[cfg(target_os = "linux")]
+mod linux_login;
+#[cfg(target_os = "linux")]
 pub mod systemd;
+
+/// Only a new SSH-started Linux core imports login settings; holders inherit the core.
+#[allow(unused_variables)]
+pub fn core_environment(cmd: &mut std::process::Command, state: &std::path::Path) {
+    #[cfg(target_os = "linux")]
+    linux_login::apply(cmd, state);
+}
 
 #[cfg(target_os = "macos")]
 mod macos_launchd;
 #[cfg(target_os = "macos")]
 mod macos_shutdown;
+
+/// Whether foreground observations can distinguish a shell from its jobs.
+pub fn foreground_tracks_jobs() -> bool {
+    cfg!(unix)
+}
 
 /// Run before threads or runtime setup: a launchd launcher forks the core here.
 pub fn daemon_startup() -> bool {
@@ -69,6 +83,8 @@ mod windows_exec;
 pub use windows_exec::*;
 #[cfg(windows)]
 mod windows_env;
+#[cfg(windows)]
+mod windows_foreground;
 #[cfg(windows)]
 mod windows_session;
 

@@ -15,6 +15,9 @@ h0x-core machine ls
 h0x-core run --on box --cwd /srv/app cargo test
 ```
 
+Without `--name`, the first host label becomes its name (IPs stay whole), shortened to 32 characters.
+Names that are taken or look like terminal ids get a numbered suffix: `t14` becomes `t14-2`.
+
 The other machine needs h0x-core. In an interactive terminal, add asks before copying h0x-core there if it is missing or too old to talk to.
 For a script, `h0x-core machine add user@host --name box --install` allows that copy without asking.
 When the OS and CPU match, it copies your current build. Otherwise it uses this version's released build for that target.
@@ -108,5 +111,8 @@ Repeat old/new pairs for several edits; all succeed or none do.
 - With a custom connection, check that it passes bytes unchanged and does not prompt. Do not request a remote PTY.
 - If a socket path is too long, use a shorter session name or socket path. See [state and endpoints](security.md#state-and-endpoints).
 
-Once a machine is added, core retries a lost connection. Reattach after it returns.
+Once a machine is added, core retries a lost connection. If SSH authentication fails,
+it shows `needs_login` and retries after 2 minutes, then 5 minutes, then every 10 minutes.
+Run `h0x-core machine login box` in a terminal to log in and reconnect immediately.
+A successful connection resets these delays. Reattach after it returns.
 To forget the connection here, use `h0x-core machine rm box`. That does not stop its remote terminals.

@@ -11,7 +11,7 @@ use crate::terminals::Registry;
 use crate::viewers::Viewer;
 use ghostty_vt::Terminal as Screen;
 use std::collections::{HashMap, HashSet};
-use std::io;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant, SystemTime};
@@ -96,6 +96,8 @@ pub struct State {
     pub peer_lines: HashMap<String, (usize, Arc<crate::remote::Line>)>,
     /// Notes from other machines for parents here, until typed.
     pub afar_notes: HashMap<u32, Vec<String>>,
+    /// Provisional callback grants: (parent, machine) -> (runs pending, keep after failure).
+    pub afar_runs: HashMap<(u32, String), (usize, bool)>,
     /// What a machine must hear once its line is back (a parent here finished).
     pub machine_outbox: HashMap<String, Vec<serde_json::Value>>,
     /// When each holder was last reconnected to after our reading of it failed.
@@ -177,9 +179,9 @@ impl Core {
         let reg: Registry = read_state(&paths.state.join("terminals.json"))?;
         let docs_path = paths.state.join("docs.json");
         let docs = read_state(&docs_path).unwrap_or_else(|e| {
-            eprintln!("core: cannot load documents, starting empty: {e}");
+            let _ = writeln!(io::stderr(), "core: cannot load documents, starting empty: {e}");
             if let Err(e) = std::fs::rename(&docs_path, paths.state.join("docs.json.bad")) {
-                eprintln!("core: cannot quarantine documents: {e}");
+                let _ = writeln!(io::stderr(), "core: cannot quarantine documents: {e}");
             }
             Default::default()
         });
@@ -257,18 +259,30 @@ impl Core {
 
     /// Acknowledged mutations wait here without holding the state lock or blocking the executor.
     /// Attach, events.subscribe snapshots, forwarded run `afar`, and NotesAfar replies do not wait.
-    /// Completed write failures are logged, as before; a stuck disk still times out.
+    /// A failed write is reported here and retried in the background.
     pub async fn flush_saved(&self) -> Result<(), crate::rpc::RpcError> {
-        tokio::time::timeout(Duration::from_secs(10), self.registry_writer.flush())
-            .await
-            .map_err(|_| {
-                crate::rpc::RpcError::new(
-                    "unavailable",
-                    "registry persistence timed out; the operation may already have completed",
-                    "check the terminal and disk before retrying",
-                )
-            })?
-            .map_err(|e| crate::rpc::RpcError::internal(format!("cannot save terminals: {e}")))
+        self.wait_for_save().await?.map_err(|e| {
+            crate::rpc::RpcError::new(
+                "unavailable",
+                format!("cannot save terminals: {e}; the operation may already have completed"),
+                "check the terminal and disk before retrying",
+            )
+        })
+    }
+
+    /// Return the action's observed result even when a registry write failed.
+    pub async fn flush_observed(&self) -> Result<(), crate::rpc::RpcError> {
+        self.wait_for_save().await.map(drop)
+    }
+
+    async fn wait_for_save(&self) -> Result<io::Result<()>, crate::rpc::RpcError> {
+        tokio::time::timeout(Duration::from_secs(10), self.registry_writer.flush()).await.map_err(|_| {
+            crate::rpc::RpcError::new(
+                "unavailable",
+                "registry persistence timed out; the operation may already have completed",
+                "check the terminal and disk before retrying",
+            )
+        })
     }
 
     /// For frequent changes a crash may lose (the next start rebuilds them):
@@ -510,6 +524,8 @@ impl Core {
                 // A crash tail repeats reports we already counted: take its final word,
                 // but count at most the one turn that may have ended while we were down.
                 let (turn, was, since) = (rec.turn, rec.status.as_ref().map(|s| s.state.clone()), rec.status_ms);
+                let facts = |t: &crate::terminals::Terminal| (t.status.clone(), t.records.clone(), t.reported);
+                let heard = facts(rec);
                 for r in &reports {
                     crate::status::apply(rec, r);
                 }
@@ -521,7 +537,9 @@ impl Core {
                 // Only a changed final word/turn proves new activity in a crash replay.
                 // A repeated done, or done -> idle, entirely during downtime can remain unobservable.
                 let root_report = rec.turn != turn || now != was;
-                self.status_changed(st, id, crate::status::Change { root_report, ..Default::default() });
+                // Subscribers hear the final facts once, and only if the replay changed them.
+                let status = facts(rec) != heard;
+                self.status_changed(st, id, crate::status::Change { status, root_report, ..Default::default() });
             }
             if spawning {
                 self.spawn_result(st, instance, id, Ok(h.pid));
@@ -634,10 +652,13 @@ impl Core {
                 Ok(Ok(_))
             );
         if taken {
-            eprintln!("core: lost the link to holder {instance}, reconnected");
+            let _ = writeln!(io::stderr(), "core: lost the link to holder {instance}, reconnected");
             return;
         }
-        eprintln!("core: lost the link to holder {instance} for good; its terminals wait for the next core start");
+        let _ = writeln!(
+            io::stderr(),
+            "core: lost the link to holder {instance} for good; its terminals wait for the next core start"
+        );
         // Closed, so the holder sees us leave instead of waiting on a link nobody reads.
         if let Ok(ours) = ours {
             let _ = ours.shutdown(std::net::Shutdown::Both);
@@ -776,7 +797,7 @@ impl Core {
         if let Some(snapshot) = st.screens.remove(&id).and_then(|s| s.snapshot())
             && let Err(e) = write_atomic(&self.snapshot_path(id), &snapshot)
         {
-            eprintln!("core: cannot save screen of {}: {e}", crate::terminals::address(id));
+            let _ = writeln!(io::stderr(), "core: cannot save screen of {}: {e}", crate::terminals::address(id));
         }
         // `--rm`: gone now, unless its parent is waiting for the exit code.
         let rm = st.reg.terminals.get(&id).is_some_and(|t| {

@@ -9,6 +9,7 @@ use crate::terminals::{NewTerminal, Public, Terminal};
 use crate::wait::{WaitResult, WaitSpec};
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +17,7 @@ pub const GENERATION: u32 = 1;
 pub const FEATURES: &[&str] =
     &["framed", "attach", "events", "status", "shell", "resize_notifications", "automatic_input"];
 pub const FINISHED_LINES: usize = 1000;
-/// A terminal's identity: fixed at start from whoever starts it.
+/// Terminal identity variables replaced by the core's defaults unless explicitly overridden.
 pub const IDENTITY_VARS: &[&str] = &["TERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "COLORTERM"];
 
 mod doc;
@@ -89,15 +90,15 @@ methods! { Ctx<'_>;
         errors ["not_found", "machine_unknown"];
     "terminal.kill" => terminal_kill, TerminalParams => Public,
         "End the program: hangup, then terminate, then kill. Returns the observed result.",
-        errors ["not_found", "machine_unknown"];
+        errors ["not_found", "machine_unknown", "unavailable"];
     "terminal.rm" => terminal_rm, TerminalParams => RemoveResult,
         "Remove a finished terminal.",
-        errors ["not_found", "machine_unknown", "live"];
+        errors ["not_found", "machine_unknown", "live", "unavailable"];
     "terminal.keep" => terminal_keep, KeepParams => Public,
-        "Set whether a live terminal restarts as a shell after loss, including death by signal without an exit code. Exit with a code and explicit kill close it. Recovery runs on every OS after a grace delay, except while the core stops/restarts or Windows reports session shutdown. Streams end on loss; reattach after restarted.", errors ["not_found", "invalid_params"];
+        "Set whether a live terminal restarts as a shell after loss, including death by signal without an exit code. Exit with a code and explicit kill close it. Recovery runs on every OS after a grace delay, except while the core stops/restarts or Windows reports session shutdown. Streams end on loss; reattach after restarted.", errors ["not_found", "invalid_params", "unavailable"];
     "terminal.label" => terminal_label, LabelParams => Public,
         "Set or remove labels (free-form `key=value`, never interpreted).",
-        errors ["not_found", "machine_unknown", "invalid_params"];
+        errors ["not_found", "machine_unknown", "invalid_params", "unavailable"];
     "terminal.read" => terminal_read, ReadParams => ReadResult,
         "The screen plus `lines` of history as text, live or finished.",
         errors ["not_found", "machine_unknown"];
@@ -109,7 +110,7 @@ methods! { Ctx<'_>;
         errors ["not_found", "machine_unknown", "finished", "unavailable", "blocked", "status_mismatch", "invalid_params", "config"];
     "terminal.wait" => terminal_wait, WaitParams => crate::wait::WaitResult,
         "Wait until the program is not working (any word but working, or it exited/was lost); already not working returns at once. A program that never reported status is working until it exits. After a send from the same caller, waits for the turn that send started. A message to the caller also ends it: ended false, reason message, from = sender. A timeout is a check-in: ended false, current status.",
-        errors ["not_found", "machine_unknown", "invalid_params", "needs_target", "config"];
+        errors ["not_found", "machine_unknown", "invalid_params", "needs_target", "config", "unavailable"];
     "terminal.keys" => terminal_keys, KeysParams => KeysResult,
         "Press named keys, encoded for the program's current keyboard modes, after ~3 s of quiet. Does not wait for an unsent draft.",
         errors ["not_found", "machine_unknown", "finished", "unavailable", "invalid_params"];
@@ -240,7 +241,7 @@ async fn server_stop(core: Ctx<'_>, _: Empty) -> Result<StopResult, RpcError> {
     }
     crate::restart::discard(&core.paths);
     if let Err(e) = core.shutdown().await {
-        eprintln!("core: shutdown registry flush failed: {}", e.message);
+        let _ = writeln!(io::stderr(), "core: shutdown registry flush failed: {}", e.message);
     }
     Ok(StopResult { stopped: true })
 }
@@ -306,7 +307,7 @@ async fn terminal_list(core: Ctx<'_>, p: ListParams) -> Result<ListResult, RpcEr
         let st = core.lock();
         machines.iter().map(|m| crate::remote::view(&st, m)).collect()
     };
-    core.flush_saved().await?;
+    core.flush_observed().await?;
     Ok(ListResult { terminals, hidden_finished, machines })
 }
 
@@ -314,7 +315,7 @@ async fn terminal_get(core: Ctx<'_>, p: TerminalParams) -> Result<Public, RpcErr
     let id = resolve(core, &p.terminal)?;
     core.saw(p.caller.as_deref(), id);
     let result = record(core, id).map(Public);
-    core.flush_saved().await?;
+    core.flush_observed().await?;
     result
 }
 
@@ -349,25 +350,33 @@ async fn terminal_rm(core: Ctx<'_>, p: TerminalParams) -> Result<RemoveResult, R
 
 async fn terminal_keep(core: Ctx<'_>, p: KeepParams) -> Result<Public, RpcError> {
     let id = resolve(core, &p.terminal)?;
-    let public = {
+    // `--rm` forgets a finished terminal at once: keep what it looked like at its end.
+    let mut ended = None;
+    {
         let mut st = core.lock();
         let t = st.reg.terminals.get_mut(&id).expect("resolved");
         if !t.is_live() {
             return Err(RpcError::invalid_params("only live terminals can be kept"));
         }
         t.keep = p.keep;
-        let public = Public(t.clone());
         let lost = (!p.keep && t.holder.is_none()).then(|| t.reason.clone().unwrap_or_else(|| "holder_lost".into()));
+        let before = t.clone();
         core.emit(&mut st, "keep", id, json!({"keep": p.keep}));
         if let Some(reason) = lost {
             core.record_finish(&mut st, id, proto::Exit { code: None, signal: None }, &reason);
             core.changed.notify_waiters();
+            if !st.reg.terminals.contains_key(&id) {
+                ended = Some(Terminal { state: "finished".into(), pid: None, reason: Some(reason), ..before });
+            }
         }
         core.save(&st);
-        public
-    };
+    }
+    let result = record(core, id).map(Public);
     core.flush_saved().await?;
-    Ok(public)
+    match (result, ended) {
+        (Err(_), Some(ended)) => Ok(Public(ended)),
+        (result, _) => result,
+    }
 }
 
 async fn terminal_label(core: Ctx<'_>, p: LabelParams) -> Result<Public, RpcError> {
@@ -407,7 +416,7 @@ async fn terminal_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcEr
                 ReadResult { text, complete: false, how: "screen".into(), why }
             }
         };
-        core.flush_saved().await?;
+        core.flush_observed().await?;
         return Ok(result);
     }
     let result = {
@@ -436,7 +445,7 @@ async fn terminal_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcEr
             why: None,
         }
     };
-    core.flush_saved().await?;
+    core.flush_observed().await?;
     Ok(result)
 }
 
@@ -517,7 +526,7 @@ async fn terminal_send(core: Ctx<'_>, p: SendParams) -> Result<SendResult, RpcEr
     } else {
         None
     };
-    core.flush_saved().await?;
+    core.flush_observed().await?;
     Ok(SendResult { status: sent.status, turn: sent.turn, started: sent.started, wait })
 }
 
@@ -597,7 +606,7 @@ async fn terminal_keys(core: Ctx<'_>, p: KeysParams) -> Result<KeysResult, RpcEr
     let id = resolve(core, &p.terminal)?;
     let (status, turn) = core.keys(id, &p.keys).await?;
     core.saw(p.caller.as_deref(), id);
-    core.flush_saved().await?;
+    core.flush_observed().await?;
     Ok(KeysResult { status, turn })
 }
 
@@ -612,7 +621,7 @@ async fn terminal_interrupt(core: Ctx<'_>, p: InterruptParams) -> Result<Interru
         Interrupted::StillWorking => "still_working",
         Interrupted::Unknown => "unknown",
     };
-    core.flush_saved().await?;
+    core.flush_observed().await?;
     Ok(InterruptResult { outcome: outcome.into(), key })
 }
 

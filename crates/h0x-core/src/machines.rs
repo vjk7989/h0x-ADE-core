@@ -5,6 +5,7 @@ use crate::rpc::RpcError;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::io::{self, Write};
 use std::path::Path;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -91,7 +92,7 @@ pub fn unknown(machines: &[Machine], name: &str) -> crate::rpc::RpcError {
 pub fn save(state: &Path, machines: &[Machine]) {
     let bytes = serde_json::to_vec_pretty(machines).expect("machines serialize");
     if let Err(e) = crate::paths::write_atomic(&state.join("machines.json"), &bytes) {
-        eprintln!("core: cannot save machines: {e}");
+        let _ = writeln!(io::stderr(), "core: cannot save machines: {e}");
     }
 }
 
@@ -99,6 +100,16 @@ pub fn save(state: &Path, machines: &[Machine]) {
 /// (`ssh://can@rohan:2222`): ssh reads a plain `rohan:2222` as a host name.
 pub fn ssh_target(target: String) -> String {
     let host = target.rsplit_once('@').map_or(target.as_str(), |(_, host)| host);
+    // `[::1]:22`: the brackets stay in the URL; a bare IPv6 address has no port to move.
+    if !target.starts_with("ssh://")
+        && let Some((h, port)) = host.rsplit_once("]:")
+        && h.starts_with('[')
+        && h.len() > 1
+        && !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+    {
+        return format!("ssh://{target}");
+    }
     match host.split_once(':') {
         Some((h, port))
             if !target.starts_with("ssh://")
@@ -122,10 +133,12 @@ pub fn default_name(target: &str, taken: impl Fn(&str) -> bool) -> Option<String
     if name.len() > 32 {
         name = name.chars().take(32).collect::<String>().trim_end_matches('-').into();
     }
-    check_name(&name).ok()?;
+    if !crate::terminals::id_shaped(&name) {
+        check_name(&name).ok()?;
+    }
     let base = name.clone();
     let mut number = 1;
-    while taken(&name) {
+    while crate::terminals::id_shaped(&name) || taken(&name) {
         number += 1;
         let suffix = format!("-{number}");
         name = format!("{}{}", base[..base.len().min(32 - suffix.len())].trim_end_matches('-'), suffix);
@@ -291,8 +304,10 @@ fn unreachable(to: Reach, why: &str) -> RpcError {
 
 /// ssh refused us a login only a person can give (code, password, key).
 fn wants_login(err: &str) -> bool {
-    err.contains("Permission denied")
-        && ["publickey", "keyboard-interactive", "password"].iter().any(|k| err.contains(k))
+    // Too many keys offered (sshd's MaxAuthTries) fails auth the same way; retrying fast gets banned.
+    err.contains("Too many authentication failures")
+        || err.contains("Permission denied")
+            && ["publickey", "keyboard-interactive", "password"].iter().any(|k| err.contains(k))
 }
 
 /// An open pipe to the core there, past its hello.
@@ -621,6 +636,63 @@ mod tests {
         assert_eq!(platform("Linux x86_64"), "linux x86_64");
         assert_eq!(platform("MINGW64_NT-10.0 x86_64"), "windows x86_64");
         assert_eq!(platform("MSYS_NT-10.0 x86_64"), "windows x86_64");
+    }
+
+    #[test]
+    fn id_shaped_hosts_get_a_free_name() {
+        for host in ["t440s", "t14", &format!("t1{}", "b".repeat(30))] {
+            let expected = format!("{}-2", &host[..host.len().min(30)]);
+            assert_eq!(default_name(host, |_| false), Some(expected));
+            assert_eq!(
+                default_name(host, |name| name.ends_with("-2")),
+                Some(format!("{}-3", &host[..host.len().min(30)]))
+            );
+        }
+        assert_eq!(default_name("t14!", |_| false), None);
+    }
+
+    #[test]
+    fn id_shaped_hosts_are_named_whatever_the_case_user_port_or_domain() {
+        for target in ["T14", "can@t14", "ssh://can@t14:2222", "t14.lan", "t14.", "CAN@T14.LAN:22"] {
+            assert_eq!(default_name(target, |_| false).as_deref(), Some("t14-2"), "{target}");
+        }
+        // Not id-shaped: kept as they are.
+        for (target, name) in [("t0", "t0"), ("ta1", "ta1"), ("t", "t"), ("tl4", "tl4"), ("Rohan.", "rohan")] {
+            assert_eq!(default_name(target, |_| false).as_deref(), Some(name), "{target}");
+        }
+        // The suffix never makes a 32-character name longer.
+        for len in [31, 32, 33] {
+            let host = format!("t1{}", "b".repeat(len - 2));
+            let name = default_name(&host, |_| false).unwrap();
+            assert!(name.len() <= 32 && name.ends_with("-2") && !crate::terminals::id_shaped(&name), "{len}: {name}");
+        }
+    }
+
+    #[test]
+    fn a_host_and_port_target_becomes_an_ssh_url_whatever_its_shape() {
+        for (target, url) in [
+            ("CAN@ROHAN:2222", "ssh://CAN@ROHAN:2222"),
+            ("rohan.lan.:22", "ssh://rohan.lan.:22"),
+            ("t14:22", "ssh://t14:22"),
+            ("can@rohan:0", "ssh://can@rohan:0"),
+            ("can@rohan:65535", "ssh://can@rohan:65535"),
+            ("a@b@rohan:22", "ssh://a@b@rohan:22"),
+        ] {
+            assert_eq!(ssh_target(target.into()), url, "{target}");
+        }
+        for unchanged in
+            ["", ":22", "rohan:22:33", "rohan:-22", "rohan: 22", "::1", "[::1]", "can@[fe80::1]", "ssh://rohan:22"]
+        {
+            assert_eq!(ssh_target(unchanged.into()), unchanged, "{unchanged}");
+        }
+    }
+
+    #[test]
+    fn a_bracketed_ipv6_host_and_port_becomes_an_ssh_url() {
+        // ssh reads a port only from `ssh://`: `[::1]:22` as a plain target is a host name.
+        for (target, url) in [("[::1]:22", "ssh://[::1]:22"), ("can@[fe80::1]:2222", "ssh://can@[fe80::1]:2222")] {
+            assert_eq!(ssh_target(target.into()), url, "{target}");
+        }
     }
 
     #[test]

@@ -96,6 +96,29 @@ fn connect_starting(paths: &Paths, explicit: bool) -> Result<Stream, RpcError> {
         return Err(err);
     }
     platform::may_autostart(explicit)?;
+    paths.create_dirs().map_err(|e| unavailable(format!("cannot start core: {e}")))?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(paths.state.join("core.lock"))
+        .map_err(|e| unavailable(format!("cannot open core lock: {e}")))?;
+    let waited = Instant::now();
+    loop {
+        if let Ok(stream) = platform::connect(&paths.socket) {
+            return Ok(stream);
+        }
+        // A closing connection does not mean serve has released its lock yet.
+        // Starting its replacement early would make that process exit immediately.
+        if platform::try_lock(&lock) {
+            break;
+        }
+        if waited.elapsed() > START_WAIT {
+            return Err(unavailable(format!("core did not stop or start within {} s", START_WAIT.as_secs())));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    drop(lock);
     spawn_core(paths)?;
     // The new core makes the pipe salt as it starts: name its socket again each try.
     let start = Instant::now();
@@ -191,6 +214,9 @@ pub fn spawn_detached(paths: &Paths, args: &[&str], log: &str) -> std::io::Resul
     let log = paths.state.join(log);
     let exe = EXE.get().cloned().map_or_else(std::env::current_exe, Ok)?;
     let mut cmd = Command::new(exe);
+    if args.first() == Some(&"serve") {
+        platform::core_environment(&mut cmd, &paths.state);
+    }
     // A core or holder started from inside a terminal is not that terminal's:
     // ending the terminal must not end them.
     cmd.args(args).env_remove(crate::sweep::VAR).env(crate::sweep::RUNTIME, "1");

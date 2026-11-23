@@ -109,12 +109,15 @@ async fn automatic_input_survives_relays_but_not_a_capability_downgrade() {
         core.lock().relayed.insert(
             (conn_key(&conn), 7),
             Relayed {
+                active_at: std::time::Instant::now(),
                 automatic_input: true,
                 line: Line::new(old_frames, &json!({"features": ["automatic_input"]})),
                 there: 9,
                 conn: conn.clone(),
                 machine: machine.id.clone(),
+                terminal: "t1".into(),
                 params: json!({"terminal": "t1"}),
+                size_pending: false,
             },
         );
         assert!(relay_in(&core, &conn, 7, wire::AUTOMATIC_INPUT, b"\x1b"));
@@ -141,6 +144,75 @@ async fn automatic_input_survives_relays_but_not_a_capability_downgrade() {
         drop(core);
         let _ = std::fs::remove_dir_all(root);
     }
+}
+
+#[tokio::test]
+async fn reattach_applies_missed_sizes_without_replaying_delivered_activity() {
+    let root = crate::platform::test_scratch().join(format!("h0x-core-reattach-{}", crate::platform::random_hex()));
+    let paths = Paths {
+        socket: root.join("core.sock"),
+        holder_socket: root.join("holder.sock"),
+        state: root.clone(),
+        config: root.join("config.toml"),
+    };
+    paths.create_dirs().unwrap();
+    let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
+    let machine: Machine = serde_json::from_value(json!({
+        "name": "away", "target": "away", "id": "away", "host": "away", "version": "test"
+    }))
+    .unwrap();
+    let conn = Arc::new(Conn::default());
+    let (old_frames, _old_rx) = mpsc::unbounded_channel();
+    let old = Line::new(old_frames, &json!({}));
+    let (frames, mut rx) = mpsc::unbounded_channel();
+    let line = Line::new(frames, &json!({}));
+    let now = std::time::Instant::now();
+    for (ch, active_at, target, via) in
+        [(7, now - Duration::from_secs(1), "t1", &old), (8, now, "t1", &old), (9, now, "t2", &line)]
+    {
+        core.lock().relayed.insert(
+            (conn_key(&conn), ch),
+            Relayed {
+                active_at,
+                automatic_input: false,
+                line: via.clone(),
+                there: ch,
+                conn: conn.clone(),
+                machine: machine.id.clone(),
+                terminal: target.into(),
+                params: json!({"terminal": target, "cols": 80, "rows": 24}),
+                size_pending: false,
+            },
+        );
+    }
+    let task = tokio::spawn(reattach(core.clone(), machine, line.clone()));
+    let frame = rx.recv().await.unwrap();
+    let first: Value = serde_json::from_slice(&frame[wire::HEADER..]).unwrap();
+    let size = [132, 0, 45, 0];
+    assert!(relay_in(&core, &conn, 7, wire::RESIZE, &size));
+    line.take_reply(json!({"id": first["id"], "result": {"channel": 17}}));
+    assert_eq!(rx.recv().await.unwrap(), wire::encode(17, wire::RESIZE, &size));
+    let frame = rx.recv().await.unwrap();
+    let second: Value = serde_json::from_slice(&frame[wire::HEADER..]).unwrap();
+    let missed = [90, 0, 30, 0];
+    assert!(relay_in(&core, &conn, 8, wire::RESIZE, &missed));
+    assert!(relay_in(&core, &conn, 7, wire::FOCUS, &[1]));
+    assert!(relay_in(&core, &conn, 9, wire::RESIZE, &size));
+    assert_eq!(rx.try_recv().unwrap(), wire::encode(17, wire::FOCUS, &[1]));
+    assert_eq!(rx.try_recv().unwrap(), wire::encode(9, wire::RESIZE, &size));
+    line.take_reply(json!({"id": second["id"], "result": {"channel": 18}}));
+    task.await.unwrap();
+    assert!(rx.try_recv().is_err(), "a newer viewer is already in control and B was never disconnected");
+    {
+        let st = core.lock();
+        assert_eq!(st.relayed[&(conn_key(&conn), 7)].params["cols"], 132);
+        assert_eq!(st.relayed[&(conn_key(&conn), 8)].params["cols"], 90);
+    }
+    assert!(relay_in(&core, &conn, 8, wire::FOCUS, &[1]));
+    assert_eq!(rx.try_recv().unwrap(), wire::encode(18, wire::RESIZE, &missed));
+    assert_eq!(rx.try_recv().unwrap(), wire::encode(18, wire::FOCUS, &[1]));
+    drop(core);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]
@@ -229,12 +301,15 @@ async fn failed_reattach_drains_pending_data_before_close() {
     core.lock().relayed.insert(
         (conn_key(&conn), 7),
         Relayed {
+            active_at: std::time::Instant::now(),
             automatic_input: true,
             line: old_line,
             there: 9,
             conn: conn.clone(),
             machine: machine.id.clone(),
+            terminal: "t1".into(),
             params: json!({"terminal": "t1"}),
+            size_pending: false,
         },
     );
     drop(old_rx); // The viewer survives its old line.
@@ -502,4 +577,257 @@ async fn a_batch_of_status_reports_reaches_a_mirror_with_the_whole_record_set() 
     assert_eq!(mirrored["reported"], true);
     drop(core);
     let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn the_line_lost_notice_shows_even_if_the_line_dropped_mid_sequence() {
+    let mut screen = ghostty_vt::Terminal::new(80, 24, 0);
+    screen.write(b"\x1b_Gm=1;AAAA");
+    screen.write(lost_notice("rohan").as_bytes());
+    assert!(screen.plain_text().contains("[line to rohan lost"));
+}
+
+#[tokio::test]
+async fn provisional_grants_survive_only_successful_or_ambiguous_launches() {
+    let root = crate::platform::test_scratch().join(format!("h0x-core-run-grants-{}", crate::platform::random_hex()));
+    let paths = Paths {
+        socket: root.join("core.sock"),
+        holder_socket: root.join("holder.sock"),
+        state: root.clone(),
+        config: root.join("config.toml"),
+    };
+    paths.create_dirs().unwrap();
+    let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
+    let machine: Machine = serde_json::from_value(json!({
+        "name": "away", "target": "away", "id": "away", "host": "away", "version": "test"
+    }))
+    .unwrap();
+    let failed = || Err(RpcError::new("spawn_failed", "bad program", ""));
+    for (first, second, retained) in [
+        (Some(failed()), Some(failed()), false),
+        (Some(failed()), Some(Ok(json!({}))), true),
+        (Some(Ok(json!({}))), Some(failed()), true),
+        (Some(failed()), None, true), // The forwarding future was cancelled.
+        (Some(failed()), Some(Err(RpcError::new("unavailable", "lost the line", ""))), true),
+        (Some(failed()), Some(Err(RpcError::new("spawn_failed", "the holder did not answer", ""))), true),
+        (Some(failed()), Some(Err(RpcError::new("internal", "cannot save terminals", ""))), true),
+    ] {
+        let parent = core
+            .lock()
+            .reg
+            .create(crate::terminals::NewTerminal { argv: vec!["true".into()], ..Default::default() }, 0)
+            .unwrap();
+        let params = json!({"caller": format!("here/{}", crate::terminals::address(parent))});
+        let a = RunGrant::start(&core, &machine, "terminal.run", &params).unwrap();
+        let b = RunGrant::start(&core, &machine, "terminal.run", &params).unwrap();
+        a.answered(&first.unwrap());
+        assert!(core.lock().reg.terminals[&parent].afar.contains("away"), "another run still needs the grant");
+        match second {
+            Some(result) => b.answered(&result),
+            None => drop(b),
+        }
+        assert_eq!(core.lock().reg.terminals[&parent].afar.contains("away"), retained);
+        if retained {
+            assert!(RunGrant::start(&core, &machine, "terminal.run", &params).is_none());
+            assert!(core.lock().reg.terminals[&parent].afar.contains("away"));
+        }
+        assert!(core.lock().afar_runs.is_empty());
+    }
+    core.flush_saved().await.unwrap();
+    drop(core);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn grant_core(name: &str) -> (Arc<Core>, Machine, std::path::PathBuf) {
+    let root = crate::platform::test_scratch().join(format!("h0x-core-{name}-{}", crate::platform::random_hex()));
+    let paths = Paths {
+        socket: root.join("core.sock"),
+        holder_socket: root.join("holder.sock"),
+        state: root.clone(),
+        config: root.join("config.toml"),
+    };
+    paths.create_dirs().unwrap();
+    let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
+    let machine: Machine = serde_json::from_value(json!({
+        "name": "away", "target": "away", "id": "away", "host": "away", "version": "test"
+    }))
+    .unwrap();
+    (core, machine, root)
+}
+
+#[tokio::test]
+async fn only_a_run_this_core_asked_for_gets_a_grant() {
+    let (core, machine, root) = grant_core("run-grant-none");
+    let parent = core
+        .lock()
+        .reg
+        .create(crate::terminals::NewTerminal { argv: vec!["true".into()], ..Default::default() }, 0)
+        .unwrap();
+    let caller = format!("here/{}", crate::terminals::address(parent));
+    for (method, params) in [
+        ("terminal.send", json!({"caller": caller})),
+        ("terminal.run", json!({"caller": caller, "no_parent": true})),
+        ("terminal.run", json!({"caller": caller, "parent": "t9"})),
+        ("terminal.run", json!({})),
+        ("terminal.run", json!({"caller": null})),
+        ("terminal.run", json!({"caller": crate::terminals::address(parent)})),
+        ("terminal.run", json!({"caller": format!("elsewhere/{}", crate::terminals::address(parent))})),
+        ("terminal.run", json!({"caller": "here/ppid:12"})),
+        ("terminal.run", json!({"caller": "here/t9999"})),
+    ] {
+        assert!(RunGrant::start(&core, &machine, method, &params).is_none(), "{method} {params}");
+        assert!(core.lock().afar_runs.is_empty(), "{method} {params}");
+        assert!(core.lock().reg.terminals[&parent].afar.is_empty(), "{method} {params}");
+    }
+    // `no_parent: false` is no opt-out.
+    let grant = RunGrant::start(&core, &machine, "terminal.run", &json!({"caller": caller, "no_parent": false}));
+    assert!(grant.is_some());
+    drop(grant);
+    core.flush_saved().await.unwrap();
+    drop(core);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn a_single_run_that_proves_nothing_started_removes_its_grant() {
+    let (core, machine, root) = grant_core("run-grant-one");
+    let err = |kind: &str, message: &str| Err(RpcError::new(kind, message, ""));
+    for (result, retained) in [
+        (Ok(json!({})), true),
+        (err("invalid_params", "bad"), false),
+        (err("name_taken", "x"), false),
+        (err("machine_unknown", "x"), false),
+        (err("unknown_method", "x"), false),
+        (err("unavailable", "the core is stopping"), false),
+        (err("unavailable", "no holder: cannot start"), false),
+        (err("unavailable", "this core has used every terminal id"), false),
+        (err("unavailable", "registry persistence timed out; the operation may already have completed"), true),
+        (err("unavailable", "the core is stopping soon"), true),
+        (err("spawn_failed", "the holder did not answer"), true),
+        (err("needs_update", "older"), true),
+        (err("timeout", "x"), true),
+    ] {
+        let parent = core
+            .lock()
+            .reg
+            .create(crate::terminals::NewTerminal { argv: vec!["true".into()], ..Default::default() }, 0)
+            .unwrap();
+        let params = json!({"caller": format!("here/{}", crate::terminals::address(parent))});
+        let grant = RunGrant::start(&core, &machine, "terminal.run", &params).unwrap();
+        assert!(core.lock().reg.terminals[&parent].afar.contains("away"), "granted before the reply");
+        let label = format!("{result:?}");
+        grant.answered(&result);
+        assert_eq!(core.lock().reg.terminals[&parent].afar.contains("away"), retained, "{label}");
+        assert!(core.lock().afar_runs.is_empty(), "{label}");
+    }
+    core.flush_saved().await.unwrap();
+    drop(core);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_run_never_revokes_a_grant_that_was_already_permanent() {
+    let (core, machine, root) = grant_core("run-grant-kept");
+    let parent = core
+        .lock()
+        .reg
+        .create(crate::terminals::NewTerminal { argv: vec!["true".into()], ..Default::default() }, 0)
+        .unwrap();
+    core.lock().reg.terminals.get_mut(&parent).unwrap().afar.insert("away".into());
+    let params = json!({"caller": format!("here/{}", crate::terminals::address(parent))});
+    assert!(RunGrant::start(&core, &machine, "terminal.run", &params).is_none(), "nothing provisional to track");
+    assert!(core.lock().reg.terminals[&parent].afar.contains("away"));
+    // The parent removed while its run was in flight: dropping the grant is harmless.
+    let other = core
+        .lock()
+        .reg
+        .create(crate::terminals::NewTerminal { argv: vec!["true".into()], ..Default::default() }, 0)
+        .unwrap();
+    let params = json!({"caller": format!("here/{}", crate::terminals::address(other))});
+    let grant = RunGrant::start(&core, &machine, "terminal.run", &params).unwrap();
+    core.lock().reg.terminals.remove(&other);
+    grant.answered(&Err(RpcError::new("invalid_params", "bad", "")));
+    assert!(core.lock().afar_runs.is_empty());
+    core.flush_saved().await.unwrap();
+    drop(core);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn a_returning_viewer_sends_its_missed_size_once_on_its_first_activity() {
+    let (core, machine, root) = grant_core("size-pending");
+    let conn = Arc::new(Conn::default());
+    let (frames, mut rx) = mpsc::unbounded_channel();
+    let line = Line::new(frames, &json!({}));
+    let insert = |observe: bool| {
+        core.lock().relayed.insert(
+            (conn_key(&conn), 7),
+            Relayed {
+                active_at: std::time::Instant::now(),
+                automatic_input: false,
+                line: line.clone(),
+                there: 17,
+                conn: conn.clone(),
+                machine: machine.id.clone(),
+                terminal: "t1".into(),
+                params: json!({"terminal": "t1", "cols": 90, "rows": 30, "observe": observe}),
+                size_pending: true,
+            },
+        );
+    };
+    let size = wire::encode(17, wire::RESIZE, &[90, 0, 30, 0]);
+    insert(false);
+    // Not activity: a focus loss, an empty focus, or a malformed resize.
+    for (kind, payload) in [(wire::FOCUS, &[0u8][..]), (wire::FOCUS, &[][..]), (wire::RESIZE, &[1, 0, 2][..])] {
+        assert!(relay_in(&core, &conn, 7, kind, payload));
+        assert_eq!(rx.try_recv().unwrap(), wire::encode(17, kind, payload), "only the frame itself");
+        assert!(rx.try_recv().is_err());
+    }
+    assert!(core.lock().relayed[&(conn_key(&conn), 7)].size_pending);
+    assert!(relay_in(&core, &conn, 7, wire::DATA, b"x"));
+    assert_eq!(rx.try_recv().unwrap(), size, "the missed size first");
+    assert_eq!(rx.try_recv().unwrap(), wire::encode(17, wire::DATA, b"x"));
+    assert!(relay_in(&core, &conn, 7, wire::DATA, b"y"));
+    assert_eq!(rx.try_recv().unwrap(), wire::encode(17, wire::DATA, b"y"), "sent once only");
+    assert!(rx.try_recv().is_err());
+
+    // A resize of its own replaces the missed one.
+    insert(false);
+    let own = [100, 0, 40, 0];
+    assert!(relay_in(&core, &conn, 7, wire::RESIZE, &own));
+    assert_eq!(rx.try_recv().unwrap(), wire::encode(17, wire::RESIZE, &own));
+    assert!(relay_in(&core, &conn, 7, wire::DATA, b"z"));
+    assert_eq!(rx.try_recv().unwrap(), wire::encode(17, wire::DATA, b"z"));
+    assert!(rx.try_recv().is_err());
+
+    // An observer's typing is no claim on the size.
+    insert(true);
+    let before = core.lock().relayed[&(conn_key(&conn), 7)].active_at;
+    assert!(relay_in(&core, &conn, 7, wire::FOCUS, &[1]));
+    assert_eq!(rx.try_recv().unwrap(), wire::encode(17, wire::FOCUS, &[1]));
+    assert!(rx.try_recv().is_err());
+    assert_eq!(core.lock().relayed[&(conn_key(&conn), 7)].active_at, before);
+
+    assert!(!relay_in(&core, &conn, 8, wire::DATA, b"x"), "not relayed");
+    drop(core);
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn the_line_lost_notice_survives_any_cut_sequence_and_odd_names() {
+    for cut in [&b"\x1b"[..], b"\x1b[", b"\x1b[38;2;1", b"\x1b]0;title", b"\x1bP1$r", b"\x1b_Gm=1;"] {
+        let mut screen = ghostty_vt::Terminal::new(80, 24, 0);
+        screen.write(cut);
+        screen.write(lost_notice("rohan").as_bytes());
+        assert!(screen.plain_text().contains("[line to rohan lost; reconnecting...]"), "{cut:?}");
+    }
+    assert!(lost_notice("").starts_with('\x18'));
+    assert!(lost_notice("my-box.lan").contains("[line to my-box.lan lost"));
+}
+
+#[test]
+fn login_retries_back_off_to_ten_minutes_and_stay_there() {
+    let secs = |attempt| login_backoff(attempt).as_secs();
+    assert_eq!((secs(0), secs(1), secs(2)), (120, 300, 600));
+    assert_eq!((secs(3), secs(1000), secs(u32::MAX)), (600, 600, 600));
 }

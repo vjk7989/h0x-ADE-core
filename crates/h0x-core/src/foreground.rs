@@ -30,9 +30,9 @@ pub fn about(pid: i32) -> Option<Foreground> {
     Some(Foreground { pid, name, argv, cwd })
 }
 
-/// A pseudo console has no foreground group: this is the terminal's first
-/// process, with the folder and command line Windows keeps in its memory.
-/// None for a 32-bit process, whose own copy of them lives elsewhere.
+/// A pseudo console has no foreground group: this is the program the
+/// platform put in front, with the folder and command line Windows keeps in
+/// its memory. None for a 32-bit process, whose own copy of them lives elsewhere.
 #[cfg(windows)]
 pub fn about(pid: i32) -> Option<Foreground> {
     use std::ffi::c_void;
@@ -150,6 +150,21 @@ pub fn procargs(pid: i32) -> Option<(Vec<String>, Vec<u8>)> {
     Some((argv, rest.to_vec()))
 }
 
+fn shell_root(root: &Foreground) -> bool {
+    // Command and script wrappers can share their foreground group with a live agent.
+    if root.argv.iter().skip(1).any(|arg| {
+        (!arg.starts_with('-') && !arg.starts_with('+'))
+            || matches!(arg.split('=').next(), Some("--command" | "--commands"))
+            || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('c'))
+    }) {
+        return false;
+    }
+    let program =
+        if root.name.is_empty() { root.argv.first().map(String::as_str).unwrap_or_default() } else { &root.name };
+    let name = program.rsplit('/').next().unwrap_or(program);
+    matches!(name, "sh" | "bash" | "zsh" | "fish" | "nu" | "dash" | "ksh" | "tcsh")
+}
+
 impl Core {
     /// Keeps every live terminal's `foreground` current, with an event on each change.
     pub async fn watch_foreground(self: Arc<Self>) {
@@ -170,16 +185,31 @@ impl Core {
     /// terminal back: one that crashed or never turned them off would have
     /// every move of the mouse typed at the shell's prompt.
     pub(crate) fn foreground_is(&self, st: &mut State, id: u32, now: Option<Foreground>) {
-        let Some(t) = st.reg.terminals.get_mut(&id).filter(|t| t.is_live() && t.foreground != now) else {
+        let Some(t) = st.reg.terminals.get_mut(&id).filter(|t| t.is_live()) else {
             return;
         };
-        let back = back_at_shell(t.pid, t.foreground.as_ref(), now.as_ref());
+        // A child that exited back to the shell leaves its status behind: clear it.
+        let at_shell = crate::platform::foreground_tracks_jobs()
+            && now.as_ref().is_some_and(|n| Some(n.pid as u32) == t.pid && shell_root(n));
+        let change = (at_shell && (t.status.is_some() || !t.records.is_empty())).then(|| {
+            t.first_task_turn = None;
+            crate::status::reset(t)
+        });
+        let foreground_changed = t.foreground != now;
+        let back = foreground_changed && back_at_shell(t.pid, t.foreground.as_ref(), now.as_ref());
         if let Some(f) = &now {
             t.last_cwd = Some(f.cwd.clone());
         }
         t.foreground = now.clone();
-        self.save_soon();
-        self.emit(st, "foreground", id, serde_json::to_value(&now).unwrap_or_default());
+        if change.is_some() || foreground_changed {
+            self.save_soon();
+        }
+        if let Some(change) = change {
+            self.status_changed(st, id, change);
+        }
+        if foreground_changed {
+            self.emit(st, "foreground", id, serde_json::to_value(&now).unwrap_or_default());
+        }
         if back {
             self.end_input_reports(st, id);
         }
@@ -342,6 +372,84 @@ mod tests {
         core.output(&mut st, id, b"\x1b[?1003h\x1b[?1006h\x1b]0;half a tit");
         core.foreground_is(&mut st, id, front(10));
         assert!(st.screens[&id].dec_mode(1003), "never written into the middle of a sequence");
+        drop(st);
+        drop(core);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn command_flags_keep_shell_roots_from_clearing_live_status() {
+        for shell in ["sh", "bash", "zsh", "fish", "nu", "dash", "ksh", "tcsh"] {
+            let mut root = Foreground { pid: 1, name: shell.into(), argv: vec![shell.into()], cwd: "/".into() };
+            assert!(shell_root(&root), "{shell}");
+            for arg in ["-i", "-li", "--login", "--no-config"] {
+                root.argv = vec![shell.into(), arg.into()];
+                assert!(shell_root(&root), "{shell} {arg}");
+            }
+            for arg in ["-c", "-cecho", "-ic echo", "--command", "--command=echo", "--commands", "--commands=echo"] {
+                root.argv = vec![shell.into(), arg.into()];
+                assert!(!shell_root(&root), "{shell} {arg}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_shell_root_is_known_by_its_name_or_else_its_first_argument() {
+        let root = |name: &str, argv: &[&str]| Foreground {
+            pid: 1,
+            name: name.into(),
+            argv: argv.iter().map(|a| a.to_string()).collect(),
+            cwd: "/".into(),
+        };
+        assert!(shell_root(&root("", &["/usr/bin/zsh"])), "no name: the path's last part");
+        assert!(shell_root(&root("bash", &["-bash"])), "a login shell's dash name");
+        assert!(shell_root(&root("bash", &[])), "no arguments at all");
+        assert!(shell_root(&root("zsh", &["zsh", "+o", "-l"])));
+        assert!(!shell_root(&root("", &[])), "nothing to go by");
+        assert!(!shell_root(&root("", &["-bash"])), "only a dash name, no process name");
+        for other in ["python3", "node", "Bash", "pwsh", "cmd.exe", "bash.exe", "shell"] {
+            assert!(!shell_root(&root(other, &[other])), "{other}");
+        }
+        assert!(!shell_root(&root("bash", &["bash", "script.sh"])), "a script runs in it");
+        assert!(!shell_root(&root("bash", &["bash", "-x", "script.sh"])));
+    }
+
+    #[test]
+    fn a_child_exiting_back_to_the_shell_clears_status_where_jobs_are_seen() {
+        let (core, id, _conn, _channel, root) = core_with_viewer();
+        let shell = |argv: &[&str]| {
+            Some(Foreground {
+                pid: 10,
+                name: "sh".into(),
+                argv: argv.iter().map(|a| a.to_string()).collect(),
+                cwd: "/".into(),
+            })
+        };
+        let working = || crate::status::Status {
+            state: "working".into(),
+            kind: None,
+            progress: None,
+            app: String::new(),
+            title: String::new(),
+            msg: String::new(),
+        };
+        let mut st = core.lock();
+        st.reg.terminals.get_mut(&id).unwrap().status = Some(working());
+        core.foreground_is(&mut st, id, shell(&["sh"]));
+        let cleared = st.reg.terminals[&id].status.is_none();
+        assert_eq!(cleared, crate::platform::foreground_tracks_jobs(), "Windows cannot tell the shell from its jobs");
+
+        // Not the shell: another pid, a command wrapper, or nothing readable.
+        for now in [front(20), shell(&["sh", "-c", "agent"]), None] {
+            st.reg.terminals.get_mut(&id).unwrap().status = Some(working());
+            core.foreground_is(&mut st, id, now.clone());
+            assert!(st.reg.terminals[&id].status.is_some(), "{now:?} kept the status");
+        }
+        // The same shell seen again: still cleared, though nothing else changed.
+        core.foreground_is(&mut st, id, shell(&["sh"]));
+        st.reg.terminals.get_mut(&id).unwrap().status = Some(working());
+        core.foreground_is(&mut st, id, shell(&["sh"]));
+        assert_eq!(st.reg.terminals[&id].status.is_none(), crate::platform::foreground_tracks_jobs());
         drop(st);
         drop(core);
         let _ = std::fs::remove_dir_all(root);

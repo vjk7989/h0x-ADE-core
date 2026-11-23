@@ -38,7 +38,7 @@ sha256() {
 }
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+trap 'rm -rf "$tmp" "$bin/h0x-core.staged"' EXIT
 
 # https only, and the download on GitHub; a site set by H0X_CORE_RELEASES_URL
 # (tests: a local http one) is trusted as it is.
@@ -112,10 +112,18 @@ if [ -z "${H0X_CORE_RELEASES_URL:-}" ]; then
   fi
 fi
 tar -xzf "$archive" -C "$tmp"
-"$tmp/h0x-core" --version >/dev/null 2>&1 || fail "the downloaded h0x-core does not run on this machine"
+core=$tmp/h0x-core
+if ! "$core" --version >/dev/null 2>&1; then
+  # A noexec mount under the temp dir fails the check with EACCES, which is
+  # not "cannot run here": stage on the destination filesystem and re-check.
+  mkdir -p "$bin"
+  core=$bin/h0x-core.staged
+  cp "$tmp/h0x-core" "$core" && chmod 755 "$core" || fail "cannot stage h0x-core in $bin"
+  "$core" --version >/dev/null 2>&1 || fail "the downloaded h0x-core does not run on this machine"
+fi
 if [ "$signed" = 1 ]; then
   say "h0x-core: no installed h0x-core can check the signature: the downloaded one does (trusted on first use: TLS to GitHub and the checksum)."
-  "$tmp/h0x-core" update --from "$archive" --check >/dev/null || fail "$asset is not signed by the h0x-core release key (see above)"
+  "$core" update --from "$archive" --check >/dev/null || fail "$asset is not signed by the h0x-core release key (see above)"
 fi
 mkdir -p "$bin"
 
@@ -123,14 +131,14 @@ if [ -x "$bin/h0x-core" ]; then
   # Swapped the planned way, so its terminals keep running.
   # The signed archive; a core older than this one takes only the bare binary
   # (verified above, so only who swaps changes).
-  if [ -n "${H0X_CORE_RELEASES_URL:-}" ]; then from=$tmp/h0x-core; else from=$archive; fi
+  if [ -n "${H0X_CORE_RELEASES_URL:-}" ]; then from=$core; else from=$archive; fi
   if ! "$bin/h0x-core" update --from "$from" >/dev/null 2>"$tmp/update.err"; then
-    "$bin/h0x-core" update --from "$tmp/h0x-core" >/dev/null 2>>"$tmp/update.err" ||
+    "$bin/h0x-core" update --from "$core" >/dev/null 2>>"$tmp/update.err" ||
       { cat "$tmp/update.err" >&2; fail "updating $bin/h0x-core failed (see above)"; }
   fi
   say "h0x-core updated to $version."
 else
-  cp "$tmp/h0x-core" "$bin/h0x-core.new"
+  cp "$core" "$bin/h0x-core.new"
   chmod 755 "$bin/h0x-core.new"
   mv -f "$bin/h0x-core.new" "$bin/h0x-core"
   say "h0x-core $version installed into $bin/h0x-core."

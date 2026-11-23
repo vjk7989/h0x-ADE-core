@@ -252,6 +252,154 @@ fn update_never_takes_a_release_of_another_generation() {
     drop(r);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn the_install_script_installs_when_the_temp_dir_cannot_execute() {
+    // The installer downloads and extracts fine, but the first `--version`
+    // check is refused by the noexec mount (EACCES). It must stage the binary
+    // on the destination filesystem and install, then update from that stage
+    // too, not cry "wrong machine".
+    let s = Session::new();
+    let r = Releases::new(&s, THIS, &[&here()]);
+    let bin = s.root.join("bin");
+    let tmp = s.root.join("noexec-tmp");
+    std::fs::create_dir(&tmp).unwrap();
+    // The runner may forbid user namespaces (hardened CI): skip when
+    // unprivileged mounting is out.
+    let probe = Command::new("unshare").args(["-rm", "--map-root-user", "true"]).output().unwrap();
+    if !probe.status.success() {
+        return;
+    }
+    // Root inside a fresh mount namespace: a noexec tmpfs for TMPDIR, the
+    // install dir on a normal filesystem. (Root cannot bypass noexec: the
+    // refusal is a mount flag, not a permission bit.)
+    let script = format!(
+        "set -e; mount --make-rprivate /; mount -t tmpfs -o size=256M,noexec tmpfs {}; \
+         export TAR_OPTIONS=--no-same-owner; \
+         export H0X_CORE_INSTALL_DIR={} TMPDIR={} H0X_CORE_RELEASES_URL={}; \
+         /usr/bin/sh {}/../../distribution/install.sh; \
+         /usr/bin/sh {}/../../distribution/install.sh",
+        tmp.display(),
+        bin.display(),
+        tmp.display(),
+        r.url,
+        ROOT,
+        ROOT
+    );
+    let out = s.program("unshare").args(["-rm", "--map-root-user", "sh", "-c", &script]).output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("does not run"), "the noexec mount was read as a wrong machine: {stdout}{stderr}");
+    assert!(out.status.success(), "{stdout}{stderr}");
+    assert!(stdout.contains("installed"));
+    assert!(stdout.contains("updated"));
+    assert!(bin.join("h0x-core").is_file());
+    assert!(!bin.join("h0x-core.staged").exists(), "the stage is cleaned up");
+    drop(r);
+}
+
+/// A downloaded h0x-core stand-in that runs only from the install folder's stage
+/// (as under a noexec temp dir) and logs where each later call ran from.
+fn runs_only_when_staged(s: &Session) -> String {
+    format!(
+        "#!/bin/sh\ncase \"$0\" in */h0x-core.staged) ;; *) [ \"$1\" = --version ] && exit 126 ;; esac\n\
+         case \"$*\" in\n  --version) echo 'h0x-core 9.9.9' ;;\n  *) printf '%s %s\\n' \"$0\" \"$*\" >> '{}' ;;\nesac\nexit 0\n",
+        s.root.join("ran.log").display()
+    )
+}
+
+/// install.sh with curl from `stub`, into `bin`; signed unless `releases` is given.
+fn install_with(stub: &Path, bin: &Path, releases: Option<&str>) -> std::process::Output {
+    let mut cmd = Command::new("sh");
+    cmd.arg(format!("{ROOT}/../../distribution/install.sh"))
+        .env("PATH", format!("{}:/usr/bin:/bin", stub.display()))
+        .env_remove("H0X_CORE_VERSION")
+        .env("H0X_CORE_INSTALL_DIR", bin);
+    match releases {
+        Some(url) => cmd.env("H0X_CORE_RELEASES_URL", url),
+        None => cmd.env_remove("H0X_CORE_RELEASES_URL"),
+    };
+    cmd.output().unwrap()
+}
+
+/// A first signed install whose temp dir cannot run the download: the stage
+/// checks the signature and is what gets installed, then it is gone.
+#[test]
+fn a_first_signed_install_checks_and_installs_from_the_stage() {
+    let s = Session::new();
+    let (stub, name, new_bytes) = stubbed_release(&s, "", &runs_only_when_staged(&s));
+    let bin = s.root.join("my bin");
+    let out = install_with(&stub, &bin, None);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(!err.contains("does not run"), "{err}");
+    let ran = std::fs::read_to_string(s.root.join("ran.log")).unwrap_or_default();
+    let check = ran.lines().find(|l| l.contains("--check")).unwrap_or_else(|| panic!("no signature check: {ran}"));
+    assert!(check.starts_with(&format!("{}/h0x-core.staged update --from ", bin.display())), "{check}");
+    assert!(check.ends_with(&format!("/{name} --check")), "{check}");
+    assert_eq!(std::fs::read(bin.join("h0x-core")).unwrap(), new_bytes, "the checked binary is installed");
+    assert!(!bin.join("h0x-core.staged").exists(), "the stage is cleaned up");
+    assert!(!bin.join("h0x-core.new").exists());
+}
+
+/// An old installed core that takes only a bare binary gets the stage, not the
+/// unrunnable copy in the temp dir; signed and unsigned (test site) alike.
+#[test]
+fn an_update_hands_the_installed_core_the_stage() {
+    for releases in [None, Some("http://127.0.0.1:9")] {
+        let s = Session::new();
+        let (stub, name, _) = stubbed_release(&s, "", &runs_only_when_staged(&s));
+        let bin = s.root.join("installed");
+        std::fs::create_dir_all(&bin).unwrap();
+        let took = s.root.join("took.log");
+        let old_core = format!(
+            "#!/bin/sh\ncase \"$1\" in\n  --version) echo 'h0x-core 0.1.8' ;;\n  update) case \"$3\" in *.tar.gz) exit 1 ;; esac; [ -x \"$3\" ] || exit 1; printf '%s\\n' \"$3\" >> '{}' ;;\nesac\n",
+            took.display()
+        );
+        std::fs::write(bin.join("h0x-core"), &old_core).unwrap();
+        std::fs::set_permissions(bin.join("h0x-core"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let out = install_with(&stub, &bin, releases);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{releases:?}: {err}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("updated"), "{releases:?}");
+        let took = std::fs::read_to_string(&took).unwrap_or_default();
+        assert_eq!(took.trim(), format!("{}/h0x-core.staged", bin.display()), "{releases:?}: {err}");
+        if releases.is_none() {
+            let ran = std::fs::read_to_string(s.root.join("ran.log")).unwrap_or_default();
+            assert!(ran.lines().any(|l| l.ends_with(&format!("/{name} --check"))), "the stage checked it: {ran}");
+        }
+        assert!(!bin.join("h0x-core.staged").exists(), "{releases:?}: the stage is cleaned up");
+    }
+}
+
+/// A download that runs neither in the temp dir nor staged really is for
+/// another machine: refused, nothing installed, no stage left behind.
+#[test]
+fn a_download_that_runs_nowhere_is_refused_and_leaves_nothing() {
+    let s = Session::new();
+    let (stub, _, _) = stubbed_release(&s, "", "#!/bin/sh\nexit 126\n");
+    for installed in [false, true] {
+        let bin = s.root.join(format!("bin-{installed}"));
+        let old_core = "#!/bin/sh\n[ \"$1\" = --version ] && echo 'h0x-core 0.1.8'\nexit 0\n";
+        if installed {
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join("h0x-core"), old_core).unwrap();
+            std::fs::set_permissions(bin.join("h0x-core"), std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+        }
+        let out = install_with(&stub, &bin, None);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{err}");
+        assert!(err.contains("does not run on this machine"), "{err}");
+        assert!(!bin.join("h0x-core.staged").exists(), "the stage is cleaned up");
+        if installed {
+            assert_eq!(std::fs::read(bin.join("h0x-core")).unwrap(), old_core.as_bytes(), "the old core stays");
+        } else {
+            assert!(!bin.join("h0x-core").exists());
+        }
+    }
+}
+
 #[test]
 fn a_machine_of_another_cpu_gets_the_released_build_for_it() {
     let mut odd = Session::new();
