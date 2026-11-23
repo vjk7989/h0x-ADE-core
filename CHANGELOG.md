@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.1.20] - 2026-11-24
+
+Less memory per terminal and safety fixes.
+
+### Changed
+- Each terminal keeps 3.6 MB of history by default (was 5 MB), and terminals without a window start at 160x50 (was 200x120). Both use less memory and can still be changed in the settings.
+
+### Fixed
+- A second core started with different settings no longer takes over the running core's terminals.
+- Waiting on a terminal no longer leaks memory over time.
+- Waiting for output no longer misses text when a character is split between two reads, and a program that exits ends the wait with the right reason.
+
 ## [0.1.19] - 2026-11-23
 
 Phone panel over Tailscale, safer data handling, and a faster Windows core.
