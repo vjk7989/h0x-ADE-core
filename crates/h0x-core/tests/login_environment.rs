@@ -131,14 +131,14 @@ fn a_login_profile_cannot_block_machine_start_forever() {
 #[test]
 fn a_profile_printing_garbage_still_loads_its_exports() {
     let s = ssh_session(
-        "head -c 4096 /dev/urandom | tr -d '\000'\nprintf 'H0X_LOGIN_END\n=\n'\nexport LOGIN_TEST=loaded\n",
+        "head -c 4096 /dev/urandom | tr -d '\\000'\nprintf 'H0X_LOGIN_END\n=\n'\nexport LOGIN_TEST=loaded\n",
     );
     assert_eq!(value(&s), "loaded");
 }
 
 #[test]
 fn a_profile_faking_the_capture_marker_falls_back_to_the_inherited_environment() {
-    let mut s = ssh_session("printf '\000H0X_LOGIN_ENV\000not a setting'\nexport LOGIN_TEST=profile\n");
+    let mut s = ssh_session("printf '\\000H0X_LOGIN_ENV\\000not a setting'\nexport LOGIN_TEST=profile\n");
     s.env.push(("LOGIN_TEST".into(), "inherited".into()));
     assert_eq!(value(&s), "inherited");
     let log = std::fs::read_to_string(s.root.join("state/h0x-core/test/core.log")).unwrap();
