@@ -879,6 +879,25 @@ fn sessions_lists_live_and_finished_terminals_as_buttons() {
 }
 
 #[test]
+fn a_session_kind_and_message_stay_out_of_the_telegram_buttons() {
+    let mut f = fixture();
+    let core = |_: &str, _: Value| -> Result<Value, RpcError> {
+        Ok(json!({"terminals": [
+            {"address": "t2", "name": "api \"x\"", "argv": ["claude"], "cwd": r"C:\Users\x\proj", "state": "live",
+             "status": {"state": "blocked", "kind": "question", "msg": "line one\nAPI_KEY=abcdef0123456789 <b>"}},
+            {"address": "t9", "argv": ["codex"], "state": "exited", "exit_code": 0,
+             "status": {"state": "blocked", "kind": "permission", "msg": "old"}},
+        ]}))
+    };
+    let out = f.front.handle(&core, &said(ME, "/sessions"), T);
+    assert_eq!(texts(&out), ["Sessions"]);
+    assert_eq!(
+        keyboard(&out, 0),
+        [("api \"x\" · claude · blocked".into(), "t:t2".into()), ("t9 · codex · exit 0".into(), "t:t9".into())]
+    );
+}
+
+#[test]
 fn tapping_a_session_selects_it_and_plain_text_goes_there_through_the_gates() {
     let mut f = fixture();
     // No selection: today's answer, nothing reaches the core.
