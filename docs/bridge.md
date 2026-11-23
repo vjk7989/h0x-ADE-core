@@ -169,6 +169,7 @@ From the device:
 - `auth` `{session}`: every later connection.
 - `command` `{cmd, id, ...}`, where `cmd` is one of:
   - `list`
+  - `sessions`: every terminal, live and finished
   - `read` `{terminal, lines}`
   - `send` `{terminal, text}`
   - `keys` `{terminal, keys}`
@@ -186,7 +187,7 @@ From the server:
 - `snapshot` `{lines, tunnel}`: the terminals, as `/agents` lists them.
   `tunnel` is true on a connection that came through the Cloudflare tunnel, so the page can say Cloudflare delivers it.
 - `reply` `{id, kind, ...}`, where `kind` is one of:
-  - `done` `{text}`
+  - `done` `{text}`, or `{sessions}` for `sessions`: a list of `{address, name, agent, folder, status, live, kind, msg}` (`kind` is null unless the program is blocked on something; text is redacted)
   - `needs_confirm` `{token, what}`
   - `locked`
   - `rate_limited` `{retry_secs}`

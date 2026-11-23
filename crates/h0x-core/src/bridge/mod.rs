@@ -16,7 +16,7 @@ pub mod web;
 
 pub use command::{Command, Key, Reply, Sender, Session};
 pub use notice::{Kind, Notice, Notices, watch};
-pub use redact::redact;
+pub use redact::{RedactParams, RedactResult, redact, redact_rpc};
 
 use crate::config::BridgeConfig;
 use crate::rpc::RpcError;

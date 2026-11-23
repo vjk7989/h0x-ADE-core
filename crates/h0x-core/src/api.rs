@@ -78,6 +78,9 @@ methods! { Ctx<'_>;
     "route" => route, crate::route::RouteParams => crate::route::RouteResult,
         "Classify a session start from its working directory and first prompt, with rules only: the session kind, the tools it needs, whether a code map helps and whether the cheap model is enough. Without `cwd` (a remote machine) there is no code map and no model change; an empty prompt or an unreadable directory gives the edit profile.",
         errors [];
+    "text.redact" => text_redact, crate::bridge::RedactParams => crate::bridge::RedactResult,
+        "Replace API keys, tokens, private keys and `password=...` values in a text with `[redacted]`. A pattern list, not a guarantee. Refuses more than 64 KB (`too_large`), with no partial answer. Empty in, empty out. No network.",
+        errors ["too_large"];
     "terminal.list" => terminal_list, ListParams => ListResult,
         "Live terminals (all with `all`), optionally filtered by labels.",
         errors [];
@@ -253,6 +256,10 @@ async fn templates_list(core: Ctx<'_>, _: Empty) -> Result<TemplatesResult, RpcE
 
 async fn route(_: Ctx<'_>, params: crate::route::RouteParams) -> Result<crate::route::RouteResult, RpcError> {
     Ok(crate::route::route(&params))
+}
+
+async fn text_redact(_: Ctx<'_>, params: crate::bridge::RedactParams) -> Result<crate::bridge::RedactResult, RpcError> {
+    crate::bridge::redact_rpc(&params)
 }
 
 async fn gate_stats(core: Ctx<'_>, _: Empty) -> Result<crate::gate::GateStats, RpcError> {

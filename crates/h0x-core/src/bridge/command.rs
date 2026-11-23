@@ -176,6 +176,10 @@ pub struct Session {
     pub folder: String,
     pub status: String,
     pub live: bool,
+    /// What a blocked program waits on (`permission`, `question`, ...), if it says.
+    pub kind: Option<String>,
+    /// The program's own status message (redacted).
+    pub msg: String,
 }
 
 #[derive(Debug, PartialEq)]
@@ -443,8 +447,12 @@ fn sessions(call: &impl Fn(&str, Value) -> Result<Value, RpcError>) -> Result<Ve
             name: text(t, "name"),
             agent: redact(&agent(t)),
             folder: redact(cwd(t).unwrap_or_default()),
-            status: status(t).0,
+            status: redact(&status(t).0),
             live: t["state"] == "live",
+            kind: (t["state"] == "live" && t["status"]["state"] == "blocked")
+                .then(|| t["status"]["kind"].as_str().map(redact))
+                .flatten(),
+            msg: text(&t["status"], "msg"),
         })
         .collect())
 }
