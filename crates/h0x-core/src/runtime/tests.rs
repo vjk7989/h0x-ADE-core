@@ -106,6 +106,159 @@ async fn server_stop_succeeds_even_when_the_registry_flush_times_out() {
     assert_eq!(stop.unwrap()["stopped"], true);
 }
 
+#[tokio::test]
+async fn a_wait_leaves_nothing_registered_however_it_ends() {
+    let (core, root) = test_core();
+    let spec = || crate::wait::WaitSpec { output: Some("never".into()), timeout: Duration::ZERO, after_turn: None };
+    let new = || crate::terminals::NewTerminal { argv: vec!["sh".into()], ..Default::default() };
+    let (done, quiet) = {
+        let mut st = core.lock();
+        let done = st.reg.create(new(), now_ms()).unwrap();
+        st.reg.finish(done, Some(0), None, "exited", now_ms());
+        (done, st.reg.create(new(), now_ms()).unwrap())
+    };
+    // Neither sends anything afterwards that would clear a stale registration.
+    assert_eq!(core.wait(done, spec(), None).await.reason, "exit");
+    assert_eq!(core.wait(quiet, spec(), None).await.reason, "timeout");
+    let left = {
+        let st = core.lock();
+        (st.events.subs.len(), st.output_watch.values().map(Vec::len).sum::<usize>())
+    };
+    drop(core);
+    remove_root(&root);
+    assert_eq!(left, (0, 0), "(event subscriptions, output watchers) left behind");
+}
+
+/// (event subscriptions, output watchers) the core holds right now.
+fn waits_registered(core: &Core) -> (usize, usize) {
+    let st = core.lock();
+    (st.events.subs.len(), st.output_watch.values().map(Vec::len).sum::<usize>())
+}
+
+#[tokio::test]
+async fn a_cancelled_wait_leaves_the_others_and_a_matched_one_leaves_nothing() {
+    let (core, root) = test_core();
+    let id = new_terminal(&core);
+    let spec = |needle: &str| crate::wait::WaitSpec {
+        output: Some(needle.into()),
+        timeout: Duration::from_secs(60),
+        after_turn: None,
+    };
+    // A client that goes away mid-wait drops the future.
+    let mut cancelled = Box::pin(core.wait(id, spec("never"), None));
+    assert!(tokio::time::timeout(Duration::from_millis(20), &mut cancelled).await.is_err());
+    assert_eq!(waits_registered(&core), (1, 1), "the wait registered before it was cut");
+    let mut matching = Box::pin(core.wait(id, spec("준비"), None));
+    assert!(tokio::time::timeout(Duration::from_millis(20), &mut matching).await.is_err());
+    assert_eq!(waits_registered(&core), (2, 2));
+    drop(cancelled);
+    let after_cancel = waits_registered(&core);
+    // The needle arrives cut inside its first character, as a pipe may deliver it.
+    let watcher = core.lock().output_watch[&id][0].clone();
+    let word = "준비".as_bytes();
+    watcher.send(word[..2].to_vec()).unwrap();
+    watcher.send(word[2..].to_vec()).unwrap();
+    let matched = tokio::time::timeout(Duration::from_secs(5), matching).await;
+    drop(watcher);
+    let left = waits_registered(&core);
+    drop(core);
+    remove_root(&root);
+    assert_eq!(after_cancel, (1, 1), "a cancelled wait takes only its own registrations");
+    assert_eq!(matched.expect("the cut needle matched").reason, "output");
+    assert_eq!(left, (0, 0), "(event subscriptions, output watchers) left behind");
+}
+
+#[tokio::test]
+async fn waits_that_end_at_once_leave_nothing_registered() {
+    let (core, root) = test_core();
+    let id = new_terminal(&core);
+    core.lock().reg.terminals.get_mut(&id).unwrap().turn = 1;
+    let spec = |output: Option<&str>, after_turn| crate::wait::WaitSpec {
+        output: output.map(String::from),
+        timeout: Duration::ZERO,
+        after_turn,
+    };
+    let mut seen = Vec::new();
+    // No such terminal: the error path.
+    seen.push((core.wait(9999, spec(Some("x"), None), None).await.reason, waits_registered(&core)));
+    // Its turn already ended.
+    seen.push((core.wait(id, spec(Some("x"), Some(0)), None).await.reason, waits_registered(&core)));
+    // A plain wait (no output watch) that times out at once.
+    seen.push((core.wait(id, spec(None, None), None).await.reason, waits_registered(&core)));
+    // An empty needle: any output matches.
+    seen.push((core.wait(id, spec(Some(""), None), None).await.reason, waits_registered(&core)));
+    drop(core);
+    remove_root(&root);
+    let reasons: Vec<_> = seen.iter().map(|(r, _)| r.as_str()).collect();
+    assert_eq!(reasons, ["exit", "status", "timeout", "timeout"]);
+    assert!(seen.iter().all(|(_, left)| *left == (0, 0)), "{seen:?}");
+}
+
+#[tokio::test]
+async fn a_working_program_that_exits_mid_wait_ends_it_with_exit_and_leaves_nothing() {
+    let (core, root) = test_core();
+    let id = new_terminal(&core);
+    let idle = new_terminal(&core);
+    {
+        let mut st = core.lock();
+        core.report_status(&mut st, id, &[root_report("working")]);
+        core.report_status(&mut st, idle, &[root_report("working")]);
+    }
+    let plain = || crate::wait::WaitSpec { output: None, timeout: Duration::from_secs(60), after_turn: None };
+    let mut exiting = Box::pin(core.wait(id, plain(), None));
+    let mut stopping = Box::pin(core.wait(idle, plain(), None));
+    assert!(tokio::time::timeout(Duration::from_millis(20), &mut exiting).await.is_err(), "still working");
+    assert!(tokio::time::timeout(Duration::from_millis(20), &mut stopping).await.is_err(), "still working");
+    assert_eq!(waits_registered(&core), (2, 0));
+    {
+        let mut st = core.lock();
+        // A finish clears the status first, then says how the program ended.
+        core.record_finish(&mut st, id, Exit { code: Some(4), signal: None }, "exited");
+        core.report_status(&mut st, idle, &[root_report("idle")]);
+    }
+    let exited = tokio::time::timeout(Duration::from_secs(5), exiting).await;
+    let stopped = tokio::time::timeout(Duration::from_secs(5), stopping).await;
+    let left = waits_registered(&core);
+    drop(core);
+    remove_root(&root);
+    let exited = exited.expect("the exit ended the wait");
+    assert_eq!((exited.reason.as_str(), exited.exit_code), ("exit", Some(4)));
+    let stopped = stopped.expect("idle ended the wait");
+    assert_eq!(
+        (stopped.reason.as_str(), stopped.status.as_deref()),
+        ("status", Some("idle")),
+        "a live stop is unchanged"
+    );
+    assert_eq!(left, (0, 0), "(event subscriptions, output watchers) left behind");
+}
+
+#[tokio::test]
+async fn unsubscribing_a_waiter_twice_or_one_never_subscribed_is_harmless() {
+    use crate::events::{Filter, Sink};
+    let (core, root) = test_core();
+    let (gone, _gone_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (kept, _kept_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (never, _never_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    let conn = Arc::new(crate::wire::Conn::default());
+    let counts = {
+        let mut st = core.lock();
+        // Nothing subscribed at all.
+        core.unsubscribe_waiter(&mut st, &never);
+        let empty = st.events.subs.len();
+        core.subscribe(&mut st, Filter::default(), Sink::Waiter(gone.clone()));
+        core.subscribe(&mut st, Filter::default(), Sink::Waiter(kept));
+        core.subscribe(&mut st, Filter::default(), Sink::Framed { conn: conn.clone(), channel: 1 });
+        core.unsubscribe_waiter(&mut st, &gone);
+        let once = st.events.subs.len();
+        core.unsubscribe_waiter(&mut st, &gone);
+        core.unsubscribe_waiter(&mut st, &never);
+        (empty, once, st.events.subs.len(), core.subscribed(&st, &conn, 1))
+    };
+    drop(core);
+    remove_root(&root);
+    assert_eq!(counts, (0, 2, 2, true), "(empty, after one, after repeats, framed kept)");
+}
+
 fn test_core() -> (Arc<Core>, PathBuf) {
     let root = std::env::temp_dir().join(format!("h0x-core-persistence-{}", platform::random_hex()));
     let paths = Paths {
