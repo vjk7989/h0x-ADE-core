@@ -70,8 +70,8 @@ fn json_from_the_core_to_a_closed_stdout_exits_141() {
 
 #[cfg(unix)]
 #[test]
-fn the_server_keeps_the_default_panic_on_a_closed_stderr() {
-    // The quiet exit is for a person's `| head`; a core that cannot log is a crash.
+fn the_server_keeps_running_on_a_closed_stderr() {
+    // A core that cannot log must not take its terminals down with it.
     let s = common::Session::new();
     let state = s.root.join("state/h0x-core/test");
     std::fs::create_dir_all(&state).unwrap();
@@ -87,16 +87,19 @@ fn the_server_keeps_the_default_panic_on_a_closed_stderr() {
         .spawn()
         .unwrap();
     drop(core.stderr.take());
+    common::wait_until("the core answers", || s.connect_ok());
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    assert!(core.try_wait().unwrap().is_none(), "serve exited after its stderr write failed");
+    assert!(s.json(&["server", "status"])["pid"].as_u64().is_some());
+    let t = common::run(&s, &["sleep", "600"]);
+    assert!(common::get(&s, &t)["pid"].is_number());
+    s.json(&["server", "stop"]);
     let start = std::time::Instant::now();
-    let status = loop {
-        if let Some(status) = core.try_wait().unwrap() {
-            break status;
-        }
+    while core.try_wait().unwrap().is_none() {
         if start.elapsed() > std::time::Duration::from_secs(10) {
             let _ = core.kill();
-            panic!("serve kept running after its stderr write failed");
+            panic!("serve did not stop cleanly");
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
-    };
-    assert_eq!(status.code(), Some(101), "the default panic, not the CLI's quiet 141");
+    }
 }

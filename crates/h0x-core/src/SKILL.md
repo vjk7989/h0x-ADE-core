@@ -138,6 +138,8 @@ h0x-core wait web --output ready         # match output printed AFTER this wait 
 h0x-core read web --lines 100
 ```
 
+If `h0x-core run` reports a registry save failure, the terminal may already exist. Check `h0x-core ls` before retrying.
+
 ### Slow commands: don't block yourself
 
 Your own shell tool holds you until its command ends: no messages, no
@@ -172,7 +174,11 @@ Your harness's own file tools touch only the machine you run on. Use h0x-core fo
 remote files and commands. `h0x-core machine ls` lists configured machines; see
 `h0x-core machine --help` to configure SSH or `--via <cmd>` connections.
 Without `--name`, SSH machines use the first host label (IPs stay whole),
-shortened to 32 characters with `-2`, `-3`, etc. added if the name is taken.
+shortened to 32 characters with `-2`, `-3`, etc. added if the name is taken
+or looks like a terminal id (`t14` becomes `t14-2`).
+
+A machine whose SSH login fails shows `needs_login` and retries slowly (up to
+every 10 minutes); `h0x-core machine login <name>` in a terminal reconnects now.
 
 On Windows, `h0x-core server status` never starts a core. If elevated SSH startup
 would block the same user's desktop session, open HyperOx on that Windows
@@ -204,11 +210,23 @@ paths start at your current folder. Prefer explicit paths for remote work.
 - State is `live` or `finished`. Status comes from the program's OSC 7501
   reports: `idle`, `working`, `done`, `blocked`, `error`; plain programs
   report none. Do not guess status from screen text.
+  On Unix, status clears when the root interactive shell returns to the foreground.
+  Direct programs and shell command/script wrappers keep status while their tools run.
+  Returning to a nested shell is not detected; a shell's own status and a backgrounded
+  agent's status clear. Windows and Unix PowerShell do not clear on shell return yet.
 - `blocked` means a person is needed (permission or a question): read the
   screen and ask your user. `send` refuses unless `--force`; don't use it to
   bypass a permission decision. `error`: read why, then send or kill.
   Send `kind=permission` with `state=blocked` if a phone or chat may answer it;
   `question` and `auth` are answered only in the terminal.
+- A new Linux core started over SSH loads the account shell's non-interactive
+  login environment once, so remote terminals and commands can find programs
+  from login PATH settings. Local Linux starts, macOS and Windows are unchanged.
+  Reconnecting and crash recovery keep the loaded environment. Profiles have five
+  seconds and a combined 1 MiB output limit; remaining profile jobs are ended after
+  capture. A failed or blocked profile falls back to the incoming environment and records
+  the shell and reason in `core.log`. To refresh an existing remote core, run
+  `h0x-core server stop`, then start it again from a normal SSH login outside HyperOx.
 - `h0x-core run` without a command starts this machine's own shell. On macOS,
   this is a login shell so it loads the login environment; explicit commands
   are unchanged. Recovery shells use the same rule.
@@ -217,9 +235,12 @@ paths start at your current folder. Prefer explicit paths for remote work.
   and recovery. Each list item is one argument. Changes apply on the next
   launch; running programs stay running. A missing executable reports
   `spawn_failed`; recovery retries and logs launch errors in `holder.log`.
-- Programs get the login session's environment. A local `DISPLAY` or
-  `WAYLAND_DISPLAY` is left out only when its socket is missing or refuses
-  connections. Host displays (including SSH forwarding) stay as they are.
+- Programs get the login session's environment with the core's terminal identity:
+  TERM=xterm-256color, COLORTERM=truecolor and TERM_PROGRAM=ghostty, with no
+  TERM_PROGRAM_VERSION. The caller's identity is not forwarded. Explicit API
+  `env` overrides still apply; kept replacement shells retain that identity.
+  A local `DISPLAY` or `WAYLAND_DISPLAY` is left out only when its socket is
+  missing or refuses connections. Host displays (including SSH forwarding) stay as they are.
   A missing `XAUTHORITY` file does not remove a display.
 - `h0x-core keep <t>` (or `run --keep`) replaces a lost program with a shell,
   never reruns a task. `h0x-core keep <t> --off` disables recovery. Signal death

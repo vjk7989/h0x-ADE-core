@@ -244,8 +244,7 @@ pub(crate) fn terminal_env(
     (env, scope)
 }
 
-/// The core's environment minus whoever started the core's identity, plus the
-/// caller's identity and this terminal's address.
+/// The core's environment with its own terminal identity and explicit client overrides.
 pub(crate) fn child_env(base: BTreeMap<String, String>, extra: BTreeMap<String, String>) -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = base
         .into_iter()
@@ -254,6 +253,9 @@ pub(crate) fn child_env(base: BTreeMap<String, String>, extra: BTreeMap<String, 
                 && !["H0X_TERMINAL_ID", "H0X_CORE_EXE", crate::sweep::VAR, crate::sweep::RUNTIME].contains(&k.as_str())
         })
         .collect();
+    env.insert("TERM".into(), "xterm-256color".into());
+    env.insert("COLORTERM".into(), "truecolor".into());
+    env.insert("TERM_PROGRAM".into(), "ghostty".into());
     crate::platform::merge_env(&mut env, extra);
     if let Ok(session) = std::env::var("H0X_CORE_SESSION") {
         env.insert("H0X_CORE_SESSION".into(), session);
@@ -261,9 +263,7 @@ pub(crate) fn child_env(base: BTreeMap<String, String>, extra: BTreeMap<String, 
     if let Some(lang) = crate::locale::for_programs(&env) {
         env.insert("LANG".into(), lang); // a core started from Finder has none
     }
-    env.entry("TERM".into()).or_insert_with(|| "xterm-256color".into());
-    env.entry("COLORTERM".into()).or_insert_with(|| "truecolor".into());
-    if env.get("TERM_PROGRAM").is_none_or(|p| p == "h0x") {
+    if env.get("TERM_PROGRAM").is_some_and(|p| p == "h0x") {
         env.insert("TERM_PROGRAM".into(), "ghostty".into());
         env.remove("TERM_PROGRAM_VERSION"); // the version belonged to whatever we replaced
     }
@@ -327,5 +327,51 @@ mod tests {
         assert!(!env.contains_key("TERM_PROGRAM_VERSION"), "the version belonged to h0x");
         let env = super::child_env(base(&[]), base(&[]));
         assert_eq!(env["TERM_PROGRAM"], "ghostty", "no terminal at all");
+    }
+
+    #[test]
+    fn the_core_sets_terminal_identity_and_only_an_explicit_client_value_overrides_it() {
+        let map = |pairs: &[(&str, &str)]| {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<std::collections::BTreeMap<_, _>>()
+        };
+        // Whoever started the core never decides a child's identity.
+        let core = map(&[
+            ("TERM", "dumb"),
+            ("COLORTERM", ""),
+            ("TERM_PROGRAM", "iTerm.app"),
+            ("TERM_PROGRAM_VERSION", "3.5"),
+            ("PATH", "/usr/bin"),
+        ]);
+        let env = super::child_env(core.clone(), map(&[]));
+        assert_eq!(env["TERM"], "xterm-256color");
+        assert_eq!(env["COLORTERM"], "truecolor");
+        assert_eq!(env["TERM_PROGRAM"], "ghostty");
+        assert!(!env.contains_key("TERM_PROGRAM_VERSION"), "the core's launcher version is not ours");
+        assert_eq!(env["PATH"], "/usr/bin");
+        // One explicit value overrides only itself.
+        let env = super::child_env(core.clone(), map(&[("TERM", "screen-256color")]));
+        assert_eq!(env["TERM"], "screen-256color");
+        assert_eq!(env["COLORTERM"], "truecolor");
+        assert_eq!(env["TERM_PROGRAM"], "ghostty");
+        assert!(!env.contains_key("TERM_PROGRAM_VERSION"));
+        // An explicit empty value is still explicit.
+        let env = super::child_env(core.clone(), map(&[("COLORTERM", "")]));
+        assert_eq!(env["COLORTERM"], "");
+        assert_eq!(env["TERM"], "xterm-256color");
+        // The h0x sentinel is rewritten even when it is all the client sent.
+        let env = super::child_env(core, map(&[("TERM_PROGRAM", "h0x")]));
+        assert_eq!(env["TERM_PROGRAM"], "ghostty");
+        assert!(!env.contains_key("TERM_PROGRAM_VERSION"));
+    }
+
+    #[test]
+    fn a_client_identity_key_overrides_in_the_platforms_own_case_rules() {
+        let map = |pairs: &[(&str, &str)]| {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let env = super::child_env(map(&[]), map(&[("term", "vt100")]));
+        assert_eq!(env["term"], "vt100");
+        // Windows keys ignore case: one TERM, the client's. Unix keys are distinct.
+        assert_eq!(env.get("TERM").map(String::as_str), if cfg!(windows) { None } else { Some("xterm-256color") });
     }
 }

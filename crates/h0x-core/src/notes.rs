@@ -52,9 +52,10 @@ fn last_lines(text: &str) -> Vec<String> {
 }
 
 /// A parent can take a note: a live agent not on a dialog (typing could answer
-/// it). A working agent takes typed text as a message, like any steer.
+/// it), with a program to type into. A working agent takes typed text as a
+/// message, like any steer.
 fn can_take_note(t: &Terminal) -> bool {
-    t.is_live() && t.reported && !blocked(t)
+    t.is_live() && t.reported && !blocked(t) && t.check_program().is_ok()
 }
 
 /// `t7 reviewer`: address, then name or template.
@@ -233,7 +234,9 @@ impl Core {
         let st = self.lock();
         let sender = from.and_then(parse_id).filter(|f| *f != to).and_then(|f| st.reg.terminals.get(&f));
         let target = st.reg.terminals.get(&to);
-        // A child on another machine calling back (`rohan/t7`).
+        // HyperOx deviates from upstream here on purpose: ANY sender with a `/` is another machine's and stays
+        // tagged (and escaped), even a shell there (`rohan/ppid:12`) or a hostile string; untagged would
+        // make remote text look local.
         if let Some(afar) = from.filter(|f| f.contains('/'))
             && target.is_some_and(|t| t.reported)
         {
@@ -635,5 +638,95 @@ mod tests {
         assert_eq!(body("a\u{1b}[31mb\u{7}c\u{9b}d"), "a[31mbcd");
         assert_eq!(body("a\tb"), "a\tb");
         assert_eq!(body("\u{1f980}\u{200d}<"), "\u{1f980}\u{200d}&lt;");
+    }
+
+    #[test]
+    fn a_kept_parent_without_a_program_takes_no_note_until_it_has_one() {
+        let mut r = Registry::default();
+        let id = r.create(NewTerminal { argv: vec!["x".into()], keep: true, ..Default::default() }, 0).unwrap();
+        let t = r.terminals.get_mut(&id).unwrap();
+        t.reported = true;
+        t.pid = Some(42);
+        assert!(can_take_note(t));
+        for reason in ["signaled", "spawn_pending"] {
+            t.pid = None;
+            t.reason = Some(reason.into());
+            assert!(!can_take_note(t), "{reason}: typing would fail, and the delivery loop would retry at once");
+        }
+        t.pid = Some(43);
+        t.reason = None;
+        t.reported = false; // a fresh shell, as recovery leaves it
+        assert!(!can_take_note(t));
+        t.reported = true;
+        assert!(can_take_note(t), "its new program reported");
+    }
+
+    #[test]
+    fn only_a_lost_program_blocks_a_note_not_a_reason_or_a_missing_pid_alone() {
+        let mut r = Registry::default();
+        let id = r.create(NewTerminal { argv: vec!["x".into()], keep: true, ..Default::default() }, 0).unwrap();
+        let t = r.terminals.get_mut(&id).unwrap();
+        t.reported = true;
+        // Not started yet (no pid, no reason): typing still has somewhere to go.
+        t.pid = None;
+        t.reason = None;
+        assert!(t.check_program().is_ok() && can_take_note(t));
+        t.pid = Some(7);
+        t.reason = Some("signaled".into());
+        assert!(can_take_note(t), "a reason left from before, but a program now");
+        t.pid = None;
+        assert_eq!(t.check_program().unwrap_err().kind, "unavailable");
+        assert!(!can_take_note(t));
+        t.state = "finished".into();
+        assert!(!can_take_note(t), "finished");
+    }
+
+    #[test]
+    fn a_shell_on_another_machine_sends_untagged_whatever_its_host_is_called() {
+        let root = crate::platform::test_scratch().join(format!(
+            "h0x-core-notes-shell-{}-{}",
+            std::process::id(),
+            crate::platform::random_hex()
+        ));
+        let paths = crate::paths::Paths {
+            socket: root.join("core.sock"),
+            holder_socket: root.join("holder.sock"),
+            state: root.clone(),
+            config: root.join("config.toml"),
+        };
+        paths.create_dirs().unwrap();
+        let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
+        let id = {
+            let mut st = core.lock();
+            let id = st.reg.create(NewTerminal { argv: vec!["x".into()], ..Default::default() }, 0).unwrap();
+            st.reg.terminals.get_mut(&id).unwrap().reported = true;
+            id
+        };
+        // HyperOx deviates from upstream: any sender with a `/` is another machine's, shells there
+        // included (`host/ppid:N`), so it stays tagged. Only a sender with no `/` is not.
+        for shell in ["rohan/ppid:12", "t14/ppid:12", "t440s/ppid:1", "rohan/", "rohan/t0", "rohan/T7"] {
+            assert_eq!(
+                core.tagged(Some(shell), id, "hi", false),
+                format!("<h0x from=\"{shell}\">hi</h0x>"),
+                "{shell:?}"
+            );
+        }
+        for local in ["ppid:12", ""] {
+            assert_eq!(core.tagged(Some(local), id, "hi", false), "hi", "{local:?}");
+        }
+        assert_eq!(core.tagged(None, id, "hi", false), "hi");
+        // A child there is tagged, even on an id-shaped host.
+        for child in ["t14/t7", "rohan/t7", "rohan.lan/t1b"] {
+            assert_eq!(
+                core.tagged(Some(child), id, "hi", false),
+                format!("<h0x from=\"{child}\">hi</h0x>"),
+                "{child:?}"
+            );
+        }
+        // Nobody to read a tag: the target never reported.
+        core.lock().reg.terminals.get_mut(&id).unwrap().reported = false;
+        assert_eq!(core.tagged(Some("rohan/t7"), id, "hi", false), "hi");
+        drop(core);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

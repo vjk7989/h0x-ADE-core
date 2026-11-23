@@ -8,7 +8,7 @@ use crate::rpc::{self, RpcError};
 use crate::runtime::Core;
 use crate::wire::{self, Conn};
 use serde_json::Value;
-use std::io;
+use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -118,7 +118,7 @@ pub(crate) async fn finish(core: &Core) -> io::Result<()> {
         core.handover().await?;
     }
     if let Err(e) = core.flush_saved().await {
-        eprintln!("core: final registry flush failed: {}", e.message);
+        let _ = writeln!(io::stderr(), "core: final registry flush failed: {}", e.message);
     }
     Ok(())
 }
@@ -148,7 +148,10 @@ fn load_identity(state: &Path, machine_id: Option<String>) -> io::Result<CoreInf
     let saved: Option<Identity> = crate::paths::read_state(&path)?;
     let info = match saved {
         Some(saved) if saved.machine_id.is_some() && machine_id.is_some() && saved.machine_id != machine_id => {
-            eprintln!("core: this disk came from another machine: a new identity, its terminals forgotten");
+            let _ = writeln!(
+                io::stderr(),
+                "core: this disk came from another machine: a new identity, its terminals forgotten"
+            );
             // All gone before the new identity is written, or the next start tries again.
             for name in CLONE_FORGETS {
                 let p = state.join(name);
@@ -247,7 +250,7 @@ async fn connection(core: Arc<Core>, read: platform::AsyncRead, mut write: Write
         result = read_frames(&core, &conn, &mut read) => result,
         _ = &mut writer => Ok(()),
         () = conn.overflowed.notified() => {
-            eprintln!("core: a client stopped reading its replies: disconnected");
+            let _ = writeln!(io::stderr(), "core: a client stopped reading its replies: disconnected");
             Ok(())
         }
     };

@@ -163,7 +163,7 @@ fn runs_a_program_and_keeps_its_result_after_exit() {
 }
 
 #[test]
-fn child_gets_core_env_caller_identity_cwd_and_its_own_address() {
+fn child_gets_core_env_terminal_identity_cwd_and_its_own_address() {
     let s = Session::new();
     s.json(&["server", "start"]);
     let out = s
@@ -176,7 +176,7 @@ fn child_gets_core_env_caller_identity_cwd_and_its_own_address() {
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    wait_text(&s, "t1", "id=t1 foo= tp=WezTerm pwd=/var/tmp");
+    wait_text(&s, "t1", "id=t1 foo= tp=ghostty pwd=/var/tmp");
 
     // Never h0x: a program started from inside HyperOx sees plain ghostty.
     let out = s
@@ -341,6 +341,66 @@ fn planned_restart_restores_the_exact_screen() {
 }
 
 #[test]
+fn restarting_waits_for_the_old_cores_lock_after_its_connection_closes() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+
+    let s = Session::new();
+    let state = s.root.join("state/h0x-core/test");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::create_dir_all(s.socket().parent().unwrap()).unwrap();
+    let lock = std::fs::File::create(state.join("core.lock")).unwrap();
+    assert!(h0x_core::platform::try_lock(&lock));
+    let listener = UnixListener::bind(s.socket()).unwrap();
+    let socket = s.socket();
+    let old = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap()).read_line(&mut line).unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], "server.restart");
+        writeln!(stream, "{}", serde_json::json!({"id": 1, "result": {"stopped": true}})).unwrap();
+        drop(listener);
+        std::fs::remove_file(socket).unwrap();
+        drop(stream);
+        // Runtime teardown closes clients before serve's lock is dropped.
+        std::thread::sleep(Duration::from_millis(400));
+        drop(lock);
+    });
+    let out = s.core(&["server", "restart"]);
+    old.join().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(s.json(&["server", "status"])["pid"].as_u64().is_some());
+}
+
+#[test]
+fn autostart_ignores_a_stale_lock_and_gives_up_on_one_still_held() {
+    let s = Session::new();
+    let state = s.root.join("state/h0x-core/test");
+    std::fs::create_dir_all(&state).unwrap();
+    // Left by a crash: the file is there, nobody holds it.
+    std::fs::write(state.join("core.lock"), "").unwrap();
+    let started = std::time::Instant::now();
+    let pid = s.json(&["server", "status"])["pid"].as_u64().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10), "a stale lock was waited on");
+    s.json(&["server", "stop"]);
+    wait_until("the old core gone", || !pid_alive(pid as i64));
+
+    // An old core that never lets go: no second core, an answer within the wait.
+    let lock = std::fs::OpenOptions::new().write(true).open(state.join("core.lock")).unwrap();
+    assert!(h0x_core::platform::try_lock(&lock));
+    let started = std::time::Instant::now();
+    let (_, error) = s.err(&["--json", "ls"]);
+    assert!(started.elapsed() < Duration::from_secs(30), "{error}");
+    assert_eq!(error["error"]["kind"], "unavailable", "{error}");
+    assert!(error["error"]["message"].as_str().unwrap().contains("did not stop or start"), "{error}");
+    assert!(h0x_core::platform::connect(&s.socket()).is_err(), "nothing started beside the lock holder");
+    // Released: the next call starts one.
+    drop(lock);
+    assert!(s.json(&["server", "status"])["pid"].as_u64().is_some());
+}
+
+#[test]
 fn finished_terminals_and_ids_survive_server_stop() {
     let s = Session::new();
     let done = run(&s, &["sh", "-c", "echo bye"]);
@@ -358,21 +418,34 @@ fn finished_terminals_and_ids_survive_server_stop() {
 }
 
 #[test]
-fn a_failed_registry_write_does_not_break_get_or_stop() {
-    let s = Session::new();
-    let terminal = run(&s, &["sleep", "100"]);
+fn a_failed_registry_write_does_not_hide_command_results() {
+    let mut s = Session::new();
+    s.env.push(("H0X_CORE_QUIET_MS".into(), "0".into()));
+    let terminal = run(&s, &["sh", "-c", "trap '' INT; echo ready; exec cat"]);
+    wait_text(&s, &terminal, "ready");
     let pid = get(&s, &terminal)["pid"].as_i64().unwrap();
     let core = status(&s)["pid"].as_i64().unwrap();
-    // A directory in place of the temporary file fails even when tests run as root.
-    let tmp = s.root.join("state/h0x-core/test/terminals.tmp");
-    std::fs::create_dir(&tmp).unwrap();
-    let label = s.core(&["label", &terminal, "disk=failed"]);
-    let get = s.core(&["get", &terminal]);
-    let stop = s.core(&["server", "stop"]);
-    std::fs::remove_dir(tmp).unwrap();
-    for (command, output) in [("label", label), ("get", get), ("stop", stop)] {
-        assert!(output.status.success(), "{command}: {}", String::from_utf8_lossy(&output.stderr));
-    }
+    // The final rename fails even when tests run as root.
+    let snapshot = s.root.join("state/h0x-core/test/terminals.json");
+    let block_save = || {
+        std::fs::remove_file(&snapshot).unwrap();
+        std::fs::create_dir(&snapshot).unwrap();
+    };
+    block_save();
+    let (_, label) = s.err(&["--json", "label", &terminal, "disk=failed"]);
+    assert_eq!(label["error"]["kind"], "unavailable", "{label}");
+    assert_eq!(get(&s, &terminal)["labels"]["disk"], "failed");
+    s.json(&["send", &terminal, "written while saves fail"]);
+    s.json(&["keys", &terminal, "enter"]);
+    assert_eq!(s.json(&["wait", &terminal, "--timeout", "0.1"])["reason"], "timeout");
+    assert_eq!(s.json(&["interrupt", &terminal, "--timeout", "0.1"])["outcome"], "unknown");
+    wait_text(&s, &terminal, "written while saves fail");
+
+    std::fs::remove_dir(&snapshot).unwrap();
+    assert_eq!(s.json(&["label", &terminal, "disk=restored"])["labels"]["disk"], "restored");
+    assert_eq!(get(&s, &terminal)["labels"]["disk"], "restored");
+    block_save();
+    assert_eq!(s.json(&["server", "stop"])["stopped"], true);
     assert!(!pid_alive(pid), "stop left the program running");
     wait_until("core stops after a failed disk write", || !pid_alive(core));
 }

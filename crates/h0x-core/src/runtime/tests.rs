@@ -1238,3 +1238,232 @@ async fn the_runtime_size_fallback_and_history_match_the_config_defaults() {
     drop(core);
     remove_root(&root);
 }
+
+/// What a subscriber hears when a holder whose program reported `tail` while
+/// unwatched is adopted after a crash or a failed read (not a handover).
+fn status_events_on_crash_adoption(tail: &[u8]) -> Vec<serde_json::Value> {
+    use crate::events::{Filter, Sink};
+    use std::sync::atomic::AtomicBool;
+    let (core, root) = test_core();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let id = {
+        let mut st = core.lock();
+        let new = crate::terminals::NewTerminal { argv: vec!["sh".into()], ..Default::default() };
+        let id = st.reg.create(new, now_ms()).unwrap();
+        let t = st.reg.terminals.get_mut(&id).unwrap();
+        t.holder = Some("fake".into());
+        t.reported = true;
+        t.status = Some(crate::status::Status {
+            state: "working".into(),
+            kind: None,
+            progress: None,
+            app: String::new(),
+            title: String::new(),
+            msg: String::new(),
+        });
+        core.subscribe(&mut st, Filter::default(), Sink::Plain { tx, behind: Arc::new(AtomicBool::new(false)) });
+        id
+    };
+    let welcome = proto::Welcome {
+        version: proto::VERSION,
+        instance: "fake".into(),
+        pid: 0,
+        build: crate::client::build_id(),
+        previous: "crash".into(),
+        terminals: vec![proto::HeldTerminal { id, pid: 1, cols: 80, rows: 24, exit: None }],
+    };
+    {
+        let mut st = core.lock();
+        core.adopt(&mut st, &welcome, HashMap::from([(id, tail.to_vec())]));
+    }
+    let mut events = Vec::new();
+    while let Ok(line) = rx.try_recv() {
+        let msg: serde_json::Value = serde_json::from_str(&line).unwrap();
+        events.push(msg["params"].clone());
+    }
+    drop(core);
+    remove_root(&root);
+    events.into_iter().filter(|e| e["type"] == "status").collect()
+}
+
+#[test]
+fn adopting_a_holder_announces_a_status_its_tail_changed() {
+    let events = status_events_on_crash_adoption(b"\x1b]7501;state=working\x1b\\\x1b]7501;state=idle\x1b\\");
+    assert_eq!(events.len(), 1, "one status event for the final word, not one per replayed report: {events:?}");
+    assert_eq!(events[0]["data"]["status"]["state"], "idle");
+}
+
+#[test]
+fn adopting_a_holder_whose_tail_repeats_the_status_announces_nothing() {
+    let events = status_events_on_crash_adoption(b"\x1b]7501;state=working\x1b\\");
+    assert!(events.is_empty(), "a replay of what subscribers already heard: {events:?}");
+}
+
+#[test]
+fn adopting_a_holder_with_no_tail_or_only_plain_output_announces_nothing() {
+    for tail in [&b""[..], b"plain output\r\n", b"\x1b]7501;state=wor"] {
+        let events = status_events_on_crash_adoption(tail);
+        assert!(events.is_empty(), "{tail:?}: nothing new for subscribers: {events:?}");
+    }
+}
+
+/// A registry writer whose saves fail while `failing` is set, counting every attempt.
+fn flaky_writer(core: &mut Arc<Core>) -> (Arc<std::sync::atomic::AtomicBool>, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    let failing = Arc::new(AtomicBool::new(true));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let (fail, count) = (failing.clone(), attempts.clone());
+    Arc::get_mut(core).unwrap().registry_writer = RegistryWriter::start(move |_| {
+        count.fetch_add(1, SeqCst);
+        if fail.load(SeqCst) { Err(io::Error::other("No space left on device")) } else { Ok(()) }
+    })
+    .unwrap();
+    (failing, attempts)
+}
+
+#[tokio::test]
+async fn a_failing_save_is_unavailable_keeps_results_retries_and_clears_on_recovery() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (mut core, root) = test_core();
+    core.flush_saved().await.unwrap();
+    let (failing, attempts) = flaky_writer(&mut core);
+    let id = {
+        let mut st = core.lock();
+        let id = st
+            .reg
+            .create(crate::terminals::NewTerminal { argv: vec!["sh".into()], ..Default::default() }, now_ms())
+            .unwrap();
+        st.reg.finish(id, Some(0), None, "exited", now_ms());
+        id
+    };
+    let address = crate::terminals::address(id);
+    let call = crate::api::Call { core: &core, conn: None, plain: None };
+    // Repeated failures: each mutation reports the same error, and its result stays.
+    for value in ["one", "two", "three"] {
+        let labels = json!({"terminal": address, "labels": {"disk": value}});
+        let err = crate::api::dispatch(&call, "terminal.label", labels).await.unwrap_err();
+        assert_eq!(err.kind, "unavailable", "{}", err.message);
+        for part in ["cannot save terminals", "No space left on device", "may already have completed"] {
+            assert!(err.message.contains(part), "{part:?} missing: {}", err.message);
+        }
+        let got = crate::api::dispatch(&call, "terminal.get", json!({"terminal": address})).await;
+        assert_eq!(got.unwrap()["labels"]["disk"], value, "an observed read is not failed by the disk");
+        assert!(core.flush_saved().await.is_err(), "the failure is still pending after {value}");
+    }
+    // Retried without another mutation.
+    let seen = attempts.load(SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while attempts.load(SeqCst) == seen {
+        assert!(Instant::now() < deadline, "a failed save was never retried");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    failing.store(false, SeqCst);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while core.flush_saved().await.is_err() {
+        assert!(Instant::now() < deadline, "a recovered disk never cleared the error");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let labels = json!({"terminal": address, "labels": {"disk": "restored"}});
+    assert_eq!(crate::api::dispatch(&call, "terminal.label", labels).await.unwrap()["labels"]["disk"], "restored");
+    core.flush_saved().await.unwrap();
+    drop(core);
+    remove_root(&root);
+}
+
+#[tokio::test]
+async fn an_empty_registry_flushes_at_once_and_lists_machines_as_an_empty_array() {
+    let (core, root) = test_core();
+    for _ in 0..2 {
+        tokio::time::timeout(Duration::from_secs(5), core.flush_saved()).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), core.flush_observed()).await.unwrap().unwrap();
+    }
+    let call = crate::api::Call { core: &core, conn: None, plain: None };
+    for params in [json!({}), json!({"all": true})] {
+        let list = crate::api::dispatch(&call, "terminal.list", params).await.unwrap();
+        assert_eq!(list.get("machines"), Some(&json!([])), "never missing: {list}");
+        assert_eq!(list["terminals"], json!([]), "{list}");
+    }
+    drop(core);
+    remove_root(&root);
+}
+
+#[tokio::test]
+async fn keep_off_finishes_only_a_terminal_without_a_holder() {
+    for (holder, reason, state, finished_reason) in [
+        (None, Some("holder_lost"), "finished", json!("holder_lost")),
+        (None, Some("signaled"), "finished", json!("signaled")),
+        (None, None, "finished", json!("holder_lost")),
+        (Some("h1"), None, "live", json!(null)),
+    ] {
+        let (core, root) = test_core();
+        let id = {
+            let mut st = core.lock();
+            let new = crate::terminals::NewTerminal { argv: vec!["sh".into()], keep: true, ..Default::default() };
+            let id = st.reg.create(new, now_ms()).unwrap();
+            let t = st.reg.terminals.get_mut(&id).unwrap();
+            t.holder = holder.map(Into::into);
+            t.pid = holder.map(|_| 42);
+            t.reason = reason.map(Into::into);
+            id
+        };
+        let address = crate::terminals::address(id);
+        let call = crate::api::Call { core: &core, conn: None, plain: None };
+        let off = json!({"terminal": address, "keep": false});
+        let r = crate::api::dispatch(&call, "terminal.keep", off).await.unwrap();
+        assert_eq!(r["state"], state, "{holder:?} {reason:?}: {r}");
+        assert_eq!(r["keep"], false, "{r}");
+        if state == "finished" {
+            assert_eq!(r["reason"], finished_reason, "{r}");
+            assert_eq!(core.lock().reg.terminals[&id].state, "finished", "the reply is what the registry holds");
+            // Finished: keeping it again is refused, not silently ignored.
+            let on = json!({"terminal": address, "keep": true});
+            assert_eq!(crate::api::dispatch(&call, "terminal.keep", on).await.unwrap_err().kind, "invalid_params");
+        }
+        core.flush_saved().await.unwrap();
+        drop(core);
+        remove_root(&root);
+    }
+}
+
+#[test]
+fn an_observer_never_sets_the_size_and_its_leaving_resizes_nothing() {
+    use crate::viewers::AttachRequest;
+    let (core, root) = test_core();
+    let id = {
+        let mut st = core.lock();
+        let new = crate::terminals::NewTerminal { argv: vec!["sh".into()], cols: 73, rows: 19, ..Default::default() };
+        let id = st.reg.create(new, 0).unwrap();
+        st.reg.terminals.get_mut(&id).unwrap().pid = Some(10);
+        st.screens.insert(id, ghostty_vt::Terminal::new(73, 19, 1 << 20));
+        id
+    };
+    let size = |core: &Core| {
+        let st = core.lock();
+        let t = &st.reg.terminals[&id];
+        (t.cols, t.rows)
+    };
+    let request = |observe, size| AttachRequest {
+        observe,
+        resize_notifications: false,
+        history: 0,
+        size,
+        display: Default::default(),
+        resumed: false,
+    };
+    let watcher = Arc::new(crate::wire::Conn::default());
+    let watching = core.attach(&watcher, id, request(true, (40, 10))).unwrap();
+    assert_eq!(size(&core), (73, 19), "watching alone keeps the starting size");
+    let typist = Arc::new(crate::wire::Conn::default());
+    let typing = core.attach(&typist, id, request(false, (100, 30))).unwrap();
+    assert_eq!(size(&core), (100, 30), "a typing viewer sets it");
+    let second = core.attach(&watcher, id, request(true, (1, 1))).unwrap();
+    assert_eq!(size(&core), (100, 30), "a later observer does not take it over");
+    core.detach(&watcher, Some(watching));
+    assert_eq!(size(&core), (100, 30), "an observer leaving resizes nothing");
+    core.detach(&typist, Some(typing));
+    assert_eq!(size(&core), core.headless(), "the last typing viewer gone: headless, observers aside");
+    core.detach(&watcher, Some(second));
+    assert_eq!(size(&core), core.headless());
+    drop(core);
+    remove_root(&root);
+}

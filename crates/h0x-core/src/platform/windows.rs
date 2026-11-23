@@ -29,6 +29,11 @@ fn check(ok: BOOL) -> io::Result<()> {
     if ok == 0 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
+fn event() -> io::Result<OwnedHandle> {
+    let handle = unsafe { CreateEventW(null(), 1, 0, null()) };
+    if handle.is_null() { Err(io::Error::last_os_error()) } else { Ok(unsafe { OwnedHandle::from_raw_handle(handle) }) }
+}
+
 // --- Connections: named pipes in overlapped mode ---------------------------
 //
 // Synchronous I/O on one pipe is serialized by Windows: a read waiting in one
@@ -37,6 +42,8 @@ fn check(ok: BOOL) -> io::Result<()> {
 
 struct Pipe {
     handle: OwnedHandle,
+    /// Set by `shutdown`, never reset: reads on this end return 0 from then on.
+    read_stopped: OwnedHandle,
 }
 
 /// One manual-reset event per thread, reused by every overlapped op on it.
@@ -57,13 +64,22 @@ thread_local! {
 }
 
 impl Pipe {
+    fn new(handle: HANDLE) -> io::Result<Self> {
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle as RawHandle) };
+        Ok(Self { handle, read_stopped: event()? })
+    }
+
     fn raw(&self) -> HANDLE {
         self.handle.as_raw_handle() as HANDLE
     }
 
     /// One overlapped operation, waited for.
-    fn io(&self, op: impl FnOnce(HANDLE, *mut OVERLAPPED) -> BOOL) -> io::Result<usize> {
+    fn io(&self, reading: bool, op: impl FnOnce(HANDLE, *mut OVERLAPPED) -> BOOL) -> io::Result<usize> {
         unsafe {
+            let stopped = self.read_stopped.as_raw_handle() as HANDLE;
+            if reading && WaitForSingleObject(stopped, 0) == WAIT_OBJECT_0 {
+                return Ok(0);
+            }
             // During thread-local teardown the cache is gone: use a one-op event.
             let mut _one_op = None;
             let cached = THREAD_EVENT.try_with(|e| {
@@ -99,6 +115,17 @@ impl Pipe {
                         _ => Err(io::Error::from_raw_os_error(err as i32)),
                     };
                 }
+                if reading {
+                    // Shutdown can happen before ReadFile even starts. Check its persistent
+                    // signal while the read is pending and drain before dropping its buffer.
+                    let wait = WaitForMultipleObjects(2, [stopped, ov.hEvent].as_ptr(), 0, INFINITE);
+                    if wait != WAIT_OBJECT_0 + 1 {
+                        let result = if wait == WAIT_OBJECT_0 { Ok(0) } else { Err(io::Error::last_os_error()) };
+                        CancelIoEx(self.raw(), &ov);
+                        GetOverlappedResult(self.raw(), &ov, &mut 0, 1);
+                        return result;
+                    }
+                }
             }
             let mut n = 0u32;
             if GetOverlappedResult(self.raw(), &ov, &mut n, 1) == 0 {
@@ -112,13 +139,13 @@ impl Pipe {
     }
 
     fn read(&self, buf: &mut [u8]) -> io::Result<usize> {
-        self.io(|h, ov| unsafe {
+        self.io(true, |h, ov| unsafe {
             ReadFile(h, buf.as_mut_ptr(), buf.len().min(u32::MAX as usize) as u32, null_mut(), ov)
         })
     }
 
     fn write(&self, buf: &[u8]) -> io::Result<usize> {
-        let n = self.io(|h, ov| unsafe {
+        let n = self.io(false, |h, ov| unsafe {
             WriteFile(h, buf.as_ptr(), buf.len().min(u32::MAX as usize) as u32, null_mut(), ov)
         })?;
         if n == 0 && !buf.is_empty() {
@@ -142,6 +169,7 @@ impl Stream {
     /// wakes any read waiting on it.
     pub fn shutdown(&self, _: std::net::Shutdown) -> io::Result<()> {
         unsafe {
+            check(SetEvent(self.0.read_stopped.as_raw_handle()))?;
             CancelIoEx(self.0.raw(), null());
             DisconnectNamedPipe(self.0.raw());
         }
@@ -207,7 +235,7 @@ fn connect_one(path: &Path) -> io::Result<Stream> {
             CreateFileW(name.as_ptr(), GENERIC_READ | GENERIC_WRITE, 0, null(), OPEN_EXISTING, flags, null_mut())
         };
         if h != INVALID_HANDLE_VALUE {
-            let pipe = Pipe { handle: unsafe { OwnedHandle::from_raw_handle(h as RawHandle) } };
+            let pipe = Pipe::new(h)?;
             served_by_this_account(&pipe, path)?;
             return Ok(Stream(Arc::new(pipe)));
         }
@@ -319,7 +347,7 @@ fn new_instance(name: &[u16], first: bool) -> io::Result<Pipe> {
     if h == INVALID_HANDLE_VALUE {
         return Err(io::Error::last_os_error());
     }
-    Ok(Pipe { handle: unsafe { OwnedHandle::from_raw_handle(h as RawHandle) } })
+    Pipe::new(h)
 }
 
 /// A pipe name others connect to (blocking accepts: the holder).
@@ -375,7 +403,7 @@ impl Listener {
             Some(pipe) => pipe,
             None => new_instance(&self.name, false)?,
         };
-        let connected = pipe.io(|h, ov| unsafe { ConnectNamedPipe(h, ov) });
+        let connected = pipe.io(false, |h, ov| unsafe { ConnectNamedPipe(h, ov) });
         match connected {
             Ok(_) => {}
             // A client that came before we waited is connected already.
@@ -1209,9 +1237,10 @@ impl Pty {
         }
     }
 
-    /// No process groups on a pseudo console: the program it started.
+    /// No process groups on a pseudo console: a known shell's newest child,
+    /// else the terminal's first process.
     pub fn foreground(&self) -> i32 {
-        self.pid as i32
+        super::windows_foreground::in_front(self.job.as_raw_handle() as HANDLE, self.pid) as i32
     }
 
     /// Ctrl+C through the console for an interrupt; anything harder ends the
@@ -1384,6 +1413,55 @@ mod tests {
         let name = format!(r"\\.\pipe\h0x-core-test-{}", crate::platform::random_hex());
         let _listener = super::listen(Path::new(&name)).unwrap();
         super::connect(Path::new(&name)).unwrap();
+    }
+
+    #[test]
+    fn shutdown_wakes_reads_even_when_none_was_pending() {
+        for read_first in [false, true] {
+            let path = PathBuf::from(format!(r"\\.\pipe\h0x-core-test-{}", crate::platform::random_hex()));
+            let listener = super::listen(&path).unwrap();
+            let mut client = super::connect(&path).unwrap();
+            let mut server = listener.accept().unwrap();
+            if read_first {
+                server.write_all(b"x").unwrap();
+                let mut byte = [0];
+                client.read_exact(&mut byte).unwrap();
+                assert_eq!(&byte, b"x");
+            }
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+            let (send, recv) = std::sync::mpsc::channel();
+            std::thread::spawn(move || send.send(client.read(&mut [0])));
+            assert_eq!(recv.recv_timeout(Duration::from_secs(2)).unwrap().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn a_shut_down_end_stays_at_eof_for_pending_and_later_reads() {
+        let path = PathBuf::from(format!(r"\\.\pipe\h0x-core-test-{}", crate::platform::random_hex()));
+        let listener = super::listen(&path).unwrap();
+        let client = super::connect(&path).unwrap();
+        let mut server = listener.accept().unwrap();
+        let reader = client.try_clone().unwrap();
+        let (send, recv) = std::sync::mpsc::channel();
+        let pending = std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut buf = [0u8; 16];
+            send.send(reader.read(&mut buf)).unwrap();
+            reader
+        });
+        // The read is waiting when the end is shut down.
+        std::thread::sleep(Duration::from_millis(100));
+        client.shutdown(std::net::Shutdown::Both).unwrap();
+        client.shutdown(std::net::Shutdown::Both).unwrap(); // twice is harmless
+        assert_eq!(recv.recv_timeout(Duration::from_secs(2)).unwrap().unwrap(), 0);
+        let mut reader = pending.join().unwrap();
+        // Data the other side sends afterwards does not undo the end.
+        let _ = server.write_all(b"late");
+        for _ in 0..3 {
+            assert_eq!(reader.read(&mut [0u8; 4]).unwrap(), 0, "EOF stays signalled");
+        }
+        let mut empty: [u8; 0] = [];
+        assert_eq!(reader.read(&mut empty).unwrap(), 0);
     }
 
     #[test]

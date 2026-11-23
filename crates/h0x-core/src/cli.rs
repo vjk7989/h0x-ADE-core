@@ -413,22 +413,17 @@ fn bare(paths: &Paths, json: bool) -> Result<Option<Out>, RpcError> {
     let address = if chosen.is_empty() {
         // Our shell if we have one, else the machine's own (Windows has no $SHELL).
         let argv: Vec<String> = std::env::var("SHELL").into_iter().filter(|s| !s.is_empty()).collect();
-        let r = call(paths, "terminal.run", json!({"argv": argv, "cwd": here(), "env": identity_env()}))?;
+        let r = call(paths, "terminal.run", json!({"argv": argv, "cwd": here()}))?;
         r["address"].as_str().unwrap_or_default().to_string()
     } else if let Some(machine) = chosen.strip_prefix('+') {
         // No program: its own shell, whatever that is there.
-        let r = call(paths, "terminal.run", json!({"on": machine, "env": identity_env()}))?;
+        let r = call(paths, "terminal.run", json!({"on": machine}))?;
         r["address"].as_str().unwrap_or_default().to_string()
     } else {
         chosen
     };
     eprintln!("{}", crate::attach::run(paths, &address, false, 0)?);
     Ok(None)
-}
-
-/// Only our terminal's identity travels; programs get the core's environment.
-fn identity_env() -> std::collections::BTreeMap<String, String> {
-    std::env::vars().filter(|(k, _)| crate::api::IDENTITY_VARS.contains(&k.as_str())).collect()
 }
 
 /// `json`: print JSON (asked, or piped). `asked`: `--json` itself, not a
@@ -516,7 +511,6 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             if p.on.is_none() {
                 p.cwd = from_here(p.cwd); // our folder means nothing on another machine
             }
-            p.env = identity_env();
             p.caller = Some(caller());
             if let Some(line) = shell_line(&p.argv) {
                 (p.line, p.argv) = (Some(line), Vec::new());
@@ -549,7 +543,7 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             let human = table(&r);
             let rows: Vec<Value> = r["terminals"].as_array().into_iter().flatten().map(short).collect();
             let mut json = json!({"terminals": rows, "hidden_finished": r["hidden_finished"]});
-            if let Some(machines) = r["machines"].as_array() {
+            if let Some(machines) = r["machines"].as_array().filter(|m| !m.is_empty()) {
                 let keep = |m: &Value| -> Value {
                     let fields = ["name", "state", "since_ms", "why"].into_iter();
                     fields
@@ -957,13 +951,90 @@ fn wait_closed(stream: &crate::platform::Stream) {
 fn connect(paths: &Paths) -> Result<(), RpcError> {
     let stream = client::connect_or_start(paths)?;
     let mut to_core = stream.try_clone().map_err(|e| RpcError::internal(e.to_string()))?;
+    let owed = std::sync::Arc::new(std::sync::Mutex::new(Owed::default()));
+    let input = owed.clone();
     std::thread::spawn(move || {
-        pump(&mut *crate::platform::console::stdin(), &mut to_core);
-        let _ = to_core.shutdown(std::net::Shutdown::Write);
+        forward(&mut std::io::BufReader::new(&mut *crate::platform::console::stdin()), &mut to_core, &input);
+        let mut owed = input.lock().unwrap();
+        owed.input_done = true;
+        // A pipe can't half-close, so on Windows the core never sees this end:
+        // close once every plain request has its reply.
+        if cfg!(unix) || owed.replies == 0 {
+            let _ = to_core.shutdown(std::net::Shutdown::Write);
+        }
     });
     // Unbuffered: std's stdout holds bytes until a newline, and frames have none.
-    pump(&mut &stream, &mut *crate::platform::console::stdout());
+    let mut out = crate::platform::console::stdout();
+    let mut buf = [0u8; 64 * 1024];
+    let mut counting = true;
+    while let Ok(n @ 1..) = (&stream).read(&mut buf) {
+        if std::io::Write::write_all(&mut *out, &buf[..n]).is_err() {
+            break;
+        }
+        let mut owed = owed.lock().unwrap();
+        // Plain replies are one line each, in order.
+        for _ in buf[..n].iter().filter(|b| **b == b'\n') {
+            if !counting {
+                break;
+            }
+            owed.replies = owed.replies.saturating_sub(1);
+            counting = !(owed.plain_ended && owed.replies == 0);
+        }
+        if cfg!(windows) && owed.input_done && owed.replies == 0 {
+            break;
+        }
+    }
     Ok(())
+}
+
+/// Plain-mode replies the caller is still owed.
+#[derive(Default)]
+struct Owed {
+    replies: usize,
+    /// A framed `hello` or `events.subscribe` was sent: nothing after it is a plain reply.
+    plain_ended: bool,
+    input_done: bool,
+}
+
+/// Forwards the caller's input, counting the plain-mode lines the core answers.
+fn forward(from: &mut impl std::io::BufRead, to: &mut impl std::io::Write, owed: &std::sync::Mutex<Owed>) {
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if !matches!(from.read_until(b'\n', &mut line), Ok(1..)) {
+            return;
+        }
+        // Input that ends mid-line still ends that line, as EOF does on Unix.
+        if line.last() != Some(&b'\n') {
+            line.push(b'\n');
+        }
+        let (answered, last) = plain_line(&line);
+        {
+            let mut owed = owed.lock().unwrap();
+            owed.replies += usize::from(answered);
+            owed.plain_ended |= last;
+        }
+        if to.write_all(&line).is_err() {
+            return;
+        }
+        if last {
+            return pump(from, to);
+        }
+    }
+}
+
+/// Whether the core answers this plain-mode line, and whether plain mode ends after it.
+fn plain_line(line: &[u8]) -> (bool, bool) {
+    let text = String::from_utf8_lossy(line);
+    if text.trim().is_empty() {
+        return (false, false);
+    }
+    let Ok(request) = serde_json::from_str::<Value>(&text) else { return (true, false) };
+    let method = request["method"].as_str();
+    // A notification (a method, no id) is the one message without a reply.
+    let answered = method.is_none() || request.get("id").is_some();
+    let last = method == Some("events.subscribe") || (method == Some("hello") && request["params"]["framed"] == true);
+    (answered, last)
 }
 
 fn pump(from: &mut impl Read, to: &mut impl std::io::Write) {
@@ -1272,5 +1343,93 @@ mod tests {
             panic!()
         };
         assert!(!check && force);
+    }
+
+    #[test]
+    fn connect_counts_the_plain_lines_the_core_answers() {
+        for (line, answered, last) in [
+            (r#"{"jsonrpc":"2.0","id":1,"method":"doc.get"}"#, true, false),
+            (r#"{"jsonrpc":"2.0","id":null,"method":"doc.get"}"#, true, false),
+            (r#"{"jsonrpc":"2.0","method":"doc.get"}"#, false, false),
+            (r#"{"foo":1}"#, true, false),
+            ("[1,2]", true, false),
+            ("not json", true, false),
+            (" \r", false, false),
+            (r#"{"id":1,"method":"events.subscribe","params":{}}"#, true, true),
+            (r#"{"id":1,"method":"hello","params":{"framed":true}}"#, true, true),
+            (r#"{"id":1,"method":"hello","params":{"framed":false}}"#, true, false),
+        ] {
+            assert_eq!(plain_line(format!("{line}\n").as_bytes()), (answered, last), "{line}");
+        }
+    }
+
+    #[test]
+    fn connect_counts_odd_lines_as_the_core_answers_them() {
+        for (line, answered, last) in [
+            (&b"\n"[..], false, false),
+            (b"\r\n", false, false),
+            (b"\xff\xfe not utf-8\n", true, false),
+            (br#"{"method":5,"id":1}"#, true, false),
+            (br#"{"method":"events.subscribe"}"#, false, true),
+            (br#"{"id":1,"method":"hello"}"#, true, false),
+            (br#"{"id":1,"method":"hello","params":{"framed":"true"}}"#, true, false),
+            (br#"{"id":1,"method":"Events.Subscribe"}"#, true, false),
+        ] {
+            assert_eq!(plain_line(line), (answered, last), "{}", String::from_utf8_lossy(line));
+        }
+    }
+
+    fn forwarded(input: &[u8]) -> (Vec<u8>, usize, bool) {
+        let owed = std::sync::Mutex::new(Owed::default());
+        let mut out = Vec::new();
+        forward(&mut std::io::BufReader::new(input), &mut out, &owed);
+        let owed = owed.into_inner().unwrap();
+        assert!(!owed.input_done, "forward leaves that to its caller");
+        (out, owed.replies, owed.plain_ended)
+    }
+
+    #[test]
+    fn connect_forwards_input_and_owes_one_reply_per_answered_line() {
+        assert_eq!(forwarded(b""), (Vec::new(), 0, false), "no input: nothing owed");
+        let get = |id: u32| format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"doc.get"}}"#);
+        let note = r#"{"jsonrpc":"2.0","method":"doc.get"}"#;
+        // The last line has no newline: it still ends, as EOF does on Unix.
+        let input = format!("{}\n{note}\n\n \r\nnot json\n{}", get(1), get(2));
+        let (out, replies, ended) = forwarded(input.as_bytes());
+        assert_eq!(out, format!("{input}\n").into_bytes());
+        assert_eq!((replies, ended), (3, false));
+    }
+
+    #[test]
+    fn connect_passes_everything_after_a_subscription_through_uncounted() {
+        for first in [
+            r#"{"id":1,"method":"events.subscribe","params":{}}"#,
+            r#"{"id":1,"method":"hello","params":{"framed":true}}"#,
+        ] {
+            let mut input = format!("{first}\n{{\"id\":2,\"method\":\"doc.get\"}}\n").into_bytes();
+            input.extend_from_slice(b"\x00\x01framed bytes, no newline");
+            let (out, replies, ended) = forwarded(&input);
+            assert_eq!(out, input, "framed bytes are sent as they are: {first}");
+            assert_eq!((replies, ended), (1, true), "{first}");
+        }
+    }
+
+    #[test]
+    fn connect_stops_forwarding_when_the_core_side_is_gone() {
+        struct Gone(usize);
+        impl std::io::Write for Gone {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                self.0 += 1;
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let owed = std::sync::Mutex::new(Owed::default());
+        let mut gone = Gone(0);
+        forward(&mut std::io::BufReader::new(&b"{\"id\":1}\n{\"id\":2}\n"[..]), &mut gone, &owed);
+        assert_eq!(gone.0, 1, "no write after the first failed");
+        assert_eq!(owed.lock().unwrap().replies, 1);
     }
 }
