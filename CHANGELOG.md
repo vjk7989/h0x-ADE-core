@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-11-23
+
+Phone panel over Tailscale, safer data handling, and a faster Windows core.
+
+### Added
+- The phone panel can be reached through Tailscale, over HTTPS when Tailscale Serve is enabled.
+- The phone panel can list your sessions.
+- A `text.redact` method that removes secrets from text.
+- Agent handoff support for HyperOx.
+
+### Changed
+- Secret redaction catches more kinds of keys and tokens.
+- Streaming terminals use less CPU on Windows.
+
+### Fixed
+- Fixes from a security review, and a test that sometimes failed on macOS.
+
 ## [0.1.18] - 2026-11-20
 
 Token Saver fixes.
