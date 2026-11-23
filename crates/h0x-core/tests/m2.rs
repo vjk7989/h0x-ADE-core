@@ -158,7 +158,7 @@ fn in_band_resize_reports_belong_to_the_viewer_not_the_core() {
 fn size_follows_the_last_active_typing_viewer() {
     let s = Session::new();
     let t = run(&s, &["sh", "-c", "trap 'stty size' WINCH; while :; do sleep 0.05; done"]);
-    assert_eq!(size(&s, &t), (200, 120));
+    assert_eq!(size(&s, &t), (160, 50));
 
     let mut a = Viewer::attach(&s, &t, 100, 30, json!({}));
     assert_eq!(size(&s, &t), (100, 30));
@@ -175,7 +175,7 @@ fn size_follows_the_last_active_typing_viewer() {
 
     drop(a);
     drop(b);
-    wait_until("headless again", || size(&s, &t) == (200, 120));
+    wait_until("headless again", || size(&s, &t) == (160, 50));
     drop(observer);
 }
 
@@ -219,9 +219,9 @@ fn observers_receive_the_terminal_grid_and_a_repaint_when_it_changes() {
     active.conn.send(active.channel, wire::RESIZE, &[100, 0, 30, 0]);
     check(100, 30);
     drop(active);
-    check(200, 120);
+    check(160, 50);
     assert!(
-        initial.iter().any(|(_, kind, p)| *kind == wire::RESIZE && p == &[200, 0, 120, 0]),
+        initial.iter().any(|(_, kind, p)| *kind == wire::RESIZE && p == &[160, 0, 50, 0]),
         "first paint must also announce the actual grid"
     );
 }
@@ -533,5 +533,5 @@ fn hc_attach_relays_both_ways_and_detaches_on_ctrl_backslash() {
     assert!(s.json(&["read", &outer])["text"].as_str().unwrap().contains("detached"));
     let rec: Value = s.json(&["get", &inner]);
     assert_eq!(rec["state"], "live");
-    wait_until("headless after detach", || size(&s, &inner) == (200, 120));
+    wait_until("headless after detach", || size(&s, &inner) == (160, 50));
 }

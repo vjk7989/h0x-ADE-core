@@ -17,9 +17,9 @@ pub struct Config {
     pub notes: Option<bool>,
     /// Seconds of quiet before a note (default 3); after Enter or a clear it goes in at once.
     pub notes_quiet: Option<f64>,
-    /// Size of a terminal nobody is typing in, `COLSxROWS` (default 200x120).
+    /// Size of a terminal nobody is typing in, `COLSxROWS` (default 160x50).
     pub headless: Option<String>,
-    /// Scrollback kept per live terminal, in MB (default 5).
+    /// Scrollback kept per live terminal, in MB (default 3.6).
     pub history_mb: Option<f64>,
     /// Keep the machine from sleeping while a terminal's status is `working` (default off).
     /// The display and the screen lock are not affected.
@@ -67,11 +67,11 @@ impl Config {
     }
 
     pub fn headless(&self) -> Result<(u16, u16), RpcError> {
-        let Some(spec) = &self.headless else { return Ok((200, 120)) };
+        let Some(spec) = &self.headless else { return Ok((160, 50)) };
         spec.split_once('x')
             .and_then(|(c, r)| Some((c.trim().parse().ok()?, r.trim().parse().ok()?)))
             .filter(|(c, r): &(u16, u16)| *c > 0 && *r > 0)
-            .ok_or_else(|| invalid(format!("headless {spec:?}: use COLSxROWS, like \"200x120\"")))
+            .ok_or_else(|| invalid(format!("headless {spec:?}: use COLSxROWS, like \"160x50\"")))
     }
 
     pub fn machine_timeout(&self) -> std::time::Duration {
@@ -79,7 +79,7 @@ impl Config {
     }
 
     pub fn history_bytes(&self) -> usize {
-        (self.history_mb.unwrap_or(5.0).max(0.0) * 1024.0 * 1024.0) as usize
+        (self.history_mb.unwrap_or(3.6).max(0.0) * 1024.0 * 1024.0) as usize
     }
 }
 
@@ -133,6 +133,103 @@ mod tests {
         assert_eq!(key("ctrl+A").unwrap(), DetachKey { byte: 0x01, code: 97 });
         for bad in ["alt+x", "ctrl+", "ctrl+ab", "ctrl+1", "x"] {
             assert_eq!(key(bad).unwrap_err().kind, "config", "{bad}");
+        }
+    }
+
+    fn with(text: &str) -> Config {
+        toml::from_str(text).unwrap()
+    }
+
+    fn headless(spec: &str) -> Result<(u16, u16), RpcError> {
+        Config { headless: Some(spec.into()), ..Default::default() }.headless()
+    }
+
+    fn history(mb: f64) -> usize {
+        Config { history_mb: Some(mb), ..Default::default() }.history_bytes()
+    }
+
+    #[test]
+    fn without_settings_a_terminal_keeps_3_6_mb_and_starts_at_160x50() {
+        // 3.6 * 1024 * 1024 = 3_774_873.6, truncated.
+        for config in [Config::default(), with(""), with("notes = true\n")] {
+            assert_eq!(config.history_bytes(), 3_774_873);
+            assert_eq!(config.history_bytes(), (3.6 * 1024.0 * 1024.0) as usize);
+            assert_eq!(config.headless().unwrap(), (160, 50));
+        }
+        let missing = Path::new(env!("CARGO_MANIFEST_DIR")).join("no-such-dir").join("config.toml");
+        let config = load(&missing).unwrap();
+        assert_eq!((config.history_bytes(), config.headless().unwrap()), (3_774_873, (160, 50)));
+    }
+
+    #[test]
+    fn an_explicit_history_mb_wins_and_negatives_are_zero() {
+        assert_eq!(history(0.0), 0);
+        assert_eq!(history(-0.0), 0);
+        assert_eq!(history(-1.0), 0);
+        assert_eq!(history(-1e300), 0);
+        assert_eq!(history(f64::NEG_INFINITY), 0);
+        assert_eq!(history(f64::NAN), 0, "NaN.max(0.0) is 0");
+        assert_eq!(history(0.05), 52_428, "0.05 MB = 52_428.8 bytes, truncated");
+        assert_eq!(history(1.0 / 1024.0 / 1024.0), 1, "one byte");
+        assert_eq!(history(0.5 / 1024.0 / 1024.0), 0, "half a byte truncates to none");
+        assert_eq!(history(3.6), 3_774_873, "explicit default equals the default");
+        assert_eq!(history(5.0), 5 * 1024 * 1024, "the old default is still reachable");
+        assert_eq!(history(1024.0), 1024 * 1024 * 1024);
+        assert_eq!(history(1e300), usize::MAX, "huge values saturate");
+        assert_eq!(history(f64::INFINITY), usize::MAX);
+        // Through the file format too.
+        assert_eq!(with("history_mb = 0.0").history_bytes(), 0);
+        assert_eq!(with("history_mb = -2.5").history_bytes(), 0);
+        assert_eq!(with("history_mb = 0.05").history_bytes(), 52_428);
+        assert_eq!(with("history_mb = 200.0").history_bytes(), 200 * 1024 * 1024);
+        assert!(toml::from_str::<Config>("history_mb = \"3.6\"").is_err(), "a string is not a size");
+    }
+
+    #[test]
+    fn an_explicit_headless_size_wins() {
+        assert_eq!(headless("200x120").unwrap(), (200, 120), "the old default is still reachable");
+        assert_eq!(headless("160x50").unwrap(), (160, 50));
+        assert_eq!(headless("80x24").unwrap(), (80, 24));
+        assert_eq!(headless("1x1").unwrap(), (1, 1), "smallest size");
+        assert_eq!(headless("65535x65535").unwrap(), (65535, 65535), "largest size");
+        assert_eq!(headless(" 160 x 50 ").unwrap(), (160, 50), "spaces around the numbers are trimmed");
+        assert_eq!(with("headless = \"200x120\"").headless().unwrap(), (200, 120));
+    }
+
+    #[test]
+    fn a_malformed_headless_size_is_a_config_error_that_suggests_160x50() {
+        for bad in [
+            "",
+            " ",
+            "x",
+            "160x",
+            "x50",
+            "160",
+            "0x0",
+            "0x50",
+            "160x0",
+            "160X50",
+            "160 50",
+            "160*50",
+            "16 0x50",
+            "70000x50",
+            "160x70000",
+            "65536x1",
+            "-1x50",
+            "160x-50",
+            "1.5x2",
+            "160x50x2",
+            "wide",
+            "160x50 rows",
+        ] {
+            let err = headless(bad).unwrap_err();
+            assert_eq!(err.kind, "config", "{bad:?}");
+            assert!(
+                err.message.contains("like \"160x50\""),
+                "{bad:?}: the example names the new default: {}",
+                err.message
+            );
+            assert!(!err.message.contains("200x120"), "{bad:?}: the old default is gone: {}", err.message);
         }
     }
 
