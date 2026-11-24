@@ -2,14 +2,20 @@
 
 ## [Unreleased]
 
-## [0.1.20] - 2026-11-24
+## [0.1.21] - 2026-11-24
 
-Less memory per terminal and safety fixes.
+Less memory per terminal, app updates that go through on Windows, and many stability fixes. (0.1.20 was built but never released; its changes are included here.)
 
 ### Changed
 - Each terminal keeps 3.6 MB of history by default (was 5 MB), and terminals without a window start at 160x50 (was 200x120). Both use less memory and can still be changed in the settings.
+- The core sets the terminal type itself, so terminals look the same however they are started.
 
 ### Fixed
+- The core no longer holds the folder it was started from, so an app update can always replace its files on Windows.
+- A full disk or a closed error output no longer stops the core and its terminals.
+- A failed save of the terminal list is retried and reported instead of being lost.
+- Remote machines: viewer sizes and reattach changes are kept, ssh addresses with IPv6 and ports work, login retries back off, and remote cores load the login environment.
+- Windows: the program running in a terminal is named correctly, and connections and pipes close cleanly.
 - A second core started with different settings no longer takes over the running core's terminals.
 - Waiting on a terminal no longer leaks memory over time.
 - Waiting for output no longer misses text when a character is split between two reads, and a program that exits ends the wait with the right reason.
