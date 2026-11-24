@@ -955,3 +955,387 @@ fn trash_on_windows_refuses_a_share_before_reading_it() {
         assert_eq!(kind(trash("claude", UUID, &roots)), "not_found");
     }
 }
+
+/// The typed PowerShell line around `body`.
+fn ps(body: &str) -> String {
+    format!("& {{ $PSNativeCommandArgumentPassing = 'Legacy'; & {body} }}")
+}
+
+fn v(items: &[&str]) -> Vec<String> {
+    items.iter().map(|i| i.to_string()).collect()
+}
+
+const LISTS: resume::FlagLists =
+    resume::FlagLists { bool_flags: &["--yolo", "-y"], value_flags: &["--model", "--effort"] };
+
+#[test]
+fn kept_flags_are_the_allowlisted_ones_in_order() {
+    let keep = |args: &[&str]| resume::keep_flags(&v(args), &LISTS);
+    assert!(keep(&[]).is_empty());
+    assert_eq!(keep(&["--model", "opus", "--yolo", "fix the bug", "-y"]), v(&["--model", "opus", "--yolo", "-y"]));
+    assert_eq!(keep(&["--model=opus", "--effort", "high"]), v(&["--model=opus", "--effort", "high"]));
+    // A value flag without its value, or followed by a flag, is dropped.
+    assert_eq!(keep(&["--model"]), v(&[]));
+    assert_eq!(keep(&["--model", "--yolo"]), v(&["--yolo"]));
+    // Unknown flags take the next word with them; subcommands and prompts go.
+    assert_eq!(keep(&["--unknown", "x", "--yolo", "exec", "hello"]), v(&["--yolo"]));
+    // Nothing after `--`.
+    assert_eq!(keep(&["--yolo", "--", "--model", "opus"]), v(&["--yolo"]));
+    // A bool flag takes no `=` value.
+    assert_eq!(keep(&["--yolo=1"]), v(&[]));
+    // Spaces and quotes stay inside one value.
+    assert_eq!(keep(&["--model", "a b'c\"d"]), v(&["--model", "a b'c\"d"]));
+}
+
+#[test]
+fn session_and_prompt_flags_are_dropped_even_when_allowlisted() {
+    let all = resume::FlagLists {
+        bool_flags: &["--continue", "-c", "-p", "--print", "-i", "--fork-session", "--yolo"],
+        value_flags: &[
+            "--resume",
+            "--session",
+            "--session-id",
+            "--conversation",
+            "--thread",
+            "--prompt",
+            "--output-format",
+        ],
+    };
+    let args = v(&[
+        "--resume",
+        "abc",
+        "--continue",
+        "-c",
+        "--session=x",
+        "--session-id",
+        "y",
+        "--fork-session",
+        "--conversation",
+        "c",
+        "--thread",
+        "t",
+        "-p",
+        "hi",
+        "--print",
+        "--prompt",
+        "hi",
+        "-i",
+        "--output-format",
+        "json",
+        "--yolo",
+    ]);
+    assert_eq!(resume::keep_flags(&args, &all), v(&["--yolo"]));
+}
+
+#[test]
+fn kept_flag_values_are_bounded_and_clean() {
+    let keep = |args: &[String]| resume::keep_flags(args, &LISTS);
+    for bad in ["a\nb", "a\u{1b}[31m", "a\u{85}b", "a\0b", "a\rb"] {
+        assert!(keep(&v(&["--model", bad])).is_empty(), "{bad:?}");
+        assert!(keep(&[format!("--model={bad}")]).is_empty(), "{bad:?}");
+    }
+    let long = "x".repeat(4096);
+    assert_eq!(keep(&v(&["--model", &long])).len(), 2);
+    let too_long = "x".repeat(4097);
+    assert!(keep(&v(&["--model", &too_long])).is_empty());
+    assert!(keep(&[format!("--model={too_long}")]).is_empty());
+    // At most 32 tokens, and a flag is never cut from its value.
+    assert_eq!(keep(&vec!["--yolo".to_string(); 40]).len(), 32);
+    let mut pairs = vec!["--yolo".to_string()];
+    pairs.extend(std::iter::repeat_n(["--model", "m"].map(String::from), 20).flatten());
+    let kept = keep(&pairs);
+    assert_eq!(kept.len(), 31);
+    assert_eq!(kept[0], "--yolo");
+}
+
+#[test]
+fn shell_lines_quote_each_word_for_the_shell() {
+    let line = |argv: &[&str], shell: &str| resume::shell_line(&v(argv), Path::new(shell));
+    let argv = ["claude", "--resume", "it's a b"];
+    for shell in ["/bin/bash", "/usr/bin/zsh", "sh", "/bin/dash", r"C:\Program Files\Git\bin\BASH.EXE"] {
+        assert_eq!(line(&argv, shell).as_deref(), Some(r"'claude' '--resume' 'it'\''s a b'"), "{shell}");
+    }
+    for shell in [
+        "pwsh",
+        r"C:\Program Files\PowerShell\7\pwsh.exe",
+        r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\PowerShell.EXE",
+    ] {
+        assert_eq!(line(&argv, shell).as_deref(), Some(ps("'claude' '--resume' 'it''s a b'").as_str()), "{shell}");
+    }
+    assert_eq!(line(&["x", r#"a "b" \"#], "pwsh").as_deref(), Some(ps(r#"'x' '"a ""b"" \\"'"#).as_str()));
+    assert_eq!(line(&["x", "\u{2019}"], "pwsh").as_deref(), Some(ps("'x' '\u{2019}\u{2019}'").as_str()));
+    assert_eq!(line(&["x", r#"a"b"#], "bash").as_deref(), Some(r#"'x' 'a"b'"#));
+    // cmd.exe, unknown shells, an empty argv and control characters are refused.
+    for shell in ["cmd.exe", r"C:\Windows\System32\CMD.EXE", "nu", "", "pwsh-preview", "/bin/bash/"] {
+        assert_eq!(line(&argv, shell), None, "{shell}");
+    }
+    assert_eq!(line(&[], "bash"), None);
+    assert_eq!(line(&["x", "a\nb"], "bash"), None);
+    assert_eq!(line(&["x", "a\u{1b}b"], "pwsh"), None);
+}
+
+#[test]
+fn resume_ids_that_look_like_options_are_refused() {
+    for agent in ["claude", "codex", "devin", "kimi", "opencode", "letta"] {
+        for id in ["-x", "--resume", "-", "default:-x"] {
+            assert!(resume_argv(agent, id).is_err(), "{agent} {id}");
+        }
+    }
+}
+
+#[test]
+fn agents_resolve_to_their_finders() {
+    for name in [
+        "claude",
+        "codex",
+        "opencode",
+        "copilot",
+        "cursor",
+        "devin",
+        "droid",
+        "hermes",
+        "qodercli",
+        "qwen",
+        "grok",
+        "kimi",
+        "pi",
+        "kilo",
+        "omp",
+        "mastracode",
+        "agy",
+        "letta",
+        "gemini",
+    ] {
+        assert!(agent(name).is_some(), "{name}");
+    }
+    assert!(agent("nope").is_none());
+    let stub = agent("kimi").unwrap();
+    assert!((stub.root)(&|_| Some("/h".into())).is_none());
+    assert!((stub.list)(Path::new("/h"), "/w").is_empty());
+    assert!(stub.lists.bool_flags.is_empty() && stub.lists.value_flags.is_empty());
+}
+
+#[test]
+fn kept_flags_at_their_edges() {
+    let keep = |args: &[&str]| resume::keep_flags(&v(args), &LISTS);
+    assert!(keep(&[""]).is_empty());
+    assert!(keep(&["-", "--"]).is_empty());
+    // Unicode and emoji values are kept whole.
+    assert_eq!(keep(&["--model", "ölmodel-日本-🚀"]), v(&["--model", "ölmodel-日本-🚀"]));
+    assert_eq!(keep(&["--effort=🚀"]), v(&["--effort=🚀"]));
+    // `--flag=` carries its (empty) value inline: the next word is not taken as one.
+    // An empty `--flag=` is dropped by design.
+    assert_eq!(keep(&["--model=", "opus"]), v(&[]));
+    // A value flag as the last token, missing its value.
+    assert_eq!(keep(&["--yolo", "--model"]), v(&["--yolo"]));
+    assert_eq!(keep(&["--effort", "high", "--model"]), v(&["--effort", "high"]));
+    // A value flag is never followed by `--` as its value.
+    assert_eq!(keep(&["--model", "--", "--yolo"]), v(&[]));
+    // The same flag repeated stays repeated, in order.
+    assert_eq!(
+        keep(&["--model", "a", "--yolo", "--model=b", "--yolo", "-y"]),
+        v(&["--model", "a", "--yolo", "--model=b", "--yolo", "-y"])
+    );
+    // A prefix (or an extension) of an allowlisted flag is another, unknown flag.
+    assert_eq!(keep(&["--mod", "x", "--model-x", "y", "--modelx=z", "--yo", "-yy", "--yolo"]), v(&["--yolo"]));
+    // Unknown flags take only a non-dash next word.
+    assert_eq!(keep(&["--zzz", "--model", "m"]), v(&["--model", "m"]));
+    assert_eq!(keep(&["--zzz", "--", "--yolo"]), v(&[]));
+    // Session and prompt flags in `=` form, and before a flag, never swallow it.
+    assert_eq!(keep(&["--resume=abc", "-p=x", "--thread=t", "--yolo"]), v(&["--yolo"]));
+    assert_eq!(keep(&["--resume", "--yolo", "--print", "--model", "m"]), v(&["--yolo", "--model", "m"]));
+    assert_eq!(keep(&["-p", "fix it", "-i", "--output-format", "json", "-y"]), v(&["-y"]));
+}
+
+#[test]
+fn never_flags_drop_only_their_exact_names() {
+    let lists = resume::FlagLists {
+        bool_flags: &["--continue-on-error", "-cc", "--printer", "-ii"],
+        value_flags: &["--session-name", "--threads"],
+    };
+    let args = v(&["--continue-on-error", "-cc", "--printer", "-ii", "--session-name", "n", "--threads=4"]);
+    assert_eq!(resume::keep_flags(&args, &lists), args);
+}
+
+#[test]
+fn kept_flag_values_at_the_byte_and_token_limits() {
+    let keep = |args: &[String]| resume::keep_flags(args, &LISTS);
+    // Exactly 4096 bytes is kept, 4097 is not: bytes, not chars.
+    let at = "x".repeat(4096);
+    let over = "x".repeat(4097);
+    assert_eq!(keep(&[format!("--model={at}")]), vec![format!("--model={at}")]);
+    assert!(keep(&[format!("--model={over}")]).is_empty());
+    let wide = "é".repeat(2048);
+    assert_eq!(wide.len(), 4096);
+    assert_eq!(keep(&v(&["--model", &wide])), v(&["--model", &wide]));
+    let wide_over = format!("{wide}x");
+    assert!(keep(&v(&["--model", &wide_over])).is_empty());
+    let emoji_over = "🚀".repeat(1025);
+    assert!(keep(&v(&["--model", &emoji_over])).is_empty());
+    // A refused value goes with its flag; what follows is still read.
+    assert_eq!(keep(&v(&["--model", &over, "--yolo"])), v(&["--yolo"]));
+    for bad in ["a\tb", "a\u{7f}b", "a\u{9f}b", "a\u{80}b", "\n"] {
+        assert_eq!(keep(&v(&["--model", bad, "-y"])), v(&["-y"]), "{bad:?}");
+    }
+
+    let yolos = |n: usize| vec!["--yolo".to_string(); n];
+    assert_eq!(keep(&yolos(32)).len(), 32);
+    assert_eq!(keep(&yolos(33)).len(), 32);
+    // 30 + a pair is exactly 32: kept whole.
+    let mut at_cap = yolos(30);
+    at_cap.extend(v(&["--model", "m"]));
+    let kept = keep(&at_cap);
+    assert_eq!(kept.len(), 32);
+    assert_eq!(kept[30..], v(&["--model", "m"]));
+    // 31 + a pair would be 33: the pair goes whole, never its flag alone.
+    let mut over_cap = yolos(31);
+    over_cap.extend(v(&["--model", "m"]));
+    assert_eq!(keep(&over_cap), yolos(31));
+    // 31 + an inline pair is one token: 32.
+    let mut inline = yolos(31);
+    inline.push("--model=m".into());
+    assert_eq!(keep(&inline).len(), 32);
+}
+
+#[test]
+fn shell_lines_at_their_edges() {
+    let line = |argv: &[&str], shell: &str| resume::shell_line(&v(argv), Path::new(shell));
+    for shell in ["/opt/homebrew/bin/fish", r"C:\Program Files\fish shell\bin\FISH.exe", "fish"] {
+        assert_eq!(line(&["a", "it's"], shell).as_deref(), Some(r"'a' 'it\'s'"), "{shell}");
+    }
+    for shell in ["PWSH.EXE", r"C:\PROGRAM FILES\POWERSHELL\7\PWSH.EXE", "PowerShell"] {
+        assert_eq!(line(&["a"], shell).as_deref(), Some(ps("'a'").as_str()), "{shell}");
+    }
+    for shell in [r"C:\tools\run.cmd", r"C:\Windows\System32\cmd.exe", "cmd", r"C:\x y\start.bat", "/bin/tcsh"] {
+        assert_eq!(line(&["a"], shell), None, "{shell}");
+    }
+    // `'` and `"` together.
+    let both = r#"it's "x""#;
+    assert_eq!(line(&["a", both], "bash").as_deref(), Some(r#"'a' 'it'\''s "x"'"#));
+    assert_eq!(line(&["a", both], "pwsh").as_deref(), Some(ps(r#"'a' '"it''s ""x"""'"#).as_str()));
+    // Fish reads `\\` and `\'` as escapes inside single quotes.
+    let fish = |s: &str| resume::shell_line(&v(&["a", s]), Path::new("fish"));
+    assert_eq!(fish(r"C:\dir\").as_deref(), Some(r"'a' 'C:\\dir\\'"));
+    assert_eq!(fish(r"a\\b").as_deref(), Some(r"'a' 'a\\\\b'"));
+    assert_eq!(fish("it's").as_deref(), Some(r"'a' 'it\'s'"));
+    // Expansions stay inert inside single quotes.
+    let inert = ["$(rm -rf ~)", "`id`", "$HOME", "a`nb", "${x}", "!1", "*"];
+    assert_eq!(line(&inert, "sh").as_deref(), Some("'$(rm -rf ~)' '`id`' '$HOME' 'a`nb' '${x}' '!1' '*'"));
+    assert_eq!(
+        line(&inert, "pwsh").as_deref(),
+        Some(ps("'$(rm -rf ~)' '`id`' '$HOME' 'a`nb' '${x}' '!1' '*'").as_str())
+    );
+    // Unicode, emoji and empty words.
+    assert_eq!(line(&["ü 🚀", ""], "zsh").as_deref(), Some("'ü 🚀' ''"));
+    assert_eq!(line(&["ü 🚀", ""], "pwsh").as_deref(), Some(ps("'ü 🚀' ''").as_str()));
+    // Any control character, in any word, under every shell.
+    for bad in ["\t", "\u{7f}", "\u{85}", "\u{9f}", "\r"] {
+        for shell in ["bash", "fish", "pwsh"] {
+            assert_eq!(line(&["a", &format!("x{bad}y")], shell), None, "{bad:?} {shell}");
+        }
+    }
+    assert_eq!(line(&[], "pwsh"), None);
+    assert_eq!(line(&[], "fish"), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_posix_shell_line_gives_back_the_exact_argv() {
+    let words =
+        ["it's", r#"a "b" \"#, "$(echo pwned)", "`id`", r"\\n", "*", "~", "!x", "", "ü 🚀", "-n", "%s", "'", "''"];
+    let mut argv = v(&["printf", r"%s\0"]);
+    argv.extend(v(&words));
+    let line = resume::shell_line(&argv, Path::new("/bin/sh")).unwrap();
+    let out = std::process::Command::new("/bin/sh").arg("-c").arg(&line).output().unwrap();
+    assert!(out.status.success(), "{line}");
+    let out = String::from_utf8(out.stdout).unwrap();
+    let got: Vec<&str> = out.strip_suffix('\0').unwrap().split('\0').collect();
+    assert_eq!(got, words);
+}
+
+#[test]
+fn agent_finders_list_what_session_list_lists() {
+    let h = Home::new();
+    let cwd = "/srv/app";
+    h.claude("-srv-app", "c1", &[said(cwd)], 10);
+    h.codex("x1", cwd, 30);
+    h.opencode("ses_1", cwd, 20);
+    let home = h.0.display().to_string();
+    let env = |name: &str| (name == "HOME").then(|| home.clone());
+    let roots = h.roots();
+    let all = list(cwd, &roots);
+    for (name, root) in [("claude", &roots.claude), ("codex", &roots.codex), ("opencode", &roots.opencode)] {
+        let found = agent(name).unwrap();
+        let own = (found.root)(&env);
+        assert_eq!(&own, root, "{name}");
+        let ids: Vec<String> = (found.list)(own.as_deref().unwrap(), &normal(cwd)).into_iter().map(|s| s.id).collect();
+        let want: Vec<String> = all.iter().filter(|s| s.agent == name).map(|s| s.id.clone()).collect();
+        assert_eq!(want.len(), 1, "{name}");
+        assert_eq!(ids, want, "{name}");
+    }
+    // claude's list takes the config root, not its projects folder.
+    let claude = agent("claude").unwrap();
+    assert!((claude.list)(&h.0.join(".claude").join("projects"), &normal(cwd)).is_empty());
+    assert!((claude.list)(&h.0.join("missing"), &normal(cwd)).is_empty());
+    // An empty CLAUDE_CONFIG_DIR counts as unset.
+    let empty = |name: &str| match name {
+        "CLAUDE_CONFIG_DIR" => Some(String::new()),
+        "HOME" => Some("/h".to_string()),
+        _ => None,
+    };
+    assert_eq!((claude.root)(&empty), Some(Path::new("/h").join(".claude")));
+    let win = |name: &str| (name == "CLAUDE_CONFIG_DIR").then(|| r"C:\Users\a b\.claude".to_string());
+    assert_eq!((claude.root)(&win), Some(PathBuf::from(r"C:\Users\a b\.claude")));
+    assert!((claude.root)(&|_| None).is_none());
+}
+
+#[test]
+fn every_stub_agent_finds_and_keeps_nothing() {
+    let stubs = [
+        "copilot",
+        "cursor",
+        "devin",
+        "droid",
+        "hermes",
+        "qodercli",
+        "qwen",
+        "grok",
+        "kimi",
+        "pi",
+        "kilo",
+        "omp",
+        "mastracode",
+        "agy",
+        "letta",
+        "gemini",
+    ];
+    let env = |_: &str| Some("/h".to_string());
+    for name in stubs {
+        let stub = agent(name).unwrap();
+        assert!((stub.root)(&env).is_none(), "{name}");
+        assert!((stub.list)(Path::new("/h"), "/w").is_empty(), "{name}");
+        assert!(stub.lists.bool_flags.is_empty() && stub.lists.value_flags.is_empty(), "{name}");
+    }
+    for name in ["", "Claude", "CODEX", " claude", "claude ", "nope"] {
+        assert!(agent(name).is_none(), "{name:?}");
+    }
+}
+
+#[test]
+fn an_empty_inline_value_is_not_kept() {
+    assert!(resume::keep_flags(&v(&["--model="]), &LISTS).is_empty());
+    assert_eq!(resume::keep_flags(&v(&["--model=", "--yolo"]), &LISTS), v(&["--yolo"]));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fish_line_gives_back_the_exact_argv() {
+    let Ok(out) = std::process::Command::new("fish").arg("--version").output() else { return };
+    if !out.status.success() {
+        return;
+    }
+    let argv = v(&["printf", "[%s]", r"C:\dir\", r"a\\b", "it's", r"\'", "a b"]);
+    let line = resume::shell_line(&argv, Path::new("fish")).unwrap();
+    let out = std::process::Command::new("fish").arg("-c").arg(&line).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout), r"[C:\dir\][a\\b][it's][\'][a b]");
+}

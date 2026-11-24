@@ -3,6 +3,8 @@
 //! shell string; an id must have its agent's shape, so it can never be read
 //! as an option, a path or a second word.
 
+use std::path::Path;
+
 /// Longer ids are refused.
 pub(super) const MAX_ID: usize = 512;
 const MAX_ARGS: usize = 64;
@@ -115,4 +117,142 @@ fn validate(argv: &[String]) -> Result<(), String> {
         return Err("resume argv must start with a plain command name, not a path".into());
     }
     Ok(())
+}
+
+/// The flags an agent's restore keeps, as written in its own `--help`.
+#[derive(Clone, Copy)]
+pub(crate) struct FlagLists {
+    /// Flags that stand alone.
+    pub(crate) bool_flags: &'static [&'static str],
+    /// Flags followed by one value (`--flag value` or `--flag=value`).
+    pub(crate) value_flags: &'static [&'static str],
+}
+
+const MAX_KEPT: usize = 32;
+const MAX_VALUE: usize = 4096;
+/// Never kept, whatever an allowlist says: they name another session or run a prompt.
+const NEVER: [&str; 13] = [
+    "--resume",
+    "--continue",
+    "-c",
+    "--session",
+    "--session-id",
+    "--fork-session",
+    "--conversation",
+    "--thread",
+    "-p",
+    "--print",
+    "--prompt",
+    "-i",
+    "--output-format",
+];
+
+/// The allowlisted flags of an agent's argv (after its program token), in
+/// order: no prompt, file, subcommand, session flag or anything after `--`.
+#[allow(dead_code)] // read by the resume path in later sub-tasks
+pub(super) fn keep_flags(args: &[String], lists: &FlagLists) -> Vec<String> {
+    let sound = |v: &str| v.len() <= MAX_VALUE && !v.chars().any(char::is_control);
+    let mut kept: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() && args[i] != "--" {
+        let before = kept.len();
+        let arg = &args[i];
+        i += 1;
+        if !arg.starts_with('-') {
+            continue;
+        }
+        let (name, inline) = match arg.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (arg.as_str(), None),
+        };
+        // The value of a flag that is not kept goes with it.
+        let next = args.get(i).filter(|n| !n.starts_with('-') && n.as_str() != "--");
+        let skip = usize::from(inline.is_none() && next.is_some());
+        if NEVER.contains(&name) {
+            i += skip;
+        } else if lists.bool_flags.contains(&name) && inline.is_none() && sound(arg) {
+            kept.push(arg.clone());
+        } else if lists.value_flags.contains(&name) {
+            match (inline, next) {
+                (Some(value), _) if !value.is_empty() && sound(value) && sound(name) => kept.push(arg.clone()),
+                (None, Some(value)) if sound(value) => {
+                    i += 1;
+                    kept.extend([arg.clone(), value.clone()]);
+                }
+                _ => i += skip,
+            }
+        } else {
+            i += skip;
+        }
+        if kept.len() > MAX_KEPT {
+            kept.truncate(before);
+            break;
+        }
+    }
+    kept
+}
+
+/// One line that runs `argv` when typed into the shell at `shell`: each
+/// element is one word. `None` for cmd.exe, an unknown shell, an empty argv or
+/// an element with a control character (it would end the line early).
+#[allow(dead_code)] // read by the resume path in later sub-tasks
+pub(super) fn shell_line(argv: &[String], shell: &Path) -> Option<String> {
+    if argv.is_empty() || argv.iter().any(|a| a.chars().any(char::is_control)) {
+        return None;
+    }
+    // By hand: a Windows path is one path on every host.
+    let shell = shell.to_string_lossy();
+    let name = shell.rsplit(['/', '\\']).next().unwrap_or_default().to_ascii_lowercase();
+    let stem = name.rsplit_once('.').map_or(name.as_str(), |(stem, _)| stem);
+    match stem {
+        "sh" | "bash" | "zsh" | "dash" => {
+            let words: Vec<String> = argv.iter().map(|a| format!("'{}'", a.replace('\'', r"'\''"))).collect();
+            Some(words.join(" "))
+        }
+        // Fish reads `\\` and `\'` as escapes inside single quotes.
+        "fish" => {
+            let words: Vec<String> =
+                argv.iter().map(|a| format!("'{}'", a.replace('\\', r"\\").replace('\'', r"\'"))).collect();
+            Some(words.join(" "))
+        }
+        // Legacy native-argument passing (ADR-060) for this command only: pwsh 7.3+ defaults to Standard.
+        "pwsh" | "powershell" => {
+            let words: Vec<String> = argv.iter().map(|a| powershell_word(a)).collect();
+            Some(format!("& {{ $PSNativeCommandArgumentPassing = 'Legacy'; & {} }}", words.join(" ")))
+        }
+        _ => None,
+    }
+}
+
+/// A PowerShell single-quoted word; quotes doubled, curly ones too.
+fn powershell_word(arg: &str) -> String {
+    let arg = if arg.contains('"') { windows_arg(arg) } else { arg.to_string() };
+    let mut word = String::from("'");
+    for c in arg.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            word.push(c);
+        }
+        word.push(c);
+    }
+    word + "'"
+}
+
+/// One argument of a Windows command line, as C runtimes read it (ADR-060):
+/// a `"` inside quotes is written `""`; backslashes before one are doubled.
+fn windows_arg(arg: &str) -> String {
+    let mut s = String::from('"');
+    let mut slashes = 0;
+    for ch in arg.chars() {
+        match ch {
+            '\\' => {
+                slashes += 1;
+                continue;
+            }
+            '"' => s.extend(std::iter::repeat_n('\\', 2 * slashes).chain(['"', '"'])),
+            _ => s.extend(std::iter::repeat_n('\\', slashes).chain([ch])),
+        }
+        slashes = 0;
+    }
+    s.extend(std::iter::repeat_n('\\', 2 * slashes));
+    s + "\""
 }
