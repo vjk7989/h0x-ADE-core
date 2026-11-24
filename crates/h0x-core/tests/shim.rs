@@ -208,7 +208,10 @@ fn the_core_keeps_a_shim_folder_that_only_its_terminals_have_on_path() {
     let link = bin.join("claude");
     let target = |p: &Path| std::fs::canonicalize(p).unwrap();
     assert_eq!(target(&link), target(Path::new(BIN)));
-    assert_eq!(std::fs::metadata(&bin).map(|m| std::os::unix::fs::PermissionsExt::mode(&m) & 0o777).unwrap(), 0o700);
+    assert_eq!(
+        std::fs::metadata(&bin).map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777).unwrap(),
+        0o700
+    );
 
     let path = common::in_terminal_as(&s, "/bin/sh", &["-c", "echo $PATH"], b"", None, &[]);
     let path = String::from_utf8_lossy(&path.stdout).into_owned();

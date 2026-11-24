@@ -520,10 +520,13 @@ mod tests {
         {
             let shim = bin.join("claude.exe");
             let id = |p: &Path| crate::platform::file_identity(&std::fs::metadata(p).unwrap());
-            // A hardlink: one file, so even the creation time matches (a copy would get a new one).
-            assert_eq!(id(&shim), id(&exe), "claude.exe is a hardlink of the running program");
+            // A hardlink when the state folder shares the exe's volume; a copy (same bytes) across
+            // volumes, as on CI where the temp folder and the build folder are on different drives.
+            let same = |a: &Path, b: &Path| id(a) == id(b) || std::fs::read(a).unwrap() == std::fs::read(b).unwrap();
+            assert!(same(&shim, &exe), "claude.exe is the running program (a hardlink or a same-bytes copy)");
+            let before = id(&shim);
             ensure(&paths(&state)).unwrap();
-            assert_eq!(id(&shim), id(&exe));
+            assert_eq!(id(&shim), before, "a second run leaves an up-to-date claude.exe alone");
             assert_eq!(old_ones(&bin), Vec::<String>::new(), "nothing renamed when nothing changed");
         }
         let _ = std::fs::remove_dir_all(state);
