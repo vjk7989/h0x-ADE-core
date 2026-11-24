@@ -102,6 +102,9 @@ pub fn run() -> i32 {
     if std::io::stdin().read_to_end(&mut raw).is_err() {
         return 0;
     }
+    if !crate::client::vouched() {
+        return 0; // outside a HyperOx terminal: no rewrite
+    }
     std::panic::set_hook(Box::new(|_| {})); // a hook never talks to the agent: pass through quietly
     let out = std::panic::catch_unwind(|| String::from_utf8(raw).ok().and_then(|s| replace(&s)));
     if let Ok(Some((text, bytes_in, shown))) = out {

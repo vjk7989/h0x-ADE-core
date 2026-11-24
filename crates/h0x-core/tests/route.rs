@@ -1,4 +1,13 @@
 //! `h0x-core route`: `{cwd?, prompt}` on stdin, one JSON line on stdout, exit 0; and the RPC method `route`.
+//! It answers only inside a HyperOx terminal (SC-2): the tests that expect a decision run it in a
+//! terminal of their own core (`sh` on unix, `cmd` on Windows via `tests/inside`); outside one it
+//! prints nothing.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+#[cfg(unix)]
+mod common;
+#[cfg(windows)]
+mod inside;
+
 use serde_json::{Value, json};
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
@@ -31,19 +40,13 @@ fn core_cmd(name: &str, args: &[&str]) -> Command {
     cmd
 }
 
-/// `h0x-core route` with `input` on stdin; checks exit 0, no panic and exactly one JSON line.
+/// `h0x-core route` with `input` on stdin inside a terminal of an isolated core; checks exit 0, no
+/// panic and exactly one JSON line.
 fn route(input: &[u8]) -> Value {
-    let mut child = core_cmd("route-cli", &["route"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let input = input.to_vec();
-    let feed = std::thread::spawn(move || drop(stdin.write_all(&input)));
-    let out: Output = child.wait_with_output().unwrap();
-    feed.join().unwrap();
+    #[cfg(unix)]
+    let out: Output = common::in_terminal(&common::Session::new(), &["route"], input, None, &[]);
+    #[cfg(windows)]
+    let out: Output = inside::Session::new().in_terminal(&["route"], input, None, &[]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(0), "{stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
@@ -133,6 +136,7 @@ fn bad_or_empty_input_is_the_edit_profile() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn a_missing_cwd_or_a_file_as_cwd_is_no_repo() {
     let dir = scratch("route-missing");
@@ -157,6 +161,7 @@ fn a_one_megabyte_prompt_is_classified_and_answered_in_one_line() {
     assert_eq!(v, edit_profile());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_megabyte_of_navigation_words_answers_in_seconds() {
     // No `where … handled` pair matches (a `.` sits in every gap), so a pairwise search tries every
@@ -178,6 +183,7 @@ impl Drop for Core {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn the_route_rpc_method_answers_like_the_command() {
     let name = "rt-rpc";
@@ -227,4 +233,25 @@ fn the_schema_has_route_with_an_optional_cwd_and_the_seven_result_keys() {
     let mut keys: Vec<&str> = props.keys().map(String::as_str).collect();
     keys.sort_unstable();
     assert_eq!(keys, ["code", "graft", "kind", "model", "nav", "read_only", "tools"]);
+}
+
+#[test]
+fn outside_a_terminal_the_command_prints_nothing_and_exits_0() {
+    let name = "rt-outside";
+    let _core = Core(name.into());
+    for input in [json!({"cwd": repo_dir(), "prompt": RO_NAV}).to_string(), String::new(), "not json".into()] {
+        let mut child = core_cmd(name, &["route"])
+            .env_remove("H0X_SCOPE")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        let feed = std::thread::spawn(move || drop(stdin.write_all(input.as_bytes())));
+        let out = child.wait_with_output().unwrap();
+        feed.join().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
+    }
 }

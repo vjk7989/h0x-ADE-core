@@ -14,7 +14,12 @@ const LABEL: &str = "h0x.session";
 
 pub fn run(args: &[Option<&str>]) -> i32 {
     let mut raw = Vec::new();
-    if std::io::stdin().take(MAX_INPUT + 1).read_to_end(&mut raw).is_err() || raw.len() as u64 > MAX_INPUT {
+    let mut stdin = std::io::stdin();
+    if (&mut stdin).take(MAX_INPUT + 1).read_to_end(&mut raw).is_err() {
+        return 0;
+    }
+    if raw.len() as u64 > MAX_INPUT {
+        let _ = std::io::copy(&mut stdin, &mut std::io::sink()); // the writer must never see a broken pipe
         return 0;
     }
     std::panic::set_hook(Box::new(|_| {})); // a hook never talks to the agent: stay quiet
