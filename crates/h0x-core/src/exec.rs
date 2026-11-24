@@ -118,13 +118,32 @@ pub fn sweep_leftovers(state: &Path) {
     });
 }
 
+/// The folder the core was started in, kept for terminals that name none: the core
+/// itself leaves it (see `server::serve`) so it never blocks renaming that folder.
+pub const LAUNCH_DIR_VAR: &str = "H0X_CORE_LAUNCH_DIR";
+
+/// The launch folder: the one a restarting core handed over if it still exists, else `current`.
+pub fn pick_launch_dir(
+    handed: Option<std::path::PathBuf>,
+    current: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    handed.filter(|d| d.is_dir()).or(current)
+}
+
+pub static LAUNCH_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
 /// The folder `cwd` names: from this machine's home for a caller from afar,
 /// else from the core's folder; that start when none is given.
 /// Use HOME, not the core's cwd: the underlying home directory may have been replaced.
 pub fn folder(cwd: Option<&str>, from_afar: bool) -> String {
     let start = match (from_afar, std::env::var("HOME")) {
         (true, Ok(home)) => home,
-        _ => std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_else(|_| "/".into()),
+        // A launch folder that is gone ends at "/", never at the core's own (state) cwd.
+        _ => match LAUNCH_DIR.get() {
+            Some(dir) if dir.is_dir() => dir.display().to_string(),
+            Some(_) => "/".into(),
+            None => std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_else(|_| "/".into()),
+        },
     };
     match cwd {
         Some(cwd) => Path::new(&start).join(cwd).display().to_string(),
@@ -331,5 +350,67 @@ impl Drop for Tree {
             self.group.end();
             std::thread::spawn(ender);
         }
+    }
+}
+
+#[cfg(test)]
+mod launch_dir_tests {
+    use super::pick_launch_dir;
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_handed_over_folder_wins_only_if_it_exists() {
+        let here = std::env::temp_dir();
+        let now = Some(PathBuf::from("current"));
+        assert_eq!(pick_launch_dir(Some(here.clone()), now.clone()), Some(here));
+        assert_eq!(pick_launch_dir(Some(PathBuf::from("/no/such/h0x/folder")), now.clone()), now);
+        assert_eq!(pick_launch_dir(None, now.clone()), now);
+    }
+
+    #[test]
+    fn a_handed_folder_with_spaces_and_unicode_is_kept_until_it_is_deleted() {
+        let dir = std::env::temp_dir().join(format!("h0x launch ü 文 {}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = Some(PathBuf::from("current"));
+        assert_eq!(pick_launch_dir(Some(dir.clone()), now.clone()), Some(dir.clone()));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(pick_launch_dir(Some(dir), now.clone()), now, "deleted after the note was written");
+    }
+
+    #[test]
+    fn an_empty_or_non_folder_handover_falls_back_to_the_current_folder() {
+        let now = Some(PathBuf::from("current"));
+        assert_eq!(pick_launch_dir(Some(PathBuf::from("")), now.clone()), now, "empty value");
+        let file = std::env::temp_dir().join(format!("h0x-launch-file-{}", crate::platform::random_hex()));
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(pick_launch_dir(Some(file.clone()), now.clone()), now, "a file, not a folder");
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(pick_launch_dir(None, None), None, "nothing handed, no current folder");
+        assert_eq!(pick_launch_dir(Some(PathBuf::from("")), None), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_drive_root_or_backslash_folder_is_a_valid_handover() {
+        let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        let root = PathBuf::from(format!("{drive}\\"));
+        assert_eq!(pick_launch_dir(Some(root.clone()), None), Some(root));
+        let base = std::env::temp_dir().display().to_string();
+        let dir = PathBuf::from(format!("{base}\\h0x back {}\\sub", crate::platform::random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(pick_launch_dir(Some(dir.clone()), None), Some(dir.clone()));
+        std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_terminal_without_a_folder_starts_in_the_launch_folder_and_a_relative_one_joins_it() {
+        // Tests never move this process's cwd, so the launch folder is the cwd: other tests see no change.
+        let launch = super::LAUNCH_DIR.get_or_init(|| std::env::current_dir().unwrap()).clone();
+        assert_eq!(super::folder(None, false), launch.display().to_string());
+        assert_eq!(super::folder(Some(""), false), launch.join("").display().to_string(), "empty cwd");
+        let relative = "sub dir/ü 文";
+        assert_eq!(super::folder(Some(relative), false), launch.join(relative).display().to_string());
+        let absolute = if cfg!(windows) { r"C:\elsewhere" } else { "/elsewhere" };
+        assert_eq!(super::folder(Some(absolute), false), absolute, "an absolute cwd ignores the launch folder");
     }
 }

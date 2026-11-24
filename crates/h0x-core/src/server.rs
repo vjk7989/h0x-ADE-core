@@ -64,6 +64,18 @@ pub fn serve() -> io::Result<()> {
     io::Write::write_all(&mut lock, paths.socket.as_os_str().as_encoded_bytes())?;
     // The winning serve is still single-threaded, including when launched by an old holder.
     unsafe { crate::restart::restore(&paths) };
+    // Do not hold the folder we were started in: on Windows a folder that is a
+    // process's cwd cannot be renamed (the app's update swap). Terminals that name
+    // no folder still start in the launch folder, which a restart hands over in an
+    // env var that is removed here so terminals never inherit it.
+    let handed = std::env::var_os(crate::exec::LAUNCH_DIR_VAR).map(std::path::PathBuf::from);
+    unsafe { std::env::remove_var(crate::exec::LAUNCH_DIR_VAR) };
+    if let Some(start) = crate::exec::pick_launch_dir(handed, std::env::current_dir().ok()) {
+        let _ = crate::exec::LAUNCH_DIR.set(start);
+    }
+    if let Err(e) = std::env::set_current_dir(&paths.state) {
+        let _ = writeln!(io::stderr(), "core: cannot leave the start folder for {}: {e}", paths.state.display());
+    }
     let info = load_identity(&paths.state, platform::machine_id())?;
     let socket = paths.socket.clone();
     let _shutdown_watch = platform::monitor_host_shutdown();

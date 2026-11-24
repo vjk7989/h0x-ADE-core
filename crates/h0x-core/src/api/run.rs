@@ -250,13 +250,21 @@ pub(crate) fn child_env(base: BTreeMap<String, String>, extra: BTreeMap<String, 
         .into_iter()
         .filter(|(k, _)| {
             !IDENTITY_VARS.contains(&k.as_str())
-                && !["H0X_TERMINAL_ID", "H0X_CORE_EXE", crate::sweep::VAR, crate::sweep::RUNTIME].contains(&k.as_str())
+                && ![
+                    "H0X_TERMINAL_ID",
+                    "H0X_CORE_EXE",
+                    crate::sweep::VAR,
+                    crate::sweep::RUNTIME,
+                    crate::exec::LAUNCH_DIR_VAR,
+                ]
+                .contains(&k.as_str())
         })
         .collect();
     env.insert("TERM".into(), "xterm-256color".into());
     env.insert("COLORTERM".into(), "truecolor".into());
     env.insert("TERM_PROGRAM".into(), "ghostty".into());
     crate::platform::merge_env(&mut env, extra);
+    env.retain(|k, _| k != crate::exec::LAUNCH_DIR_VAR);
     if let Ok(session) = std::env::var("H0X_CORE_SESSION") {
         env.insert("H0X_CORE_SESSION".into(), session);
     }
@@ -362,6 +370,19 @@ mod tests {
         let env = super::child_env(core, map(&[("TERM_PROGRAM", "h0x")]));
         assert_eq!(env["TERM_PROGRAM"], "ghostty");
         assert!(!env.contains_key("TERM_PROGRAM_VERSION"));
+    }
+
+    #[test]
+    fn a_terminal_never_inherits_the_launch_folder_handover() {
+        let map = |pairs: &[(&str, &str)]| {
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let var = crate::exec::LAUNCH_DIR_VAR;
+        for value in ["/launch/start here", "", r"C:\Users\ü 文\start"] {
+            let env = super::child_env(map(&[(var, value), ("PATH", "/usr/bin")]), map(&[]));
+            assert!(!env.contains_key(var), "{value:?} leaked from the core");
+            assert_eq!(env["PATH"], "/usr/bin");
+        }
     }
 
     #[test]
