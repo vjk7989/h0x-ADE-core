@@ -48,6 +48,11 @@ impl Paths {
         Ok(Paths { socket, holder_socket, config, state })
     }
 
+    /// This core's shim folder (`shim::ensure` fills it); only its own terminals get it on PATH.
+    pub fn bin_dir(&self) -> PathBuf {
+        self.state.join("bin")
+    }
+
     pub fn create_dirs(&self) -> std::io::Result<()> {
         use crate::platform::private_dir;
         private_dir(&self.state)?;

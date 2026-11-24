@@ -35,6 +35,7 @@ pub mod runtime;
 pub mod server;
 pub mod session_hook;
 pub mod sessions;
+pub mod shim;
 pub mod status;
 pub mod stitch;
 pub mod sweep;

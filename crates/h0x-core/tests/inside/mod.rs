@@ -31,6 +31,19 @@ pub fn in_terminal(
     cwd: Option<&Path>,
     env: &[(&str, &str)],
 ) -> Output {
+    in_terminal_as(core, dir, Path::new(BIN), args, input, cwd, env)
+}
+
+/// `in_terminal` for another program (a copy of the core under another name).
+pub fn in_terminal_as(
+    core: &dyn Fn(&[&str]) -> Command,
+    dir: &Path,
+    program: &Path,
+    args: &[&str],
+    input: &[u8],
+    cwd: Option<&Path>,
+    env: &[(&str, &str)],
+) -> Output {
     static N: AtomicU32 = AtomicU32::new(0);
     let tag = N.fetch_add(1, Ordering::Relaxed);
     std::fs::create_dir_all(dir).unwrap();
@@ -55,7 +68,7 @@ pub fn in_terminal(
         .collect();
     bat += &format!(
         "{}{args} < {} > {} 2> {}\r\n",
-        quoted(Path::new(BIN)),
+        quoted(program),
         quoted(&file("in")),
         quoted(&file("out")),
         quoted(&file("err"))
