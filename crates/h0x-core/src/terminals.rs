@@ -166,6 +166,14 @@ impl Terminal {
             .filter(|pid| *pid > 1)
     }
 
+    /// Live, `scope` is its secret, and the program's pid is not recorded yet (it was just started).
+    pub fn awaiting_pid(&self, scope: &str) -> bool {
+        self.scope.as_deref().is_some_and(|s| !scope.is_empty() && same_secret(s, scope))
+            && self.is_live()
+            && self.pid.is_none()
+            && self.reason.as_deref().is_none_or(|r| r == "spawn_pending")
+    }
+
     pub(crate) fn program_lost(&self) -> bool {
         self.is_live() && self.pid.is_none() && self.reason.as_deref().is_some_and(|r| r != "spawn_pending")
     }
@@ -627,6 +635,27 @@ mod tests {
         t.scope = Some("s3cret".into());
         t.state = "exited".into();
         assert_eq!(t.vouched_pid("s3cret"), None, "closed");
+    }
+
+    #[test]
+    fn a_just_started_terminal_awaits_its_pid_only_for_its_own_secret() {
+        let mut reg = Registry::default();
+        let id = reg.create(new(None), 0).unwrap();
+        let t = reg.terminals.get_mut(&id).unwrap();
+        t.scope = Some("s3cret".into());
+        t.pid = None;
+        assert!(t.awaiting_pid("s3cret"));
+        assert!(!t.awaiting_pid("wrong") && !t.awaiting_pid(""));
+        t.reason = Some("spawn_pending".into());
+        assert!(t.awaiting_pid("s3cret"));
+        t.reason = Some("lost".into());
+        assert!(!t.awaiting_pid("s3cret"), "a lost program is not coming");
+        t.reason = None;
+        t.pid = Some(42);
+        assert!(!t.awaiting_pid("s3cret"), "known already");
+        t.pid = None;
+        t.state = "exited".into();
+        assert!(!t.awaiting_pid("s3cret"), "closed");
     }
 
     #[test]

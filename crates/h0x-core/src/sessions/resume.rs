@@ -131,7 +131,7 @@ pub(crate) struct FlagLists {
 const MAX_KEPT: usize = 32;
 const MAX_VALUE: usize = 4096;
 /// Never kept, whatever an allowlist says: they name another session or run a prompt.
-const NEVER: [&str; 13] = [
+const NEVER: [&str; 14] = [
     "--resume",
     "--continue",
     "-c",
@@ -145,6 +145,7 @@ const NEVER: [&str; 13] = [
     "--prompt",
     "-i",
     "--output-format",
+    "--settings", // the shim adds HyperOx's again; `--settings=x` is split to this name too
 ];
 
 /// The allowlisted flags of an agent's argv (after its program token), in

@@ -314,6 +314,18 @@ pub fn in_terminal(
     cwd: Option<&std::path::Path>,
     env: &[(&str, &str)],
 ) -> Output {
+    in_terminal_as(s, BIN, args, input, cwd, env)
+}
+
+/// `in_terminal` for another program (a copy or link of the core under another name).
+pub fn in_terminal_as(
+    s: &Session,
+    program: &str,
+    args: &[&str],
+    input: &[u8],
+    cwd: Option<&std::path::Path>,
+    env: &[(&str, &str)],
+) -> Output {
     static N: AtomicU32 = AtomicU32::new(0);
     let tag = N.fetch_add(1, Ordering::Relaxed);
     let file = |what: &str| s.root.join(format!("it{tag}-{what}"));
@@ -325,7 +337,7 @@ pub fn in_terminal(
     let args: String = args.iter().map(|a| format!(" {}", q(a))).collect();
     let body = format!(
         "{exports}{cd}{} {args} < {} > {} 2> {}; echo $? > {}; : > {}; sleep 100",
-        q(BIN),
+        q(program),
         qf("in"),
         qf("out"),
         qf("err"),

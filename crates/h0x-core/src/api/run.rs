@@ -237,6 +237,7 @@ pub(crate) fn terminal_env(
         env.insert("H0X_CORE_EXE".into(), exe.to_string_lossy().into_owned()); // the Token Saver hook's command
     }
     env.insert("H0X_TERMINAL_SOCKET".into(), core.paths.socket.display().to_string());
+    crate::shim::prepend_path(&mut env, &core.paths.bin_dir());
     let scope = crate::sweep::token();
     env.insert(crate::sweep::VAR.into(), scope.clone());
     // Preserve the requested spelling, including symlinks.

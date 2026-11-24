@@ -1322,6 +1322,26 @@ fn every_stub_agent_finds_and_keeps_nothing() {
 }
 
 #[test]
+fn settings_are_never_kept_because_the_shim_adds_them_again() {
+    // Even when an allowlist names the flag, with its value or inline.
+    let lists = resume::FlagLists { bool_flags: &["--yolo"], value_flags: &["--model", "--settings"] };
+    let keep = |args: &[&str]| resume::keep_flags(&v(args), &lists);
+    assert_eq!(keep(&["--settings", "{\"hooks\":{}}", "--yolo"]), v(&["--yolo"]));
+    assert_eq!(keep(&["--yolo", "--settings={\"hooks\":{}}", "--model", "opus"]), v(&["--yolo", "--model", "opus"]));
+    assert!(keep(&["--settings"]).is_empty());
+    assert!(resume::keep_flags(&v(&["--settings", "x.json"]), &LISTS).is_empty());
+}
+
+#[test]
+fn settings_with_an_empty_or_missing_value_are_dropped_and_the_next_flag_kept() {
+    let lists = resume::FlagLists { bool_flags: &["--yolo"], value_flags: &["--settings"] };
+    let keep = |args: &[&str]| resume::keep_flags(&v(args), &lists);
+    assert_eq!(keep(&["--settings=", "--yolo"]), v(&["--yolo"]));
+    assert_eq!(keep(&["--settings", "--yolo"]), v(&["--yolo"]), "a flag is not taken as its value");
+    assert_eq!(keep(&["--yolo", "--", "--settings", "x"]), v(&["--yolo"]), "nothing after --");
+}
+
+#[test]
 fn an_empty_inline_value_is_not_kept() {
     assert!(resume::keep_flags(&v(&["--model="]), &LISTS).is_empty());
     assert_eq!(resume::keep_flags(&v(&["--model=", "--yolo"]), &LISTS), v(&["--yolo"]));

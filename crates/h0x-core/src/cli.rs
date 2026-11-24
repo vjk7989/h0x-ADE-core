@@ -221,6 +221,10 @@ fn quiet_on_broken_pipe() {
 }
 
 pub fn main() -> i32 {
+    let mut argv = std::env::args_os();
+    if argv.next().is_some_and(|a| crate::shim::is_claude(&a)) {
+        return crate::shim::run(argv.collect());
+    }
     let daemon = crate::platform::daemon_startup();
     client::remember_exe();
     let args: Vec<_> = if daemon { vec!["serve".into()] } else { std::env::args_os().skip(1).collect() };

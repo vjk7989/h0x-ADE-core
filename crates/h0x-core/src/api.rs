@@ -269,9 +269,23 @@ async fn text_redact(_: Ctx<'_>, params: crate::bridge::RedactParams) -> Result<
 }
 
 async fn terminal_vouch(core: Ctx<'_>, p: VouchParams) -> Result<VouchResult, RpcError> {
-    let program = resolve(core, &p.terminal)
-        .ok()
-        .and_then(|id| core.lock().reg.terminals.get(&id).and_then(|t| t.vouched_pid(&p.scope)));
+    // A command started the instant the terminal opened can ask before the program's pid is
+    // recorded: wait for it (the caller gives up after 1 s).
+    let id = resolve(core, &p.terminal).ok();
+    let mut program = None;
+    for _ in 0..50 {
+        let (pid, waiting) = match id.and_then(|id| {
+            core.lock().reg.terminals.get(&id).map(|t| (t.vouched_pid(&p.scope), t.awaiting_pid(&p.scope)))
+        }) {
+            Some(found) => found,
+            None => break,
+        };
+        program = pid;
+        if pid.is_some() || !waiting {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     // The caller must descend from the program: a window detached from the terminal still carries the secret.
     let ok = match (program, core.peer) {
         (Some(program), Some(peer)) => crate::platform::descends_from(peer, program),
