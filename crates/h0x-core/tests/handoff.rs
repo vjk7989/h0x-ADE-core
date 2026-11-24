@@ -1,5 +1,13 @@
 //! `h0x-core handoff` as Claude Code runs it for `/clear`: the hook event on stdin, the package on
-//! stdout, exit 0, and nothing at all whenever there is nothing useful to say.
+//! stdout, exit 0, and nothing at all whenever there is nothing useful to say. It answers only inside
+//! a HyperOx terminal (SC-2): the tests that expect a package run it in a terminal of their own
+//! core (`sh` on unix, `cmd` on Windows via `tests/inside`); outside one it prints nothing.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+#[cfg(unix)]
+mod common;
+#[cfg(windows)]
+mod inside;
+
 use serde_json::{Value, json};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -26,8 +34,29 @@ fn put(dir: &Path, name: &str, body: impl AsRef<[u8]>, age: u64) -> PathBuf {
     path
 }
 
-/// `h0x-core handoff` with `input` on stdin in an isolated home and session; returns stdout.
-fn handoff(name: &str, input: &[u8]) -> String {
+/// `h0x-core handoff` with `input` on stdin inside a terminal of an isolated core; returns stdout.
+#[cfg(unix)]
+fn handoff(_name: &str, input: &[u8]) -> String {
+    let s = common::Session::new();
+    let out = common::in_terminal(&s, &["handoff"], input, None, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// `h0x-core handoff` with `input` on stdin inside a `cmd` terminal of an isolated core; returns stdout.
+#[cfg(windows)]
+fn handoff(_name: &str, input: &[u8]) -> String {
+    let out = inside::Session::new().in_terminal(&["handoff"], input, None, &[]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// `h0x-core handoff` with `input` on stdin outside any terminal, in an isolated home and session.
+fn handoff_outside(name: &str, input: &[u8]) -> std::process::Output {
     let home = scratch(&format!("{name}-home"));
     let mut child = Command::new(env!("CARGO_BIN_EXE_h0x-core"))
         .arg("handoff")
@@ -37,6 +66,9 @@ fn handoff(name: &str, input: &[u8]) -> String {
         .env("XDG_RUNTIME_DIR", home.join("run"))
         .env("XDG_STATE_HOME", home.join("state"))
         .env("XDG_CONFIG_HOME", home.join("config"))
+        .env_remove("H0X_TERMINAL_ID")
+        .env_remove("H0X_TERMINAL_SOCKET")
+        .env_remove("H0X_SCOPE")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -44,13 +76,10 @@ fn handoff(name: &str, input: &[u8]) -> String {
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let input = input.to_vec();
-    let feed = std::thread::spawn(move || drop(stdin.write_all(&input)));
+    let feed = std::thread::spawn(move || stdin.write_all(&input).expect("the writer must see no broken pipe"));
     let out = child.wait_with_output().unwrap();
     feed.join().unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(0), "{stderr}");
-    assert!(!stderr.contains("panicked"), "{stderr}");
-    String::from_utf8(out.stdout).unwrap()
+    out
 }
 
 fn event(source: &str, current: &Path, id: &str) -> Vec<u8> {
@@ -112,6 +141,7 @@ fn a_cleared_session_hands_its_work_to_the_next() {
     assert!(!ctx.contains("C:\\work"), "{ctx}");
 }
 
+#[cfg(unix)]
 #[test]
 fn only_clear_hands_off() {
     let dir = scratch("source");
@@ -123,6 +153,7 @@ fn only_clear_hands_off() {
     assert!(!handoff("source", &event("clear", &current, "new")).is_empty());
 }
 
+#[cfg(unix)]
 #[test]
 fn nothing_to_hand_off_is_silence() {
     let dir = scratch("silent");
@@ -143,6 +174,7 @@ fn nothing_to_hand_off_is_silence() {
     assert_eq!(handoff("silent", &event("clear", &current, "only")), "");
 }
 
+#[cfg(unix)]
 #[test]
 fn bad_events_are_silence() {
     for input in [
@@ -159,6 +191,7 @@ fn bad_events_are_silence() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn the_newest_other_transcript_is_the_previous_one() {
     let dir = scratch("newest");
@@ -174,6 +207,7 @@ fn the_newest_other_transcript_is_the_previous_one() {
     assert!(ctx.contains("deploy-canary-17") && !ctx.contains("current-marker"));
 }
 
+#[cfg(unix)]
 #[test]
 fn truncated_and_non_utf8_transcripts_do_not_panic() {
     let dir = scratch("broken");
@@ -189,6 +223,7 @@ fn truncated_and_non_utf8_transcripts_do_not_panic() {
     assert_eq!(handoff("broken", &event("clear", &current, "cur")), "");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_fifty_megabyte_transcript_is_read_from_its_end_and_fast() {
     let dir = scratch("huge");
@@ -206,6 +241,7 @@ fn a_fifty_megabyte_transcript_is_read_from_its_end_and_fast() {
     assert!(!ctx.contains("long ago"), "only the end of the transcript is read");
 }
 
+#[cfg(unix)]
 #[test]
 fn the_package_is_at_most_3000_bytes_even_with_wide_characters() {
     let dir = scratch("wide");
@@ -225,6 +261,7 @@ fn the_package_is_at_most_3000_bytes_even_with_wide_characters() {
     assert!(!ctx.contains("Pending work"), "the cut is reached: {ctx}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_path_with_spaces_and_the_platform_separators_works() {
     let dir = scratch("paths").join("with space").join("sub dir");
@@ -244,6 +281,7 @@ fn a_path_with_spaces_and_the_platform_separators_works() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn quotes_backslashes_nul_and_crlf_give_one_valid_json_line() {
     let dir = scratch("escape");
@@ -272,6 +310,7 @@ fn quotes_backslashes_nul_and_crlf_give_one_valid_json_line() {
     assert!(!ctx.contains('\r') && !ctx.contains('\t'), "{ctx:?}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_transcript_path_that_is_a_folder_or_not_a_transcript() {
     let dir = scratch("shape");
@@ -290,6 +329,7 @@ fn a_transcript_path_that_is_a_folder_or_not_a_transcript() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn an_empty_or_missing_session_id_still_finds_the_previous_transcript() {
     let dir = scratch("noid");
@@ -303,6 +343,7 @@ fn an_empty_or_missing_session_id_still_finds_the_previous_transcript() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn transcripts_with_the_same_time_are_chosen_the_same_way_every_time() {
     let when = SystemTime::now() - Duration::from_secs(100);
@@ -326,6 +367,7 @@ fn transcripts_with_the_same_time_are_chosen_the_same_way_every_time() {
     assert!(picked.iter().all(|p| *p == picked[0]), "{picked:?}");
 }
 
+#[cfg(unix)]
 #[test]
 fn unknown_fields_are_ignored_and_the_source_must_be_exactly_clear() {
     let dir = scratch("fields");
@@ -359,6 +401,7 @@ fn stdin_larger_than_a_megabyte_is_read_whole() {
     assert_eq!(handoff("bigin", &vec![b'{'; input.len()]), "");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_transcript_without_a_request_is_silence() {
     let dir = scratch("noreq");
@@ -375,6 +418,7 @@ fn a_transcript_without_a_request_is_silence() {
     assert_eq!(handoff("noreq", &event("clear", &current, "cur")), "");
 }
 
+#[cfg(unix)]
 #[test]
 fn the_new_transcript_need_not_exist_yet() {
     // Claude Code may run the hook before it writes the new session's file.
@@ -386,6 +430,7 @@ fn the_new_transcript_need_not_exist_yet() {
     assert!(ctx.contains("deploy-canary-17"));
 }
 
+#[cfg(unix)]
 #[test]
 fn the_end_of_the_first_answer_survives_an_over_budget_session() {
     let dir = scratch("factend");
@@ -406,6 +451,7 @@ fn the_end_of_the_first_answer_survives_an_over_budget_session() {
     assert!(ctx.ends_with("Pending work: continue with the next request below."), "{ctx}");
 }
 
+#[cfg(unix)]
 #[test]
 fn one_turn_more_than_shown_keeps_turn_one_with_the_real_numbers() {
     let dir = scratch("nine");
@@ -419,6 +465,7 @@ fn one_turn_more_than_shown_keeps_turn_one_with_the_real_numbers() {
     assert!(!ctx.contains("ans2") && ctx.matches("- step ").count() == 8, "{ctx}");
 }
 
+#[cfg(unix)]
 #[test]
 fn an_empty_or_whitespace_answer_is_no_answer() {
     let dir = scratch("noans");
@@ -432,6 +479,7 @@ fn an_empty_or_whitespace_answer_is_no_answer() {
     assert!(!ctx.contains('…'), "{ctx}");
 }
 
+#[cfg(unix)]
 #[test]
 fn an_answer_of_exactly_the_share_is_shown_whole() {
     let dir = scratch("share");
@@ -447,6 +495,7 @@ fn an_answer_of_exactly_the_share_is_shown_whole() {
     assert!(ctx.contains(&format!("- step 1: …{exact}\n")) && !ctx.contains('X'), "{ctx}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_single_huge_turn_stays_within_3000_bytes() {
     let dir = scratch("oneturn");
@@ -467,6 +516,7 @@ fn a_single_huge_turn_stays_within_3000_bytes() {
     assert!(ctx.chars().all(|c| c == '\n' || !c.is_control()), "{ctx:?}");
 }
 
+#[cfg(unix)]
 #[test]
 fn a_windows_path_in_a_tool_call_shows_with_slashes_while_the_lists_fit() {
     let dir = scratch("winpath");
@@ -484,6 +534,7 @@ fn a_windows_path_in_a_tool_call_shows_with_slashes_while_the_lists_fit() {
     assert!(ctx.contains("Files referenced: none\n") && !ctx.contains("server"), "{ctx}");
 }
 
+#[cfg(unix)]
 #[test]
 fn stdin_over_the_cap_is_silence() {
     let dir = scratch("hugein");
@@ -492,4 +543,22 @@ fn stdin_over_the_cap_is_silence() {
     let mut ev: Value = serde_json::from_slice(&event("clear", &current, "cur")).unwrap();
     ev["padding"] = json!("x".repeat(5 * 1024 * 1024));
     assert_eq!(handoff("hugein", ev.to_string().as_bytes()), "");
+}
+
+#[test]
+fn outside_a_terminal_a_cleared_session_gets_nothing() {
+    let dir = scratch("outside");
+    put(&dir, "old-session.jsonl", FIXTURE, 100);
+    let current = put(&dir, "new-session.jsonl", "", 0);
+    let out = handoff_outside("outside", &event("clear", &current, "new-session"));
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(out.stderr.is_empty(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[test]
+fn outside_a_terminal_stdin_past_the_cap_is_drained_whole_and_silent() {
+    let out = handoff_outside("drain", &vec![b'x'; 5 * 1024 * 1024]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.stdout.is_empty());
 }

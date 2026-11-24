@@ -81,6 +81,9 @@ pub fn run() -> i32 {
         Ok(_) => serde_json::from_slice(&raw).unwrap_or_default(),
         Err(_) => RouteParams::default(),
     };
+    if !crate::client::vouched() {
+        return 0; // outside a HyperOx terminal: no routing decision
+    }
     let out = serde_json::to_string(&route(&params)).unwrap_or_default();
     let mut stdout = std::io::stdout().lock();
     let _ = writeln!(stdout, "{out}");

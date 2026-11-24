@@ -43,6 +43,8 @@ pub struct Call<'a> {
     pub conn: Option<&'a Arc<crate::wire::Conn>>,
     /// Where a plain connection receives its subscription.
     pub plain: Option<&'a std::sync::Mutex<Option<PlainSub>>>,
+    /// The process the OS says is on the other end of a plain connection; None when unknown (framed, or the OS cannot tell).
+    pub peer: Option<u32>,
 }
 
 impl std::ops::Deref for Call<'_> {
@@ -82,6 +84,9 @@ methods! { Ctx<'_>;
     "text.redact" => text_redact, crate::bridge::RedactParams => crate::bridge::RedactResult,
         "Replace API keys, tokens, private keys and `password=...` values in a text with `[redacted]`. A pattern list, not a guarantee. Refuses more than 64 KB (`too_large`), with no partial answer. Empty in, empty out. No network.",
         errors ["too_large"];
+    "terminal.vouch" => terminal_vouch, VouchParams => VouchResult,
+        "Whether the caller is inside this live terminal: its secret matches (`H0X_SCOPE`) and the caller's process runs below the terminal's program. Any doubt is false. Never returns the secret.",
+        errors [];
     "terminal.list" => terminal_list, ListParams => ListResult,
         "Live terminals (all with `all`), optionally filtered by labels.",
         errors [];
@@ -261,6 +266,18 @@ async fn route(_: Ctx<'_>, params: crate::route::RouteParams) -> Result<crate::r
 
 async fn text_redact(_: Ctx<'_>, params: crate::bridge::RedactParams) -> Result<crate::bridge::RedactResult, RpcError> {
     crate::bridge::redact_rpc(&params)
+}
+
+async fn terminal_vouch(core: Ctx<'_>, p: VouchParams) -> Result<VouchResult, RpcError> {
+    let program = resolve(core, &p.terminal)
+        .ok()
+        .and_then(|id| core.lock().reg.terminals.get(&id).and_then(|t| t.vouched_pid(&p.scope)));
+    // The caller must descend from the program: a window detached from the terminal still carries the secret.
+    let ok = match (program, core.peer) {
+        (Some(program), Some(peer)) => crate::platform::descends_from(peer, program),
+        _ => false,
+    };
+    Ok(VouchResult { ok })
 }
 
 async fn gate_stats(core: Ctx<'_>, _: Empty) -> Result<crate::gate::GateStats, RpcError> {

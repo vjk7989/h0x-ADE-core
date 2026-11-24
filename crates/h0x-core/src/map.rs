@@ -58,6 +58,10 @@ pub enum Mode {
 
 /// The command: prints the answer, or one error line on stderr with exit 2.
 pub fn run(mode: Mode, word: &str, dir: Option<&Path>) -> i32 {
+    if !crate::client::vouched() {
+        eprintln!("map works inside HyperOx terminals");
+        return 2;
+    }
     match search(mode, word, dir.unwrap_or(Path::new("."))) {
         Ok(text) => {
             use std::io::Write;

@@ -1542,6 +1542,18 @@
         ],
         "type": "object"
       },
+      "VouchResult": {
+        "properties": {
+          "ok": {
+            "description": "True only for a live terminal with this secret, asked from inside it.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "type": "object"
+      },
       "WaitResult": {
         "properties": {
           "children": {
@@ -2131,6 +2143,39 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/RedactResult"
+        }
+      }
+    },
+    {
+      "description": "Whether the caller is inside this live terminal: its secret matches (`H0X_SCOPE`) and the caller's process runs below the terminal's program. Any doubt is false. Never returns the secret.",
+      "errors": [],
+      "name": "terminal.vouch",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The terminal's secret (`H0X_SCOPE` in its environment).",
+          "name": "scope",
+          "required": false,
+          "schema": {
+            "default": "",
+            "description": "The terminal's secret (`H0X_SCOPE` in its environment).",
+            "type": "string"
+          }
+        },
+        {
+          "description": "The terminal: `t7` or a name on this machine.",
+          "name": "terminal",
+          "required": true,
+          "schema": {
+            "description": "The terminal: `t7` or a name on this machine.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/VouchResult"
         }
       }
     },

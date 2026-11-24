@@ -304,6 +304,44 @@ pub fn executable(s: &Session, source: &str) -> String {
     path.to_str().unwrap().into()
 }
 
+/// `h0x-core <args>` run inside a HyperOx terminal of `s`'s core (started if needed), in `cwd` when
+/// given, with `env` exported and `input` on its stdin: the hook-style commands answer only there. Returns what it
+/// printed and its exit code; the terminal is left running until the session ends.
+pub fn in_terminal(
+    s: &Session,
+    args: &[&str],
+    input: &[u8],
+    cwd: Option<&std::path::Path>,
+    env: &[(&str, &str)],
+) -> Output {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let tag = N.fetch_add(1, Ordering::Relaxed);
+    let file = |what: &str| s.root.join(format!("it{tag}-{what}"));
+    let q = |text: &str| format!("'{}'", text.replace('\'', r"'\''"));
+    let qf = |what: &str| q(&file(what).display().to_string());
+    std::fs::write(file("in"), input).unwrap();
+    let cd = cwd.map(|dir| format!("cd {} && ", q(&dir.display().to_string()))).unwrap_or_default();
+    let exports: String = env.iter().map(|(k, v)| format!("export {k}={}; ", q(v))).collect();
+    let args: String = args.iter().map(|a| format!(" {}", q(a))).collect();
+    let body = format!(
+        "{exports}{cd}{} {args} < {} > {} 2> {}; echo $? > {}; : > {}; sleep 100",
+        q(BIN),
+        qf("in"),
+        qf("out"),
+        qf("err"),
+        qf("code"),
+        qf("done")
+    );
+    run(s, &["sh", "-c", &body]);
+    wait_until("the command inside the terminal", || file("done").exists());
+    let code: i32 = std::fs::read_to_string(file("code")).unwrap().trim().parse().unwrap();
+    Output {
+        status: std::os::unix::process::ExitStatusExt::from_raw(code << 8),
+        stdout: std::fs::read(file("out")).unwrap(),
+        stderr: std::fs::read(file("err")).unwrap(),
+    }
+}
+
 /// Creates the file a script's `w <name>` waits for.
 pub fn touch(s: &Session, name: &str) {
     std::fs::write(s.root.join(name), "").unwrap();

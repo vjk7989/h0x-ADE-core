@@ -33,6 +33,7 @@ pub mod route;
 pub mod rpc;
 pub mod runtime;
 pub mod server;
+pub mod session_hook;
 pub mod sessions;
 pub mod status;
 pub mod stitch;
