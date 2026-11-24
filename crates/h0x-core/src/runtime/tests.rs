@@ -95,7 +95,7 @@ async fn server_stop_succeeds_even_when_the_registry_flush_times_out() {
         Ok(())
     })
     .unwrap();
-    let call = crate::api::Call { core: &core, conn: None, plain: None };
+    let call = crate::api::Call { core: &core, conn: None, plain: None, peer: None };
     let started = Instant::now();
     let stop = crate::api::dispatch(&call, "server.stop", json!({})).await;
     release.send(()).unwrap();
@@ -294,7 +294,7 @@ async fn label_and_kill_reply_with_the_record_observed_before_flushing() {
             id
         };
         let reply = {
-            let call = crate::api::Call { core: &core, conn: None, plain: None };
+            let call = crate::api::Call { core: &core, conn: None, plain: None, peer: None };
             let request =
                 crate::api::dispatch(&call, method, json!({"terminal": crate::terminals::address(id), "labels": {}}));
             tokio::pin!(request);
@@ -362,7 +362,7 @@ async fn a_prepared_restart_survives_sigterm_and_rejects_stop() {
     };
     paths.create_dirs().unwrap();
     let core = Core::start(paths, CoreInfo { id: "test".into(), name: "test".into() }).unwrap();
-    let call = crate::api::Call { core: &core, conn: None, plain: None };
+    let call = crate::api::Call { core: &core, conn: None, plain: None, peer: None };
     crate::api::dispatch(&call, "server.restart", serde_json::json!({})).await.unwrap();
     crate::restart::on_sigterm(&core);
     assert!(core.paths.state.join("restart-env.json").exists(), "SIGTERM keeps the explicit restart's note");
@@ -996,7 +996,7 @@ async fn a_turn_that_ended_done_and_restarted_in_one_chunk_still_says_done() {
 /// The reply's `text` (the only key in the result), or the method's error.
 async fn text_redact(params: serde_json::Value) -> Result<String, crate::rpc::RpcError> {
     let (core, root) = test_core();
-    let call = crate::api::Call { core: &core, conn: None, plain: None };
+    let call = crate::api::Call { core: &core, conn: None, plain: None, peer: None };
     let reply = crate::api::dispatch(&call, "text.redact", params).await;
     drop(core);
     remove_root(&root);
@@ -1337,7 +1337,7 @@ async fn a_failing_save_is_unavailable_keeps_results_retries_and_clears_on_recov
         id
     };
     let address = crate::terminals::address(id);
-    let call = crate::api::Call { core: &core, conn: None, plain: None };
+    let call = crate::api::Call { core: &core, conn: None, plain: None, peer: None };
     // Repeated failures: each mutation reports the same error, and its result stays.
     for value in ["one", "two", "three"] {
         let labels = json!({"terminal": address, "labels": {"disk": value}});
@@ -1377,7 +1377,7 @@ async fn an_empty_registry_flushes_at_once_and_lists_machines_as_an_empty_array(
         tokio::time::timeout(Duration::from_secs(5), core.flush_saved()).await.unwrap().unwrap();
         tokio::time::timeout(Duration::from_secs(5), core.flush_observed()).await.unwrap().unwrap();
     }
-    let call = crate::api::Call { core: &core, conn: None, plain: None };
+    let call = crate::api::Call { core: &core, conn: None, plain: None, peer: None };
     for params in [json!({}), json!({"all": true})] {
         let list = crate::api::dispatch(&call, "terminal.list", params).await.unwrap();
         assert_eq!(list.get("machines"), Some(&json!([])), "never missing: {list}");
@@ -1407,7 +1407,7 @@ async fn keep_off_finishes_only_a_terminal_without_a_holder() {
             id
         };
         let address = crate::terminals::address(id);
-        let call = crate::api::Call { core: &core, conn: None, plain: None };
+        let call = crate::api::Call { core: &core, conn: None, plain: None, peer: None };
         let off = json!({"terminal": address, "keep": false});
         let r = crate::api::dispatch(&call, "terminal.keep", off).await.unwrap();
         assert_eq!(r["state"], state, "{holder:?} {reason:?}: {r}");

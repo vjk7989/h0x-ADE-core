@@ -444,10 +444,14 @@ impl AsyncListener {
         unsafe { options.create_with_security_attributes_raw(name, pipe_security()? as *mut c_void) }
     }
 
-    pub async fn accept(&mut self) -> io::Result<(AsyncRead, AsyncWrite)> {
+    /// The next caller, and the process id the OS says is on the other end (None when it cannot tell).
+    pub async fn accept(&mut self) -> io::Result<(AsyncRead, AsyncWrite, Option<u32>)> {
         self.next.connect().await?;
         let connected = std::mem::replace(&mut self.next, Self::create(&self.name, false)?);
-        Ok(tokio::io::split(connected))
+        let mut pid = 0u32;
+        let known = unsafe { GetNamedPipeClientProcessId(connected.as_raw_handle() as HANDLE, &mut pid) } != 0;
+        let (read, write) = tokio::io::split(connected);
+        Ok((read, write, (known && pid != 0).then_some(pid)))
     }
 }
 
@@ -844,6 +848,37 @@ pub fn parent_pid() -> u32 {
         }
         0
     }
+}
+
+/// Whether `pid` is `root` or runs below it, looking up to 64 parents in one process snapshot. Unknown parents: false.
+pub fn descends_from(pid: u32, root: u32) -> bool {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
+    let mut parents = std::collections::HashMap::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let snap = OwnedHandle::from_raw_handle(snap as RawHandle);
+        let mut entry: PROCESSENTRY32W = zeroed();
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut ok = Process32FirstW(snap.as_raw_handle() as HANDLE, &mut entry);
+        while ok != 0 {
+            parents.insert(entry.th32ProcessID, entry.th32ParentProcessID);
+            ok = Process32NextW(snap.as_raw_handle() as HANDLE, &mut entry);
+        }
+    }
+    let mut at = pid;
+    for _ in 0..=64 {
+        if at == root {
+            return true;
+        }
+        match parents.get(&at) {
+            Some(&parent) if parent != 0 && parent != at => at = parent,
+            _ => return false,
+        }
+    }
+    false
 }
 
 pub fn exit_signal(_: &std::process::ExitStatus) -> Option<i32> {

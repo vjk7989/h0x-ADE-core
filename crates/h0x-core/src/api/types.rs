@@ -322,6 +322,21 @@ pub struct ListResult {
     pub machines: Vec<crate::remote::MachineView>,
 }
 
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct VouchParams {
+    /// The terminal: `t7` or a name on this machine.
+    pub terminal: String,
+    /// The terminal's secret (`H0X_SCOPE` in its environment).
+    #[serde(default)]
+    pub scope: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct VouchResult {
+    /// True only for a live terminal with this secret, asked from inside it.
+    pub ok: bool,
+}
+
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
 pub struct LabelParams {
     /// The terminal: `t7`, a name, or `machine/t7`.

@@ -157,6 +157,15 @@ impl Terminal {
         self.state == "live"
     }
 
+    /// The program's pid when this terminal is live and `scope` is its secret (compared in constant time).
+    pub fn vouched_pid(&self, scope: &str) -> Option<u32> {
+        let secret = self.scope.as_deref()?;
+        (self.is_live() && !scope.is_empty() && same_secret(secret, scope))
+            .then_some(self.pid)
+            .flatten()
+            .filter(|pid| *pid > 1)
+    }
+
     pub(crate) fn program_lost(&self) -> bool {
         self.is_live() && self.pid.is_none() && self.reason.as_deref().is_some_and(|r| r != "spawn_pending")
     }
@@ -476,6 +485,16 @@ fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
+/// Equal secrets, without stopping at the first difference.
+fn same_secret(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        diff |= usize::from(a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0));
+    }
+    std::hint::black_box(diff) == 0
+}
+
 fn check_label_key(key: &str) -> Result<(), RpcError> {
     if key.is_empty() || key.contains('=') {
         return Err(RpcError::invalid_params(format!("bad label key {key:?}")));
@@ -575,5 +594,91 @@ mod tests {
         let old = r.expired(RETAIN_MS + 100);
         assert_eq!(old.len(), 100);
         assert!(!old.contains(&live));
+    }
+
+    #[test]
+    fn secrets_compare_equal_only_when_every_byte_matches() {
+        assert!(same_secret("abc123", "abc123"));
+        assert!(same_secret("", ""));
+        assert!(!same_secret("abc123", "abc124"));
+        assert!(!same_secret("abc123", "abc12"));
+        assert!(!same_secret("abc", "abc\0"));
+        assert!(!same_secret("abc123", ""));
+    }
+
+    #[test]
+    fn a_terminal_vouches_only_live_with_its_own_secret() {
+        let mut reg = Registry::default();
+        let id = reg.create(new(None), 0).unwrap();
+        let t = reg.terminals.get_mut(&id).unwrap();
+        t.scope = Some("s3cret".into());
+        t.pid = Some(42);
+        assert_eq!(t.vouched_pid("s3cret"), Some(42));
+        for wrong in ["", "S3CRET", "s3cre", "s3crets"] {
+            assert_eq!(t.vouched_pid(wrong), None, "{wrong:?}");
+        }
+        t.pid = None;
+        assert_eq!(t.vouched_pid("s3cret"), None, "no program yet");
+        t.pid = Some(42);
+        t.scope = None;
+        assert_eq!(t.vouched_pid("s3cret"), None, "no secret stored");
+        t.scope = Some(String::new());
+        assert_eq!(t.vouched_pid(""), None, "an empty secret never vouches");
+        t.scope = Some("s3cret".into());
+        t.state = "exited".into();
+        assert_eq!(t.vouched_pid("s3cret"), None, "closed");
+    }
+
+    #[test]
+    fn secrets_of_other_lengths_or_encodings_never_compare_equal() {
+        // Only the raw comparison: an empty pair is equal here, so `vouched_pid` must refuse it.
+        assert!(same_secret("", ""));
+        assert!(!same_secret("", "a"));
+        assert!(!same_secret("a", ""));
+        assert!(!same_secret("\0", ""), "a NUL is not padding");
+        assert!(!same_secret("", "\0"));
+        assert!(!same_secret("abc\0\0", "abc"));
+        assert!(same_secret("clé-日本-🔑", "clé-日本-🔑"));
+        // Same text, other normalization: different bytes, so different secrets.
+        assert!(!same_secret("caf\u{e9}", "cafe\u{301}"));
+        assert!(!same_secret("🔑", "🔒"), "differs only in the last byte of a 4-byte char");
+        assert!(!same_secret("ABC", "abc"));
+        let long = "x".repeat(4096);
+        assert!(same_secret(&long, &long.clone()));
+        assert!(!same_secret(&long, &long[..4095]));
+        assert!(!same_secret(&long, &format!("{long}x")));
+        // A difference in the first byte and in the last byte both count.
+        assert!(!same_secret(&format!("y{}", &long[1..]), &long));
+        assert!(!same_secret(&format!("{}y", &long[..4095]), &long));
+    }
+
+    #[test]
+    fn a_terminal_never_vouches_for_a_near_miss_of_its_secret() {
+        let mut reg = Registry::default();
+        let id = reg.create(new(None), 0).unwrap();
+        let t = reg.terminals.get_mut(&id).unwrap();
+        t.pid = Some(7);
+        t.scope = Some("1-clé🔑".into());
+        assert_eq!(t.vouched_pid("1-clé🔑"), Some(7), "unicode secrets work");
+        for wrong in ["1-cle🔑", "1-clé", "1-clé🔑 ", " 1-clé🔑", "1-clé🔑\0", "1-CLÉ🔑", "1-cle\u{301}🔑"]
+        {
+            assert_eq!(t.vouched_pid(wrong), None, "{wrong:?}");
+        }
+        // An empty stored secret vouches for nothing, not even a non-empty guess.
+        t.scope = Some(String::new());
+        assert_eq!(t.vouched_pid("x"), None);
+        // Any state other than live refuses, even with the right secret.
+        t.scope = Some("k".into());
+        for state in ["exited", "closed", "lost", ""] {
+            t.state = state.into();
+            assert_eq!(t.vouched_pid("k"), None, "{state:?}");
+        }
+        t.state = "live".into();
+        assert_eq!(t.vouched_pid("k"), Some(7), "live again: vouches");
+        // Pid 0 and 1 cannot be a terminal's program.
+        for pid in [0, 1] {
+            t.pid = Some(pid);
+            assert_eq!(t.vouched_pid("k"), None, "pid {pid}");
+        }
     }
 }

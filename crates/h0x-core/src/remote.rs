@@ -628,7 +628,7 @@ async fn from_machine(core: Arc<Core>, m: Machine, line: Arc<Line>, message: Val
         Some(id) => {
             params["terminal"] = crate::terminals::address(id).into();
             from_afar(&m.name, &mut params);
-            let call = crate::api::Call { core: &core, conn: None, plain: None };
+            let call = crate::api::Call { core: &core, conn: None, plain: None, peer: None };
             crate::api::dispatch(&call, method, params).await
         }
     };

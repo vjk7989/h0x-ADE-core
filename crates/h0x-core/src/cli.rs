@@ -237,6 +237,7 @@ pub fn main() -> i32 {
         [Some("gate")] => return crate::gate::run(),
         [Some("route")] => return crate::route::run(),
         [Some("handoff")] => return crate::handoff::run(),
+        [Some("hook"), Some("session"), rest @ ..] => return crate::session_hook::run(rest),
         [Some("--skill")] => {
             print!("{SKILL}");
             return 0;
@@ -1083,8 +1084,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("machine rename", "machine.rename"),
     ("machine rm", "machine.rm"),
 ];
-/// Client-only methods: handshake, opaque document storage, the rules-only `route` (its hidden command reads stdin, not a request) and `text.redact`.
-pub const API_ONLY: &[&str] = &["hello", "doc.get", "doc.set", "route", "text.redact"];
+/// Client-only methods: handshake, opaque document storage, the rules-only `route` (its hidden command reads stdin, not a request), `text.redact` and the hooks' `terminal.vouch`.
+pub const API_ONLY: &[&str] = &["hello", "doc.get", "doc.set", "route", "text.redact", "terminal.vouch"];
 
 #[cfg(test)]
 mod tests {

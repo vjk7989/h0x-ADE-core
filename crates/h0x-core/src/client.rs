@@ -301,3 +301,24 @@ pub fn terminal_id() -> Option<String> {
         .is_none_or(|s| Paths::from_env().is_ok_and(|p| p.socket.as_os_str() == s));
     std::env::var("H0X_TERMINAL_ID").ok().filter(|_| own_core)
 }
+
+/// Whether this process runs inside a HyperOx terminal: its core vouches for `H0X_TERMINAL_ID` with
+/// `H0X_SCOPE`, asked over the terminal's own socket. At most 300 ms; any failure is false.
+pub fn vouched() -> bool {
+    let (Ok(terminal), Ok(scope), Some(socket)) =
+        (std::env::var("H0X_TERMINAL_ID"), std::env::var("H0X_SCOPE"), std::env::var_os("H0X_TERMINAL_SOCKET"))
+    else {
+        return false;
+    };
+    if terminal.is_empty() || scope.is_empty() {
+        return false;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let reply = platform::connect(std::path::Path::new(&socket))
+            .ok()
+            .and_then(|stream| call(&stream, "terminal.vouch", json!({"terminal": terminal, "scope": scope})).ok());
+        let _ = tx.send(reply.is_some_and(|r| r["ok"] == true));
+    });
+    rx.recv_timeout(Duration::from_millis(300)).unwrap_or(false)
+}

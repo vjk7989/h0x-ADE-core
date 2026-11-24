@@ -99,9 +99,12 @@ impl AsyncListener {
         Ok(AsyncListener(tokio::net::UnixListener::from_std(bound)?))
     }
 
-    pub async fn accept(&mut self) -> io::Result<(AsyncRead, AsyncWrite)> {
+    /// The next caller, and the process id the OS says is on the other end (None when it cannot tell).
+    pub async fn accept(&mut self) -> io::Result<(AsyncRead, AsyncWrite, Option<u32>)> {
         let (stream, _) = self.0.accept().await?;
-        Ok(stream.into_split())
+        let peer = stream.peer_cred().ok().and_then(|c| c.pid()).and_then(|p| u32::try_from(p).ok());
+        let (read, write) = stream.into_split();
+        Ok((read, write, peer))
     }
 }
 
@@ -276,6 +279,45 @@ pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::R
 
 pub fn parent_pid() -> u32 {
     std::os::unix::process::parent_id()
+}
+
+/// The parent of a process: Linux reads /proc, macOS asks proc_pidinfo, elsewhere unknown.
+fn parent_of(pid: u32) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // "pid (name) S ppid ...": the name may hold spaces and parentheses, so start after the last ")".
+        stat.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse().ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let got = unsafe {
+            libc::proc_pidinfo(pid as libc::c_int, libc::PROC_PIDTBSDINFO, 0, std::ptr::addr_of_mut!(info).cast(), size)
+        };
+        (got == size).then_some(info.pbi_ppid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Whether `pid` is `root` or runs below it, looking up to 64 parents. Unknown parents: false.
+pub fn descends_from(pid: u32, root: u32) -> bool {
+    let mut at = pid;
+    for _ in 0..=64 {
+        if at == root {
+            return true;
+        }
+        match parent_of(at) {
+            Some(parent) if parent > 1 && parent != at => at = parent,
+            _ => return false,
+        }
+    }
+    false
 }
 
 pub fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
