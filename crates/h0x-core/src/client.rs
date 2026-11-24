@@ -303,7 +303,7 @@ pub fn terminal_id() -> Option<String> {
 }
 
 /// Whether this process runs inside a HyperOx terminal: its core vouches for `H0X_TERMINAL_ID` with
-/// `H0X_SCOPE`, asked over the terminal's own socket. At most 300 ms; any failure is false.
+/// `H0X_SCOPE`, asked over the terminal's own socket. At most 1 s; any failure is false.
 pub fn vouched() -> bool {
     let (Ok(terminal), Ok(scope), Some(socket)) =
         (std::env::var("H0X_TERMINAL_ID"), std::env::var("H0X_SCOPE"), std::env::var_os("H0X_TERMINAL_SOCKET"))
@@ -320,5 +320,5 @@ pub fn vouched() -> bool {
             .and_then(|stream| call(&stream, "terminal.vouch", json!({"terminal": terminal, "scope": scope})).ok());
         let _ = tx.send(reply.is_some_and(|r| r["ok"] == true));
     });
-    rx.recv_timeout(Duration::from_millis(300)).unwrap_or(false)
+    rx.recv_timeout(Duration::from_millis(1000)).unwrap_or(false)
 }

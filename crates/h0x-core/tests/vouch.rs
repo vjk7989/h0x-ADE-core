@@ -183,7 +183,7 @@ fn missing_or_dead_terminal_variables_exit_0_quickly() {
 }
 
 /// A server that accepts the connection and never answers: the hook gives up after
-/// `vouched()`'s 300 ms cap instead of hanging the agent. Unix only (std has no pipe server).
+/// `vouched()`'s 1 s cap instead of hanging the agent. Unix only (std has no pipe server).
 #[cfg(unix)]
 #[test]
 fn a_stalled_server_costs_the_hook_about_300_ms() {
@@ -205,7 +205,7 @@ fn a_stalled_server_costs_the_hook_about_300_ms() {
     quiet_zero("a stalled server", &out);
     assert!(took >= Duration::from_millis(250), "it did ask the server: {took:?}");
     if std::env::var_os("H0X_CORE_TEST_SLOW_RUNNER").is_none() {
-        assert!(took < Duration::from_millis(1500), "capped near 300 ms: {took:?}");
+        assert!(took < Duration::from_secs(2), "capped near 1 s: {took:?}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
