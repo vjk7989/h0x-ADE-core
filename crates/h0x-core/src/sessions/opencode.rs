@@ -16,6 +16,14 @@ const BUSY: Duration = Duration::from_millis(250);
 /// Root sessions still listed: a child (a subagent's) is resumed through its parent.
 const ROOT: &str = "parent_id IS NULL AND (time_archived IS NULL OR time_archived = 0)";
 
+pub(super) const BOOL_FLAGS: &[&str] = &[];
+pub(super) const VALUE_FLAGS: &[&str] = &[];
+pub(super) const FLAGS_BEFORE_RESUME: bool = true;
+
+pub(super) fn root(env: Env) -> Option<PathBuf> {
+    data_home(env).map(|d| d.join("opencode"))
+}
+
 pub(super) fn list(data: &Path, want: &str) -> Vec<SessionInfo> {
     let mut found = from_db(&data.join("opencode.db"), want);
     let storage = data.join("storage").join("session");

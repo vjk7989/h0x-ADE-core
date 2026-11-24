@@ -11,9 +11,25 @@ use std::fs::{DirEntry, File, Metadata};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
+mod agy;
 mod claude;
 mod codex;
+mod copilot;
+mod cursor;
+mod devin;
+mod droid;
+mod gemini;
+mod grok;
+mod hermes;
+mod kilo;
+mod kimi;
+mod letta;
+mod mastracode;
+mod omp;
 mod opencode;
+mod pi;
+mod qodercli;
+mod qwen;
 mod resume;
 #[cfg(test)]
 mod tests;
@@ -41,19 +57,81 @@ impl Roots {
     }
 
     pub fn new(env: impl Fn(&str) -> Option<String>) -> Roots {
-        let env = |name: &str| env(name).filter(|v| !v.is_empty()).map(PathBuf::from);
-        let home = env("HOME").or_else(|| env("USERPROFILE"));
-        let or_home = |var: &str, under: &[&str]| {
-            env(var).or_else(|| home.as_ref().map(|h| under.iter().fold(h.clone(), |p, part| p.join(part))))
-        };
-        let data = or_home("XDG_DATA_HOME", &[".local", "share"]);
+        let env: Env = &env;
         Roots {
-            claude: or_home("CLAUDE_CONFIG_DIR", &[".claude"]),
-            codex: or_home("CODEX_HOME", &[".codex"]),
-            opencode: data.as_ref().map(|d| d.join("opencode")),
-            trash: data.map(|d| d.join("Trash")),
+            claude: claude::root(env),
+            codex: codex::root(env),
+            opencode: opencode::root(env),
+            trash: data_home(env).map(|d| d.join("Trash")),
         }
     }
+}
+
+/// Reads environment variables; empty values count as unset.
+pub(super) type Env<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+fn var(env: Env, name: &str) -> Option<PathBuf> {
+    env(name).filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// `$<name>`, else `<home>/<under>`.
+fn or_home(env: Env, name: &str, under: &[&str]) -> Option<PathBuf> {
+    var(env, name).or_else(|| {
+        let home = var(env, "HOME").or_else(|| var(env, "USERPROFILE"))?;
+        Some(under.iter().fold(home, |p, part| p.join(part)))
+    })
+}
+
+/// `$XDG_DATA_HOME`, else `~/.local/share` (on every OS).
+fn data_home(env: Env) -> Option<PathBuf> {
+    or_home(env, "XDG_DATA_HOME", &[".local", "share"])
+}
+
+/// One agent's session finder and the flags kept when it is resumed.
+#[allow(dead_code)] // read by the resume path in later sub-tasks
+pub(super) struct Agent {
+    pub(super) root: fn(Env) -> Option<PathBuf>,
+    pub(super) list: fn(&Path, &str) -> Vec<SessionInfo>,
+    pub(super) lists: resume::FlagLists,
+    /// Whether kept flags go before the resume words (`claude -x --resume id`).
+    pub(super) flags_before_resume: bool,
+}
+
+/// The finder for every agent in the resume table (and gemini, which has no row yet).
+#[allow(dead_code)] // read by the resume path in later sub-tasks
+pub(super) fn agent(name: &str) -> Option<Agent> {
+    macro_rules! agent {
+        ($m:ident) => {
+            Agent {
+                root: $m::root,
+                list: $m::list,
+                lists: resume::FlagLists { bool_flags: $m::BOOL_FLAGS, value_flags: $m::VALUE_FLAGS },
+                flags_before_resume: $m::FLAGS_BEFORE_RESUME,
+            }
+        };
+    }
+    Some(match name {
+        "claude" => agent!(claude),
+        "codex" => agent!(codex),
+        "opencode" => agent!(opencode),
+        "copilot" => agent!(copilot),
+        "cursor" => agent!(cursor),
+        "devin" => agent!(devin),
+        "droid" => agent!(droid),
+        "hermes" => agent!(hermes),
+        "qodercli" => agent!(qodercli),
+        "qwen" => agent!(qwen),
+        "grok" => agent!(grok),
+        "kimi" => agent!(kimi),
+        "pi" => agent!(pi),
+        "kilo" => agent!(kilo),
+        "omp" => agent!(omp),
+        "mastracode" => agent!(mastracode),
+        "agy" => agent!(agy),
+        "letta" => agent!(letta),
+        "gemini" => agent!(gemini),
+        _ => return None,
+    })
 }
 
 /// Every session that ran in `folder` (absolute), newest first.
@@ -61,7 +139,7 @@ pub fn list(folder: &str, roots: &Roots) -> Vec<SessionInfo> {
     let want = normal(folder);
     let mut all = Vec::new();
     if let Some(root) = &roots.claude {
-        all.extend(claude::list(&root.join("projects"), &want));
+        all.extend(claude::list(root, &want));
     }
     if let Some(root) = &roots.codex {
         all.extend(codex::list(root, &want));

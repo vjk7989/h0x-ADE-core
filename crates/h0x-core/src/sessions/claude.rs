@@ -12,10 +12,19 @@ const ENDS: u64 = 64 * 1024;
 const TITLES: [(&str, &str); 4] =
     [("custom-title", "customTitle"), ("ai-title", "aiTitle"), ("summary", "summary"), ("last-prompt", "lastPrompt")];
 
-pub(super) fn list(projects: &Path, want: &str) -> Vec<SessionInfo> {
+pub(super) const BOOL_FLAGS: &[&str] = &[];
+pub(super) const VALUE_FLAGS: &[&str] = &[];
+pub(super) const FLAGS_BEFORE_RESUME: bool = true;
+
+pub(super) fn root(env: Env) -> Option<PathBuf> {
+    or_home(env, "CLAUDE_CONFIG_DIR", &[".claude"])
+}
+
+pub(super) fn list(root: &Path, want: &str) -> Vec<SessionInfo> {
+    let projects = root.join("projects");
     let name = encode(want);
     let windows = windows(want);
-    dirs(projects)
+    dirs(&projects)
         .filter(|dir| dir.file_name().and_then(|n| n.to_str()).is_some_and(|n| named(n, &name, windows)))
         .flat_map(|dir| files(&dir, "jsonl"))
         .filter_map(|path| read(&path, want))

@@ -11,6 +11,14 @@ const FIRST_LINE: u64 = 256 * 1024;
 /// The end of the name index read (later lines win).
 const INDEX: u64 = 1024 * 1024;
 
+pub(super) const BOOL_FLAGS: &[&str] = &[];
+pub(super) const VALUE_FLAGS: &[&str] = &[];
+pub(super) const FLAGS_BEFORE_RESUME: bool = true;
+
+pub(super) fn root(env: Env) -> Option<PathBuf> {
+    or_home(env, "CODEX_HOME", &[".codex"])
+}
+
 pub(super) fn list(home: &Path, want: &str) -> Vec<SessionInfo> {
     let mut found: Vec<SessionInfo> = dirs(&home.join("sessions"))
         .flat_map(|year| dirs(&year))
