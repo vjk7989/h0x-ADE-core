@@ -147,6 +147,20 @@ pub struct Terminal {
     /// Machines (core ids) it started work on: they may call back to it.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub afar: std::collections::BTreeSet<String>,
+    /// The agent in front now, for auto-resume after a loss (private).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentRun>,
+}
+
+/// An agent program seen in front of a terminal: never a prompt, only what a resume keeps.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq)]
+pub struct AgentRun {
+    pub agent: String,
+    /// Its session id, when its command line named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub flags: Vec<String>,
+    pub started_ms: u64,
 }
 
 impl Terminal {
@@ -332,6 +346,7 @@ impl Registry {
                 paste_gap_ms: new.template.as_ref().and_then(|t| t.paste_gap_ms),
                 foreground: None,
                 afar: Default::default(),
+                agent: None,
                 template: new.template.map(|t| t.name),
                 first_message: None,
                 holder: None,
@@ -450,6 +465,7 @@ const PRIVATE: &[&str] = &[
     "restart_after_ms",
     "restart_delay_ms",
     "program_started_ms",
+    "agent",
 ];
 
 /// A terminal as clients see it (API results, events): its facts, without
@@ -709,5 +725,62 @@ mod tests {
             t.pid = Some(pid);
             assert_eq!(t.vouched_pid("k"), None, "pid {pid}");
         }
+    }
+
+    fn with_agent(id: Option<&str>) -> Registry {
+        let mut reg = Registry::default();
+        let t = reg.create(new(None), 0).unwrap();
+        reg.terminals.get_mut(&t).unwrap().agent = Some(AgentRun {
+            agent: "codex".into(),
+            id: id.map(Into::into),
+            flags: vec!["--model".into(), "o3".into()],
+            started_ms: 42,
+        });
+        reg
+    }
+
+    #[test]
+    fn agent_run_edge_survives_a_state_file_round_trip() {
+        for id in [Some("123e4567-e89b-42d3-a456-426614174000"), None] {
+            let reg = with_agent(id);
+            let raw = serde_json::to_string(&reg).unwrap();
+            let back: Registry = serde_json::from_str(&raw).unwrap();
+            assert_eq!(back.terminals[&1].agent, reg.terminals[&1].agent, "{id:?}");
+            assert_eq!(raw.contains("\"id\""), id.is_some(), "no id is left out: {raw}");
+        }
+        // Without an agent the field is not written at all.
+        let mut reg = with_agent(None);
+        reg.terminals.get_mut(&1).unwrap().agent = None;
+        let raw = serde_json::to_string(&reg).unwrap();
+        assert!(!raw.contains("\"agent\""), "{raw}");
+        let back: Registry = serde_json::from_str(&raw).unwrap();
+        assert_eq!(back.terminals[&1].agent, None);
+    }
+
+    #[test]
+    fn agent_run_edge_old_state_files_without_it_still_load() {
+        let reg = with_agent(Some("123e4567-e89b-42d3-a456-426614174000"));
+        let mut value = serde_json::to_value(&reg).unwrap();
+        value["terminals"]["1"].as_object_mut().unwrap().remove("agent");
+        let back: Registry = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(back.terminals[&1].agent, None);
+        // A run written without its optional id loads with none; null is none too.
+        value["terminals"]["1"]["agent"] = serde_json::json!({"agent": "codex", "flags": [], "started_ms": 1});
+        let back: Registry = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(back.terminals[&1].agent.as_ref().unwrap().id, None);
+        value["terminals"]["1"]["agent"] = serde_json::Value::Null;
+        let back: Registry = serde_json::from_value(value).unwrap();
+        assert_eq!(back.terminals[&1].agent, None);
+    }
+
+    #[test]
+    fn agent_run_edge_is_private_in_api_output_and_its_schema() {
+        let reg = with_agent(Some("123e4567-e89b-42d3-a456-426614174000"));
+        let public = serde_json::to_value(Public(reg.terminals[&1].clone())).unwrap();
+        assert!(public.get("agent").is_none(), "{public}");
+        let text = public.to_string();
+        assert!(!text.contains("123e4567") && !text.contains("started_ms") && !text.contains("o3"), "{text}");
+        let schema = serde_json::to_value(schemars::schema_for!(Public)).unwrap();
+        assert!(schema["properties"].get("agent").is_none());
     }
 }
