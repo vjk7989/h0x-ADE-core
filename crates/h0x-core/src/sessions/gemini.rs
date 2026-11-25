@@ -315,12 +315,16 @@ mod tests {
         project(&h, "ok", "/w");
         chat(&h, "ok", "session-ok.jsonl", &header(ID), 1);
         let name = std::ffi::OsStr::from_bytes(b"session-\xff.jsonl");
-        std::fs::write(h.path().join(".gemini/tmp/ok/chats").join(name), header(ID)).unwrap();
+        // macOS file systems refuse names that are not UTF-8: there is nothing to skip there.
+        let _ = std::fs::write(h.path().join(".gemini/tmp/ok/chats").join(name), header(ID));
         let slug = std::ffi::OsStr::from_bytes(b"\xfe");
         let raw = h.path().join(".gemini/tmp").join(slug);
-        std::fs::create_dir_all(raw.join("chats")).unwrap();
-        std::fs::write(raw.join(".project_root"), "/w").unwrap();
-        std::fs::write(raw.join("chats/session-raw.jsonl"), header("bbbbbbbb-0000-4000-8000-00000000000b")).unwrap();
+        let slug_made = std::fs::create_dir_all(raw.join("chats")).is_ok();
+        if slug_made {
+            std::fs::write(raw.join(".project_root"), "/w").unwrap();
+            std::fs::write(raw.join("chats/session-raw.jsonl"), header("bbbbbbbb-0000-4000-8000-00000000000b"))
+                .unwrap();
+        }
         project(&h, "shut", "/w");
         chat(&h, "shut", "session-s.jsonl", &header("cccccccc-0000-4000-8000-00000000000c"), 1);
         let shut = h.path().join(".gemini/tmp/shut/chats");
@@ -328,7 +332,10 @@ mod tests {
         let ids: Vec<String> = found(&h, "/w").into_iter().map(|s| s.id).collect();
         std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(ids.contains(&ID.to_string()), "{ids:?}");
-        assert!(ids.contains(&"bbbbbbbb-0000-4000-8000-00000000000b".to_string()), "the slug's name is never read");
+        assert!(
+            !slug_made || ids.contains(&"bbbbbbbb-0000-4000-8000-00000000000b".to_string()),
+            "the slug's name is never read"
+        );
         assert!(!ids.iter().any(|i| i.starts_with("eeeeeeee")), "a linked chats folder is not followed: {ids:?}");
         assert!(!ids.iter().any(|i| i.starts_with("aaaaaaaa")), "a linked marker is not read: {ids:?}");
     }

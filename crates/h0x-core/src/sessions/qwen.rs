@@ -220,7 +220,8 @@ mod tests {
         std::os::unix::fs::symlink(outside.path().join("proj"), s.path().join("projects/l")).unwrap();
         s.put("projects/ok/chats/s3.jsonl", &line("s3", "/w/a"), 1);
         let name = std::ffi::OsStr::from_bytes(b"\xff.jsonl");
-        std::fs::write(s.path().join("projects/ok/chats").join(name), line("\u{fffd}", "/w/a")).unwrap();
+        // macOS file systems refuse names that are not UTF-8: there is nothing to skip there.
+        let _ = std::fs::write(s.path().join("projects/ok/chats").join(name), line("\u{fffd}", "/w/a"));
         let shut = s.put("projects/shut/chats/s4.jsonl", &line("s4", "/w/a"), 1);
         std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
         let ids: Vec<String> = list(s.path(), "/w/a").into_iter().map(|g| g.id).collect();

@@ -245,7 +245,8 @@ mod tests {
         std::os::unix::fs::symlink(&away, s.path().join("sessions/--w--/y.jsonl")).unwrap();
         s.put("sessions/--w--/ok.jsonl", &header("ok", "/w"), 5);
         let name = std::ffi::OsStr::from_bytes(b"\xff\xfe.jsonl");
-        std::fs::write(s.path().join("sessions/--w--").join(name), header("raw", "/w")).unwrap();
+        // macOS file systems refuse names that are not UTF-8: there is nothing to skip there.
+        let raw_made = std::fs::write(s.path().join("sessions/--w--").join(name), header("raw", "/w")).is_ok();
         let shut = s.put("sessions/--shut--/z.jsonl", &header("z", "/w"), 1);
         let shut_dir = shut.parent().unwrap().to_path_buf();
         std::fs::set_permissions(&shut_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -255,6 +256,6 @@ mod tests {
         assert!(!ids.contains(&"x".to_string()) && !ids.contains(&"y".to_string()), "links are not followed: {ids:?}");
         assert!(ids.contains(&"ok".to_string()), "{ids:?}");
         // The id comes from the header, whatever the file is called.
-        assert!(ids.contains(&"raw".to_string()), "{ids:?}");
+        assert!(!raw_made || ids.contains(&"raw".to_string()), "{ids:?}");
     }
 }
