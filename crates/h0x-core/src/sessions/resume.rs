@@ -44,6 +44,7 @@ fn table(agent: &str) -> Option<Row> {
         "opencode" => ("opencode", Shape::Prefixed("ses_"), |id| flag("--session", id)),
         "qodercli" => ("qodercli", Shape::Token, |id| flag("--resume", id)),
         "qwen" => ("qwen", Shape::Uuid, |id| flag("--resume", id)),
+        "gemini" => ("gemini", Shape::Uuid, |id| flag("--resume", id)),
         "kilo" => ("kilo", Shape::Token, |id| flag("--session", id)),
         "cursor" => {
             (if cfg!(windows) { "cursor-agent.cmd" } else { "cursor-agent" }, Shape::Token, |id| flag("--resume", id))
@@ -75,6 +76,11 @@ pub fn argv(agent: &str, id: &str) -> Result<Vec<String>, String> {
     argv.extend(args(id));
     validate(&argv)?;
     Ok(argv)
+}
+
+/// Whether `id` is a UUID (`8-4-4-4-12` hex digits).
+pub(super) fn is_uuid(id: &str) -> bool {
+    shaped(id, Shape::Uuid)
 }
 
 /// Whether `id` is an id of this shape, at most [`MAX_ID`] bytes.

@@ -1109,7 +1109,7 @@ fn agents_resolve_to_their_finders() {
         assert!(agent(name).is_some(), "{name}");
     }
     assert!(agent("nope").is_none());
-    let stub = agent("kimi").unwrap();
+    let stub = agent("devin").unwrap();
     assert!((stub.root)(&|_| Some("/h".into())).is_none());
     assert!((stub.list)(Path::new("/h"), "/w").is_empty());
     assert!(stub.lists.bool_flags.is_empty() && stub.lists.value_flags.is_empty());
@@ -1291,25 +1291,12 @@ fn agent_finders_list_what_session_list_lists() {
 
 #[test]
 fn every_stub_agent_finds_and_keeps_nothing() {
-    let stubs = [
-        "copilot",
-        "cursor",
-        "devin",
-        "droid",
-        "hermes",
-        "qodercli",
-        "qwen",
-        "grok",
-        "kimi",
-        "pi",
-        "kilo",
-        "omp",
-        "mastracode",
-        "agy",
-        "letta",
-        "gemini",
-    ];
+    let stubs = ["copilot", "cursor", "devin", "droid", "hermes", "qodercli", "grok", "agy", "letta"];
     let env = |_: &str| Some("/h".to_string());
+    // These have finders now: each finds its store under the given home.
+    for name in ["qwen", "kimi", "pi", "kilo", "omp", "mastracode", "gemini"] {
+        assert!((agent(name).unwrap().root)(&env).is_some(), "{name}");
+    }
     for name in stubs {
         let stub = agent(name).unwrap();
         assert!((stub.root)(&env).is_none(), "{name}");
@@ -1358,4 +1345,140 @@ fn a_fish_line_gives_back_the_exact_argv() {
     let line = resume::shell_line(&argv, Path::new("fish")).unwrap();
     let out = std::process::Command::new("fish").arg("-c").arg(&line).output().unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout), r"[C:\dir\][a\\b][it's][\'][a b]");
+}
+
+/// The seven new finders, each with a store under `home` holding one session of `/w` used at `ms`.
+fn new_finder_stores(h: &fixture::Scratch, ms: u64) {
+    let pi = |id: &str| format!("{{\"type\":\"session\",\"id\":\"{id}\",\"cwd\":\"/w\"}}\n");
+    h.put("pi/sessions/--w--/a.jsonl", pi("pi-1").as_bytes(), ms);
+    h.put("omp/sessions/--w--/a.jsonl", pi("omp-1").as_bytes(), ms);
+    h.put(
+        &format!("qwen/projects/-w/chats/{UUID}.jsonl"),
+        format!("{{\"sessionId\":\"{UUID}\",\"cwd\":\"/w\"}}\n").as_bytes(),
+        ms,
+    );
+    h.put("kimi/kimi.json", br#"{"work_dirs":[{"path":"/w","kaos":"local"}]}"#, ms);
+    // md5("/w")
+    h.put(
+        "kimi/sessions/1cce3e60ac2d51100ef178d6509a4972/11111111-2222-3333-4444-555555555555/context.jsonl",
+        b"{}\n",
+        ms,
+    );
+    h.put("gemini/tmp/w/.project_root", b"/w\n", ms);
+    h.put("gemini/tmp/w/chats/session-x.jsonl", format!("{{\"sessionId\":\"{UUID}\"}}\n").as_bytes(), ms);
+    std::fs::create_dir_all(h.path().join("kilo")).unwrap();
+    let kilo = rusqlite::Connection::open(h.path().join("kilo/kilo.db")).unwrap();
+    kilo.execute_batch(&format!(
+        "CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL, title TEXT NOT NULL, \
+         time_updated INTEGER NOT NULL, time_archived INTEGER); \
+         INSERT INTO session (id, directory, title, time_updated) VALUES ('ses_k', '/w', 't', {ms});"
+    ))
+    .unwrap();
+    std::fs::create_dir_all(h.path().join("mastracode")).unwrap();
+    let mastra = rusqlite::Connection::open(h.path().join("mastracode/mastra.db")).unwrap();
+    mastra
+        .execute_batch(
+            "CREATE TABLE mastra_threads (id TEXT PRIMARY KEY, resourceId TEXT NOT NULL, title TEXT NOT NULL, \
+             metadata TEXT, createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL); \
+             INSERT INTO mastra_threads VALUES ('t1', 'r', 't', '{\"projectPath\":\"/w\"}', '1970-01-01T00:00:00.000Z', \
+             '1970-01-01T00:00:00.000Z');",
+        )
+        .unwrap();
+}
+
+const NEW_FINDERS: [&str; 7] = ["pi", "omp", "qwen", "kimi", "gemini", "kilo", "mastracode"];
+
+#[test]
+fn finder_edge_new_finders_list_their_own_sessions_through_agent() {
+    let h = fixture::Scratch::new();
+    new_finder_stores(&h, 7_000);
+    let want = [
+        ("pi", "pi-1", 7_000),
+        ("omp", "omp-1", 7_000),
+        ("qwen", UUID, 7_000),
+        ("kimi", "11111111-2222-3333-4444-555555555555", 7_000),
+        ("gemini", UUID, 7_000),
+        ("kilo", "ses_k", 7_000),
+        ("mastracode", "t1", 0),
+    ];
+    for (name, id, ms) in want {
+        let found = agent(name).unwrap();
+        let got = (found.list)(&h.path().join(name), &normal("/w/"));
+        let got: Vec<(&str, &str, u64)> = got.iter().map(|s| (s.agent.as_str(), s.id.as_str(), s.last_used)).collect();
+        assert_eq!(got, [(name, id, ms)], "{name}");
+        assert!((found.list)(&h.path().join(name), "/w/x").is_empty(), "{name}: another folder");
+        assert!((found.list)(&h.path().join(name), "").is_empty(), "{name}: an empty folder");
+        // Each id is one its resume row takes.
+        assert!(resume_argv(name, id).is_ok(), "{name} {id}");
+    }
+}
+
+#[test]
+fn finder_edge_new_finders_list_nothing_from_a_file_root_or_another_agents_store() {
+    let h = fixture::Scratch::new();
+    new_finder_stores(&h, 1);
+    let file = h.put("plain-file", b"{}\n", 1);
+    for name in NEW_FINDERS {
+        let found = agent(name).unwrap();
+        assert!((found.list)(&file, "/w").is_empty(), "{name}: a file root");
+        assert!((found.list)(&h.path().join("missing"), "/w").is_empty(), "{name}: a missing root");
+        assert!(!h.path().join("missing").exists(), "{name}: nothing created");
+        for other in NEW_FINDERS {
+            // pi and omp share a layout; every other pair keeps apart.
+            if other == name || matches!((name, other), ("pi", "omp") | ("omp", "pi")) {
+                continue;
+            }
+            assert!((found.list)(&h.path().join(other), "/w").is_empty(), "{name} read {other}'s store");
+        }
+    }
+}
+
+#[test]
+fn finder_edge_new_finders_treat_empty_env_as_unset() {
+    let empty = |name: &str| match name {
+        "HOME" => Some("/h".to_string()),
+        _ => Some(String::new()),
+    };
+    let home = Path::new("/h");
+    let want = [
+        ("pi", home.join(".pi").join("agent")),
+        ("omp", home.join(".omp").join("agent")),
+        ("qwen", home.join(".qwen")),
+        ("kimi", home.join(".kimi")),
+        ("gemini", home.join(".gemini")),
+        ("kilo", home.join(".local").join("share").join("kilo")),
+    ];
+    for (name, root) in want {
+        assert_eq!((agent(name).unwrap().root)(&empty), Some(root), "{name}");
+    }
+    let none = |_: &str| Some(String::new());
+    for name in NEW_FINDERS {
+        assert_eq!((agent(name).unwrap().root)(&none), None, "{name}: every variable empty");
+    }
+}
+
+/// `newest_since` reads the real env for the root, so its filter is checked here on what the finders give it
+/// (no root seam exists): the same `last_used >= since_ms && !taken(id)`, newest first.
+#[test]
+fn finder_edge_newest_since_inputs_at_the_since_boundary() {
+    let pick = |name: &str, root: &Path, since: u64, taken: &dyn Fn(&str) -> bool| {
+        let all = (agent(name).unwrap().list)(root, &normal("/w"));
+        all.into_iter().filter(|s| s.last_used >= since && !taken(&s.id)).max_by_key(|s| s.last_used).map(|s| s.id)
+    };
+    let h = fixture::Scratch::new();
+    new_finder_stores(&h, 5_000);
+    for name in ["pi", "omp", "qwen", "kimi", "gemini", "kilo"] {
+        let root = h.path().join(name);
+        assert!(pick(name, &root, 4_999, &|_| false).is_some(), "{name}: since one ms before");
+        assert!(pick(name, &root, 5_000, &|_| false).is_some(), "{name}: since exactly then");
+        assert!(pick(name, &root, 5_001, &|_| false).is_none(), "{name}: since one ms after");
+        assert!(pick(name, &root, 0, &|_| true).is_none(), "{name}: every id taken");
+    }
+    // Two pi sessions: the newer is picked, unless taken.
+    let pi = |id: &str| format!("{{\"type\":\"session\",\"id\":\"{id}\",\"cwd\":\"/w\"}}\n");
+    h.put("pi/sessions/--w--/b.jsonl", pi("pi-2").as_bytes(), 6_000);
+    let root = h.path().join("pi");
+    assert_eq!(pick("pi", &root, 0, &|_| false).as_deref(), Some("pi-2"));
+    assert_eq!(pick("pi", &root, 0, &|id| id == "pi-2").as_deref(), Some("pi-1"));
+    assert_eq!(pick("pi", &root, 5_500, &|id| id == "pi-2"), None);
 }

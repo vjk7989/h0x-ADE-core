@@ -275,7 +275,7 @@ mod tests {
         // No id, no label and no store to find one in: a plain shell.
         let id = lost(&mut reg, "codex", None);
         assert!(line(&reg, id, &[]).is_none());
-        let id = lost(&mut reg, "gemini", Some(UUID));
+        let id = lost(&mut reg, "amp", Some(UUID));
         assert!(line(&reg, id, &[]).is_none(), "no resume row");
     }
 

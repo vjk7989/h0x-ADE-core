@@ -18,6 +18,8 @@ mod copilot;
 mod cursor;
 mod devin;
 mod droid;
+#[cfg(test)]
+mod fixture;
 mod gemini;
 mod grok;
 mod hermes;
@@ -97,7 +99,7 @@ pub(super) struct Agent {
     pub(super) flags_before_resume: bool,
 }
 
-/// The finder for every agent in the resume table (and gemini, which has no row yet).
+/// The finder for every agent in the resume table.
 pub(super) fn agent(name: &str) -> Option<Agent> {
     macro_rules! agent {
         ($m:ident) => {
