@@ -36,6 +36,7 @@ mod tests;
 mod trash;
 
 pub use resume::argv as resume_argv;
+pub(crate) use resume::{detect, resume_line};
 pub use trash::trash;
 
 /// Where each agent keeps its sessions, found as the agent finds it.
@@ -88,7 +89,6 @@ fn data_home(env: Env) -> Option<PathBuf> {
 }
 
 /// One agent's session finder and the flags kept when it is resumed.
-#[allow(dead_code)] // read by the resume path in later sub-tasks
 pub(super) struct Agent {
     pub(super) root: fn(Env) -> Option<PathBuf>,
     pub(super) list: fn(&Path, &str) -> Vec<SessionInfo>,
@@ -98,7 +98,6 @@ pub(super) struct Agent {
 }
 
 /// The finder for every agent in the resume table (and gemini, which has no row yet).
-#[allow(dead_code)] // read by the resume path in later sub-tasks
 pub(super) fn agent(name: &str) -> Option<Agent> {
     macro_rules! agent {
         ($m:ident) => {
@@ -149,6 +148,14 @@ pub fn list(folder: &str, roots: &Roots) -> Vec<SessionInfo> {
     }
     all.sort_by(|a, b| b.last_used.cmp(&a.last_used).then_with(|| (&a.agent, &a.id).cmp(&(&b.agent, &b.id))));
     all
+}
+
+/// The newest session of `name` in `folder` used at or after `since_ms`, that `taken` does not refuse.
+pub(crate) fn newest_since(name: &str, folder: &str, since_ms: u64, taken: &dyn Fn(&str) -> bool) -> Option<String> {
+    let found = agent(name)?;
+    let root = (found.root)(&|n| std::env::var(n).ok())?;
+    let all = (found.list)(&root, &normal(folder));
+    all.into_iter().filter(|s| s.last_used >= since_ms && !taken(&s.id)).max_by_key(|s| s.last_used).map(|s| s.id)
 }
 
 /// Whether a path is a Windows one: a drive letter or a `\\server` share.

@@ -150,7 +150,6 @@ const NEVER: [&str; 14] = [
 
 /// The allowlisted flags of an agent's argv (after its program token), in
 /// order: no prompt, file, subcommand, session flag or anything after `--`.
-#[allow(dead_code)] // read by the resume path in later sub-tasks
 pub(super) fn keep_flags(args: &[String], lists: &FlagLists) -> Vec<String> {
     let sound = |v: &str| v.len() <= MAX_VALUE && !v.chars().any(char::is_control);
     let mut kept: Vec<String> = Vec::new();
@@ -196,7 +195,6 @@ pub(super) fn keep_flags(args: &[String], lists: &FlagLists) -> Vec<String> {
 /// One line that runs `argv` when typed into the shell at `shell`: each
 /// element is one word. `None` for cmd.exe, an unknown shell, an empty argv or
 /// an element with a control character (it would end the line early).
-#[allow(dead_code)] // read by the resume path in later sub-tasks
 pub(super) fn shell_line(argv: &[String], shell: &Path) -> Option<String> {
     if argv.is_empty() || argv.iter().any(|a| a.chars().any(char::is_control)) {
         return None;
@@ -256,4 +254,74 @@ fn windows_arg(arg: &str) -> String {
     }
     s.extend(std::iter::repeat_n('\\', 2 * slashes));
     s + "\""
+}
+
+/// The program of a command line and the arguments after it. A script run by
+/// an interpreter (`node /x/codex.js ...`) is the script, and only then.
+fn program(argv: &[String]) -> Option<(String, &[String])> {
+    let stem = |arg: &str| {
+        let base = arg.rsplit(['/', '\\']).next().unwrap_or(arg);
+        let base = if cfg!(windows) { base.to_ascii_lowercase() } else { base.to_string() };
+        let plain = [".exe", ".cmd", ".ps1"].iter().find_map(|e| base.strip_suffix(e));
+        plain.map_or(base.clone(), str::to_string)
+    };
+    let first = stem(argv.first()?);
+    if matches!(first.as_str(), "node" | "nodejs" | "bun" | "sh" | "bash") {
+        let script = argv.get(1).filter(|a| !a.starts_with('-'))?;
+        let name = stem(script);
+        let name = name.rsplit_once('.').map_or(name.as_str(), |(s, _)| s).to_string();
+        return Some((name, &argv[2..]));
+    }
+    Some((first, &argv[1..]))
+}
+
+/// The session id an agent's own arguments name: the one its resume words
+/// would carry (and Claude's `--session-id`), in the agent's id shape.
+fn explicit_id(agent: &str, args: &[String]) -> Option<String> {
+    let found = |cand: &str| {
+        // The nil UUID names no session (as the session hook holds).
+        if cand == "00000000-0000-0000-0000-000000000000" {
+            return None;
+        }
+        let words = argv(agent, cand).ok()?;
+        let rest = &words[1..];
+        let named = args.windows(rest.len()).any(|w| w == rest)
+            || (agent == "claude"
+                && (args.windows(2).any(|w| w[0] == "--session-id" && w[1] == cand)
+                    || args.iter().any(|a| *a == format!("--resume={cand}") || *a == format!("--session-id={cand}"))));
+        named.then(|| cand.to_string())
+    };
+    args.iter().find_map(|a| found(a).or_else(|| a.split_once('=').and_then(|(_, v)| found(v))))
+}
+
+/// The agent in front when `foreground` is an agent of the resume table.
+pub(crate) fn detect(foreground: &[String], now_ms: u64) -> Option<crate::terminals::AgentRun> {
+    let (name, args) = program(foreground)?;
+    // The editor is `cursor`; the agent's program is `cursor-agent`.
+    let name = match name.as_str() {
+        "cursor" => return None,
+        "cursor-agent" => "cursor".to_string(),
+        _ => name,
+    };
+    let agent = super::agent(&name).filter(|_| table(&name).is_some())?;
+    Some(crate::terminals::AgentRun {
+        id: explicit_id(&name, args),
+        flags: keep_flags(args, &agent.lists),
+        agent: name,
+        started_ms: now_ms,
+    })
+}
+
+/// The line to type into `shell` that resumes `run`'s session `id`: the table's
+/// resume words and the kept flags, nothing else.
+pub(crate) fn resume_line(run: &crate::terminals::AgentRun, id: &str, shell: &Path) -> Option<String> {
+    let agent = super::agent(&run.agent)?;
+    let mut words = argv(&run.agent, id).ok()?.into_iter();
+    let command = words.next()?;
+    let line = if agent.flags_before_resume {
+        [command].into_iter().chain(run.flags.iter().cloned()).chain(words).collect::<Vec<_>>()
+    } else {
+        [command].into_iter().chain(words).chain(run.flags.iter().cloned()).collect()
+    };
+    shell_line(&line, shell)
 }

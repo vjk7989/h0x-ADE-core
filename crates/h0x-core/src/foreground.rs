@@ -201,7 +201,8 @@ impl Core {
             t.last_cwd = Some(f.cwd.clone());
         }
         t.foreground = now.clone();
-        if change.is_some() || foreground_changed {
+        let agent_changed = note_agent(t, now.as_ref(), at_shell && !crate::platform::host_shutdown_in_progress());
+        if change.is_some() || foreground_changed || agent_changed {
             self.save_soon();
         }
         if let Some(change) = change {
@@ -230,6 +231,25 @@ impl Core {
         let off: String = on.iter().map(|m| format!("\x1b[?{m}l")).collect();
         self.output(st, id, off.as_bytes());
     }
+}
+
+/// Records the agent now in front, or clears it once the shell has the
+/// terminal back (`at_shell`, never during host shutdown). True if it changed.
+fn note_agent(t: &mut crate::terminals::Terminal, now: Option<&Foreground>, at_shell: bool) -> bool {
+    let run = now.and_then(|n| crate::sessions::detect(&n.argv, crate::runtime::now_ms()));
+    let next = match run {
+        Some(mut run) => {
+            if let Some(old) = t.agent.as_ref().filter(|old| old.agent == run.agent) {
+                run.started_ms = old.started_ms;
+            }
+            Some(run)
+        }
+        None if at_shell => None,
+        None => return false,
+    };
+    let changed = t.agent != next;
+    t.agent = next;
+    changed
 }
 
 /// Mouse reports (X10, normal, button and any motion, and their encodings)
@@ -268,6 +288,276 @@ mod tests {
         assert!(!back(None, front(20), front(10)), "no first process (not started yet)");
         // Windows: the pseudo console's first process is always in front.
         assert!(!back(Some(10), front(10), front(10)));
+    }
+
+    fn with_argv(argv: &[&str]) -> Option<Foreground> {
+        Some(Foreground {
+            pid: 20,
+            name: "x".into(),
+            argv: argv.iter().map(|a| a.to_string()).collect(),
+            cwd: "/".into(),
+        })
+    }
+
+    fn terminal() -> crate::terminals::Terminal {
+        let mut reg = crate::terminals::Registry::default();
+        let id =
+            reg.create(crate::terminals::NewTerminal { argv: vec!["sh".into()], ..Default::default() }, 0).unwrap();
+        reg.terminals.remove(&id).unwrap()
+    }
+
+    const UUID: &str = "123e4567-e89b-42d3-a456-426614174000";
+
+    #[test]
+    fn agent_run_records_the_agent_and_its_explicit_id_but_never_a_prompt() {
+        let mut t = terminal();
+        let now = with_argv(&["/usr/bin/codex", "resume", UUID, "secret prompt"]);
+        assert!(note_agent(&mut t, now.as_ref(), false));
+        let run = t.agent.clone().unwrap();
+        assert_eq!((run.agent.as_str(), run.id.as_deref()), ("codex", Some(UUID)));
+        assert!(run.flags.is_empty() && run.started_ms > 0);
+        assert!(!serde_json::to_string(&t).unwrap().contains("secret"));
+        // The same program again changes nothing, and keeps when it started.
+        t.agent.as_mut().unwrap().started_ms = 7;
+        assert!(!note_agent(&mut t, now.as_ref(), false));
+        assert_eq!(t.agent.as_ref().unwrap().started_ms, 7);
+    }
+
+    #[test]
+    fn agent_run_without_an_id_or_with_a_bad_one_has_none() {
+        let mut t = terminal();
+        note_agent(&mut t, with_argv(&["codex", "fix it"]).as_ref(), false);
+        assert_eq!(t.agent.as_ref().unwrap().id, None);
+        note_agent(&mut t, with_argv(&["codex", "resume", "--evil"]).as_ref(), false);
+        assert_eq!(t.agent.as_ref().unwrap().id, None);
+        note_agent(&mut t, with_argv(&["claude", "--session-id", UUID]).as_ref(), false);
+        assert_eq!(t.agent.as_ref().unwrap().id.as_deref(), Some(UUID));
+    }
+
+    #[test]
+    fn agent_run_knows_scripts_by_their_stem_and_ignores_other_programs() {
+        let mut t = terminal();
+        note_agent(&mut t, with_argv(&["/usr/bin/node", "/x/bin/codex.js", "resume", UUID]).as_ref(), false);
+        assert_eq!(t.agent.as_ref().unwrap().agent, "codex");
+        let mut t = terminal();
+        for argv in [
+            &["node", "/x/server.js", "codex"][..],
+            &["node", "--inspect"],
+            &["vim", "codex"],
+            &["cursor", "."],
+            &["gemini"],
+        ] {
+            assert!(!note_agent(&mut t, with_argv(argv).as_ref(), true), "{argv:?}");
+            assert!(t.agent.is_none());
+        }
+        note_agent(&mut t, with_argv(&["cursor-agent"]).as_ref(), false);
+        assert_eq!(t.agent.as_ref().unwrap().agent, "cursor");
+    }
+
+    #[test]
+    fn agent_run_clears_only_at_the_shell() {
+        let mut t = terminal();
+        note_agent(&mut t, with_argv(&["codex"]).as_ref(), false);
+        assert!(!note_agent(&mut t, with_argv(&["git", "status"]).as_ref(), false), "a child in front");
+        assert!(!note_agent(&mut t, None, false), "nothing readable in front");
+        assert!(t.agent.is_some());
+        assert!(note_agent(&mut t, with_argv(&["bash"]).as_ref(), true), "back at the shell");
+        assert!(t.agent.is_none());
+    }
+
+    fn agent_of(argv: &[&str]) -> Option<crate::terminals::AgentRun> {
+        let mut t = terminal();
+        note_agent(&mut t, with_argv(argv).as_ref(), false);
+        t.agent
+    }
+
+    #[test]
+    fn agent_run_edge_empty_or_pathless_argv_is_no_agent_and_changes_nothing() {
+        for argv in [&[][..], &[""], &["/"], &["\\"], &["", "codex"], &["/", "resume", UUID]] {
+            assert_eq!(agent_of(argv), None, "{argv:?}");
+        }
+        // Not at the shell, a nameless program leaves a recorded agent as it was.
+        let mut t = terminal();
+        note_agent(&mut t, with_argv(&["codex"]).as_ref(), false);
+        let before = t.agent.clone();
+        for argv in [&[][..], &[""], &["/"]] {
+            assert!(!note_agent(&mut t, with_argv(argv).as_ref(), false), "{argv:?}");
+            assert_eq!(t.agent, before, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn agent_run_edge_windows_launcher_paths_name_their_agent_on_every_host() {
+        for argv in [
+            &[r"C:\Users\x\AppData\Roaming\npm\codex.cmd", "resume", UUID][..],
+            &[r"C:\Users\x\AppData\Roaming\npm\codex.ps1", "resume", UUID],
+            &[r"C:\Program Files\codex\codex.exe", "resume", UUID],
+            &[r"\\server\share\bin\codex.exe", "resume", UUID],
+            &["C:/Users/x/AppData/Roaming/npm/codex.cmd", "resume", UUID],
+        ] {
+            let run = agent_of(argv).unwrap_or_else(|| panic!("{argv:?}"));
+            assert_eq!((run.agent.as_str(), run.id.as_deref()), ("codex", Some(UUID)), "{argv:?}");
+        }
+        // An interpreter given as a Windows path still runs a script by its stem.
+        let run = agent_of(&[
+            r"C:\Program Files\nodejs\node.exe",
+            r"C:\Users\x\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js",
+        ])
+        .unwrap();
+        assert_eq!(run.agent, "codex");
+        // Only the three launcher suffixes are stripped.
+        for argv in [&["codex.bat"][..], &["codex.sh"], &["codex.exe.bak"], &["codexx"], &["xcodex"]] {
+            assert_eq!(agent_of(argv), None, "{argv:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn agent_run_edge_names_are_case_insensitive_on_windows() {
+        for argv in [&["CLAUDE.EXE"][..], &[r"C:\Tools\Claude.Exe"], &["CODEX.CMD"], &["Codex"]] {
+            assert!(agent_of(argv).is_some(), "{argv:?}");
+        }
+        assert_eq!(agent_of(&["CLAUDE.EXE"]).unwrap().agent, "claude");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn agent_run_edge_names_are_case_sensitive_off_windows() {
+        for argv in [&["CLAUDE.EXE"][..], &["Claude"], &["CODEX"], &["/usr/bin/Codex"]] {
+            assert_eq!(agent_of(argv), None, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn agent_run_edge_interpreters_need_a_script_named_as_the_agent() {
+        for argv in [
+            &["node"][..],
+            &["/usr/bin/node"],
+            &["node", ""],
+            &["node", "-e", "codex"],
+            &["bun", "--smol"],
+            &["node", "/x/codex-helper.js"],
+            &["node", "/x/my-codex.js"],
+            &["node", "/x/codex.min.js"],
+            &["node", "/x/claude-code/cli.js"],
+            &["bash", "-c", "codex resume 123e4567-e89b-42d3-a456-426614174000"],
+            &["sh"],
+        ] {
+            assert_eq!(agent_of(argv), None, "{argv:?}");
+        }
+        for (argv, agent) in [
+            (&["nodejs", "/x/codex.js"][..], "codex"),
+            (&["bun", "/x/claude.ts"], "claude"),
+            (&["node", "/x/bin/codex"], "codex"),
+            (&["sh", "/x/codex.sh"], "codex"),
+        ] {
+            assert_eq!(agent_of(argv).map(|r| r.agent).as_deref(), Some(agent), "{argv:?}");
+        }
+        // The script's own words are its arguments: the id after it is read.
+        let run = agent_of(&["node", "/x/codex.js", "resume", UUID]).unwrap();
+        assert_eq!(run.id.as_deref(), Some(UUID));
+    }
+
+    #[test]
+    fn agent_run_edge_malformed_ids_are_none() {
+        for bad in [
+            "123e4567-e89b-42d3-a456-42661417400",   // one short
+            "123e4567-e89b-42d3-a456-4266141740000", // one long
+            "123e4567e89b42d3a456426614174000",      // no dashes
+            "{123e4567-e89b-42d3-a456-426614174000}",
+            "123e4567-e89b-42d3-a456-42661417400g",
+            "123e4567_e89b_42d3_a456_426614174000",
+            "",
+            "--last",
+            "../123e4567-e89b-42d3-a456-426614174000",
+        ] {
+            assert_eq!(agent_of(&["codex", "resume", bad]).unwrap().id, None, "{bad:?}");
+            assert_eq!(agent_of(&["claude", "--resume", bad]).unwrap().id, None, "{bad:?}");
+            assert_eq!(agent_of(&["claude", "--session-id", bad]).unwrap().id, None, "{bad:?}");
+        }
+        // A UUID that is a prompt, or a word of one, or after another word, is no id.
+        for argv in [
+            &["codex", "fix", UUID][..],
+            &["codex", format!("resume {UUID}").as_str()],
+            &["claude", UUID],
+            &["claude", "--model", UUID],
+            &["codex", "--resume", UUID],
+        ] {
+            assert_eq!(agent_of(argv).unwrap().id, None, "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn agent_run_edge_the_nil_uuid_is_no_id() {
+        let nil = "00000000-0000-0000-0000-000000000000";
+        assert_eq!(agent_of(&["codex", "resume", nil]).unwrap().id, None);
+        assert_eq!(agent_of(&["claude", "--resume", nil]).unwrap().id, None);
+    }
+
+    #[test]
+    fn agent_run_edge_inline_resume_and_session_flags_name_the_id() {
+        let id = |argv: &[&str]| agent_of(argv).unwrap().id;
+        assert_eq!(id(&["claude", format!("--resume={UUID}").as_str()]).as_deref(), Some(UUID));
+        assert_eq!(id(&["claude", format!("--session-id={UUID}").as_str()]).as_deref(), Some(UUID));
+        assert_eq!(id(&["copilot", format!("--resume={UUID}").as_str()]).as_deref(), Some(UUID));
+    }
+
+    #[test]
+    fn agent_run_edge_flags_never_hold_prompts_settings_or_session_flags() {
+        let run = agent_of(&[
+            "claude",
+            "--settings",
+            "/tmp/x.json",
+            "--settings=/tmp/y.json",
+            "-p",
+            "say hi",
+            "--print",
+            "--continue",
+            "--fork-session",
+            "--output-format",
+            "json",
+            "--resume",
+            UUID,
+            "$(rm -rf ~)",
+            "a\nb",
+        ])
+        .unwrap();
+        assert!(run.flags.is_empty(), "{:?}", run.flags);
+        assert_eq!(run.id.as_deref(), Some(UUID));
+        // Past both caps (33 tokens, a 4097 byte value): still nothing kept, nothing panics.
+        let mut argv = vec!["codex".to_string()];
+        argv.extend(std::iter::repeat_n("--yolo".to_string(), 40));
+        argv.extend(["--model".to_string(), "x".repeat(4097)]);
+        let mut t = terminal();
+        let now = Some(Foreground { pid: 20, name: "x".into(), argv, cwd: "/".into() });
+        note_agent(&mut t, now.as_ref(), false);
+        let run = t.agent.unwrap();
+        assert!(run.flags.len() <= 32 && run.flags.iter().all(|f| f.len() <= 4096 + 16), "{:?}", run.flags.len());
+    }
+
+    #[test]
+    fn agent_run_edge_started_ms_resets_only_when_the_agent_changes() {
+        let mut t = terminal();
+        note_agent(&mut t, with_argv(&["codex"]).as_ref(), false);
+        t.agent.as_mut().unwrap().started_ms = 7;
+        // The same agent with a new id: changed, but it started when it started.
+        assert!(note_agent(&mut t, with_argv(&["codex", "resume", UUID]).as_ref(), false));
+        assert_eq!(t.agent.as_ref().unwrap().started_ms, 7);
+        assert_eq!(t.agent.as_ref().unwrap().id.as_deref(), Some(UUID));
+        // A child in front, then the agent again: still the same start.
+        assert!(!note_agent(&mut t, with_argv(&["git", "log"]).as_ref(), false));
+        assert!(!note_agent(&mut t, with_argv(&["codex", "resume", UUID]).as_ref(), false));
+        assert_eq!(t.agent.as_ref().unwrap().started_ms, 7);
+        // Another agent: a new start.
+        assert!(note_agent(&mut t, with_argv(&["claude"]).as_ref(), false));
+        let run = t.agent.clone().unwrap();
+        assert_eq!(run.agent, "claude");
+        assert_ne!(run.started_ms, 7);
+        assert_eq!(run.id, None, "the old agent's id is not carried over");
+        // At the shell with nothing recorded: no change, no save.
+        let mut t = terminal();
+        assert!(!note_agent(&mut t, with_argv(&["bash"]).as_ref(), true));
+        assert!(!note_agent(&mut t, None, true));
     }
 
     fn core_with_viewer() -> (Arc<Core>, u32, Arc<crate::wire::Conn>, u32, std::path::PathBuf) {

@@ -408,3 +408,124 @@ fn keep_off_on_a_lost_terminal_reports_it_finished() {
     assert_eq!(r["state"], "finished", "{r}");
     assert_eq!(r["reason"], "holder_lost");
 }
+
+const SESSION: &str = "123e4567-e89b-42d3-a456-426614174000";
+
+/// A fake `codex` on PATH that logs its arguments and runs until `quit` appears.
+fn fake_codex(s: &mut Session) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = s.root.join("fake-bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = s.root.join("codex.log");
+    let script = format!(
+        "#!/bin/sh\necho \"$@\" >> {}\nwhile [ ! -e {} ]; do sleep 0.05; done\n",
+        log.display(),
+        s.root.join("quit").display()
+    );
+    std::fs::write(dir.join("codex"), script).unwrap();
+    std::fs::set_permissions(dir.join("codex"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    s.env.push(("PATH".into(), format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default())));
+    s.env.push(("SHELL".into(), "/bin/sh".into()));
+    s.env.push(("H0X_CORE_FOREGROUND_MS".into(), "30".into()));
+    log
+}
+
+fn runs(log: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(log).map(|l| l.lines().map(str::to_string).collect()).unwrap_or_default()
+}
+
+fn agent_recorded(s: &Session) -> bool {
+    let raw = std::fs::read_to_string(s.root.join("state/h0x-core/test/terminals.json")).unwrap_or_default();
+    let state: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+    state["terminals"]["1"]["agent"]["agent"] == "codex"
+}
+
+/// Runs the fake codex in a kept shell, loses the holder, and returns how its runs are logged
+/// once the replacement shell has had time to take a typed line.
+fn lose_holder_with_codex(label_off: bool, exits_first: bool) -> Vec<String> {
+    let mut s = Session::new();
+    let log = fake_codex(&mut s);
+    let t = run(&s, &["--keep"]);
+    if label_off {
+        s.json(&["label", &t, "h0x.resume=off"]);
+    }
+    s.json(&["send", &t, &format!("codex resume {SESSION} --not-kept 'a prompt'")]);
+    wait_until("codex runs", || runs(&log).len() == 1 && agent_recorded(&s));
+    if exits_first {
+        std::fs::write(s.root.join("quit"), "").unwrap();
+        wait_until("shell has it back", || !agent_recorded(&s));
+    }
+    let old = get(&s, &t)["pid"].as_i64().unwrap();
+    let holder = s.json(&["server", "status"])["holder"]["pid"].as_i64().unwrap();
+    unsafe {
+        libc::kill(holder as i32, libc::SIGKILL);
+    }
+    wait_until("replacement shell", || {
+        let r = get(&s, &t);
+        r["state"] == "live" && r["pid"].as_i64().is_some_and(|p| p != old)
+    });
+    // The line is typed once the new shell's prompt has been quiet for 0.8 s.
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+    std::fs::write(s.root.join("quit"), "").unwrap();
+    runs(&log)
+}
+
+#[test]
+fn a_lost_agent_is_resumed_in_the_replacement_shell() {
+    let runs = lose_holder_with_codex(false, false);
+    assert_eq!(runs.len(), 2, "{runs:?}");
+    assert_eq!(runs[1], format!("resume {SESSION}"), "only the resume words are typed, never the prompt");
+}
+
+#[test]
+fn resume_off_leaves_a_plain_shell() {
+    assert_eq!(lose_holder_with_codex(true, false).len(), 1);
+}
+
+#[test]
+fn an_agent_that_exited_is_not_resumed() {
+    assert_eq!(lose_holder_with_codex(false, true).len(), 1);
+}
+
+fn agents_recorded(s: &Session) -> usize {
+    let raw = std::fs::read_to_string(s.root.join("state/h0x-core/test/terminals.json")).unwrap_or_default();
+    let state: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+    state["terminals"].as_object().map_or(0, |ts| ts.values().filter(|t| t["agent"]["agent"] == "codex").count())
+}
+
+#[test]
+fn auto_resume_edge_two_terminals_with_the_same_newest_session_resume_it_once() {
+    let mut s = Session::new();
+    let log = fake_codex(&mut s);
+    let dir = s.root.join("work");
+    std::fs::create_dir(&dir).unwrap();
+    let dir = std::fs::canonicalize(&dir).unwrap();
+    let ts: Vec<String> = (0..2).map(|_| run(&s, &["--keep"])).collect();
+    for t in &ts {
+        s.json(&["send", t, &format!("cd {} && codex", dir.display())]);
+    }
+    wait_until("both run codex without an id", || runs(&log).len() == 2 && agents_recorded(&s) == 2);
+    // One codex session in that folder, used after both started: the newest for each.
+    let meta = serde_json::json!({"timestamp": "2026-11-05T10:00:00.000Z", "type": "session_meta",
+        "payload": {"id": SESSION, "cwd": dir.display().to_string()}});
+    let rollout = s.root.join(".codex/sessions/2026/11/05");
+    std::fs::create_dir_all(&rollout).unwrap();
+    std::fs::write(rollout.join(format!("rollout-2026-11-05T10-00-00-{SESSION}.jsonl")), format!("{meta}\n")).unwrap();
+    let old: Vec<i64> = ts.iter().map(|t| get(&s, t)["pid"].as_i64().unwrap()).collect();
+    let holder = s.json(&["server", "status"])["holder"]["pid"].as_i64().unwrap();
+    unsafe {
+        libc::kill(holder as i32, libc::SIGKILL);
+    }
+    wait_until("both replacement shells", || {
+        ts.iter().zip(&old).all(|(t, old)| {
+            let r = get(&s, t);
+            r["state"] == "live" && r["pid"].as_i64().is_some_and(|p| p != *old)
+        })
+    });
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+    std::fs::write(s.root.join("quit"), "").unwrap();
+    let runs = runs(&log);
+    let resumed = runs.iter().filter(|r| **r == format!("resume {SESSION}")).count();
+    assert_eq!(resumed, 1, "one session is resumed in one terminal only: {runs:?}");
+    assert_eq!(runs.len(), 3, "{runs:?}");
+}
