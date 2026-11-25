@@ -1,6 +1,38 @@
 {
   "components": {
     "schemas": {
+      "AgentRun": {
+        "description": "An agent program seen in front of a terminal: never a prompt, only what a resume keeps.",
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "flags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "id": {
+            "description": "Its session id, when its command line named one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "started_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "agent",
+          "flags",
+          "started_ms"
+        ],
+        "type": "object"
+      },
       "AttachResult": {
         "properties": {
           "automatic_input": {
