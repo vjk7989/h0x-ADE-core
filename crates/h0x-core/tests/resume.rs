@@ -72,7 +72,9 @@ fn lose(launch: &str, label: Option<&str>, shell: Option<&str>) -> Vec<String> {
 fn a_lost_claude_resumes_its_session_with_its_kept_flags_and_no_prompt() {
     let runs = lose(&format!("claude --session-id {ID} --model x 'secret prompt'"), None, None);
     assert_eq!(runs.len(), 2, "{runs:?}");
-    assert_eq!(runs[1], format!("--resume {ID}"), "{runs:?}");
+    // The shim adds exactly its `--settings` (a vouched terminal, no settings of the person's), then only the resume words.
+    let settings = h0x_core::shim::claude_settings(true);
+    assert_eq!(runs[1], format!("--settings {settings} --resume {ID}"), "{runs:?}");
 }
 
 #[test]

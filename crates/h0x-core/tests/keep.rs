@@ -470,11 +470,18 @@ fn lose_holder_with_codex(label_off: bool, exits_first: bool) -> Vec<String> {
     runs(&log)
 }
 
+/// What the fake codex logs for a resume: the shim's own `-c notify=<json>` pair (the core's program,
+/// `hook session --agent codex`; a vouched terminal gets it when the person has no `notify`), then exactly the resume words.
+fn shimmed_resume() -> String {
+    let notify = serde_json::json!([BIN, "hook", "session", "--agent", "codex"]);
+    format!("-c notify={notify} resume {SESSION}")
+}
+
 #[test]
 fn a_lost_agent_is_resumed_in_the_replacement_shell() {
     let runs = lose_holder_with_codex(false, false);
     assert_eq!(runs.len(), 2, "{runs:?}");
-    assert_eq!(runs[1], format!("resume {SESSION}"), "only the resume words are typed, never the prompt");
+    assert_eq!(runs[1], shimmed_resume(), "only the resume words are typed, never the prompt");
 }
 
 #[test]
@@ -525,7 +532,7 @@ fn auto_resume_edge_two_terminals_with_the_same_newest_session_resume_it_once() 
     std::thread::sleep(std::time::Duration::from_millis(3000));
     std::fs::write(s.root.join("quit"), "").unwrap();
     let runs = runs(&log);
-    let resumed = runs.iter().filter(|r| **r == format!("resume {SESSION}")).count();
+    let resumed = runs.iter().filter(|r| **r == shimmed_resume()).count();
     assert_eq!(resumed, 1, "one session is resumed in one terminal only: {runs:?}");
     assert_eq!(runs.len(), 3, "{runs:?}");
 }
