@@ -595,7 +595,8 @@ pub fn make_executable(_: &Path) -> io::Result<()> {
 }
 
 /// The files of a release, as they sit beside h0x-core.exe.
-const RELEASE: [&str; 3] = ["h0x-core.exe", r"conpty\conpty.dll", r"conpty\x64\OpenConsole.exe"];
+const RELEASE: [&str; 4] =
+    ["h0x-core.exe", r"conpty\conpty.dll", r"conpty\x64\OpenConsole.exe", r"h0x-core-tools\h0x-wt.exe"];
 
 /// Puts the release whose h0x-core.exe is `from` where `dest`'s folder
 /// is. Windows won't overwrite a running file but will rename one: every
@@ -612,7 +613,7 @@ pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::R
         )
         .open(dir.join(".update.lock"))
     })?;
-    for leftover in [dir.to_path_buf(), dir.join("conpty"), dir.join(r"conpty\x64")]
+    for leftover in [dir.to_path_buf(), dir.join("conpty"), dir.join(r"conpty\x64"), dir.join("h0x-core-tools")]
         .iter()
         .filter_map(|d| std::fs::read_dir(d).ok())
         .flatten()
@@ -628,7 +629,7 @@ pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::R
                     && hex.bytes().all(|b| b.is_ascii_hexdigit())
             })
         };
-        let ours = ["h0x-core.exe", "conpty.dll", "openconsole.exe"]
+        let ours = ["h0x-core.exe", "conpty.dll", "openconsole.exe", "h0x-wt.exe"]
             .iter()
             .flat_map(|f| ["old", "new", "failed"].map(|w| format!("{f}.{w}-")))
             .any(|prefix| name.strip_prefix(&prefix).is_some_and(tagged));
@@ -639,40 +640,46 @@ pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::R
     let tag = format!("{}-{}", std::process::id(), crate::platform::random_hex());
     let aside = |p: &Path, what: &str| PathBuf::from(format!("{}.{what}-{tag}", p.display()));
 
-    // (staged, final) pairs, all staged before anything moves.
-    let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
-    let stage = || -> io::Result<Vec<(PathBuf, PathBuf)>> {
-        let mut done = Vec::new();
+    // (staged, final) pairs, all staged before anything moves. No staged file: the release has no
+    // h0x-wt, so the installed one is moved away.
+    let mut staged: Vec<(Option<PathBuf>, PathBuf)> = Vec::new();
+    let regular = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_file());
+    let stage = |done: &mut Vec<(Option<PathBuf>, PathBuf)>| -> io::Result<()> {
         for rel in RELEASE {
             let (from, to) = (src.join(rel), dir.join(rel));
-            if !from.is_file() {
+            if !regular(&from) {
+                if rel == RELEASE[3] && std::fs::symlink_metadata(&to).is_ok() {
+                    done.push((None, to));
+                }
                 continue; // a bare exe (an app's own build): its ConPTY stays
             }
             std::fs::create_dir_all(to.parent().unwrap())?;
             std::fs::copy(&from, aside(&to, "new"))?;
-            done.push((aside(&to, "new"), to));
+            done.push((Some(aside(&to, "new")), to));
         }
-        Ok(done)
+        Ok(())
     };
     let result = (|| {
-        staged = stage()?;
-        if !staged.first().is_some_and(|(s, _)| works(s)) {
+        stage(&mut staged)?;
+        if !staged.first().and_then(|(s, _)| s.as_deref()).is_some_and(works) {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
         Ok(())
     })();
-    let cleanup = |staged: &[(PathBuf, PathBuf)]| staged.iter().for_each(|(s, _)| drop(std::fs::remove_file(s)));
+    let cleanup = |staged: &[(Option<PathBuf>, PathBuf)]| {
+        staged.iter().filter_map(|(s, _)| s.as_ref()).for_each(|s| drop(std::fs::remove_file(s)))
+    };
     if let Err(e) = result {
         cleanup(&staged);
         return Err(e);
     }
 
     // (final, moved-aside old) for each file swapped so far.
-    let mut swapped: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+    let mut swapped: Vec<(PathBuf, Option<PathBuf>, bool)> = Vec::new();
     for (new, to) in &staged {
-        let old = to.exists().then(|| aside(to, "old"));
+        let old = std::fs::symlink_metadata(to).is_ok().then(|| aside(to, "old"));
         let step = old.as_ref().map_or(Ok(()), |old| retry(|| std::fs::rename(to, old))).and_then(|_| {
-            retry(|| std::fs::rename(new, to)).inspect_err(|_| {
+            new.as_ref().map_or(Ok(()), |new| retry(|| std::fs::rename(new, to))).inspect_err(|_| {
                 if let Some(old) = &old {
                     let _ = retry(|| std::fs::rename(old, to));
                 }
@@ -683,8 +690,8 @@ pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::R
             // scanner may be reading the file we just moved in). What can't
             // go back is said, and its old copy kept out of cleanup's reach.
             let mut stuck = Vec::new();
-            for (to, old) in swapped.iter().rev() {
-                let moved = retry(|| std::fs::rename(to, aside(to, "failed")));
+            for (to, old, placed) in swapped.iter().rev() {
+                let moved = if *placed { retry(|| std::fs::rename(to, aside(to, "failed"))) } else { Ok(()) };
                 if let Some(old) = old
                     && (moved.is_err() || retry(|| std::fs::rename(old, to)).is_err())
                 {
@@ -699,7 +706,7 @@ pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::R
             }
             return Err(e);
         }
-        swapped.push((to.clone(), old));
+        swapped.push((to.clone(), old, new.is_some()));
     }
     Ok(())
 }

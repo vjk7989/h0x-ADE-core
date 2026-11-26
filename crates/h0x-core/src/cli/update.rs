@@ -150,15 +150,16 @@ pub(super) fn rolled_back_body(message: &str) -> Value {
     json!({"rolled_back": true, "error": message})
 }
 
-/// Replaces `previous_dir` with a copy of the live release: the h0x-core and, on Windows, its ConPTY files.
+/// Replaces `previous_dir` with a copy of the live release: the h0x-core, `h0x-core-tools/h0x-wt` and, on Windows, its ConPTY files.
 fn keep_previous(dest: &std::path::Path) -> std::io::Result<()> {
     let (dir, src) = (previous_dir(dest), dest.parent().unwrap_or(dest));
     clear_previous(&dir)?;
     let exe = dest.file_name().unwrap_or_default();
     let conpty = ["conpty/conpty.dll", "conpty/x64/OpenConsole.exe"].into_iter().filter(|_| cfg!(windows));
-    for rel in std::iter::once(std::path::Path::new(exe)).chain(conpty.map(std::path::Path::new)) {
+    let tool = if cfg!(windows) { "h0x-core-tools/h0x-wt.exe" } else { "h0x-core-tools/h0x-wt" };
+    for rel in std::iter::once(std::path::Path::new(exe)).chain(conpty.chain([tool]).map(std::path::Path::new)) {
         let from = src.join(rel);
-        if from.is_file() {
+        if std::fs::symlink_metadata(&from).is_ok_and(|m| m.file_type().is_file()) {
             let to = dir.join(rel);
             std::fs::create_dir_all(to.parent().unwrap_or(&dir))?;
             std::fs::copy(&from, &to)?;
@@ -168,7 +169,7 @@ fn keep_previous(dest: &std::path::Path) -> std::io::Result<()> {
 }
 
 /// Removes an earlier `previous` folder, but only one that holds nothing except what is put there
-/// (h0x-core / h0x-core.exe and a `conpty` folder): the install folder may be shared (`~/.local/bin`),
+/// (h0x-core / h0x-core.exe, a `conpty` folder and an `h0x-core-tools` folder): the install folder may be shared (`~/.local/bin`),
 /// and a foreign folder named `previous` is left alone with an error.
 fn clear_previous(dir: &std::path::Path) -> std::io::Result<()> {
     let entries = match std::fs::read_dir(dir) {
@@ -176,20 +177,47 @@ fn clear_previous(dir: &std::path::Path) -> std::io::Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e),
     };
+    let refuse = |inside: &std::path::Path, name: &std::ffi::OsStr| {
+        Err(std::io::Error::other(format!(
+            "{} holds {}, which h0x-core did not put there; move or remove that folder",
+            inside.display(),
+            name.to_string_lossy()
+        )))
+    };
     for entry in entries {
         let entry = entry?;
         let name = entry.file_name();
-        let ours = match name.to_str() {
-            Some("h0x-core" | "h0x-core.exe") => entry.file_type()?.is_file(),
-            Some("conpty") => entry.file_type()?.is_dir(),
-            _ => false,
+        // The names h0x-core puts in each folder; anything else, at any depth, is foreign.
+        let (is_dir, inside): (bool, &[&str]) = match name.to_str() {
+            Some("h0x-core" | "h0x-core.exe") => (false, &[]),
+            Some("conpty") => (true, &["conpty.dll", "x64"]),
+            Some("h0x-core-tools") => (true, &["h0x-wt", "h0x-wt.exe"]),
+            _ => return refuse(dir, &name),
         };
-        if !ours {
-            return Err(std::io::Error::other(format!(
-                "{} holds {}, which h0x-core did not put there; move or remove that folder",
-                dir.display(),
-                name.to_string_lossy()
-            )));
+        if entry.file_type()?.is_dir() != is_dir || (!is_dir && !entry.file_type()?.is_file()) {
+            return refuse(dir, &name);
+        }
+        if is_dir {
+            for inner in std::fs::read_dir(entry.path())? {
+                let inner = inner?;
+                let kind = inner.file_type()?;
+                let ours = match inner.file_name().to_str() {
+                    Some("x64") => kind.is_dir() && name == "conpty",
+                    Some(f) if inside.contains(&f) => kind.is_file(),
+                    _ => false,
+                };
+                if !ours {
+                    return refuse(&entry.path(), &inner.file_name());
+                }
+                if kind.is_dir() {
+                    for deep in std::fs::read_dir(inner.path())? {
+                        let deep = deep?;
+                        if deep.file_name() != "OpenConsole.exe" || !deep.file_type()?.is_file() {
+                            return refuse(&inner.path(), &deep.file_name());
+                        }
+                    }
+                }
+            }
         }
     }
     std::fs::remove_dir_all(dir)
@@ -343,6 +371,36 @@ mod tests {
     }
 
     #[test]
+    fn h0x_wt_is_kept_in_previous_with_the_core_and_dropped_when_the_live_release_has_none() {
+        let dir = scratch("tools");
+        let tool = if cfg!(windows) { "h0x-core-tools/h0x-wt.exe" } else { "h0x-core-tools/h0x-wt" };
+        std::fs::create_dir_all(dir.join("h0x-core-tools")).unwrap();
+        std::fs::write(dir.join(tool), "wt 1").unwrap();
+        std::fs::write(dir.join("h0x-core"), "live").unwrap();
+        keep_previous(&dir.join("h0x-core")).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("previous").join(tool)).unwrap(), "wt 1");
+        // The next release was installed from an archive without the folder: nothing stale is kept.
+        std::fs::remove_dir_all(dir.join("h0x-core-tools")).unwrap();
+        keep_previous(&dir.join("h0x-core")).unwrap();
+        assert!(!dir.join("previous/h0x-core-tools").exists());
+        assert!(dir.join("previous/h0x-core").is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_foreign_h0x_core_tools_entry_in_previous_is_refused_like_any_other() {
+        let dir = scratch("tools-foreign");
+        let prev = dir.join("previous");
+        std::fs::create_dir_all(&prev).unwrap();
+        std::fs::write(prev.join("h0x-core-tools"), "a file, not our folder").unwrap();
+        std::fs::write(dir.join("h0x-core"), "live").unwrap();
+        let err = keep_previous(&dir.join("h0x-core")).unwrap_err();
+        assert!(err.to_string().contains("did not put there"), "{err}");
+        assert_eq!(std::fs::read_to_string(prev.join("h0x-core-tools")).unwrap(), "a file, not our folder");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_foreign_previous_folder_is_refused_and_left_alone() {
         for foreign in ["notes.txt", "h0x-core.bak", "other/deep.txt"] {
             let dir = scratch("foreign");
@@ -372,5 +430,191 @@ mod tests {
         assert!(clear_previous(&dir.join("previous")).is_err());
         assert!(dir.join("previous/h0x-core").is_dir());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- edge cases (WT-S1 test writer) ----------------------------------------------------
+
+    const EXE: &str = if cfg!(windows) { "h0x-core.exe" } else { "h0x-core" };
+    const TOOL: &str = if cfg!(windows) { "h0x-core-tools/h0x-wt.exe" } else { "h0x-core-tools/h0x-wt" };
+
+    /// A release folder in `dir`: the core saying `core`, and h0x-wt saying `tool` when given.
+    fn release_in(dir: &Path, core: &str, tool: Option<&str>) -> std::path::PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(EXE), core).unwrap();
+        if let Some(tool) = tool {
+            std::fs::create_dir_all(dir.join("h0x-core-tools")).unwrap();
+            std::fs::write(dir.join(TOOL), tool).unwrap();
+        }
+        dir.join(EXE)
+    }
+
+    /// An update of the install in `live` to `release` as `update` does it: the old release is kept
+    /// in `previous` from inside the check, then swapped. The install's h0x-core.
+    fn update_to(live: &Path, release: &Path) -> std::path::PathBuf {
+        let dest = live.join(EXE);
+        crate::platform::swap_in(release, &dest, |_| keep_previous(&dest).is_ok()).unwrap();
+        dest
+    }
+
+    #[test]
+    fn with_h0x_wt_to_with_h0x_wt_and_back_restores_the_old_h0x_wt() {
+        let root = scratch("wt-both");
+        let live = root.join("live");
+        release_in(&live, "old core", Some("old wt"));
+        let new = release_in(&root.join("new"), "new core", Some("new wt"));
+        let dest = update_to(&live, &new);
+        assert_eq!(std::fs::read_to_string(live.join(TOOL)).unwrap(), "new wt");
+        assert_eq!(std::fs::read_to_string(live.join("previous").join(TOOL)).unwrap(), "old wt");
+        crate::platform::swap_in(&previous_exe(&dest), &dest, |_| true).unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "old core");
+        assert_eq!(
+            std::fs::read_to_string(live.join(TOOL)).unwrap(),
+            "old wt",
+            "the rollback puts the old h0x-wt back"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn without_h0x_wt_to_with_h0x_wt_keeps_none_in_previous_and_a_rollback_leaves_no_stale_h0x_wt() {
+        let root = scratch("wt-none-then-some");
+        let live = root.join("live");
+        release_in(&live, "old core", None);
+        let new = release_in(&root.join("new"), "new core", Some("new wt"));
+        let dest = update_to(&live, &new);
+        assert_eq!(std::fs::read_to_string(live.join(TOOL)).unwrap(), "new wt");
+        assert!(!live.join("previous/h0x-core-tools").exists(), "the old release had no h0x-wt to keep");
+        crate::platform::swap_in(&previous_exe(&dest), &dest, |_| true).unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "old core");
+        // The release rolled back to shipped no h0x-wt: the new one must not stay behind (and keep its shim alive).
+        assert!(!live.join(TOOL).exists(), "a stale h0x-wt survives the rollback to a core without it");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn with_h0x_wt_to_without_keeps_it_in_previous_and_a_rollback_still_has_it() {
+        let root = scratch("wt-some-then-none");
+        let live = root.join("live");
+        release_in(&live, "old core", Some("old wt"));
+        let new = release_in(&root.join("new"), "new core", None);
+        let dest = update_to(&live, &new);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "new core");
+        assert_eq!(std::fs::read_to_string(live.join("previous").join(TOOL)).unwrap(), "old wt");
+        crate::platform::swap_in(&previous_exe(&dest), &dest, |_| true).unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "old core");
+        assert_eq!(std::fs::read_to_string(live.join(TOOL)).unwrap(), "old wt");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_live_h0x_core_tools_that_is_a_file_or_an_h0x_wt_that_is_a_folder_is_not_kept() {
+        let dir = scratch("wt-odd-live");
+        std::fs::write(dir.join(EXE), "live").unwrap();
+        std::fs::write(dir.join("h0x-core-tools"), "a file, not the folder").unwrap();
+        keep_previous(&dir.join(EXE)).unwrap();
+        assert!(dir.join("previous").join(EXE).is_file());
+        assert!(!dir.join("previous/h0x-core-tools").exists());
+
+        std::fs::remove_file(dir.join("h0x-core-tools")).unwrap();
+        std::fs::create_dir_all(dir.join(TOOL)).unwrap(); // a folder named like the tool
+        keep_previous(&dir.join(EXE)).unwrap();
+        assert!(!dir.join("previous").join(TOOL).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_update_into_an_install_whose_h0x_core_tools_is_a_file_fails_and_keeps_the_core() {
+        let root = scratch("wt-tools-file");
+        let live = root.join("live");
+        release_in(&live, "old core", None);
+        std::fs::write(live.join("h0x-core-tools"), "a file, not the folder").unwrap();
+        let new = release_in(&root.join("new"), "new core", Some("new wt"));
+        assert!(crate::platform::swap_in(&new, &live.join(EXE), |_| true).is_err());
+        assert_eq!(std::fs::read_to_string(live.join(EXE)).unwrap(), "old core", "no half update");
+        assert_eq!(std::fs::read_to_string(live.join("h0x-core-tools")).unwrap(), "a file, not the folder");
+        let left: Vec<String> = std::fs::read_dir(&live)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".new"))
+            .collect();
+        assert!(left.is_empty(), "staged copies left behind: {left:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn h0x_wt_is_kept_in_previous_in_a_folder_with_spaces_and_unicode() {
+        let root = scratch("wt-unicode");
+        let live = root.join("Program Files").join("H0X Core \u{00fc}\u{65e5}\u{672c}");
+        release_in(&live, "live", Some("wt"));
+        keep_previous(&live.join(EXE)).unwrap();
+        assert_eq!(std::fs::read_to_string(live.join("previous").join(TOOL)).unwrap(), "wt");
+        keep_previous(&live.join(EXE)).unwrap(); // our own previous/h0x-core-tools is replaced, not refused
+        assert_eq!(std::fs::read_to_string(live.join("previous").join(TOOL)).unwrap(), "wt");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `previous/h0x-core-tools` is a folder, but holds something h0x-core never put there: refused,
+    /// as a foreign entry at the top of `previous` is, and not deleted.
+    #[test]
+    fn a_foreign_file_inside_previous_h0x_core_tools_is_refused_and_left_alone() {
+        let dir = scratch("wt-foreign-inside");
+        let prev = dir.join("previous");
+        std::fs::create_dir_all(prev.join("h0x-core-tools")).unwrap();
+        std::fs::write(prev.join("h0x-core-tools/notes.txt"), "mine").unwrap();
+        std::fs::write(dir.join(EXE), "live").unwrap();
+        assert!(keep_previous(&dir.join(EXE)).is_err(), "a foreign file inside h0x-core-tools is deleted");
+        assert_eq!(std::fs::read_to_string(prev.join("h0x-core-tools/notes.txt")).unwrap(), "mine");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A release whose h0x-wt is a symlink (to anything) is not installed through it: install.sh
+    /// refuses one too.
+    #[cfg(unix)]
+    #[test]
+    fn a_release_whose_h0x_wt_is_a_symlink_does_not_install_it() {
+        let root = scratch("wt-symlink");
+        let live = root.join("live");
+        release_in(&live, "old core", None);
+        let elsewhere = root.join("elsewhere");
+        std::fs::write(&elsewhere, "not the tool").unwrap();
+        let new = release_in(&root.join("new"), "new core", None);
+        std::fs::create_dir_all(root.join("new/h0x-core-tools")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, root.join("new").join(TOOL)).unwrap();
+        crate::platform::swap_in(&new, &live.join(EXE), |_| true).unwrap();
+        assert_eq!(std::fs::read_to_string(live.join(EXE)).unwrap(), "new core");
+        assert!(!live.join(TOOL).exists(), "the symlink's target was installed as h0x-wt");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A running h0x-wt.exe can't be overwritten but can be renamed away: the update still lands.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_a_running_h0x_wt_exe_is_renamed_away_by_the_update() {
+        use std::os::windows::process::CommandExt;
+        let root = scratch("wt-running");
+        let live = root.join("live");
+        release_in(&live, "old core", None);
+        std::fs::create_dir_all(live.join("h0x-core-tools")).unwrap();
+        let cmd = Path::new(&std::env::var("SystemRoot").unwrap()).join("System32").join("cmd.exe");
+        std::fs::copy(cmd, live.join(TOOL)).unwrap();
+        let mut child = std::process::Command::new(live.join(TOOL))
+            .args(["/d", "/q", "/k"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .spawn()
+            .unwrap();
+        let new = release_in(&root.join("new"), "new core", Some("new wt"));
+        let swapped = crate::platform::swap_in(&new, &live.join(EXE), |_| true);
+        let still = child.try_wait().unwrap().is_none();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        swapped.unwrap();
+        assert!(still, "the running h0x-wt was not disturbed");
+        assert_eq!(std::fs::read_to_string(live.join(TOOL)).unwrap(), "new wt");
+        assert_eq!(std::fs::read_to_string(live.join(EXE)).unwrap(), "new core");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -144,6 +144,15 @@ else
   say "h0x-core $version installed into $bin/h0x-core."
 fi
 
+# h0x-wt beside it, when the archive carries it (older archives do not), on an update too:
+# a core from before h0x-wt does not unpack it.
+if [ -f "$tmp/h0x-core-tools/h0x-wt" ] && [ ! -L "$tmp/h0x-core-tools/h0x-wt" ]; then
+  mkdir -p "$bin/h0x-core-tools"
+  cp "$tmp/h0x-core-tools/h0x-wt" "$bin/h0x-core-tools/h0x-wt.new"
+  chmod 755 "$bin/h0x-core-tools/h0x-wt.new"
+  mv -f "$bin/h0x-core-tools/h0x-wt.new" "$bin/h0x-core-tools/h0x-wt"
+fi
+
 case ":$PATH:" in
   *":$bin:"*) ;;
   *) say "Add $bin to your PATH to use h0x-core." ;;
