@@ -118,7 +118,7 @@ fn bot_commands_parse_into_bridge_commands() {
             "/keys t1 Enter ESC ctrl+c up y",
             Ask::Do(Command::Keys { terminal: t("t1"), keys: vec![Key::Enter, Key::Esc, Key::CtrlC, Key::Up, Key::Y] }),
         ),
-        ("/approve t2", Ask::Do(Command::Approve { terminal: t("t2") })),
+        ("/approve t2", Ask::Do(Command::Approve { terminal: t("t2"), prompt_sha256: None })),
         ("/deny t2", Ask::Do(Command::Deny { terminal: t("t2") })),
         ("/interrupt t3", Ask::Do(Command::Interrupt { terminal: t("t3") })),
         ("/kill t3", Ask::Do(Command::Kill { terminal: t("t3") })),

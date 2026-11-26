@@ -225,3 +225,86 @@ fn inside_the_terminal_only_well_formed_input_records_the_session() {
     assert_eq!(codes.lines().count(), 14, "{codes}");
     assert!(codes.lines().all(|c| c == "0"), "{codes}");
 }
+
+#[test]
+fn a_codex_notify_call_records_the_thread_only_inside_the_terminal() {
+    let s = Session::new();
+    let root = s.root.display();
+    let turn = |id: &str| format!(r#"{{"type":"agent-turn-complete","thread-id":"{id}","turn-id":"t","cwd":"/w"}}"#);
+    let body = format!(
+        "printf %s \"$H0X_SCOPE\" > {root}/scope; printf %s \"$H0X_TERMINAL_ID\" > {root}/id; \
+         printf %s \"$H0X_TERMINAL_SOCKET\" > {root}/socket; \
+         {BIN} hook session --agent codex '{}' < /dev/null > {root}/hook.out 2>&1; echo $? > {root}/hook.code; \
+         : > {root}/done; sleep 100",
+        turn(INSIDE)
+    );
+    let t = run(&s, &["sh", "-c", &body]);
+    wait_until("the notify call inside the terminal", || s.root.join("done").exists());
+    let read = |name: &str| std::fs::read_to_string(s.root.join(name)).unwrap();
+    assert_eq!(read("hook.code").trim(), "0");
+    assert_eq!(read("hook.out"), "");
+    assert_eq!(get(&s, &t)["labels"]["h0x.session"], format!("codex:{INSIDE}"));
+    // Copied secrets outside, and events that are not a finished turn, change nothing.
+    let carried =
+        [("H0X_TERMINAL_ID", read("id")), ("H0X_TERMINAL_SOCKET", read("socket")), ("H0X_SCOPE", read("scope"))];
+    let notify = |env: &[(&str, String)], event: &str| {
+        let mut cmd = s.cmd();
+        cmd.args(["hook", "session", "--agent", "codex", event]).envs(env.iter().map(|(k, v)| (*k, v.as_str())));
+        cmd.stdin(Stdio::null()).output().unwrap()
+    };
+    silent_success(&notify(&carried, &turn(OUTSIDE)));
+    silent_success(&notify(&[], &turn(OUTSIDE)));
+    silent_success(&notify(&carried, "not json"));
+    silent_success(&notify(&carried, &format!(r#"{{"type":"approval-requested","thread-id":"{OUTSIDE}"}}"#)));
+    assert_eq!(get(&s, &t)["labels"]["h0x.session"], format!("codex:{INSIDE}"), "nothing replaced it");
+}
+
+/// Inside a vouched terminal, a Codex notify call records only a finished turn whose thread id is a
+/// canonical UUID; every other event, shape or argument form is a silent exit 0 that sets nothing.
+/// A notify call never reads stdin: a SessionStart event piped in beside it is ignored.
+#[test]
+fn notify_edge_inside_the_terminal_only_a_finished_turn_with_a_uuid_records() {
+    let s = Session::new();
+    let (a, b) = ("aaaaaaaa-0000-4000-8000-00000000000a", "bbbbbbbb-0000-4000-8000-00000000000b");
+    let turn = |id: &str| format!(r#"{{"type":"agent-turn-complete","thread-id":"{id}","turn-id":"t"}}"#);
+    let file = |name: &str, text: String| std::fs::write(s.root.join(name), text).unwrap();
+    file("no_id", r#"{"type":"agent-turn-complete","turn-id":"t"}"#.into());
+    file("short", turn("1234"));
+    file("braced", turn(&format!("{{{a}}}")));
+    file("upper", turn(&a.to_uppercase()));
+    file("nil", turn("00000000-0000-0000-0000-000000000000"));
+    file("other", format!(r#"{{"type":"approval-requested","thread-id":"{a}"}}"#));
+    file("garbage", "\u{1}{{not json".into());
+    file("valid_a", turn(a));
+    file("valid_b", turn(b));
+    file("start_a", event(a));
+    let root = s.root.display();
+    let body = script(
+        &s,
+        &format!(
+            "cd {root}; h(){{ {BIN} hook session \"$@\" < /dev/null >> hook.out 2>&1; echo $? >> codes; }}; \
+             h --agent codex \"$(cat no_id)\"; h --agent codex \"$(cat short)\"; h --agent codex \"$(cat braced)\"; \
+             h --agent codex \"$(cat upper)\"; h --agent codex \"$(cat nil)\"; h --agent codex \"$(cat other)\"; \
+             h --agent codex \"$(cat garbage)\"; h --agent codex ''; \
+             h --agent codex \"$(cat valid_a)\" extra; h --agent Codex \"$(cat valid_a)\"; \
+             h --agent claude \"$(cat valid_a)\"; \
+             : > step1; w go1; \
+             {BIN} hook session --agent codex \"$(cat valid_b)\" < start_a >> hook.out 2>&1; echo $? >> codes; \
+             : > done; sleep 100"
+        ),
+    );
+    let t = run(&s, &["sh", "-c", &body]);
+    let read = |name: &str| std::fs::read_to_string(s.root.join(name)).unwrap();
+    let label = || get(&s, &t)["labels"].get("h0x.session").cloned();
+
+    wait_until("the bad notify calls", || s.root.join("step1").exists());
+    assert_eq!(label(), None, "no id, short, braced, upper-case, nil, another event, garbage, empty, bad forms");
+    touch(&s, "go1");
+    wait_until("the good notify call", || s.root.join("done").exists());
+    assert_eq!(label(), Some(format!("codex:{b}").into()), "the argument decides; stdin is never read");
+
+    assert_eq!(read("hook.out"), "", "a hook prints nothing");
+    let codes = read("codes");
+    assert_eq!(codes.lines().count(), 12, "{codes}");
+    assert!(codes.lines().all(|c| c == "0"), "{codes}");
+}

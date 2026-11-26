@@ -4,4 +4,6 @@ Copyright 2026 PAVii
 This product includes software developed by the herdr project
 (https://github.com/herdrdev/herdr-core), licensed under the Apache License, Version 2.0.
 It includes libghostty-vt from Ghostty (https://github.com/ghostty-org/ghostty), MIT License.
+HyperOx Worktrees (h0x-wt) is a modified copy of worktrunk (https://github.com/max-sixty/worktrunk),
+Copyright (c) 2025 Maximilian Roos, MIT OR Apache-2.0, used under the MIT license; its changes are listed in h0x-wt/PATCHES.md.
 See LICENSE and the third-party notices shipped with this distribution.

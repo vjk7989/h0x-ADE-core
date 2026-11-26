@@ -460,4 +460,53 @@ mod tests {
         }
         assert!(line(&reg, 9999, &[]).is_none(), "no such terminal");
     }
+
+    /// The closed-store agents: no store is read, so only a hook-reported or explicit id resumes them.
+    fn closed() -> [(&'static str, &'static str, [&'static str; 2]); 5] {
+        let cursor = if cfg!(windows) { "cursor-agent.cmd" } else { "cursor-agent" };
+        [
+            ("cursor", cursor, ["--resume", "id_1"]),
+            ("droid", "droid", ["--resume", "id_1"]),
+            ("devin", "devin", ["--resume", "id_1"]),
+            ("agy", "agy", ["--conversation", "id_1"]),
+            ("grok", "grok", ["--resume", "id_1"]),
+        ]
+    }
+
+    #[test]
+    fn closed_store_agents_resume_from_the_hook_reported_id_of_their_own_terminal() {
+        for (agent, command, words) in closed() {
+            let mut reg = Registry::default();
+            let id = nowhere(&mut reg, agent, None);
+            assert!(line(&reg, id, &[]).is_none(), "{agent}: no id, no store: a plain shell");
+            let labels = &mut reg.terminals.get_mut(&id).unwrap().labels;
+            labels.insert("h0x.session".into(), format!("{agent}:id_1"));
+            let want = format!("'{command}' '{}' '{}'", words[0], words[1]);
+            assert_eq!(line(&reg, id, &[]).unwrap(), ("id_1".to_string(), want), "{agent}");
+            // Another agent's label, or an id of the wrong shape, resumes nothing.
+            let labels = &mut reg.terminals.get_mut(&id).unwrap().labels;
+            labels.insert("h0x.session".into(), "claude:id_1".into());
+            assert!(line(&reg, id, &[]).is_none(), "{agent}: another agent's label");
+            reg.terminals.get_mut(&id).unwrap().labels.insert("h0x.session".into(), format!("{agent}:--evil"));
+            assert!(line(&reg, id, &[]).is_none(), "{agent}: an id of the wrong shape");
+        }
+    }
+
+    #[test]
+    fn closed_store_agents_prefer_an_explicit_resume_id_in_the_launch_over_the_label() {
+        for (agent, command, words) in closed() {
+            let mut reg = Registry::default();
+            let program = if agent == "cursor" { "cursor-agent" } else { agent };
+            let argv = [program, words[0], "explicit_2", "a prompt"].map(String::from);
+            let run = crate::sessions::detect(&argv, 5).unwrap();
+            assert_eq!(run.id.as_deref(), Some("explicit_2"), "{agent}");
+            let id = nowhere(&mut reg, agent, None);
+            let t = reg.terminals.get_mut(&id).unwrap();
+            t.agent = Some(run);
+            t.labels.insert("h0x.session".into(), format!("{agent}:id_1"));
+            let (session, typed) = line(&reg, id, &[]).unwrap();
+            assert_eq!(session, "explicit_2", "{agent}");
+            assert_eq!(typed, format!("'{command}' '{}' 'explicit_2'", words[0]), "{agent}");
+        }
+    }
 }

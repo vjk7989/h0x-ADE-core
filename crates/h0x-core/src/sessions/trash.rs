@@ -15,7 +15,7 @@ pub fn trash(agent: &str, id: &str, roots: &Roots) -> Result<Vec<PathBuf>, RpcEr
         "claude" => &roots.claude,
         "codex" => &roots.codex,
         "opencode" => &roots.opencode,
-        _ => return Err(unsupported(format!("h0x-core does not read {agent}'s sessions"))),
+        _ => return Err(RpcError::invalid_params(format!("h0x-core cannot move {agent}'s sessions to the trash"))),
     };
     let found = match root {
         // Where the store's trash is decided before the store is read.

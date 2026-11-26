@@ -222,8 +222,8 @@ fn quiet_on_broken_pipe() {
 
 pub fn main() -> i32 {
     let mut argv = std::env::args_os();
-    if argv.next().is_some_and(|a| crate::shim::is_claude(&a)) {
-        return crate::shim::run(argv.collect());
+    if let Some(name) = argv.next().and_then(|a| crate::shim::program(&a)) {
+        return crate::shim::run(name, argv.collect());
     }
     let daemon = crate::platform::daemon_startup();
     client::remember_exe();

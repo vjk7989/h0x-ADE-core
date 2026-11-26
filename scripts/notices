@@ -16,7 +16,8 @@ jq -r '.packages[] | select(.source != null) | "\(.name) \(.version)\t\(.license
         uucode-unicode:"uucode Unicode data (Unicode-3.0)" uucode-utf8:"uucode UTF-8 decoder (MIT)" \
         musl:"musl 1.2.5, statically linked on Linux (MIT and BSD)" rust:"Rust 1.95.0 standard library and compiler runtime" \
         sqlite:"SQLite, in libsqlite3-sys (public domain)" \
-        noble:"noble crypto libraries, in the web panel script noble.js (MIT)"; do
+        noble:"noble crypto libraries, in the web panel script noble.js (MIT)" \
+        worktrunk:"HyperOx Worktrees, from worktrunk (MIT OR Apache-2.0)"; do
         printf '\n==== %s\n\n' "${part#*:}"
         cat "distribution/notices/${part%%:*}.txt"
     done

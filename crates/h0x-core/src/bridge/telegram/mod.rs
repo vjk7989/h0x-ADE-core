@@ -145,7 +145,7 @@ fn parse(text: &str) -> Option<Ask> {
                 _ => Ask::Usage("/keys <t> <keys...>: enter esc ctrl+c up down left right y n"),
             }
         }
-        "approve" => one("/approve <t>", |terminal| Command::Approve { terminal }),
+        "approve" => one("/approve <t>", |terminal| Command::Approve { terminal, prompt_sha256: None }),
         "deny" => one("/deny <t>", |terminal| Command::Deny { terminal }),
         "interrupt" => one("/interrupt <t>", |terminal| Command::Interrupt { terminal }),
         "kill" => one("/kill <t>", |terminal| Command::Kill { terminal }),
@@ -620,7 +620,7 @@ impl Frontend {
                 }
                 return out;
             }
-            "a" => Command::Approve { terminal },
+            "a" => Command::Approve { terminal, prompt_sha256: None },
             "d" => Command::Deny { terminal },
             "i" => Command::Interrupt { terminal },
             "s" => Command::Read { terminal, lines: 20 },

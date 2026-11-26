@@ -1,8 +1,9 @@
-//! `claude` typed by hand inside a HyperOx terminal (ADR-129). Each core keeps a private
-//! folder (`Paths::bin_dir`, marked by `.h0x-shim`) with `claude` pointing at this program and
-//! puts it first on PATH for its own terminals only. Started under that name, the program
-//! finds the real `claude` further down PATH and runs it, adding HyperOx's `--settings` when the
-//! core vouches for the terminal and the person gave none. Anywhere else it runs Claude unchanged.
+//! `claude` and `codex` typed by hand inside a HyperOx terminal (ADR-129). Each core keeps a
+//! private folder (`Paths::bin_dir`, marked by `.h0x-shim`) with both names pointing at this
+//! program and puts it first on PATH for its own terminals only. Started under one of them, the
+//! program finds the real one further down PATH and runs it, adding HyperOx's `--settings` to
+//! Claude, or a `notify` program to Codex, when the core vouches for the terminal and the person
+//! gave none. Anywhere else it runs the agent unchanged.
 
 use crate::paths::Paths;
 use serde_json::json;
@@ -37,11 +38,47 @@ pub fn has_settings<S: AsRef<OsStr>>(args: &[S]) -> bool {
         .any(|a| a == b"--settings" || a.starts_with(b"--settings="))
 }
 
+/// The programs this one stands in for.
+const SHIMS: [&str; 2] = ["claude", "codex"];
+
+fn is_named(argv0: &OsStr, name: &str) -> bool {
+    Path::new(argv0).file_stem().is_some_and(|s| if cfg!(windows) { s.eq_ignore_ascii_case(name) } else { s == name })
+}
+
 /// Whether this process was started as `claude` (its folder's shim link).
 pub fn is_claude(argv0: &OsStr) -> bool {
-    Path::new(argv0)
-        .file_stem()
-        .is_some_and(|s| if cfg!(windows) { s.eq_ignore_ascii_case("claude") } else { s == "claude" })
+    is_named(argv0, "claude")
+}
+
+/// The program this process was started as, when it is one of the shims.
+pub fn program(argv0: &OsStr) -> Option<&'static str> {
+    SHIMS.into_iter().find(|name| is_named(argv0, name))
+}
+
+/// Codex `-c` flags that make it run `h0x-core hook session --agent codex '<event>'` after each
+/// turn, so the thread id reaches the terminal's label. None when the person has their own
+/// `notify` (in `config.toml` of `codex_home`, or on the command line) or when the config cannot
+/// be read: theirs is never replaced or shadowed.
+fn codex_notify(args: &[OsString], codex_home: Option<&Path>, exe: Option<&OsStr>) -> Vec<OsString> {
+    let (Some(home), Some(exe)) = (codex_home, exe.and_then(OsStr::to_str)) else { return Vec::new() };
+    let given = |a: &str| a.trim_start().starts_with("notify");
+    let mut words = args.iter().map(|a| a.to_string_lossy()).take_while(|a| a != "--");
+    while let Some(word) = words.next() {
+        let own = match &*word {
+            "-c" | "--config" => words.next().is_some_and(|v| given(&v)),
+            _ => word.strip_prefix("--config=").or_else(|| word.strip_prefix("-c")).is_some_and(given),
+        };
+        if own {
+            return Vec::new();
+        }
+    }
+    match std::fs::read_to_string(home.join("config.toml")) {
+        Ok(text) if text.parse::<toml::Table>().is_ok_and(|t| !t.contains_key("notify")) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        _ => return Vec::new(),
+    }
+    let command = json!([exe, "hook", "session", "--agent", "codex"]);
+    vec![OsString::from("-c"), format!("notify={command}").into()]
 }
 
 /// How many shims run above this one (set for the child only; Claude's own children inherit it, so
@@ -73,53 +110,59 @@ fn is_self(p: &Path) -> bool {
     }
 }
 
-/// The real `claude`: the first one on `path` outside every shim folder, and not this program.
-fn find_real(path: &OsStr) -> Option<PathBuf> {
+/// The real `name`: the first one on `path` outside every shim folder, and not this program.
+fn find_real(path: &OsStr, name: &str) -> Option<PathBuf> {
     let dirs = std::env::split_paths(path).filter(|d| !d.as_os_str().is_empty() && !d.join(MARKER).exists());
     #[cfg(windows)]
     {
         let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
-        dirs.filter_map(|d| crate::platform::resolve("claude", &d.to_string_lossy(), &exts)).find(|p| !is_self(p))
+        dirs.filter_map(|d| crate::platform::resolve(name, &d.to_string_lossy(), &exts)).find(|p| !is_self(p))
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        dirs.map(|d| d.join("claude")).find(|p| {
+        dirs.map(|d| d.join(name)).find(|p| {
             std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0) && !is_self(p)
         })
     }
 }
 
-/// Shim mode: run the real `claude` with `args`; returns the exit code (unix: only on failure).
-pub fn run(mut args: Vec<OsString>) -> i32 {
+/// Shim mode: run the real `name` (`claude` or `codex`) with `args`; returns the exit code (unix: only on failure).
+pub fn run(name: &str, mut args: Vec<OsString>) -> i32 {
     let Some(depth) = next_depth(std::env::var_os(DEPTH_VAR).as_deref()) else {
-        eprintln!("claude resolves back to HyperOx");
+        eprintln!("{name} resolves back to HyperOx");
         return 127;
     };
-    let Some(real) = find_real(&std::env::var_os("PATH").unwrap_or_default()) else {
-        eprintln!("claude not found on PATH");
+    let Some(real) = find_real(&std::env::var_os("PATH").unwrap_or_default(), name) else {
+        eprintln!("{name} not found on PATH");
         return 127;
     };
-    if crate::client::vouched() && !has_settings(&args) {
-        let token_saver = std::env::var_os("H0X_TOKEN_SAVER").is_none_or(|v| v != "0");
-        args.splice(0..0, [OsString::from("--settings"), claude_settings(token_saver).into()]);
+    if crate::client::vouched() {
+        if name == "claude" && !has_settings(&args) {
+            let token_saver = std::env::var_os("H0X_TOKEN_SAVER").is_none_or(|v| v != "0");
+            args.splice(0..0, [OsString::from("--settings"), claude_settings(token_saver).into()]);
+        } else if name == "codex" {
+            let home = crate::sessions::Roots::from_env().codex;
+            let flags = codex_notify(&args, home.as_deref(), std::env::var_os("H0X_CORE_EXE").as_deref());
+            args.splice(0..0, flags);
+        }
     }
     let mut cmd = std::process::Command::new(&real);
     cmd.args(&args).env(DEPTH_VAR, depth.to_string());
-    launch(&real, cmd)
+    launch(name, &real, cmd)
 }
 
 #[cfg(unix)]
-fn launch(real: &Path, mut cmd: std::process::Command) -> i32 {
+fn launch(name: &str, real: &Path, mut cmd: std::process::Command) -> i32 {
     use std::os::unix::process::CommandExt;
     let err = cmd.exec();
-    eprintln!("claude: {}: {err}", real.display());
+    eprintln!("{name}: {}: {err}", real.display());
     126
 }
 
 /// The child shares our console: Ctrl+C reaches it, and only its end ends the shim.
 #[cfg(windows)]
-fn launch(real: &Path, mut cmd: std::process::Command) -> i32 {
+fn launch(name: &str, real: &Path, mut cmd: std::process::Command) -> i32 {
     use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
     unsafe extern "system" fn ignore(kind: u32) -> windows_sys::core::BOOL {
         i32::from(kind <= 1) // Ctrl+C and Ctrl+Break only
@@ -128,7 +171,7 @@ fn launch(real: &Path, mut cmd: std::process::Command) -> i32 {
     match cmd.status() {
         Ok(status) => status.code().unwrap_or(1),
         Err(e) => {
-            eprintln!("claude: {}: {e}", real.display());
+            eprintln!("{name}: {}: {e}", real.display());
             1
         }
     }
@@ -152,8 +195,8 @@ pub fn prepend_path(env: &mut BTreeMap<String, String>, bin: &Path) {
     }
 }
 
-/// Create or refresh this core's shim folder: the marker and `claude` pointing at the running
-/// program. Unix: a symlink, swapped atomically. Windows: a hardlink `claude.exe` (a copy across
+/// Create or refresh this core's shim folder: the marker and `claude` and `codex` pointing at the
+/// running program. Unix: a symlink, swapped atomically. Windows: a hardlink `claude.exe` (a copy across
 /// volumes); a shim that is still running can't be replaced but can be renamed away, and the
 /// renamed ones are removed here at the next start.
 pub fn ensure(paths: &Paths) -> io::Result<()> {
@@ -164,29 +207,29 @@ pub fn ensure(paths: &Paths) -> io::Result<()> {
         std::fs::write(marker, b"")?;
     }
     let exe = crate::client::own_exe().ok_or_else(|| io::Error::other("no path for this program"))?;
-    link(&bin, &exe)
+    SHIMS.into_iter().try_for_each(|name| link(&bin, &exe, name))
 }
 
 #[cfg(unix)]
-fn link(bin: &Path, exe: &Path) -> io::Result<()> {
-    let shim = bin.join("claude");
+fn link(bin: &Path, exe: &Path, name: &str) -> io::Result<()> {
+    let shim = bin.join(name);
     if std::fs::read_link(&shim).is_ok_and(|t| t == exe) {
         return Ok(());
     }
-    let tmp = bin.join(".claude.tmp");
+    let tmp = bin.join(format!(".{name}.tmp"));
     let _ = std::fs::remove_file(&tmp);
     std::os::unix::fs::symlink(exe, &tmp)?;
     std::fs::rename(tmp, shim)
 }
 
 #[cfg(windows)]
-fn link(bin: &Path, exe: &Path) -> io::Result<()> {
+fn link(bin: &Path, exe: &Path, name: &str) -> io::Result<()> {
     for old in std::fs::read_dir(bin)?.flatten() {
-        if old.file_name().to_string_lossy().starts_with("claude.exe.old-") {
+        if old.file_name().to_string_lossy().starts_with(&format!("{name}.exe.old-")) {
             let _ = std::fs::remove_file(old.path()); // fails while it still runs: next start
         }
     }
-    let shim = bin.join("claude.exe");
+    let shim = bin.join(format!("{name}.exe"));
     let same = |a: &std::fs::Metadata, b: &std::fs::Metadata| {
         crate::platform::file_identity(a) == crate::platform::file_identity(b)
             || (a.len() == b.len() && a.modified().ok() == b.modified().ok()) // a copy of the same build
@@ -196,7 +239,7 @@ fn link(bin: &Path, exe: &Path) -> io::Result<()> {
             return Ok(());
         }
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-        let old = bin.join(format!("claude.exe.old-{}-{nanos}", std::process::id()));
+        let old = bin.join(format!("{name}.exe.old-{}-{nanos}", std::process::id()));
         std::fs::rename(&shim, &old)?; // a running exe can be renamed, not deleted
         let _ = std::fs::remove_file(old);
     }
@@ -206,6 +249,14 @@ fn link(bin: &Path, exe: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn find_real(path: &OsStr) -> Option<PathBuf> {
+        super::find_real(path, "claude")
+    }
+
+    fn link(bin: &Path, exe: &Path) -> io::Result<()> {
+        super::link(bin, exe, "claude")
+    }
 
     #[test]
     fn settings_have_the_session_hooks_and_the_gate_only_with_token_saver() {
@@ -250,6 +301,180 @@ mod tests {
     const SEP: &str = if cfg!(windows) { ";" } else { ":" };
 
     /// A fresh folder under the temp dir (the gate points TEMP at the workspace cache).
+    fn os(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    fn home_with(config: Option<&str>) -> PathBuf {
+        let home = std::env::temp_dir().join(format!("h0x-shim-codex-{}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&home).unwrap();
+        if let Some(config) = config {
+            std::fs::write(home.join("config.toml"), config).unwrap();
+        }
+        home
+    }
+
+    #[test]
+    fn a_codex_without_its_own_notify_gets_the_hook_as_a_config_flag() {
+        let exe = OsString::from(r"/a b/h0x-core");
+        for config in [None, Some(""), Some("model = \"o3\"\n[tui]\nnotify = [\"x\"]\n")] {
+            let home = home_with(config);
+            let flags = codex_notify(&os(&["exec", "hi"]), Some(&home), Some(&exe));
+            assert_eq!(
+                flags,
+                os(&["-c", r#"notify=["/a b/h0x-core","hook","session","--agent","codex"]"#]),
+                "{config:?}"
+            );
+            let _ = std::fs::remove_dir_all(home);
+        }
+    }
+
+    #[test]
+    fn a_notify_of_the_persons_own_is_never_replaced() {
+        let exe = OsString::from("/x/h0x-core");
+        let home = home_with(Some("notify = [\"/usr/bin/mine\"]\n"));
+        assert!(codex_notify(&os(&[]), Some(&home), Some(&exe)).is_empty(), "in the config");
+        let none = home_with(None);
+        for given in [
+            os(&["-c", "notify=[\"x\"]"]),
+            os(&["--config", " notify=[]"]),
+            os(&["--config=notify=[]"]),
+            os(&["-cnotify=[]", "hi"]),
+            os(&["hi", "-c", "notify=[]"]),
+        ] {
+            assert!(codex_notify(&given, Some(&none), Some(&exe)).is_empty(), "{given:?}");
+        }
+        // Not theirs: another setting, after `--`, or a prompt that mentions it.
+        for other in [os(&["-c", "model=o3"]), os(&["--", "-c", "notify=[]"]), os(&["notify"])] {
+            assert_eq!(codex_notify(&other, Some(&none), Some(&exe)).len(), 2, "{other:?}");
+        }
+        let _ = std::fs::remove_dir_all(home);
+        let _ = std::fs::remove_dir_all(none);
+    }
+
+    #[test]
+    fn an_unreadable_config_or_no_home_or_no_program_adds_nothing() {
+        let exe = OsString::from("/x/h0x-core");
+        let broken = home_with(Some("this is [not toml"));
+        assert!(codex_notify(&os(&[]), Some(&broken), Some(&exe)).is_empty());
+        // A folder where the file goes: an error other than "missing".
+        let folder = home_with(None);
+        std::fs::create_dir(folder.join("config.toml")).unwrap();
+        assert!(codex_notify(&os(&[]), Some(&folder), Some(&exe)).is_empty());
+        let fine = home_with(None);
+        assert!(codex_notify(&os(&[]), None, Some(&exe)).is_empty());
+        assert!(codex_notify(&os(&[]), Some(&fine), None).is_empty());
+        for home in [broken, folder, fine] {
+            let _ = std::fs::remove_dir_all(home);
+        }
+    }
+
+    #[test]
+    fn codex_edge_notify_in_the_config_counts_only_as_a_top_level_key_or_table() {
+        let exe = OsString::from("/x/h0x-core");
+        let theirs = [
+            "notify = [\"/usr/bin/mine\"]\n",
+            "notify = []\n",
+            "\"notify\" = [\"x\"]\n",
+            "[notify]\nprogram = \"x\"\n",
+            "notify.program = \"x\"\n",
+            "model = \"o3\"\r\nnotify = [\"x\"]\r\n",
+            "\u{feff}notify = [\"x\"]\n",
+        ];
+        for config in theirs {
+            let home = home_with(Some(config));
+            assert!(codex_notify(&os(&["hi"]), Some(&home), Some(&exe)).is_empty(), "theirs: {config:?}");
+            let _ = std::fs::remove_dir_all(home);
+        }
+        let ours = [
+            "# notify = [\"/usr/bin/mine\"]\n",
+            "   # notify = []\nmodel = \"o3\"\n",
+            "model = \"notify\"\n",
+            "[profiles.fast]\nmodel = \"o3\"\n",
+            "[tui]\nnotifications = true\n",
+            "notifyx = 1\n",
+        ];
+        for config in ours {
+            let home = home_with(Some(config));
+            assert_eq!(codex_notify(&os(&["hi"]), Some(&home), Some(&exe)).len(), 2, "not theirs: {config:?}");
+            let _ = std::fs::remove_dir_all(home);
+        }
+    }
+
+    #[test]
+    fn codex_edge_notify_on_the_command_line_in_every_spelling_is_theirs() {
+        let exe = OsString::from("/x/h0x-core");
+        let none = home_with(None);
+        for given in [
+            os(&["-c", "notify=[]"]),
+            os(&["-c", "notify = [\"x\"]"]),
+            os(&["--config", "notify=[]"]),
+            os(&["--config=notify=[]"]),
+            os(&["--config= notify=[]"]),
+            os(&["-cnotify=[]"]),
+            os(&["-c", "notify.program=\"x\""]),
+            os(&["exec", "--json", "-c", "notify=[]", "prompt"]),
+            os(&["-c", "model=o3", "--config", "notify=[]"]),
+        ] {
+            assert!(codex_notify(&given, Some(&none), Some(&exe)).is_empty(), "{given:?}");
+        }
+        for not_theirs in [
+            os(&["-c", "tui.notifications=true"]),
+            os(&["--config", "model=notify"]),
+            os(&["notify=[]"]),
+            os(&["--notify=[]"]),
+            os(&["exec", "--", "--config", "notify=[]"]),
+            os(&[]),
+        ] {
+            assert_eq!(codex_notify(&not_theirs, Some(&none), Some(&exe)).len(), 2, "{not_theirs:?}");
+        }
+        let _ = std::fs::remove_dir_all(none);
+    }
+
+    #[test]
+    fn codex_edge_the_notify_flag_is_valid_toml_for_a_windows_path() {
+        let none = home_with(None);
+        for path in [r"C:\Program Files\HyperOx\h0x-core.exe", r#"C:\Users\Zoë "q"\h0x-core.exe"#, "/a b/h0x-core"] {
+            let flags = codex_notify(&os(&["hi"]), Some(&none), Some(OsStr::new(path)));
+            assert_eq!(flags.len(), 2, "{path}");
+            assert_eq!(flags[0], "-c");
+            let table: toml::Table = flags[1].to_str().unwrap().parse().unwrap();
+            let want: Vec<toml::Value> =
+                [path, "hook", "session", "--agent", "codex"].into_iter().map(toml::Value::from).collect();
+            assert_eq!(table["notify"].as_array().unwrap(), &want, "{path}");
+        }
+        let _ = std::fs::remove_dir_all(none);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn codex_edge_a_program_path_that_is_not_utf8_adds_nothing() {
+        use std::os::unix::ffi::OsStrExt;
+        let none = home_with(None);
+        let exe = OsStr::from_bytes(b"/x/\xff/h0x-core");
+        assert!(codex_notify(&os(&["hi"]), Some(&none), Some(exe)).is_empty());
+        let _ = std::fs::remove_dir_all(none);
+    }
+
+    #[test]
+    fn the_shim_names_are_claude_and_codex_only() {
+        assert_eq!(program(OsStr::new("/a/codex")), Some("codex"));
+        assert_eq!(program(OsStr::new("claude")), Some("claude"));
+        for no in ["", "h0x-core", "codex-x", "codexx", "xcodex", "codex.exe.old-1"] {
+            assert_eq!(program(OsStr::new(no)), None, "{no:?}");
+        }
+    }
+
+    #[test]
+    fn ensure_links_codex_beside_claude() {
+        let state = scratch("ensure-codex");
+        ensure(&paths(&state)).unwrap();
+        let bin = state.join("bin");
+        assert!(bin.join(if cfg!(windows) { "codex.exe" } else { "codex" }).exists());
+        assert!(bin.join(if cfg!(windows) { "claude.exe" } else { "claude" }).exists());
+        let _ = std::fs::remove_dir_all(state);
+    }
+
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("h0x-shim-{name}-{}", crate::platform::random_hex()));
         std::fs::create_dir_all(&dir).unwrap();
