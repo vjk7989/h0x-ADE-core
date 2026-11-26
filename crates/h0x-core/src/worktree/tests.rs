@@ -1046,4 +1046,45 @@ mod live_edges {
         // The API promises the branch goes with the worktree after a merge.
         assert!(m.removed.branch_deleted && !sc.has_branch(&main, "feat/d"), "{m:?}");
     }
+
+    /// A home reached through a symlink (macOS /var -> /private/var): create reports the real path
+    /// list reports, and merge and remove accept either spelling.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_parent_is_the_same_worktree_by_either_spelling() {
+        let Some(sc) = scratch("link") else { return };
+        let main = sc.repo("proj");
+        let real_home = sc.root.join("real-home");
+        std::fs::create_dir_all(&real_home).unwrap();
+        let link = sc.root.join("link-home");
+        std::os::unix::fs::symlink(&real_home, &link).unwrap();
+
+        let x = create(&link, &s(&main), "feat/x", None).unwrap();
+        let listed = list(&s(&main)).unwrap();
+        assert!(listed.worktrees.iter().any(|w| w.path == x.path), "{} not in {:?}", x.path, listed.worktrees);
+        assert!(x.path.starts_with(&s(&real_home)), "{}", x.path);
+        // The same folder through the symlink.
+        let via_link = x.path.replacen(&s(&real_home), &s(&link), 1);
+        assert_ne!(via_link, x.path);
+        sc.commit(Path::new(&x.path), "x.txt", "x\n");
+        let m = merge(&via_link, None, true).unwrap();
+        assert!(m.merged && !Path::new(&x.path).exists(), "{m:?}");
+
+        let y = create(&link, &s(&main), "feat/y", None).unwrap();
+        let r = remove(&y.path.replacen(&s(&real_home), &s(&link), 1), false).unwrap();
+        assert_eq!(r.path, y.path);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn same_path_follows_symlinks() {
+    let root = std::env::temp_dir().join(format!("h0x-core-same-{}", crate::platform::random_hex()));
+    std::fs::create_dir_all(root.join("real/sub")).unwrap();
+    std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+    let (a, b) = (root.join("real/sub").display().to_string(), root.join("link/sub").display().to_string());
+    assert!(same_path(&a, &b) && same_path(&b, &a));
+    assert!(!same_path(&root.join("link").display().to_string(), &a), "a parent is not the subfolder");
+    assert_eq!(real(&b), real(&a));
+    let _ = std::fs::remove_dir_all(&root);
 }

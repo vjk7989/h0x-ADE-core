@@ -418,7 +418,19 @@ fn slashes(path: &str) -> String {
     path.replace('\\', "/")
 }
 
+/// The real spelling of an existing path (symlinks resolved, as git reports it; no verbatim prefix
+/// on Windows); the path as given when it is not there.
+fn real(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map_or_else(|_| slashes(path), |p| slashes(p.to_string_lossy().trim_start_matches(r"\\?\")))
+}
+
+/// The same folder, however spelled: by text, or by where the symlinks lead.
 fn same_path(a: &str, b: &str) -> bool {
+    same_text(a, b) || same_text(&real(a), &real(b))
+}
+
+fn same_text(a: &str, b: &str) -> bool {
     let norm = |s: &str| slashes(s.trim_start_matches(r"\\?\")).trim_end_matches('/').to_string();
     let (a, b) = (norm(a), norm(b));
     if cfg!(windows) { a.eq_ignore_ascii_case(&b) } else { a == b }
@@ -473,7 +485,7 @@ struct Switched {
 
 fn parse_switch(json: &str) -> Result<Created, Error> {
     let s: Switched = serde_json::from_str(json).map_err(|e| unexpected("switch", e))?;
-    let path = slashes(&s.path);
+    let path = real(&s.path); // as list spells it: git reports real paths
     // `existing` or `already_at`: the branch already has a worktree, which is not ours to hand out again.
     if s.action != "created" {
         return Err(Error::CheckedOut(path));
