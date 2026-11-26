@@ -345,7 +345,7 @@ mod tests {
             &["node", "--inspect"],
             &["vim", "codex"],
             &["cursor", "."],
-            &["gemini"],
+            &["amp"],
         ] {
             assert!(!note_agent(&mut t, with_argv(argv).as_ref(), true), "{argv:?}");
             assert!(t.agent.is_none());

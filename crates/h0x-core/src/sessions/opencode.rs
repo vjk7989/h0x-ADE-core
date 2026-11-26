@@ -25,7 +25,7 @@ pub(super) fn root(env: Env) -> Option<PathBuf> {
 }
 
 pub(super) fn list(data: &Path, want: &str) -> Vec<SessionInfo> {
-    let mut found = from_db(&data.join("opencode.db"), want);
+    let mut found = from_db(&data.join("opencode.db"), want, "opencode");
     let storage = data.join("storage").join("session");
     let older = dirs(&storage).flat_map(|project| files(&project, "json")).filter_map(|p| read(&p, want));
     for s in older {
@@ -36,13 +36,13 @@ pub(super) fn list(data: &Path, want: &str) -> Vec<SessionInfo> {
     found
 }
 
-/// The database's sessions in the folder; none when it is missing, locked or unreadable.
-fn from_db(db: &Path, want: &str) -> Vec<SessionInfo> {
+/// The database's sessions in the folder, as `agent`'s (a fork keeps the same table); none when it is missing, locked or unreadable.
+pub(super) fn from_db(db: &Path, want: &str, agent: &str) -> Vec<SessionInfo> {
     // A real file in the store, never a link out of it.
     if !std::fs::symlink_metadata(db).is_ok_and(|m| m.is_file()) {
         return Vec::new();
     }
-    query(db, want).unwrap_or_else(|e| {
+    query(db, want, agent).unwrap_or_else(|e| {
         skipped(db, e);
         Vec::new()
     })
@@ -54,15 +54,31 @@ pub(super) fn in_db(db: &Path, id: &str) -> bool {
         && connect(db).and_then(|conn| conn.query_row("SELECT 1 FROM session WHERE id = ?1", [id], |_| Ok(()))).is_ok()
 }
 
-fn connect(db: &Path) -> rusqlite::Result<Connection> {
-    // Read-only, never created: OpenCode's database is its own.
+pub(super) fn connect(db: &Path) -> rusqlite::Result<Connection> {
+    // Read-only, never created: OpenCode's database is its own. A WAL-mode database
+    // with no `-wal` file has no writer: `immutable` then keeps SQLite from creating
+    // `-wal`/`-shm`. Any other database is read normally, so a writer's lock is honoured.
+    let mut wal = db.as_os_str().to_owned();
+    wal.push("-wal");
+    let idle_wal = wal_mode(db) && std::fs::symlink_metadata(&wal).is_err();
+    let query = if idle_wal { "mode=ro&immutable=1" } else { "mode=ro" };
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = Connection::open_with_flags(uri(db), flags)?;
+    let conn = Connection::open_with_flags(uri(db, query), flags)?;
     conn.busy_timeout(BUSY)?;
     Ok(conn)
 }
 
-fn query(db: &Path, want: &str) -> rusqlite::Result<Vec<SessionInfo>> {
+/// Whether the file's SQLite header says WAL mode (write and read versions 2).
+fn wal_mode(db: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 20];
+    std::fs::File::open(db).and_then(|mut f| f.read_exact(&mut head)).is_ok()
+        && head.starts_with(b"SQLite format 3\0")
+        && head[18] == 2
+        && head[19] == 2
+}
+
+fn query(db: &Path, want: &str, agent: &str) -> rusqlite::Result<Vec<SessionInfo>> {
     let conn = connect(db)?;
     // Paths are stored as OpenCode got them: compare folders here, by our rules.
     let mut folders = conn.prepare(&format!("SELECT DISTINCT directory FROM session WHERE {ROOT}"))?;
@@ -79,7 +95,7 @@ fn query(db: &Path, want: &str) -> rusqlite::Result<Vec<SessionInfo>> {
     for folder in &folders {
         let sessions = rows.query_map([folder], |row| {
             Ok(SessionInfo {
-                agent: "opencode".into(),
+                agent: agent.into(),
                 id: row.get(0)?,
                 title: row.get::<_, Option<String>>(1)?.as_deref().and_then(title),
                 last_used: row.get::<_, Option<i64>>(2)?.map_or(0, |ms| ms.max(0) as u64),
@@ -92,7 +108,7 @@ fn query(db: &Path, want: &str) -> rusqlite::Result<Vec<SessionInfo>> {
 }
 
 /// The database as an SQLite URI (`file:///C:/x/opencode.db` on Windows), so `mode=ro` holds.
-fn uri(db: &Path) -> String {
+fn uri(db: &Path, query: &str) -> String {
     let path = db.display().to_string().replace('\\', "/");
     let mut out = String::from("file://");
     if !path.starts_with('/') {
@@ -104,7 +120,7 @@ fn uri(db: &Path) -> String {
             _ => out.push(c),
         }
     }
-    out + "?mode=ro"
+    format!("{out}?{query}")
 }
 
 fn read(path: &Path, want: &str) -> Option<SessionInfo> {
