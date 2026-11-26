@@ -27,7 +27,10 @@ struct Rig {
 impl Rig {
     fn new(name: &str) -> Rig {
         let base = if cfg!(unix) { PathBuf::from("/var/tmp") } else { PathBuf::from(env!("CARGO_TARGET_TMPDIR")) };
-        let root = base.join(format!("h0x-shim-{}-{name}", std::process::id()));
+        // Unique per rig: tests share a process, and a rig starts by clearing its folder.
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root = base.join(format!("h0x-shim-{}-{n}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (shim_dir, bait, real) = (root.join("shim"), root.join("bait"), root.join("real dir"));
         for dir in [&shim_dir, &bait, &real] {
@@ -603,4 +606,103 @@ fn the_first_program_of_a_terminal_is_vouched_at_once() {
     s.env.push(("PATH".into(), rig.path()));
     let t = common::run(&s, &[rig.shim.to_str().unwrap(), "x"]);
     common::wait_until("the settings reach the fake claude", || common::text(&s, &t).contains("[--settings]"));
+}
+
+/// `codex` typed inside a terminal: the notify hook goes first as one `-c`, and only when the person
+/// has no `notify` of their own in `$CODEX_HOME/config.toml` or on the command line; outside a
+/// terminal nothing is added. `CODEX_HOME` is a scratch folder, never `~/.codex`.
+#[cfg(unix)]
+#[test]
+fn codex_edge_inside_a_terminal_the_notify_hook_is_added_only_without_the_persons_own() {
+    let rig = Rig::new("codex-notify");
+    let codex = rig.root.join("shim").join("codex");
+    std::os::unix::fs::symlink(BIN, &codex).unwrap();
+    write_fake(&rig.root.join("bait").join("codex"), "#!/bin/sh\necho BAIT\n");
+    write_fake(&rig.real.join("codex"), "#!/bin/sh\nfor a; do printf '[%s]\n' \"$a\"; done\nexit ${FAKE_EXIT:-0}\n");
+    let home = rig.root.join("codex home");
+    std::fs::create_dir_all(&home).unwrap();
+    let config = home.join("config.toml");
+    let path = rig.path();
+    let s = common::Session::new();
+    let inside = |args: &[&str]| {
+        let env = [("PATH", path.as_str()), ("CODEX_HOME", home.to_str().unwrap()), ("FAKE_EXIT", "0")];
+        let out = common::in_terminal_as(&s, codex.to_str().unwrap(), args, b"", None, &env);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        lines(&out)
+    };
+
+    let got = inside(&["exec", "hi there"]);
+    assert_eq!(got.len(), 4, "{got:?}");
+    assert_eq!(got[0], "[-c]");
+    let value = got[1].strip_prefix('[').and_then(|v| v.strip_suffix(']')).unwrap();
+    let table: toml::Table = value.parse().unwrap_or_else(|e| panic!("{value}: {e}"));
+    let notify = table["notify"].as_array().unwrap();
+    assert_eq!(notify.len(), 5, "{notify:?}");
+    assert!(notify[0].as_str().is_some_and(|exe| !exe.is_empty()), "{notify:?}");
+    assert_eq!(notify[1..], ["hook", "session", "--agent", "codex"].map(toml::Value::from));
+    assert_eq!(got[2..], ["[exec]", "[hi there]"]);
+    assert!(!config.exists(), "the config is only read, never written");
+
+    // A commented-out notify is not theirs.
+    std::fs::write(&config, "# notify = [\"/usr/bin/mine\"]\n").unwrap();
+    assert_eq!(inside(&["x"]).len(), 3);
+    // Theirs, as a key or a table: passed through untouched, and the file is unchanged.
+    for own in ["notify = [\"/usr/bin/mine\"]\n", "[notify]\nprogram = \"mine\"\n"] {
+        std::fs::write(&config, own).unwrap();
+        assert_eq!(inside(&["x"]), ["[x]"], "{own:?}");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), own);
+    }
+    // A config that does not parse: theirs may be in it, so nothing is added.
+    std::fs::write(&config, "notify = [").unwrap();
+    assert_eq!(inside(&["x"]), ["[x]"]);
+    std::fs::remove_file(&config).unwrap();
+    let owns: [&[&str]; 3] = [&["-c", "notify=[]", "x"], &["--config", "notify=[]"], &["--config=notify=[]"]];
+    for own in owns {
+        let want: Vec<String> = own.iter().map(|a| format!("[{a}]")).collect();
+        assert_eq!(inside(own), want, "{own:?}");
+    }
+
+    // Outside a terminal: unchanged, even with no config at all.
+    let out = Command::new(&codex)
+        .args(["exec", "hi"])
+        .env("PATH", &path)
+        .env("CODEX_HOME", &home)
+        .env_remove("H0X_TERMINAL_ID")
+        .env_remove("H0X_TERMINAL_SOCKET")
+        .env_remove("H0X_SCOPE")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(lines(&out), ["[exec]", "[hi]"]);
+}
+
+/// With no real `codex` on PATH the shim names codex, not claude, and exits 127.
+#[test]
+fn codex_edge_a_missing_real_codex_exits_127_naming_codex() {
+    let rig = Rig::new("codex-none");
+    #[cfg(unix)]
+    let codex = {
+        let codex = rig.root.join("shim").join("codex");
+        std::os::unix::fs::symlink(BIN, &codex).unwrap();
+        codex
+    };
+    #[cfg(windows)]
+    let codex = {
+        let codex = rig.root.join("shim").join("codex.exe");
+        std::fs::copy(BIN, &codex).unwrap();
+        codex
+    };
+    let only_shims = format!("{}{SEP}{}", rig.root.join("shim").display(), rig.root.join("bait").display());
+    let out = Command::new(&codex)
+        .arg("x")
+        .env("PATH", &only_shims)
+        .env_remove("H0X_TERMINAL_ID")
+        .env_remove("H0X_TERMINAL_SOCKET")
+        .env_remove("H0X_SCOPE")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(127));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("codex not found on PATH"), "{err}");
+    assert!(out.stdout.is_empty());
 }

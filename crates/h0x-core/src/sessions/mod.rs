@@ -52,7 +52,29 @@ pub struct Roots {
     /// `$XDG_DATA_HOME/Trash`, else `~/.local/share/Trash`: the freedesktop
     /// home trash `session.trash` uses on Linux and the BSDs.
     pub trash: Option<PathBuf>,
+    /// The other agents of the resume table that have a store, each at its own root.
+    others: Vec<(&'static str, PathBuf)>,
 }
+
+/// The agents `Roots` finds beside the three it names.
+const OTHERS: [&str; 16] = [
+    "copilot",
+    "cursor",
+    "devin",
+    "droid",
+    "hermes",
+    "qodercli",
+    "qwen",
+    "grok",
+    "kimi",
+    "pi",
+    "kilo",
+    "omp",
+    "mastracode",
+    "agy",
+    "letta",
+    "gemini",
+];
 
 impl Roots {
     pub fn from_env() -> Roots {
@@ -66,6 +88,7 @@ impl Roots {
             codex: codex::root(env),
             opencode: opencode::root(env),
             trash: data_home(env).map(|d| d.join("Trash")),
+            others: OTHERS.into_iter().filter_map(|name| Some((name, (agent(name)?.root)(env)?))).collect(),
         }
     }
 }
@@ -147,6 +170,11 @@ pub fn list(folder: &str, roots: &Roots) -> Vec<SessionInfo> {
     }
     if let Some(root) = &roots.opencode {
         all.extend(opencode::list(root, &want));
+    }
+    for (name, root) in &roots.others {
+        if let Some(found) = agent(name) {
+            all.extend((found.list)(root, &want));
+        }
     }
     all.sort_by(|a, b| b.last_used.cmp(&a.last_used).then_with(|| (&a.agent, &a.id).cmp(&(&b.agent, &b.id))));
     all

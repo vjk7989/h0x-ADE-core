@@ -407,7 +407,13 @@ fn command(data: &Value) -> Result<Command, String> {
             let keys = names.iter().map(|k| k.as_str().and_then(Key::parse).ok_or(format!("unknown key {k}")));
             Command::Keys { terminal: terminal()?, keys: keys.collect::<Result<_, _>>()? }
         }
-        "approve" => Command::Approve { terminal: terminal()? },
+        "approve" => {
+            let prompt_sha256 = match data.get("prompt_sha256") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(v.as_str().ok_or("prompt_sha256 must be a string")?.to_string()),
+            };
+            Command::Approve { terminal: terminal()?, prompt_sha256 }
+        }
         "deny" => Command::Deny { terminal: terminal()? },
         "interrupt" => Command::Interrupt { terminal: terminal()? },
         "kill" => Command::Kill { terminal: terminal()? },

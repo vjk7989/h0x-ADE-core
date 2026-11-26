@@ -21,13 +21,18 @@ pub(super) fn root(env: Env) -> Option<PathBuf> {
 }
 
 pub(super) fn list(root: &Path, want: &str) -> Vec<SessionInfo> {
+    list_as("claude", root, want)
+}
+
+/// The sessions of `agent`, which keeps its store as Claude does (qodercli): only Claude's titles are read.
+pub(super) fn list_as(agent: &'static str, root: &Path, want: &str) -> Vec<SessionInfo> {
     let projects = root.join("projects");
     let name = encode(want);
     let windows = windows(want);
     dirs(&projects)
         .filter(|dir| dir.file_name().and_then(|n| n.to_str()).is_some_and(|n| named(n, &name, windows)))
         .flat_map(|dir| files(&dir, "jsonl"))
-        .filter_map(|path| read(&path, want))
+        .filter_map(|path| read(agent, &path, want))
         .collect()
 }
 
@@ -53,7 +58,7 @@ fn named(dir: &str, name: &str, windows: bool) -> bool {
     dir.as_bytes().get(MAX_NAME) == Some(&b'-') && dir.get(..MAX_NAME).is_some_and(|cut| same(cut, &name[..MAX_NAME]))
 }
 
-fn read(path: &Path, want: &str) -> Option<SessionInfo> {
+fn read(agent: &'static str, path: &Path, want: &str) -> Option<SessionInfo> {
     let id = path.file_stem()?.to_str()?;
     // An older subagent's side chain, not a session.
     if id.starts_with("agent-") {
@@ -72,11 +77,15 @@ fn read(path: &Path, want: &str) -> Option<SessionInfo> {
     if lines.iter().find_map(|l| l["cwd"].as_str()).is_some_and(|cwd| normal(cwd) != want) {
         return None;
     }
-    let title = TITLES.iter().find_map(|(kind, key)| {
-        lines.iter().rev().filter(|l| l["type"] == *kind).find_map(|l| l[*key].as_str().and_then(title))
-    });
+    let title = (agent == "claude")
+        .then(|| {
+            TITLES.iter().find_map(|(kind, key)| {
+                lines.iter().rev().filter(|l| l["type"] == *kind).find_map(|l| l[*key].as_str().and_then(title))
+            })
+        })
+        .flatten();
     Some(SessionInfo {
-        agent: "claude".into(),
+        agent: agent.into(),
         id: id.into(),
         title,
         last_used: modified_ms(&meta),

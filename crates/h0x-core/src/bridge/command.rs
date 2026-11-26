@@ -88,9 +88,13 @@ pub enum Command {
         terminal: String,
         keys: Vec<Key>,
     },
-    /// Answer the prompt a terminal is blocked on: yes.
+    /// Answer the prompt a terminal is blocked on: yes. `prompt_sha256` is the lowercase hex
+    /// SHA-256 of the prompt text this core listed for it (`Session::msg`): when given and the
+    /// prompt has changed since, nothing is pressed. A client that sends none gets the old
+    /// behaviour: the keys go to whatever prompt is up when the command runs.
     Approve {
         terminal: String,
+        prompt_sha256: Option<String>,
     },
     /// Answer it: no.
     Deny {
@@ -122,7 +126,7 @@ impl Command {
             Command::Read { terminal, .. }
             | Command::Send { terminal, .. }
             | Command::Keys { terminal, .. }
-            | Command::Approve { terminal }
+            | Command::Approve { terminal, .. }
             | Command::Deny { terminal }
             | Command::Interrupt { terminal }
             | Command::Kill { terminal } => Some(terminal),
@@ -270,6 +274,25 @@ fn answerable(t: &Value, address: &str) -> Result<(), RpcError> {
             _ => "a request of unknown kind",
         };
         return Err(failed(format!("{address} is blocked on {asks}: answer it in the terminal, not from here")));
+    }
+    Ok(())
+}
+
+/// Refuses an approve whose `expected` hash (lowercase hex SHA-256) is not that of the prompt
+/// text the terminal shows now: the text a client was shown (`Session::msg`, redacted).
+fn check_prompt(expected: &str, t: &Value, address: &str) -> Result<(), RpcError> {
+    use sha2::{Digest, Sha256};
+    if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Err(RpcError::invalid_params("prompt_sha256 must be 64 lower-case hex digits"));
+    }
+    let shown = redact(t["status"]["msg"].as_str().unwrap_or_default());
+    let now: String = Sha256::digest(shown.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+    if now != expected {
+        return Err(RpcError::new(
+            "prompt_changed",
+            format!("prompt_changed: the prompt in {address} is not the one you saw; nothing was pressed"),
+            "list the sessions again",
+        ));
     }
     Ok(())
 }
@@ -515,6 +538,9 @@ fn plan(
         }
         Command::Approve { .. } | Command::Deny { .. } => {
             let yes = matches!(command, Command::Approve { .. });
+            if let Command::Approve { prompt_sha256: Some(expected), .. } = command {
+                check_prompt(expected, &t, &address)?;
+            }
             let state = t["status"]["state"].as_str().unwrap_or("no status");
             if reports && state != "blocked" {
                 return Err(failed(format!("{address} is not waiting on you (it is {state})")));
@@ -872,7 +898,7 @@ mod tests {
         for t in ["t4", "t6"] {
             let send = f.send(Command::Send { terminal: t.into(), text: "ls".into() }, T);
             assert!(matches!(send, Reply::NeedsConfirm { .. }), "{t}");
-            let approve = f.send(Command::Approve { terminal: t.into() }, T);
+            let approve = f.send(Command::Approve { terminal: t.into(), prompt_sha256: None }, T);
             assert!(matches!(approve, Reply::NeedsConfirm { .. }), "{t}");
             assert!(f.acted().is_empty(), "{t}");
             assert!(matches!(f.send(Command::Confirm { token: token(&approve) }, T), Reply::Done(_)));
@@ -884,7 +910,11 @@ mod tests {
     fn answer_with(f: &mut Fixture, from: &Sender, terminal: &str, kind: Value, yes: bool) -> Reply {
         *f.kind.borrow_mut() = kind;
         let terminal = terminal.to_string();
-        f.send_as(from, if yes { Command::Approve { terminal } } else { Command::Deny { terminal } }, T)
+        f.send_as(
+            from,
+            if yes { Command::Approve { terminal, prompt_sha256: None } } else { Command::Deny { terminal } },
+            T,
+        )
     }
 
     #[test]
@@ -941,7 +971,10 @@ mod tests {
             assert!(f.acted().is_empty(), "nothing typed after the kind changed");
         }
         // Not blocked at all (a shell with no report): unchanged, y/n after a confirmation.
-        assert!(matches!(f.send(Command::Approve { terminal: "t1".into() }, T), Reply::NeedsConfirm { .. }));
+        assert!(matches!(
+            f.send(Command::Approve { terminal: "t1".into(), prompt_sha256: None }, T),
+            Reply::NeedsConfirm { .. }
+        ));
     }
 
     /// A terminal whose foreground program is `front` and whose root status is `status`.
@@ -973,7 +1006,7 @@ mod tests {
             [("working", "permission"), ("idle", "question"), ("done", "auth"), ("Blocked", "permission")]
         {
             *f.k3.borrow_mut() = k3("claude", json!({"state": state, "kind": kind}));
-            let reply = f.send(Command::Approve { terminal: "k3".into() }, T);
+            let reply = f.send(Command::Approve { terminal: "k3".into(), prompt_sha256: None }, T);
             assert!(
                 matches!(&reply, Reply::Failed(m) if m.contains(&format!("not waiting on you (it is {state})"))),
                 "{state} {kind}: {reply:?}"
@@ -997,13 +1030,13 @@ mod tests {
         let mut t = k3("claude", json!({"state": "working"}));
         t["records"] = json!({"sub": permission});
         *f.k3.borrow_mut() = t;
-        let reply = f.send(Command::Approve { terminal: "k3".into() }, T);
+        let reply = f.send(Command::Approve { terminal: "k3".into(), prompt_sha256: None }, T);
         assert!(matches!(&reply, Reply::Failed(m) if m.contains("it is working")), "{reply:?}");
         // The root asks a question; a child's permission doesn't turn it into one.
         let mut t = k3("claude", json!({"state": "blocked", "kind": "question"}));
         t["records"] = json!({"sub": permission, "sub/deeper": permission});
         *f.k3.borrow_mut() = t;
-        let reply = f.send(Command::Approve { terminal: "k3".into() }, T);
+        let reply = f.send(Command::Approve { terminal: "k3".into(), prompt_sha256: None }, T);
         assert!(matches!(&reply, Reply::Failed(m) if m.contains("a question")), "{reply:?}");
         assert!(f.acted().is_empty());
     }
@@ -1014,14 +1047,16 @@ mod tests {
         let mut t = k3("claude", json!({"state": "blocked", "kind": "permission"}));
         t["records"] = json!({"sub": {"state": "blocked", "kind": "question"}});
         *f.k3.borrow_mut() = t.clone();
-        for command in [Command::Approve { terminal: "k3".into() }, Command::Deny { terminal: "k3".into() }] {
+        for command in
+            [Command::Approve { terminal: "k3".into(), prompt_sha256: None }, Command::Deny { terminal: "k3".into() }]
+        {
             let reply = f.send(command, T);
             assert!(matches!(&reply, Reply::Failed(m) if m.contains("a question")), "{reply:?}");
         }
         // A child permission, or a child at work, does not.
         t["records"] = json!({"a": {"state": "blocked", "kind": "permission"}, "b": {"state": "working"}});
         *f.k3.borrow_mut() = t;
-        assert!(matches!(f.send(Command::Approve { terminal: "k3".into() }, T), Reply::Done(_)));
+        assert!(matches!(f.send(Command::Approve { terminal: "k3".into(), prompt_sha256: None }, T), Reply::Done(_)));
         assert_eq!(f.acted().len(), 1, "only the allowed one pressed a key");
     }
 
@@ -1032,7 +1067,7 @@ mod tests {
         let shell = "pwsh.exe";
         for (later, what) in [(json!({"state": "working"}), "working"), (Value::Null, "no status")] {
             *f.k3.borrow_mut() = k3(shell, blocked.clone());
-            let ask = f.send(Command::Approve { terminal: "k3".into() }, T);
+            let ask = f.send(Command::Approve { terminal: "k3".into(), prompt_sha256: None }, T);
             *f.k3.borrow_mut() = k3(shell, later);
             let reply = f.send(Command::Confirm { token: token(&ask) }, T);
             assert!(matches!(&reply, Reply::Failed(m) if m.contains("no longer waiting")), "{what}: {reply:?}");
@@ -1040,8 +1075,61 @@ mod tests {
             assert_eq!(f.bridge.log(1).unwrap()[0]["result"], "failed", "the refusal is audited");
         }
         // A terminal that never reported keeps the old rule: ask, then type.
-        let ask = f.send(Command::Approve { terminal: "t1".into() }, T);
+        let ask = f.send(Command::Approve { terminal: "t1".into(), prompt_sha256: None }, T);
         assert!(matches!(f.send(Command::Confirm { token: token(&ask) }, T), Reply::Done(_)));
+    }
+
+    fn sha_hex(text: &str) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(text.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn approve_with(f: &mut Fixture, hash: Option<&str>) -> Reply {
+        f.send(Command::Approve { terminal: "k3".into(), prompt_sha256: hash.map(String::from) }, T)
+    }
+
+    #[test]
+    fn an_approve_with_the_hash_of_the_listed_prompt_presses_and_another_one_presses_nothing() {
+        let mut f = fixture(BridgeConfig::default());
+        let blocked = |msg: &str| k3("claude", json!({"state": "blocked", "kind": "permission", "msg": msg}));
+        *f.k3.borrow_mut() = blocked("Run `ls`?");
+        assert!(matches!(approve_with(&mut f, Some(&sha_hex("Run `ls`?"))), Reply::Done(_)));
+        assert_eq!(f.acted()[0].1["keys"], json!(["enter"]));
+        // The prompt was swapped after the client looked: refused, and no key is sent.
+        *f.k3.borrow_mut() = blocked("Run `rm -rf ~`?");
+        let reply = approve_with(&mut f, Some(&sha_hex("Run `ls`?")));
+        assert!(matches!(&reply, Reply::Failed(m) if m.starts_with("prompt_changed")), "{reply:?}");
+        assert!(f.acted().is_empty(), "nothing pressed");
+        // No status message at all hashes the empty text, as the listing shows it.
+        *f.k3.borrow_mut() = k3("claude", json!({"state": "blocked", "kind": "permission"}));
+        assert!(matches!(approve_with(&mut f, Some(&sha_hex(""))), Reply::Done(_)));
+        f.acted();
+    }
+
+    #[test]
+    fn an_approve_without_a_hash_behaves_as_before() {
+        let mut f = fixture(BridgeConfig::default());
+        *f.k3.borrow_mut() = k3("claude", json!({"state": "blocked", "kind": "permission", "msg": "anything"}));
+        assert!(matches!(approve_with(&mut f, None), Reply::Done(_)));
+        assert_eq!(f.acted()[0].1["keys"], json!(["enter"]));
+    }
+
+    #[test]
+    fn a_malformed_hash_is_refused_as_invalid_params_before_anything_is_pressed() {
+        let mut f = fixture(BridgeConfig::default());
+        *f.k3.borrow_mut() = k3("claude", json!({"state": "blocked", "kind": "permission", "msg": "m"}));
+        let good = sha_hex("m");
+        let upper = good.to_uppercase();
+        let long = format!("{good}0");
+        for bad in ["", "abc", upper.as_str(), long.as_str(), &good[..63], &format!("g{}", &good[1..])] {
+            let reply = approve_with(&mut f, Some(bad));
+            assert!(matches!(&reply, Reply::Failed(m) if m.contains("64 lower-case hex")), "{bad:?}: {reply:?}");
+            assert!(f.acted().is_empty(), "{bad:?}: nothing pressed");
+        }
+        let t = json!({"status": {"msg": "m"}});
+        assert_eq!(check_prompt("zz", &t, "k3").unwrap_err().kind, "invalid_params");
+        assert_eq!(check_prompt(&sha_hex("x"), &t, "k3").unwrap_err().kind, "prompt_changed");
+        assert!(check_prompt(&good, &t, "k3").is_ok());
     }
 
     #[test]
@@ -1050,11 +1138,11 @@ mod tests {
         *f.k3.borrow_mut() = k3("codex", json!({"state": "blocked", "kind": "auth"}));
         *f.kind.borrow_mut() = json!("question");
         for (terminal, said) in [("k3", "a sign-in"), ("k1", "a question")] {
-            let reply = f.send(Command::Approve { terminal: terminal.into() }, T);
+            let reply = f.send(Command::Approve { terminal: terminal.into(), prompt_sha256: None }, T);
             assert!(matches!(&reply, Reply::Failed(m) if m.contains(said) && m.starts_with(terminal)), "{reply:?}");
         }
         // t2 asks a permission: answered, and only t2 gets the key.
-        assert!(matches!(f.send(Command::Approve { terminal: "t2".into() }, T), Reply::Done(_)));
+        assert!(matches!(f.send(Command::Approve { terminal: "t2".into(), prompt_sha256: None }, T), Reply::Done(_)));
         assert_eq!(f.acted(), [("terminal.keys".to_string(), json!({"terminal": "t2", "keys": ["enter"]}))]);
         // A permission on k1 now, k3 still signing in: k3's refusal is unchanged.
         *f.kind.borrow_mut() = json!("permission");
@@ -1067,11 +1155,14 @@ mod tests {
     fn a_question_on_another_machine_is_refused_by_its_address() {
         let mut f = fixture(BridgeConfig::default());
         *f.k3.borrow_mut() = k3("claude", json!({"state": "blocked", "kind": "question"}));
-        let reply = f.send(Command::Approve { terminal: "box/k3".into() }, T);
+        let reply = f.send(Command::Approve { terminal: "box/k3".into(), prompt_sha256: None }, T);
         assert!(matches!(&reply, Reply::Failed(m) if m.starts_with("box/k3 is blocked on a question")), "{reply:?}");
         assert!(f.acted().is_empty());
         *f.k3.borrow_mut() = k3("claude", json!({"state": "blocked", "kind": "permission"}));
-        assert!(matches!(f.send(Command::Approve { terminal: "box/k3".into() }, T), Reply::Done(_)));
+        assert!(matches!(
+            f.send(Command::Approve { terminal: "box/k3".into(), prompt_sha256: None }, T),
+            Reply::Done(_)
+        ));
         assert_eq!(f.acted()[0].1, json!({"terminal": "box/k3", "keys": ["enter"]}));
     }
 
@@ -1085,7 +1176,7 @@ mod tests {
             (Value::Null, "no terminal k3"),
         ] {
             *f.k3.borrow_mut() = shell(json!({"state": "blocked", "kind": "permission"}));
-            let ask = f.send(Command::Approve { terminal: "k3".into() }, T);
+            let ask = f.send(Command::Approve { terminal: "k3".into(), prompt_sha256: None }, T);
             *f.k3.borrow_mut() = then;
             let reply = f.send(Command::Confirm { token: token(&ask) }, T + 1);
             assert!(matches!(&reply, Reply::Failed(m) if m.contains(said)), "{said}: {reply:?}");
@@ -1158,11 +1249,11 @@ mod tests {
             Reply::Failed("no keys to press".into())
         );
 
-        assert!(matches!(f.send(Command::Approve { terminal: "t2".into() }, T), Reply::Done(_)));
+        assert!(matches!(f.send(Command::Approve { terminal: "t2".into(), prompt_sha256: None }, T), Reply::Done(_)));
         assert!(matches!(f.send(Command::Deny { terminal: "t2".into() }, T), Reply::Done(_)));
         let pressed: Vec<Value> = f.acted().into_iter().map(|(_, p)| p["keys"].clone()).collect();
         assert_eq!(pressed, [json!(["enter"]), json!(["esc"])]);
-        let busy = f.send(Command::Approve { terminal: "t3".into() }, T);
+        let busy = f.send(Command::Approve { terminal: "t3".into(), prompt_sha256: None }, T);
         assert_eq!(busy, Reply::Failed("t3 is not waiting on you (it is working)".into()));
         let plain = f.send(Command::Deny { terminal: "t1".into() }, T);
         assert!(matches!(f.send(Command::Confirm { token: token(&plain) }, T), Reply::Done(_)));
@@ -1316,7 +1407,7 @@ mod tests {
         std::fs::remove_file(&audit).unwrap();
         std::fs::create_dir(&audit).unwrap();
         // The summary is due but can't be written: the approve is refused before it reaches the core.
-        let reply = f.send(Command::Approve { terminal: "t2".into() }, T + 600_000);
+        let reply = f.send(Command::Approve { terminal: "t2".into(), prompt_sha256: None }, T + 600_000);
         assert!(matches!(&reply, Reply::Failed(m) if m.contains("audit log")), "{reply:?}");
         assert!(f.calls.borrow().is_empty(), "nothing reached the core");
         // The log is back: the three held-back failures still reach it, before the next command's line.

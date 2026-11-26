@@ -595,8 +595,8 @@ fn trash_refuses_what_is_not_a_session_in_the_store() {
         assert_eq!(kind(trash("claude", id, &roots)), "invalid_params", "{id:?}");
     }
     assert_eq!(kind(trash("vim", "x", &roots)), "invalid_params");
-    // Resumable, but h0x-core does not read its store.
-    assert_eq!(kind(trash("copilot", UUID, &roots)), "unsupported");
+    // Resumable, but h0x-core has no trash rule for its store.
+    assert_eq!(kind(trash("copilot", UUID, &roots)), "invalid_params");
     // Missing, or only beside the store.
     assert_eq!(kind(trash("claude", UUID, &roots)), "not_found");
     let beside = h.put(&format!(".claude/{UUID}.jsonl"), b"{}\n", 1);
@@ -1291,10 +1291,10 @@ fn agent_finders_list_what_session_list_lists() {
 
 #[test]
 fn every_stub_agent_finds_and_keeps_nothing() {
-    let stubs = ["copilot", "cursor", "devin", "droid", "hermes", "qodercli", "grok", "agy", "letta"];
+    let stubs = ["cursor", "devin", "droid", "grok", "agy", "letta"];
     let env = |_: &str| Some("/h".to_string());
     // These have finders now: each finds its store under the given home.
-    for name in ["qwen", "kimi", "pi", "kilo", "omp", "mastracode", "gemini"] {
+    for name in ["qwen", "kimi", "pi", "kilo", "omp", "mastracode", "gemini", "qodercli", "hermes", "copilot"] {
         assert!((agent(name).unwrap().root)(&env).is_some(), "{name}");
     }
     for name in stubs {
@@ -1481,4 +1481,159 @@ fn finder_edge_newest_since_inputs_at_the_since_boundary() {
     assert_eq!(pick("pi", &root, 0, &|_| false).as_deref(), Some("pi-2"));
     assert_eq!(pick("pi", &root, 0, &|id| id == "pi-2").as_deref(), Some("pi-1"));
     assert_eq!(pick("pi", &root, 5_500, &|id| id == "pi-2"), None);
+}
+
+#[test]
+fn list_walks_every_agent_with_a_root_newest_first_and_stable_on_ties() {
+    let h = Home::new();
+    let pi = |id: &str| format!("{{\"type\":\"session\",\"id\":\"{id}\",\"cwd\":\"/w\"}}\n");
+    h.claude("-w", UUID, &[said("/w")], 1_000);
+    h.put(".pi/agent/sessions/--w--/a.jsonl", pi("pi-1").as_bytes(), 3_000);
+    h.put(".omp/agent/sessions/--w--/a.jsonl", pi("omp-1").as_bytes(), 3_000);
+    h.put(
+        &format!(".qwen/projects/-w/chats/{UUID}.jsonl"),
+        format!("{{\"sessionId\":\"{UUID}\",\"cwd\":\"/w\"}}\n").as_bytes(),
+        2_000,
+    );
+    h.put(".gemini/tmp/w/.project_root", b"/w\n", 1);
+    h.put(".gemini/tmp/w/chats/session-x.jsonl", format!("{{\"sessionId\":\"{UUID}\"}}\n").as_bytes(), 4_000);
+    let got: Vec<(String, String)> = h.list("/w").into_iter().map(|(agent, id, _)| (agent, id)).collect();
+    let want = [("gemini", UUID), ("omp", "omp-1"), ("pi", "pi-1"), ("qwen", UUID), ("claude", UUID)];
+    assert_eq!(got, want.map(|(a, i)| (a.to_string(), i.to_string())), "ties break by agent, then id");
+    assert!(h.list("/elsewhere").is_empty());
+    // A root that is missing is skipped without a word, and nothing is created.
+    let none = Roots::new(|name| (name == "HOME").then(|| h.0.join("absent").display().to_string()));
+    assert!(list("/w", &none).is_empty());
+    assert!(!h.0.join("absent").exists());
+}
+
+#[test]
+fn list_matches_a_windows_folder_through_normal() {
+    let h = Home::new();
+    h.put(
+        &format!(".qwen/projects/c--work/chats/{UUID}.jsonl"),
+        format!("{}\n", json!({"sessionId": UUID, "cwd": r"C:\Work\App"})).as_bytes(),
+        5,
+    );
+    assert_eq!(h.list("c:/work/app/").len(), 1);
+    assert_eq!(h.list(r"\\?\C:\WORK\app").len(), 1);
+    assert!(h.list("c:/work").is_empty());
+}
+
+#[test]
+fn trash_for_an_agent_with_no_trash_rule_is_invalid_params_and_touches_nothing() {
+    let h = Home::new();
+    let qwen = h.put(
+        &format!(".qwen/projects/-w/chats/{UUID}.jsonl"),
+        format!("{{\"sessionId\":\"{UUID}\",\"cwd\":\"/w\"}}\n").as_bytes(),
+        2,
+    );
+    let e = trash("qwen", UUID, &h.roots()).unwrap_err();
+    assert_eq!(e.kind, "invalid_params", "{e:?}");
+    assert!(e.message.contains("qwen"), "{e:?}");
+    assert!(qwen.is_file());
+}
+
+/// Hermes' store under a scratch HOME with no `LOCALAPPDATA`: as `hermes::root` finds it.
+fn hermes_db(h: &Home) -> rusqlite::Connection {
+    let dir = if cfg!(windows) { h.0.join("AppData/Local/hermes") } else { h.0.join(".hermes") };
+    std::fs::create_dir_all(&dir).unwrap();
+    let conn = rusqlite::Connection::open(dir.join("state.db")).unwrap();
+    conn.execute(
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT NOT NULL, parent_session_id TEXT, \
+         started_at REAL NOT NULL, ended_at REAL, cwd TEXT, title TEXT)",
+        [],
+    )
+    .unwrap();
+    conn
+}
+
+#[test]
+fn list_edge_every_new_finder_in_one_folder_sorts_newest_first_then_by_agent_then_id() {
+    let h = Home::new();
+    let copilot = "123e4567-e89b-42d3-a456-426614174000";
+    let qoder = |id: &str, ms: u64| {
+        let line = json!({"type": "user", "sessionId": id, "cwd": "/w"});
+        h.put(&format!(".qoder/projects/-w/{id}.jsonl"), format!("{line}\n").as_bytes(), ms);
+    };
+    h.claude("-w", UUID, &[said("/w")], 3_000);
+    qoder("q-b", 3_000);
+    qoder("q-a", 3_000);
+    qoder("q-new", 6_000);
+    h.put(
+        &format!(".copilot/session-state/{copilot}/workspace.yaml"),
+        format!("id: {copilot}\ncwd: /w\n").as_bytes(),
+        3_000,
+    );
+    let conn = hermes_db(&h);
+    for (id, started) in [("h1", 3.0), ("h0", 5.0)] {
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, cwd) VALUES (?1, 'cli', ?2, '/w')",
+            rusqlite::params![id, started],
+        )
+        .unwrap();
+    }
+    drop(conn);
+    let got: Vec<(String, String)> = h.list("/w").into_iter().map(|(agent, id, _)| (agent, id)).collect();
+    let want = [
+        ("qodercli", "q-new"),
+        ("hermes", "h0"),
+        ("claude", UUID),
+        ("copilot", copilot),
+        ("hermes", "h1"),
+        ("qodercli", "q-a"),
+        ("qodercli", "q-b"),
+    ];
+    assert_eq!(got, want.map(|(a, i)| (a.to_string(), i.to_string())));
+    // The same order every time.
+    let again: Vec<(String, String)> = h.list("/w").into_iter().map(|(agent, id, _)| (agent, id)).collect();
+    assert_eq!(again, got);
+    // Another folder sees none of them; an empty folder lists nothing.
+    assert!(h.list("/w2").is_empty());
+    assert!(h.list("").is_empty());
+}
+
+#[test]
+fn list_edge_a_broken_store_of_one_agent_does_not_hide_the_others() {
+    let h = Home::new();
+    h.claude("-w", UUID, &[said("/w")], 1_000);
+    let hermes = if cfg!(windows) { "AppData/Local/hermes/state.db" } else { ".hermes/state.db" };
+    h.put(hermes, b"not a database", 1);
+    h.put(".copilot/session-state/not-a-uuid/workspace.yaml", b"id: not-a-uuid\ncwd: /w\n", 1);
+    h.put(".qoder/projects/-w/broken.jsonl", b"{not json\n", 1);
+    let got: Vec<(String, String)> = h.list("/w").into_iter().map(|(agent, id, _)| (agent, id)).collect();
+    assert_eq!(got, [("claude".to_string(), UUID.to_string())]);
+}
+
+#[test]
+fn trash_edge_an_agent_without_a_trash_rule_is_invalid_params_and_moves_nothing() {
+    let h = Home::new();
+    let copilot = "123e4567-e89b-42d3-a456-426614174000";
+    let yaml = h.put(
+        &format!(".copilot/session-state/{copilot}/workspace.yaml"),
+        format!("id: {copilot}\ncwd: /w\n").as_bytes(),
+        1,
+    );
+    let qoder = h.put(&format!(".qoder/projects/-w/{UUID}.jsonl"), b"{\"cwd\":\"/w\"}\n", 1);
+    drop(hermes_db(&h));
+    let db = if cfg!(windows) { h.0.join("AppData/Local/hermes/state.db") } else { h.0.join(".hermes/state.db") };
+    let db_before = std::fs::read(&db).unwrap();
+    let roots = h.roots();
+    for (agent, id) in [
+        ("copilot", copilot),
+        ("qodercli", UUID),
+        ("hermes", "h1"),
+        ("hermes", UUID),
+        ("", UUID),
+        ("CLAUDE", UUID),
+        ("claude ", UUID),
+        ("../claude", UUID),
+        ("not-an-agent", UUID),
+    ] {
+        let e = trash(agent, id, &roots).unwrap_err();
+        assert_eq!(e.kind, "invalid_params", "{agent:?} {id:?}: {e:?}");
+    }
+    assert!(yaml.is_file() && qoder.is_file());
+    assert_eq!(std::fs::read(&db).unwrap(), db_before);
+    assert_eq!(std::fs::read_dir(db.parent().unwrap()).unwrap().count(), 1, "no journal or trash beside it");
 }

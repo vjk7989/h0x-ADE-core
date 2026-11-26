@@ -187,3 +187,5 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for contributor setup and checks.
 
 [Apache-2.0](LICENSE); see [NOTICE](NOTICE) for attribution.
 `h0x-core --licenses` prints the included third-party licenses.
+HyperOx Worktrees is a modified copy of [worktrunk](https://github.com/max-sixty/worktrunk)
+by Maximilian Roos (MIT OR Apache-2.0); see [NOTICE](NOTICE).
