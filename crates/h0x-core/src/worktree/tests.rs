@@ -225,7 +225,8 @@ fn errors_map_to_stable_api_kinds() {
     assert_eq!(Error::MissingTool.rpc().hint, "Update h0x-core to use Worktrees");
 }
 
-/// The first `n` bytes of a fixture, cut wherever that falls (also inside a UTF-8 letter).
+/// The first `n` bytes of a fixture, cut wherever that falls (also inside a UTF-8 letter). The last
+/// cut is made from `trim_end()` so CRLF checkouts lose the closing brace too.
 fn cut(text: &str, n: usize) -> String {
     String::from_utf8_lossy(&text.as_bytes()[..n.min(text.len())]).into_owned()
 }
@@ -233,7 +234,7 @@ fn cut(text: &str, n: usize) -> String {
 #[test]
 fn truncated_empty_or_null_tool_output_is_a_failure_not_a_panic() {
     for fixture in [LIST_MAIN_ONLY, LIST_WORKTREES] {
-        for n in [0, 1, fixture.len() / 3, fixture.len() / 2, fixture.len() - 2] {
+        for n in [0, 1, fixture.len() / 3, fixture.len() / 2, fixture.trim_end().len() - 1] {
             let bad = cut(fixture, n);
             assert!(matches!(parse_list(&bad), Err(Error::Failed(m)) if m.contains("unexpected list output")), "{n}");
         }
@@ -241,13 +242,13 @@ fn truncated_empty_or_null_tool_output_is_a_failure_not_a_panic() {
     for bad in ["", " \n", "null", "{}", r#"{"repo":{}}"#, r#"{"items":[]}"#, r#"{"repo":{},"items":null}"#] {
         assert!(matches!(parse_list(bad), Err(Error::Failed(_))), "{bad:?}");
     }
-    for n in [0, 1, SWITCH_CREATED.len() / 2, SWITCH_CREATED.len() - 2] {
+    for n in [0, 1, SWITCH_CREATED.len() / 2, SWITCH_CREATED.trim_end().len() - 1] {
         assert!(matches!(parse_switch(&cut(SWITCH_CREATED, n)), Err(Error::Failed(m)) if m.contains("switch")), "{n}");
     }
     for bad in ["", "null", "[]", r#"{"action":"created","path":"/h/x"}"#] {
         assert!(matches!(parse_switch(bad), Err(Error::Failed(_))), "{bad:?}");
     }
-    for n in [0, 1, REMOVE_DELETED.len() / 2, REMOVE_DELETED.len() - 2] {
+    for n in [0, 1, REMOVE_DELETED.len() / 2, REMOVE_DELETED.trim_end().len() - 1] {
         assert!(matches!(parse_removal(&cut(REMOVE_DELETED, n)), Err(Error::Failed(m)) if m.contains("remove")), "{n}");
     }
     for bad in ["", "null", r#"[null]"#, r#"[{"branch":7}]"#] {
@@ -584,8 +585,10 @@ mod live {
             return;
         }
         let root = std::env::temp_dir().join(format!("h0x-core-wt-{}", crate::platform::random_hex()));
+        std::fs::create_dir_all(root.join("proj é")).unwrap();
+        // Git reports real paths (macOS /var is /private/var); Windows paths stay without \?.
+        let root = if cfg!(windows) { root } else { root.canonicalize().unwrap() };
         let main = root.join("proj é");
-        std::fs::create_dir_all(&main).unwrap();
         git(&main, &["init", "-q", "-b", "main"]);
         // The tool commits (squash) itself, so the repository needs an identity of its own.
         git(&main, &["config", "user.name", "t"]);

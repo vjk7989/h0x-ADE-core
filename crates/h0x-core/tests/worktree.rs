@@ -76,6 +76,7 @@ fn create_list_merge_and_remove_through_the_core() {
     let Some(s) = installed() else { return };
     let main = repo(&s, "proj é");
     let folder = main.display().to_string();
+    s.json(&["server", "status"]); // starts the core
     let mut c = s.connect();
 
     // create: a new branch under the home's worktrees folder.
@@ -133,6 +134,7 @@ fn a_conflicting_merge_changes_nothing_and_names_the_files() {
     let Some(s) = installed() else { return };
     let main = repo(&s, "conflict");
     let folder = main.display().to_string();
+    s.json(&["server", "status"]); // starts the core
     let mut c = s.connect();
     let r = c.call(1, "worktree.create", json!({"branch": "feat/c", "folder": folder}));
     let path = ok(&r)["path"].as_str().unwrap().to_string();

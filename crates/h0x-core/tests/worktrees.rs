@@ -49,6 +49,7 @@ fn without_h0x_wt_every_verb_is_missing_tool_with_the_update_hint() {
         let message = e["error"]["message"].as_str().unwrap();
         assert!(message.contains("h0x-wt") && !message.contains(&install), "{message}");
     }
+    s.json(&["server", "status"]); // starts the core
     let mut conn = s.connect();
     for (n, method, params) in [
         (1, "worktree.list", json!({"folder": repo})),
@@ -68,6 +69,7 @@ fn bad_params_are_invalid_params_before_anything_runs() {
     let repo = s.root.join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     let repo = repo.display().to_string();
+    s.json(&["server", "status"]); // starts the core
     let mut conn = s.connect();
     for (n, method, params) in [
         (1, "worktree.list", json!({})),
@@ -116,6 +118,7 @@ fn folders_that_are_not_there_are_not_git_relative_or_windows_style() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("missing_tool"), "{stderr}");
     }
+    s.json(&["server", "status"]); // starts the core
     let mut conn = s.connect();
     for (n, folder) in [(1, "/no/such/repo é"), (2, r"C:\Users\dev\my repo"), (3, "C:/Users/dev/my repo")] {
         let r = conn.call(n, "worktree.list", json!({"folder": folder}));
@@ -158,6 +161,7 @@ fn worktree_calls_go_to_a_machine_and_read_folders_there() {
             assert_eq!(e["error"]["hint"], HINT, "{args:?}: {e}");
         }
     }
+    s.json(&["server", "status"]); // starts the core
     let mut conn = s.connect();
     let r = conn.call(1, "worktree.merge", json!({"path": "/srv", "on": "nope"}));
     assert_eq!(kind(&r), "machine_unknown", "{r}");
