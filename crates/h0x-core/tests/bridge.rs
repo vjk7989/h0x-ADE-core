@@ -86,7 +86,10 @@ fn a_paired_account_drives_real_terminals() {
     // This stand-in agent is a plain `sh` printing a status report, which a
     // shell can always forge: approving still needs the confirmation, then
     // presses the dialog's key. (A real agent's answer needs none: unit tests.)
-    let Reply::NeedsConfirm { token, .. } = ask(Command::Approve { terminal: agent.clone(), prompt_sha256: None }) else { panic!() };
+    let Reply::NeedsConfirm { token, .. } = ask(Command::Approve { terminal: agent.clone(), prompt_sha256: None })
+    else {
+        panic!()
+    };
     assert!(!text(&s, &agent).contains("answered:"), "not before the confirmation");
     assert!(matches!(ask(Command::Confirm { token }), Reply::Done(_)));
     wait_until("the agent got its answer", || text(&s, &agent).contains("answered:"));
