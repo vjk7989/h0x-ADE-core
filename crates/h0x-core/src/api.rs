@@ -152,6 +152,18 @@ methods! { Ctx<'_>;
     "session.trash" => session_trash, SessionParams => SessionTrashResult,
         "Move a Claude Code, Codex or OpenCode (JSON storage) session's files from the agent's own store to the OS trash (Recycle Bin, Trash), here or on a machine (`on`); never a permanent delete. Links are never followed. `unsupported` where there is no trash, or for an OpenCode session kept in its database.",
         errors ["invalid_params", "not_found", "unsupported", "unavailable", "machine_unknown", "needs_update"];
+    "worktree.list" => worktree_list, WorktreeListParams => crate::worktree::Listing,
+        "Every worktree of the repository a folder belongs to, here or on a machine (`on`): path, branch (null when detached), main checkout first, uncommitted changes, commits ahead of and behind the default branch, why its work is already in the default branch, and its last commit time. Done by h0x-wt, shipped next to h0x-core.",
+        errors ["not_git", "missing_tool", "failed", "invalid_params", "machine_unknown", "unavailable", "needs_update"];
+    "worktree.create" => worktree_create, WorktreeCreateParams => crate::worktree::Created,
+        "Make a worktree for a branch at `~/.h0x/worktrees/<repo>/<branch folder>`, here or on a machine (`on`): a new branch from `base` (default: the default branch), or the existing branch as it is. Never runs the repository's hooks. `checked_out` when the branch already has a worktree.",
+        errors ["not_git", "missing_tool", "checked_out", "failed", "invalid_params", "machine_unknown", "unavailable", "needs_update"];
+    "worktree.remove" => worktree_remove, WorktreeRemoveParams => crate::worktree::Removed,
+        "Remove a worktree, here or on a machine (`on`). `unpushed` when a submodule has commits no remote has (unless `force`). The branch goes too only when its work is already in the default branch. `dirty` when it has uncommitted changes (unless `force`); `main_checkout` for the main checkout. Never runs hooks.",
+        errors ["not_git", "missing_tool", "dirty", "unpushed", "main_checkout", "failed", "invalid_params", "machine_unknown", "unavailable", "needs_update"];
+    "worktree.merge" => worktree_merge, WorktreeMergeParams => crate::worktree::Merged,
+        "Merge a worktree's branch into the default branch (or `target`), squashed unless `squash` is false (then rebased and fast-forwarded), and remove the worktree and branch, here or on a machine (`on`). `conflict` lists the conflicting files and leaves both branches as they were. Never runs hooks.",
+        errors ["not_git", "missing_tool", "conflict", "unpushed", "main_checkout", "failed", "invalid_params", "machine_unknown", "unavailable", "needs_update"];
     "events.subscribe" => events_subscribe, SubscribeParams => SubscribeResult,
         "Snapshot of matching terminals, then every fact change in order (created, lost, restarted, keep, finished, removed, status, turn, title, labels, size, doc) as `event` notifications, `heartbeat` every 15 s, and `missed` + fresh snapshot for a subscriber that fell behind.",
         errors ["not_found", "machine_unknown"];
@@ -605,6 +617,46 @@ async fn session_trash(_: Ctx<'_>, p: SessionParams) -> Result<SessionTrashResul
         Ok(SessionTrashResult { trashed: trashed.iter().map(|p| p.display().to_string()).collect() })
     })
     .await
+}
+
+async fn worktree_list(core: Ctx<'_>, p: WorktreeListParams) -> Result<crate::worktree::Listing, RpcError> {
+    if p.folder.is_empty() {
+        return Err(RpcError::invalid_params("folder is empty"));
+    }
+    let folder = crate::exec::folder(Some(&p.folder), from_afar(core));
+    blocking(move || crate::worktree::list(&folder).map_err(crate::worktree::Error::rpc)).await
+}
+
+async fn worktree_create(core: Ctx<'_>, p: WorktreeCreateParams) -> Result<crate::worktree::Created, RpcError> {
+    if p.folder.is_empty() {
+        return Err(RpcError::invalid_params("folder is empty"));
+    }
+    let folder = crate::exec::folder(Some(&p.folder), from_afar(core));
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| RpcError::internal("no home folder"))?;
+    blocking(move || {
+        crate::worktree::create(&home, &folder, &p.branch, p.base.as_deref()).map_err(crate::worktree::Error::rpc)
+    })
+    .await
+}
+
+async fn worktree_remove(core: Ctx<'_>, p: WorktreeRemoveParams) -> Result<crate::worktree::Removed, RpcError> {
+    if p.path.is_empty() {
+        return Err(RpcError::invalid_params("path is empty"));
+    }
+    let path = crate::exec::folder(Some(&p.path), from_afar(core));
+    blocking(move || crate::worktree::remove(&path, p.force).map_err(crate::worktree::Error::rpc)).await
+}
+
+async fn worktree_merge(core: Ctx<'_>, p: WorktreeMergeParams) -> Result<crate::worktree::Merged, RpcError> {
+    if p.path.is_empty() {
+        return Err(RpcError::invalid_params("path is empty"));
+    }
+    let path = crate::exec::folder(Some(&p.path), from_afar(core));
+    blocking(move || crate::worktree::merge(&path, p.target.as_deref(), p.squash).map_err(crate::worktree::Error::rpc))
+        .await
 }
 
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, RpcError> + Send + 'static) -> Result<T, RpcError> {

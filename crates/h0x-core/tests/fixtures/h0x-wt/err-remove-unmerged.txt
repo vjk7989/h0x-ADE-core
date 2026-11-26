@@ -1,0 +1,3 @@
+◎ Removing feat/ahead worktree...
+✓ Removed feat/ahead worktree (4 files · 87 B)
+↳ Branch unmerged; to delete, run h0x-wt remove -D feat/ahead

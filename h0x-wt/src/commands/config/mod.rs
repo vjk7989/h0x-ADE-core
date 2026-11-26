@@ -1,0 +1,433 @@
+//! Configuration commands.
+//!
+//! Commands for managing user config, project config, state, and hints.
+
+mod alias;
+mod approvals;
+mod codex;
+mod create;
+mod hints;
+mod omp;
+pub mod opencode;
+mod pi;
+mod plugins;
+mod show;
+mod state;
+mod update;
+
+// Re-export public functions
+pub use alias::{handle_alias_dry_run, handle_alias_show};
+pub use approvals::{add_approvals, clear_approvals, list_approvals};
+pub use codex::{handle_codex_install, handle_codex_uninstall};
+pub use create::handle_config_create;
+pub use hints::{handle_hints_clear, handle_hints_get};
+pub use omp::{handle_omp_install, handle_omp_uninstall};
+pub use opencode::{handle_opencode_install, handle_opencode_uninstall};
+pub use pi::{handle_pi_install, handle_pi_uninstall};
+pub use plugins::{
+    handle_claude_approve_enter_worktree, handle_claude_hook, handle_claude_install,
+    handle_claude_install_statusline, handle_claude_uninstall,
+};
+pub use show::handle_config_show;
+pub use state::{
+    handle_cache_clear, handle_cache_get, handle_logs_list, handle_logs_profile,
+    handle_state_clear, handle_state_clear_all, handle_state_get, handle_state_set,
+    handle_state_show, handle_vars_clear, handle_vars_get, handle_vars_list, handle_vars_set,
+};
+pub use update::handle_config_update;
+use h0x_wt::styling::{eprintln, hint_message, info_message, success_message};
+
+/// Install or update a file-based agent plugin after confirmation.
+fn install_file_plugin(
+    name: &str,
+    target: &std::path::Path,
+    source: &str,
+    yes: bool,
+) -> anyhow::Result<()> {
+    use crate::output::prompt::{PromptResponse, prompt_yes_no_preview};
+    use anyhow::Context;
+    use color_print::cformat;
+    use h0x_wt::path::format_path_for_display;
+
+    let target_display = format_path_for_display(target);
+    if target.exists()
+        && let Ok(existing) = std::fs::read_to_string(target)
+        && existing == source
+    {
+        eprintln!(
+            "{}",
+            info_message(cformat!(
+                "Plugin already installed @ <bold>{target_display}</>"
+            ))
+        );
+        return Ok(());
+    }
+
+    let action = if target.exists() { "Update" } else { "Install" };
+    let preview_msg = info_message(cformat!("Would write to <bold>{target_display}</>"));
+    let preview = || eprintln!("{}", preview_msg);
+    let confirmed = yes
+        || prompt_yes_no_preview(
+            &cformat!("{action} {name} plugin @ <bold>{target_display}</>?"),
+            preview,
+        )? == PromptResponse::Accepted;
+    if !confirmed {
+        return Ok(());
+    }
+
+    let parent = target
+        .parent()
+        .context("Plugin path has no parent directory")?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+    h0x_wt::utils::write_atomically(target, source)
+        .with_context(|| format!("Failed to write plugin to {target_display}"))?;
+
+    eprintln!(
+        "{}",
+        success_message(cformat!("Plugin installed @ <bold>{target_display}</>"))
+    );
+    eprintln!(
+        "{}",
+        hint_message(cformat!(
+            "Activity markers (🤖/💬) will appear in <underline>h0x-wt list</>"
+        ))
+    );
+    Ok(())
+}
+
+/// Remove a file-based agent plugin after confirmation.
+fn uninstall_file_plugin(name: &str, target: &std::path::Path, yes: bool) -> anyhow::Result<()> {
+    use crate::output::prompt::{PromptResponse, prompt_yes_no_preview};
+    use anyhow::Context;
+    use color_print::cformat;
+    use h0x_wt::path::format_path_for_display;
+
+    let target_display = format_path_for_display(target);
+    if !target.exists() {
+        eprintln!("{}", info_message("Plugin not installed"));
+        return Ok(());
+    }
+
+    let preview_msg = info_message(cformat!("Would remove <bold>{target_display}</>"));
+    let preview = || eprintln!("{}", preview_msg);
+    let confirmed = yes
+        || prompt_yes_no_preview(
+            &cformat!("Remove {name} plugin @ <bold>{target_display}</>?"),
+            preview,
+        )? == PromptResponse::Accepted;
+    if !confirmed {
+        return Ok(());
+    }
+
+    std::fs::remove_file(target)
+        .with_context(|| format!("Failed to remove plugin at {target_display}"))?;
+    eprintln!(
+        "{}",
+        success_message(cformat!("Plugin removed from <bold>{target_display}</>"))
+    );
+    Ok(())
+}
+
+/// Run a plugin-CLI command (`claude` / `codex`), surfacing a non-zero exit
+/// as a typed [`h0x_wt::git::CommandError`].
+fn run_plugin_cli(program: &str, args: &[&str]) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let output = h0x_wt::shell_exec::Cmd::new(program)
+        .args(args.iter().copied())
+        .run()
+        .with_context(|| format!("Failed to run {program} CLI"))?;
+    if !output.status.success() {
+        return Err(
+            h0x_wt::git::CommandError::from_failed_output(program, args, &output).into(),
+        );
+    }
+    Ok(())
+}
+
+/// The JSON a harness prints for a `--json` listing of its own state, or
+/// `None` where it did not answer.
+///
+/// Every question wt asks about what another harness holds goes through here.
+/// The alternative — reading the file the harness keeps them in — is a guess
+/// at private layout, and a guess that cannot fail loudly: a record that moved
+/// looks exactly like a record that was never written, so an installed plugin
+/// reads as absent and a failed removal reads as one already finished. Asking
+/// has no such gap, and a harness that will not answer at all leaves the
+/// question open rather than answering it wrong.
+fn harness_listing(program: &str, args: &[&str]) -> Option<serde_json::Value> {
+    let output = h0x_wt::shell_exec::Cmd::new(program)
+        .args(args.iter().copied())
+        .run()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    serde_json::from_slice(&output.stdout).ok()
+}
+
+/// Whether any of `entries` carries `field` equal to `value`, or `None` where
+/// they are not objects carrying that field as a string.
+///
+/// An empty list is a confident `Some(false)`: the harness has said it holds
+/// nothing. An entry of a shape this does not understand answers nothing
+/// rather than reporting an absence it inferred from a field that moved.
+fn listing_names(entries: &[serde_json::Value], field: &str, value: &str) -> Option<bool> {
+    let mut listed = false;
+    for entry in entries {
+        listed |= entry.get(field)?.as_str()? == value;
+    }
+    Some(listed)
+}
+
+/// Run a removal whose goal is that the target is gone.
+///
+/// `claude plugin uninstall`, and both harnesses' `plugin marketplace remove`,
+/// exit non-zero when the target is not there — the state the removal is
+/// trying to reach — so running `uninstall` twice would otherwise fail with
+/// nothing left to do. Asking `still_present` after the attempt tells that
+/// apart from a removal that genuinely failed, which still surfaces the
+/// harness's own stderr in the gutter.
+///
+/// Only a confident `Some(false)` drops the error. `None` — the harness would
+/// not list what it holds, or listed it in a shape this does not recognize —
+/// keeps it, because an answer that could not be read has not established that
+/// the removal worked. Reporting success there would fail open on exactly the
+/// silent case, printing `Plugin & marketplace removed` over a plugin or
+/// marketplace that is still there.
+///
+/// The command runs either way, so the `?` preview lists what the uninstall
+/// actually invokes.
+fn run_plugin_removal(
+    program: &str,
+    args: &[&str],
+    still_present: impl Fn() -> Option<bool>,
+) -> anyhow::Result<()> {
+    match run_plugin_cli(program, args) {
+        Ok(()) => Ok(()),
+        Err(err) => match still_present() {
+            Some(false) => Ok(()),
+            _ => Err(err),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use insta::assert_snapshot;
+    use h0x_wt::config::{ProjectConfig, UserConfig};
+
+    use super::create::comment_out_config;
+    use super::show::{render_ci_tool_status, warn_unknown_keys};
+
+    // ==================== comment_out_config tests ====================
+
+    #[test]
+    fn test_comment_out_config() {
+        // Basic key-value
+        assert_snapshot!(comment_out_config("key = \"value\"\n"), @r#"# key = "value""#);
+
+        // Preserves existing comments
+        assert_snapshot!(comment_out_config("# This is a comment\nkey = \"value\"\n"), @r#"
+        # This is a comment
+        # key = "value"
+        "#);
+
+        // Preserves empty lines (not commented)
+        assert_snapshot!(comment_out_config("key1 = \"value\"\n\nkey2 = \"value\"\n"), @r#"
+        # key1 = "value"
+
+        # key2 = "value"
+        "#);
+
+        // Section headers
+        assert_snapshot!(comment_out_config("[hooks]\ncommand = \"npm test\"\n"), @r#"
+        # [hooks]
+        # command = "npm test"
+        "#);
+
+        // Empty input
+        assert_snapshot!(comment_out_config(""), @"");
+
+        // Only empty lines
+        assert_snapshot!(comment_out_config("\n\n\n"), @"");
+
+        // Only comments (unchanged)
+        assert_snapshot!(comment_out_config("# comment 1\n# comment 2\n"), @"
+        # comment 1
+        # comment 2
+        ");
+
+        // Mixed content
+        assert_snapshot!(
+            comment_out_config("# Header comment\n\n[section]\nkey = \"value\"\n\n# Another comment\nkey2 = true\n"),
+            @r#"
+        # Header comment
+
+        # [section]
+        # key = "value"
+
+        # Another comment
+        # key2 = true
+        "#
+        );
+
+        // Inline table
+        assert_snapshot!(comment_out_config("point = { x = 1, y = 2 }\n"), @"# point = { x = 1, y = 2 }");
+
+        // Multiline array
+        assert_snapshot!(comment_out_config("args = [\n  \"--flag\",\n  \"value\"\n]\n"), @r#"
+        # args = [
+        #   "--flag",
+        #   "value"
+        # ]
+        "#);
+
+        // Whitespace-only lines are not empty, so they get commented
+        assert_snapshot!(comment_out_config("key = 1\n   \nkey2 = 2\n"), @"
+        # key = 1
+        #    
+        # key2 = 2
+        ");
+    }
+
+    #[test]
+    fn test_comment_out_config_preserves_trailing_newline() {
+        assert!(comment_out_config("key = \"value\"\n").ends_with('\n'));
+        assert!(!comment_out_config("key = \"value\"").ends_with('\n'));
+    }
+
+    // ==================== warn_unknown_keys tests ====================
+
+    #[test]
+    fn test_warn_unknown_keys_empty() {
+        let out = warn_unknown_keys::<UserConfig>("");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_warn_unknown_keys() {
+        // Single unknown key
+        assert_snapshot!(warn_unknown_keys::<UserConfig>("unknown-key = \"value\"\n"), @"[33m▲[39m [33mUnknown key [1munknown-key[22m will be ignored[39m");
+
+        // Multiple unknown keys (output is sorted deterministically)
+        assert_snapshot!(warn_unknown_keys::<UserConfig>("key1 = \"v1\"\nkey2 = \"v2\"\n"), @"
+        [33m▲[39m [33mUnknown key [1mkey1[22m will be ignored[39m
+        [33m▲[39m [33mUnknown key [1mkey2[22m will be ignored[39m
+        ");
+    }
+
+    #[test]
+    fn test_warn_unknown_keys_nested() {
+        // Nested typos surface as dotted paths — a UX win from round-trip analysis.
+        insta::assert_snapshot!(warn_unknown_keys::<UserConfig>("[merge]\nsquas = true\n"));
+    }
+
+    #[test]
+    fn test_warn_unknown_keys_suggests_other_config() {
+        // skip-shell-integration-prompt in project config should suggest user config
+        assert_snapshot!(
+            warn_unknown_keys::<ProjectConfig>("skip-shell-integration-prompt = true\n"),
+            @"[33m▲[39m [33mKey [1mskip-shell-integration-prompt[22m belongs in user config (will be ignored)[39m");
+
+        // forge in user config should suggest project config
+        assert_snapshot!(warn_unknown_keys::<UserConfig>("[forge]\nplatform = \"github\"\n"), @r#"[33m▲[39m [33mKey [1mforge[22m belongs in project config (will be ignored); to set it from user config, add it under [projects."<id>"][39m"#);
+    }
+
+    #[test]
+    fn test_warn_unknown_keys_user_only_commit_key_redirects_to_user_config() {
+        // The LLM `command` is user-config-only. In a *project* config it must
+        // redirect the user to user config — both via the legacy flat
+        // `[commit-generation]` and the canonical `[commit.generation]`, since
+        // `[commit.generation]` is now a valid project section (for
+        // `template-append`) so the offending key surfaces nested.
+        assert_snapshot!(
+            warn_unknown_keys::<ProjectConfig>("[commit-generation]\ncommand = \"llm\"\n"),
+            @"[33m▲[39m [33mKey [1mcommit.generation.command[22m belongs in user config (will be ignored); to scope it to this repo, add it under [projects.\"<id>\"] in user config[39m");
+        assert_snapshot!(
+            warn_unknown_keys::<ProjectConfig>("[commit.generation]\ncommand = \"llm\"\n"),
+            @"[33m▲[39m [33mKey [1mcommit.generation.command[22m belongs in user config (will be ignored); to scope it to this repo, add it under [projects.\"<id>\"] in user config[39m");
+
+        // The one project-valid key in the section is unaffected.
+        assert!(
+            warn_unknown_keys::<ProjectConfig>("[commit.generation]\ntemplate-append = \"x\"\n")
+                .is_empty()
+        );
+        // The same user-only key in user config is valid — no warning there.
+        assert!(
+            warn_unknown_keys::<UserConfig>("[commit.generation]\ncommand = \"llm\"\n").is_empty()
+        );
+    }
+
+    #[test]
+    fn test_warn_unknown_keys_deprecated_section_in_wrong_config() {
+        // `ci` is deprecated in favor of `[forge]`, which is project-only; in
+        // user config it redirects with the canonical form.
+        assert_snapshot!(
+            warn_unknown_keys::<UserConfig>("[ci]\nplatform = \"github\"\n"),
+            @"[33m▲[39m [33mKey [1mci[22m belongs in project config as [forge][39m");
+    }
+
+    #[test]
+    fn test_warn_unknown_keys_deprecated_in_right_config_is_skipped() {
+        // commit-generation in user config should be skipped (deprecation system handles it)
+        assert!(
+            warn_unknown_keys::<UserConfig>("[commit-generation]\ncommand = \"llm\"\n").is_empty()
+        );
+
+        // ci in project config should be skipped (deprecation system handles it)
+        assert!(warn_unknown_keys::<ProjectConfig>("[ci]\nplatform = \"github\"\n").is_empty());
+    }
+
+    // ==================== render_ci_tool_status tests ====================
+
+    #[test]
+    fn test_render_ci_tool_status() {
+        // Installed and authenticated
+        let mut out = String::new();
+        render_ci_tool_status(&mut out, "gh", "GitHub", Some("github.com"), true, true);
+        assert_snapshot!(out, @"[2m○[22m [1mgh[22m installed & authenticated");
+
+        // Installed but not authenticated
+        let mut out = String::new();
+        render_ci_tool_status(&mut out, "gh", "GitHub", Some("github.com"), true, false);
+        assert_snapshot!(out, @"
+        [33m▲[39m [33m[1mgh[22m installed but not authenticated for [1mgithub.com[22m[39m
+        [2m↳[22m [2mTo authenticate, run [4mgh auth login[24m[22m
+        ");
+
+        // The auth-setup command differs by CLI: `tea` uses `tea login add`,
+        // `az` uses `az login`, the rest use `<tool> auth login`.
+        let mut out = String::new();
+        render_ci_tool_status(
+            &mut out,
+            "tea",
+            "Gitea",
+            Some("gitea.example.com"),
+            true,
+            false,
+        );
+        assert_snapshot!(out, @"
+        [33m▲[39m [33m[1mtea[22m installed but not authenticated for [1mgitea.example.com[22m[39m
+        [2m↳[22m [2mTo authenticate, run [4mtea login add[24m[22m
+        ");
+
+        let mut out = String::new();
+        render_ci_tool_status(&mut out, "az", "Azure DevOps", None, true, false);
+        assert_snapshot!(out, @"
+        [33m▲[39m [33m[1maz[22m installed but not authenticated[39m
+        [2m↳[22m [2mTo authenticate, run [4maz login[24m[22m
+        ");
+
+        // Not installed
+        let mut out = String::new();
+        render_ci_tool_status(&mut out, "glab", "GitLab", Some("gitlab.com"), false, false);
+        assert_snapshot!(out, @"[2m○[22m [1mglab[22m not found (GitLab CI status unavailable)");
+
+        // glab installed and authenticated
+        let mut out = String::new();
+        render_ci_tool_status(&mut out, "glab", "GitLab", Some("gitlab.com"), true, true);
+        assert_snapshot!(out, @"[2m○[22m [1mglab[22m installed & authenticated");
+    }
+}

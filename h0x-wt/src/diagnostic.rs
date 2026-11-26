@@ -1,0 +1,642 @@
+//! Diagnostic report generation for issue reporting.
+//!
+//! This module generates a markdown file users can attach to GitHub issues —
+//! command line, environment, worktree state, config, and the captured trace
+//! log.
+//!
+//! # When Diagnostics Are Generated
+//!
+//! A `diagnostic.md` bundle is written on every `-vv` run (one file per
+//! command, overwritten each time). Without `-vv`, the hint simply tells users
+//! to rerun with `-vv`. This ensures the diagnostic file contains the trace the
+//! report inlines.
+//!
+//! # Report Format
+//!
+//! The report is a markdown file designed for easy pasting into GitHub issues:
+//!
+//! 1. **Header** — Timestamp, command that was run, and result
+//! 2. **Performance profile** — Rendered view of `trace.jsonl`: where time went,
+//!    parallelism, and same-context cache misses (omitted if no records). Shown
+//!    first as the at-a-glance summary, expanded by default; the raw dumps
+//!    below stay collapsed.
+//! 3. **Environment** — wt version, OS, git version, shell integration
+//! 4. **Environment variables** — a curated, non-secret allowlist of the
+//!    pager / terminal / locale knobs (`PAGER`, `GIT_PAGER`, `TERM`, …) plus
+//!    git's resolved `core.pager`, since these most often explain a rendering
+//!    bug (issue #3322: `wt config show` suspending on a pager write)
+//! 5. **Worktrees** — Raw `git worktree list --porcelain` output
+//! 6. **Config** — User and project config contents
+//! 7. **Trace log** — `trace.log` contents, truncated to the last ~50KB
+//! 8. **Raw subprocess output** — Path to `subprocess.log`, which holds the full
+//!    captured stdout/stderr (the report links it rather than inlining it)
+//!
+//! # Privacy
+//!
+//! The report explicitly documents what IS and ISN'T included:
+//!
+//! **Included:** worktree paths, branch names, worktree status (prunable, locked),
+//! config files, trace/output logs, commit messages (in trace logs), and a
+//! fixed allowlist of pager / terminal / locale environment variables
+//!
+//! **Not included:** file contents, credentials, any environment variable
+//! outside the curated allowlist (the report never does a blanket `env` dump,
+//! so a credential-bearing variable can't leak in)
+//!
+//! # File Location
+//!
+//! Reports are written to `<git-common-dir>/h0x-wt/logs/diagnostic.md` (typically
+//! `.git/h0x-wt/logs/diagnostic.md`). Companion log files (`trace.log`,
+//! `trace.jsonl`, `subprocess.log`) live in the same directory.
+//!
+//! # Usage
+//!
+//! ```rust,ignore
+//! use crate::diagnostic::issue_hint;
+//!
+//! // Show hint telling user to run with -vv
+//! eprintln!("{}", hint_message(issue_hint()));
+//! ```
+//!
+use std::path::PathBuf;
+
+use ansi_str::AnsiStr;
+use color_print::cformat;
+use minijinja::{Environment, context};
+use h0x_wt::config::ConfigFileKind;
+use h0x_wt::git::{Repository, git_version};
+use h0x_wt::path::format_path_for_display;
+use h0x_wt::shell_exec::Cmd;
+use h0x_wt::styling::{eprintln, hint_message, info_message, warning_message};
+
+use crate::cli::version_str;
+use crate::output;
+
+/// Markdown template for the diagnostic report.
+///
+/// This template makes the report structure immediately visible.
+/// Variables are filled in by `format_report()`.
+const REPORT_TEMPLATE: &str = r#"## Diagnostic Report
+
+**Generated:** {{ timestamp }}
+**Command:** `{{ command }}`
+**Result:** {{ context }}
+{%- if performance_profile %}
+
+<details open>
+<summary>Performance profile</summary>
+
+```
+{{ performance_profile }}
+```
+</details>
+{%- endif %}
+
+<details>
+<summary>Environment</summary>
+
+```
+wt {{ version }} ({{ os }} {{ arch }})
+git {{ git_version }}
+Shell integration: {{ shell_integration }}
+```
+</details>
+
+<details>
+<summary>Environment variables</summary>
+
+```
+{{ env_vars }}
+```
+</details>
+
+<details>
+<summary>Worktrees</summary>
+
+```
+{{ worktree_list }}
+```
+</details>
+{%- if config_show %}
+
+<details>
+<summary>Config</summary>
+
+```
+{{ config_show }}
+```
+</details>
+{%- endif %}
+{%- if trace_log %}
+
+<details>
+<summary>Trace log</summary>
+
+```
+{{ trace_log }}
+```
+</details>
+{%- endif %}
+{%- if subprocess_log_path %}
+
+<details>
+<summary>Raw subprocess output</summary>
+
+Full captured stdout/stderr is in `{{ subprocess_log_path }}`.
+</details>
+{%- endif %}
+"#;
+
+/// The curated, non-secret environment variables surfaced in the diagnostic
+/// report, in display order. This is a strict allowlist — the report never does
+/// a blanket `env` dump — so a credential-bearing variable (a token, a password)
+/// can never reach the uploaded report. Every entry is a knob that shapes
+/// rendering, output, or worktrunk's own behaviour, which is the class of bug a
+/// diagnostic most often needs (issue #3322: a pager interaction suspending
+/// `wt config show`). To surface a new variable, add its name here.
+const DIAGNOSTIC_ENV_VARS: &[&str] = &[
+    // Pager selection — the class behind issue #3322. `core.pager` (git config)
+    // is appended separately by `environment_vars`.
+    "PAGER",
+    "GIT_PAGER",
+    "LESS",
+    // Terminal & colour capability — drives width detection and ANSI output.
+    "TERM",
+    "COLORTERM",
+    "COLUMNS",
+    "LINES",
+    "NO_COLOR",
+    "CLICOLOR",
+    "CLICOLOR_FORCE",
+    // Shell & locale — affect interactive probes, escaping, and date rendering.
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_TIME",
+    // Worktrunk's own runtime knobs and logging.
+    "RUST_LOG",
+    "H0X_WT_VERBOSE",
+    "H0X_WT_FOREGROUND",
+    "H0X_WT_MAX_CONCURRENT_COMMANDS",
+];
+
+/// Collected diagnostic information for issue reporting.
+pub(crate) struct DiagnosticReport {
+    /// Formatted markdown content
+    content: String,
+}
+
+impl DiagnosticReport {
+    /// Collect diagnostic information from the current environment.
+    ///
+    /// # Arguments
+    /// * `repo` - Repository to collect worktree info from
+    /// * `command` - The command that was run (e.g., "wt list -vv")
+    /// * `context` - Context describing the result (error message or success)
+    pub fn collect(repo: &Repository, command: &str, context: String) -> Self {
+        // Render the profile once from `trace.jsonl`; the markdown bundle
+        // inlines it as its lead section.
+        let profile = crate::log_files::TRACE_JSONL
+            .path()
+            .and_then(|path| std::fs::read_to_string(&path).ok())
+            .as_deref()
+            .and_then(render_trace_profile);
+        let content = Self::format_report(repo, command, &context, profile.as_deref());
+        Self { content }
+    }
+
+    /// Format the complete diagnostic report as markdown using minijinja template.
+    fn format_report(
+        repo: &Repository,
+        command: &str,
+        context: &str,
+        performance_profile: Option<&str>,
+    ) -> String {
+        // Strip ANSI codes from context - the diagnostic is a markdown file for GitHub
+        let context = context.ansi_strip();
+
+        // Collect data for template
+        let timestamp = h0x_wt::utils::now_iso8601();
+        let version = version_str();
+        let os = std::env::consts::OS;
+        let arch = std::env::consts::ARCH;
+        let git_version = git_version().unwrap_or_else(|_| "(unknown)".to_string());
+        let shell_integration = if output::is_shell_integration_active() {
+            "active"
+        } else {
+            "inactive"
+        };
+        let worktree_list = repo
+            .run_command(&["worktree", "list", "--porcelain"])
+            .map(|s| s.trim_end().to_string())
+            .unwrap_or_else(|_| "(failed to get worktree list)".to_string());
+
+        // Curated, non-secret env vars (pager / terminal / locale knobs) plus
+        // git's resolved `core.pager` — the inputs a rendering bug report needs.
+        let env_vars = environment_vars(repo);
+
+        // Get config show output (if available)
+        let config_show = config_show_output(repo);
+
+        // Read the trace once, then derive two views: a bounded raw inline (the
+        // records themselves) and a rendered performance profile (the summary of
+        // where time went). The raw subprocess output log is only *referenced* by
+        // path — it can be multi-MB and would drown out the trace records that
+        // matter in a bug report.
+        let trace_content = crate::log_files::TRACE
+            .path()
+            .and_then(|path| std::fs::read_to_string(&path).ok());
+        let trace_log = trace_content
+            .as_deref()
+            .map(|content| truncate_log(content.trim()))
+            .filter(|s| !s.is_empty());
+        // Forward slashes on both platforms so the rendered markdown reads the
+        // same in bug reports regardless of where it was produced.
+        let subprocess_log_path = crate::log_files::SUBPROCESS
+            .path()
+            .map(|p| path_slash::PathExt::to_slash_lossy(p.as_path()).into_owned());
+
+        // Render template
+        let env = Environment::new();
+        let tmpl = env.template_from_str(REPORT_TEMPLATE).unwrap();
+        let rendered = tmpl
+            .render(context! {
+                timestamp,
+                command,
+                context,
+                version,
+                os,
+                arch,
+                git_version,
+                shell_integration,
+                env_vars,
+                worktree_list,
+                config_show,
+                performance_profile,
+                trace_log,
+                subprocess_log_path,
+            })
+            .unwrap();
+
+        // Final sanitize at the upload boundary. This is the only place that
+        // covers *every* inlined source at once: `config_show` and
+        // `worktree_list` are spliced in directly, never through the
+        // already-escaped `trace.log`, so a control byte from either (or from
+        // the `context` error string) would still make `gh gist create` reject
+        // diagnostic.md as binary. `escape_controls` preserves tabs/newlines,
+        // so the markdown structure is intact, and is idempotent over the
+        // trace.log the formatter already cleaned.
+        h0x_wt::utils::escape_controls(&rendered).into_owned()
+    }
+
+    /// Write the diagnostic report to a file.
+    ///
+    /// Called from `write_diagnostic()`, which `write_if_verbose()` runs when
+    /// verbose >= 2.
+    /// Returns the path if successful, None if write failed.
+    pub fn write_diagnostic_file(&self, repo: &Repository) -> Option<PathBuf> {
+        let log_dir = repo.wt_logs_dir();
+        std::fs::create_dir_all(&log_dir).ok()?;
+
+        let path = log_dir.join("diagnostic.md");
+        std::fs::write(&path, &self.content).ok()?;
+
+        Some(path)
+    }
+}
+
+/// Return hint telling users to run with `-vv` for diagnostics.
+///
+/// This is a free function (not a method on DiagnosticReport) because it
+/// doesn't require collecting diagnostic data - just returns a static hint.
+///
+/// TODO: Consider showing this hint automatically when any `log::warn!` occurs
+/// during command execution, since runtime warnings often indicate unexpected
+/// conditions that could be bugs worth reporting.
+pub(crate) fn issue_hint() -> String {
+    cformat!("To create a diagnostic file, run with <underline>-vv</>")
+}
+
+/// Write diagnostic file when -vv is used.
+///
+/// Called at the end of command execution. If verbose level is >= 2, writes
+/// a diagnostic report to `.git/h0x-wt/logs/diagnostic.md` for issue filing.
+///
+/// Silently returns if:
+/// - verbose < 2
+/// - Not in a git repository
+///
+/// Warns if diagnostic file write fails.
+pub(crate) fn write_if_verbose(verbose: u8, command_line: &str, error_msg: Option<&str>) {
+    if verbose < 2 {
+        return;
+    }
+
+    // The collector runs after the command and writes to the same trace. Mark
+    // all of its subprocesses at the source so aggregate profiles can exclude
+    // them without recognizing individual commands or relying on their order.
+    h0x_wt::trace::emit::with_diagnostic_context(|| {
+        write_diagnostic(command_line, error_msg);
+    });
+}
+
+fn write_diagnostic(command_line: &str, error_msg: Option<&str>) {
+    // Use Repository::current() which honors the -C flag
+    let Ok(repo) = Repository::current() else {
+        return;
+    };
+
+    // Check if we're actually in a git repo
+    if repo.current_worktree().git_dir().is_err() {
+        return;
+    }
+
+    // Build context based on success/error
+    let context = match error_msg {
+        Some(msg) => format!("Command failed: {msg}"),
+        None => "Command completed successfully".to_string(),
+    };
+
+    // Collect and write the diagnostic bundle. `diagnostic.md` is the single
+    // human-facing doc — it's what the headline names. The raw companions
+    // (`trace.jsonl`, `subprocess.log`) live alongside it in the same
+    // directory (named at the start of every `-vv` run), and the report body
+    // points at them directly (subprocess_log_path in the template above;
+    // the performance profile section names `trace.jsonl` as its source).
+    let report = DiagnosticReport::collect(&repo, command_line, context);
+
+    match report.write_diagnostic_file(&repo) {
+        Some(path) => {
+            let path_display = format_path_for_display(&path);
+            eprintln!(
+                "{}",
+                info_message(format!(
+                    "Diagnostics and performance profile saved @ {path_display}"
+                ))
+            );
+
+            // Only show gh command if gh is installed
+            if is_gh_installed() {
+                let issue_url = "https://github.com/vjk7989/h0x-ADE-core/issues/new";
+                eprintln!(
+                    "{}",
+                    hint_message(cformat!(
+                        "To report a bug, open an issue (<underline>{issue_url}</>) and attach a secret gist: <underline>gh gist create --web {path_display}</>"
+                    ))
+                );
+            }
+        }
+        None => {
+            eprintln!("{}", warning_message("Failed to write diagnostic file"));
+        }
+    }
+}
+
+/// Check if the GitHub CLI (gh) is installed.
+fn is_gh_installed() -> bool {
+    Cmd::new("gh")
+        .arg("--version")
+        .run()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Render the captured trace as a human-readable performance profile for the
+/// report — a derived view of `trace.jsonl` (where time went, parallelism,
+/// same-context cache misses), ANSI-stripped for the markdown bundle. `None`
+/// when the capture has no trace records, so the section is omitted.
+fn render_trace_profile(trace_jsonl: &str) -> Option<String> {
+    let entries = h0x_wt::trace::parse_lines(trace_jsonl);
+    if entries.is_empty() {
+        return None;
+    }
+    let rendered = h0x_wt::trace::Profile::from_entries(&entries).render_text("trace.jsonl");
+    Some(rendered.ansi_strip().to_string())
+}
+
+/// Truncate log content to ~50KB if it's too large.
+///
+/// Keeps the last ~50KB of the log, cutting at a line boundary.
+fn truncate_log(content: &str) -> String {
+    const MAX_LOG_SIZE: usize = 50 * 1024;
+    if content.len() <= MAX_LOG_SIZE {
+        return content.to_string();
+    }
+
+    // Snap to a char boundary before slicing — the last ~50KB can begin
+    // mid-character otherwise.
+    let start = content.floor_char_boundary(content.len() - MAX_LOG_SIZE);
+    // Find the next newline to avoid cutting mid-line
+    let start = content[start..]
+        .find('\n')
+        .map(|i| start + i + 1)
+        .unwrap_or(start);
+
+    format!("(log truncated to last ~50KB)\n{}", &content[start..])
+}
+
+/// Render the curated environment variables ([`DIAGNOSTIC_ENV_VARS`]) plus git's
+/// resolved `core.pager` as `KEY=value` lines for the diagnostic report.
+///
+/// Every name comes from the explicit allowlist — never a blanket `env` dump —
+/// so no credential-bearing variable can reach the report. An unset variable is
+/// rendered as `(unset)` so an absent `PAGER` is as visible as a set one, which
+/// is exactly the distinction a pager-suspension report (issue #3322) turns on.
+fn environment_vars(repo: &Repository) -> String {
+    let mut lines: Vec<String> = DIAGNOSTIC_ENV_VARS
+        .iter()
+        .map(|name| {
+            let value = std::env::var(name).unwrap_or_else(|_| "(unset)".to_string());
+            format!("{name}={value}")
+        })
+        .collect();
+
+    // git's `core.pager` is the pager source `PAGER`/`GIT_PAGER` don't capture.
+    let core_pager = repo
+        .config_value("core.pager")
+        .ok()
+        .flatten()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "(unset)".to_string());
+    lines.push(format!("core.pager={core_pager}"));
+
+    lines.join("\n")
+}
+
+/// Get config show output for diagnostic.
+///
+/// Returns a summary of user and project config files.
+fn config_show_output(repo: &Repository) -> Option<String> {
+    let mut output = String::new();
+
+    // User config
+    if let Some(user_config_path) = h0x_wt::config::config_path() {
+        output.push_str(&format_config_section(
+            &user_config_path,
+            ConfigFileKind::User,
+        ));
+    }
+
+    // Project config
+    if let Ok(Some(project_config_path)) = repo.project_config_path() {
+        output.push_str(&format!(
+            "\n{}",
+            format_config_section(&project_config_path, ConfigFileKind::Project)
+        ));
+    }
+
+    if output.is_empty() {
+        None
+    } else {
+        Some(output.trim().to_string())
+    }
+}
+
+/// Format a config file section for diagnostic output.
+fn format_config_section(path: &std::path::Path, kind: ConfigFileKind) -> String {
+    let mut output = format!("{}: {}\n", kind.label(), path.display());
+    if path.exists() {
+        match std::fs::read_to_string(path) {
+            Ok(content) if content.trim().is_empty() => output.push_str("(empty file)\n"),
+            Ok(content) => {
+                // Include content, but truncate if very long. Snap to a char
+                // boundary so a multi-byte character straddling offset 4000
+                // doesn't panic the slice.
+                let content = if content.len() > 4000 {
+                    let end = content.floor_char_boundary(4000);
+                    format!("{}...\n(truncated)", &content[..end])
+                } else {
+                    content
+                };
+                output.push_str(&content);
+                if !output.ends_with('\n') {
+                    output.push('\n');
+                }
+            }
+            Err(e) => output.push_str(&format!("(read failed: {})\n", e)),
+        }
+    } else {
+        output.push_str("(file not found)\n");
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_format_config_section_file_not_found() {
+        let result = format_config_section(
+            std::path::Path::new("/nonexistent/path.toml"),
+            ConfigFileKind::User,
+        );
+        insta::assert_snapshot!(result, @"
+        User config: /nonexistent/path.toml
+        (file not found)
+        ");
+    }
+
+    #[test]
+    fn test_format_config_section_empty_file() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("empty.toml");
+        std::fs::write(&path, "").unwrap();
+
+        let result = format_config_section(&path, ConfigFileKind::User);
+        assert!(result.contains("(empty file)"));
+    }
+
+    #[test]
+    fn test_format_config_section_with_content() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "key = \"value\"\n").unwrap();
+
+        let result = format_config_section(&path, ConfigFileKind::User);
+        assert!(result.contains("key = \"value\""));
+    }
+
+    #[test]
+    fn test_format_config_section_adds_trailing_newline() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(&path, "no-newline").unwrap();
+
+        let result = format_config_section(&path, ConfigFileKind::User);
+        assert!(result.ends_with('\n'));
+    }
+
+    #[test]
+    fn test_format_config_section_truncates_long_content() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("big.toml");
+        let content = "x".repeat(5000);
+        std::fs::write(&path, &content).unwrap();
+
+        let result = format_config_section(&path, ConfigFileKind::User);
+        assert!(result.contains("(truncated)"));
+        assert!(result.len() < 5000);
+    }
+
+    #[test]
+    fn test_format_config_section_truncates_multibyte_at_boundary() {
+        // A multi-byte char straddling the 4000-byte cut must not panic the
+        // slice. "🦀" is 4 bytes; padding 3998 ASCII bytes puts a crab boundary
+        // at 3998/4002/4006/... so byte 4000 lands mid-character.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("emoji.toml");
+        let content = format!("{}{}", "x".repeat(3998), "🦀".repeat(100));
+        std::fs::write(&path, &content).unwrap();
+
+        let result = format_config_section(&path, ConfigFileKind::User);
+        assert!(result.contains("(truncated)"));
+    }
+
+    #[test]
+    fn test_render_trace_profile_summarizes_records() {
+        let trace = r#"{"kind":"cmd_completed","ts":1000,"tid":1,"context":"main","cmd":"git status","dur_us":12000,"ok":true}
+{"kind":"cmd_completed","ts":1000,"tid":2,"context":"feature","cmd":"git status","dur_us":8000,"ok":true}
+"#;
+        let rendered = render_trace_profile(trace).expect("records present");
+        assert!(rendered.contains("PERFORMANCE PROFILE"), "{rendered}");
+        assert!(rendered.contains("BY COMMAND TYPE"), "{rendered}");
+        // ANSI is stripped for the markdown bundle.
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "should be ANSI-free: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_render_trace_profile_none_without_records() {
+        assert!(render_trace_profile("not a trace line\nanother line\n").is_none());
+    }
+
+    #[test]
+    fn test_truncate_log_small_content() {
+        let content = "small log content";
+        let result = truncate_log(content);
+        assert_eq!(result, content);
+    }
+
+    #[test]
+    fn test_truncate_log_large_content() {
+        let content = "x".repeat(60 * 1024); // 60KB
+        let result = truncate_log(&content);
+        assert!(result.starts_with("(log truncated to last ~50KB)"));
+        assert!(result.len() < 55 * 1024);
+    }
+
+    #[test]
+    fn test_truncate_log_large_content_multibyte_at_boundary() {
+        // The 50KB-from-end offset must not split a multi-byte char. "€" is 3
+        // bytes and 51200 is not a multiple of 3, so a newline-free 3-byte-char
+        // tail forces the cut offset to land mid-character with no '\n' to
+        // realign on — the exact case that panicked before the boundary snap.
+        let content = format!("{}{}", "x".repeat(2000), "€".repeat(20000));
+        let result = truncate_log(&content);
+        assert!(result.starts_with("(log truncated to last ~50KB)"));
+    }
+}

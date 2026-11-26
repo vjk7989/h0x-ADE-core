@@ -1,0 +1,204 @@
+use std::fmt;
+
+use color_print::cformat;
+use h0x_wt::config::{Command, ProjectConfig};
+use h0x_wt::git::HookType;
+use h0x_wt::styling::{format_bash_with_gutter, format_with_gutter};
+
+/// What triggered a project command — determines the label in approval prompts.
+#[derive(Clone)]
+pub enum Phase {
+    Hook(HookType),
+    Alias,
+    /// Project-level commit-message append fragment — not a shell command.
+    /// Approving records the raw fragment as "approved" so subsequent LLM
+    /// calls include it without re-prompting.
+    CommitTemplateAppend,
+}
+
+impl fmt::Display for Phase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Phase::Hook(hook_type) => write!(f, "{hook_type}"),
+            Phase::Alias => write!(f, "alias"),
+            Phase::CommitTemplateAppend => write!(f, "commit-template-append"),
+        }
+    }
+}
+
+/// A project-config command pending approval.
+#[derive(Clone)]
+pub struct ApprovableCommand {
+    pub phase: Phase,
+    pub command: Command,
+}
+
+impl ApprovableCommand {
+    /// Build an approvable for the project-level commit append fragment.
+    /// The raw fragment is reused as the `Command::template` so the
+    /// approvals store (`approved-commands`) treats it like any other
+    /// approved input.
+    pub fn commit_template_append(text: String) -> Self {
+        Self {
+            phase: Phase::CommitTemplateAppend,
+            command: Command::new(None, text),
+        }
+    }
+
+    /// `phase name:` label shown before the command body, in the approval
+    /// prompt and the approvals listing.
+    pub fn label(&self) -> String {
+        command_label(&self.phase, self.command.name.as_deref())
+    }
+
+    /// Gutter-formatted template. Shell commands get bash syntax
+    /// highlighting; the commit template fragment is plain text
+    /// (markdown-ish) and shouldn't be tokenized as bash.
+    pub fn format_template(&self) -> String {
+        match self.phase {
+            Phase::CommitTemplateAppend => format_with_gutter(&self.command.template, None),
+            _ => format_bash_with_gutter(&self.command.template),
+        }
+    }
+}
+
+/// `phase name:` label shown before a command body. Free-standing rather
+/// than a method on [`ApprovableCommand`] so `wt hook show` can label user
+/// hooks, which are never approvable.
+pub fn command_label(phase: impl fmt::Display, name: Option<&str>) -> String {
+    match name {
+        Some(name) => cformat!("{phase} <bold>{name}</>:"),
+        None => format!("{phase}:"),
+    }
+}
+
+/// Collect commands for the given hook types, preserving order of the provided hooks.
+pub fn collect_commands_for_hooks(
+    project_config: &ProjectConfig,
+    hooks: &[HookType],
+) -> Vec<ApprovableCommand> {
+    let mut commands = Vec::new();
+    for hook in hooks {
+        if let Some(config) = project_config.hooks.get(*hook) {
+            commands.extend(config.commands().cloned().map(|command| ApprovableCommand {
+                phase: Phase::Hook(*hook),
+                command,
+            }));
+        }
+    }
+    commands
+}
+
+/// Collect commands for every project-config alias, in `BTreeMap` (alphabetical) order.
+///
+/// Mirrors `approve_alias_commands` in `command_approval.rs`: unnamed steps within
+/// an alias inherit the alias name, so users see a stable label in approval prompts.
+pub fn collect_commands_for_aliases(project_config: &ProjectConfig) -> Vec<ApprovableCommand> {
+    project_config
+        .aliases
+        .iter()
+        .flat_map(|(alias_name, alias_cfg)| {
+            alias_cfg.commands().map(move |cmd| ApprovableCommand {
+                phase: Phase::Alias,
+                command: Command::new(
+                    Some(cmd.name.clone().unwrap_or_else(|| alias_name.clone())),
+                    cmd.template.clone(),
+                ),
+            })
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_project_config_with_hooks() -> ProjectConfig {
+        // Use TOML deserialization to create ProjectConfig
+        let toml_content = r#"
+pre-start = "npm install"
+pre-merge = "cargo test"
+"#;
+        toml::from_str(toml_content).unwrap()
+    }
+
+    #[test]
+    fn test_collect_commands_for_hooks_empty_hooks() {
+        let config = make_project_config_with_hooks();
+        let commands = collect_commands_for_hooks(&config, &[]);
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn test_collect_commands_for_hooks_single_hook() {
+        let config = make_project_config_with_hooks();
+        let commands = collect_commands_for_hooks(&config, &[HookType::PreCreate]);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].command.template, "npm install");
+    }
+
+    #[test]
+    fn test_collect_commands_for_hooks_multiple_hooks() {
+        let config = make_project_config_with_hooks();
+        let commands =
+            collect_commands_for_hooks(&config, &[HookType::PreCreate, HookType::PreMerge]);
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].command.template, "npm install");
+        assert_eq!(commands[1].command.template, "cargo test");
+    }
+
+    #[test]
+    fn test_collect_commands_for_hooks_missing_hook() {
+        let config = make_project_config_with_hooks();
+        let commands = collect_commands_for_hooks(&config, &[HookType::PostCreate]);
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn test_collect_commands_for_hooks_order_preserved() {
+        let config = make_project_config_with_hooks();
+        // Order should match the order of hooks provided
+        let commands =
+            collect_commands_for_hooks(&config, &[HookType::PreMerge, HookType::PreCreate]);
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].command.template, "cargo test");
+        assert_eq!(commands[1].command.template, "npm install");
+    }
+
+    #[test]
+    fn test_collect_commands_for_hooks_all_hook_types() {
+        use strum::IntoEnumIterator;
+
+        let config = ProjectConfig::default();
+        // All hooks should work even when empty
+        let hooks: Vec<_> = HookType::iter().collect();
+        let commands = collect_commands_for_hooks(&config, &hooks);
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn test_collect_commands_for_hooks_named_commands() {
+        let toml_content = r#"
+[pre-start]
+install = "npm install"
+build = "npm run build"
+"#;
+        let config: ProjectConfig = toml::from_str(toml_content).unwrap();
+        let commands = collect_commands_for_hooks(&config, &[HookType::PreCreate]);
+        assert_eq!(commands.len(), 2);
+        // Named commands preserve order from TOML
+        assert_eq!(commands[0].command.name, Some("install".to_string()));
+        assert_eq!(commands[1].command.name, Some("build".to_string()));
+    }
+
+    #[test]
+    fn test_collect_commands_for_hooks_phase_is_set() {
+        let config = make_project_config_with_hooks();
+        let commands = collect_commands_for_hooks(&config, &[HookType::PreCreate]);
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            commands[0].phase,
+            Phase::Hook(HookType::PreCreate)
+        ));
+    }
+}

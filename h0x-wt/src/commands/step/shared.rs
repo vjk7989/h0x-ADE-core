@@ -1,0 +1,326 @@
+//! Helpers shared between multiple step subcommands.
+//!
+//! - `print_dry_run` — used by `commit` and `squash` for `--dry-run` output.
+//! - Copy-ignored discovery (`list_and_filter_ignored_entries` and friends) —
+//!   used by `copy_ignored` and `promote`.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::Context;
+use ignore::gitignore::GitignoreBuilder;
+use h0x_wt::config::CopyIgnoredConfig;
+use h0x_wt::git::Repository;
+use h0x_wt::shell_exec::Cmd;
+use h0x_wt::styling::{format_bash_with_gutter, format_heading, format_with_gutter};
+
+use super::super::commit::CommitGenerator;
+
+/// Print the three dry-run sections: rendered prompt, LLM command, generated message.
+///
+/// The COMMAND and MESSAGE sections use the same gutter treatment as the regular commit
+/// flow — `format_bash_with_gutter` for the shell invocation, and the bold-first-line
+/// commit message format wrapped in `format_with_gutter`. The PROMPT is left ungutter'd
+/// to keep `--dry-run`'s output visually aligned with `--show-prompt`.
+///
+/// Output is routed through the pager when stdout is a TTY (see writing-user-outputs →
+/// "When to page output"). The helper falls back to direct stdout when piped.
+pub(super) fn print_dry_run(
+    prompt: &str,
+    commit_config: &h0x_wt::config::CommitGenerationConfig,
+    message: &str,
+) -> anyhow::Result<()> {
+    let command_block = match commit_config
+        .command
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(cmd) => format_bash_with_gutter(&crate::llm::render_llm_invocation(cmd)?),
+        None => format_with_gutter("(LLM not configured — using built-in fallback)", None),
+    };
+    let formatted = CommitGenerator::new(commit_config, None).format_message_for_display(message);
+    let out = format!(
+        "{prompt_heading}\n{prompt}\n\n{command_heading}\n{command_block}\n\n{message_heading}\n{message_block}\n",
+        prompt_heading = format_heading("PROMPT", None),
+        command_heading = format_heading("COMMAND", None),
+        message_heading = format_heading("MESSAGE", None),
+        message_block = format_with_gutter(&formatted, None),
+    );
+
+    crate::help_pager::show_help_in_pager(&out, true)?;
+    Ok(())
+}
+
+/// Built-in excludes for `wt step copy-ignored`: VCS metadata + tool-state directories.
+///
+/// VCS directories contain internal state tied to a specific working directory.
+/// Git's own `.git` is implicitly excluded (git ls-files never reports it), but
+/// other VCS tools colocated with git need explicit exclusion. Tool-state
+/// directories (`.conductor/`, `.worktrees/`, etc.) are project-local state that
+/// shouldn't be shared between worktrees.
+pub(super) const BUILTIN_COPY_IGNORED_EXCLUDES: &[&str] = &[
+    ".bzr/",
+    ".conductor/",
+    ".entire/",
+    ".hg/",
+    ".jj/",
+    ".pijul/",
+    ".sl/",
+    ".svn/",
+    ".worktrees/",
+];
+
+fn default_copy_ignored_excludes() -> Vec<String> {
+    BUILTIN_COPY_IGNORED_EXCLUDES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+/// Resolve the full copy-ignored config by merging built-in defaults, project
+/// config (`.config/h0x-wt.toml`), and user config (global + per-project overrides).
+pub(super) fn resolve_copy_ignored_config(repo: &Repository) -> anyhow::Result<CopyIgnoredConfig> {
+    let mut config = CopyIgnoredConfig {
+        exclude: default_copy_ignored_excludes(),
+    };
+    let user_config = repo.user_config();
+    // No `.context()`: `project_config()` already wraps the load failure with
+    // exactly that header (see `handle_hook_show`).
+    let project_config = repo.project_config()?;
+    if let Some(project_config) = project_config
+        && let Some(project_copy_ignored) = project_config.copy_ignored()
+    {
+        config = config.merged_with(project_copy_ignored);
+    }
+    let project_id = repo.project_identifier().ok();
+    config = config.merged_with(&user_config.copy_ignored(project_id.as_ref()));
+    Ok(config)
+}
+
+/// List gitignored entries in a worktree, filtered by `.worktreeinclude` and excluding
+/// configured patterns, VCS metadata directories, and entries that contain nested worktrees.
+///
+/// Combines five steps:
+/// 1. `list_ignored_entries()` — git ls-files for ignored entries
+/// 2. `.worktreeinclude` filtering — only matching entries if the file exists
+/// 3. `[step.copy-ignored].exclude` filtering — skip entries matching configured patterns
+/// 4. Built-in exclude filtering — always skip VCS metadata and tool-state directories
+/// 5. Nested worktree filtering — exclude entries containing other worktrees
+pub(super) fn list_and_filter_ignored_entries(
+    worktree_path: &Path,
+    context: &str,
+    worktree_paths: &[PathBuf],
+    exclude_patterns: &[String],
+) -> anyhow::Result<Vec<(PathBuf, bool)>> {
+    let ignored_entries = list_ignored_entries(worktree_path, context)?;
+
+    // Filter to entries that match .worktreeinclude (or all if no file exists)
+    let include_path = worktree_path.join(".worktreeinclude");
+    let filtered: Vec<_> = if include_path.exists() {
+        let include_matcher = {
+            let mut builder = GitignoreBuilder::new(worktree_path);
+            if let Some(err) = builder.add(&include_path) {
+                // The `ignore` crate formats the path with OS-native separators;
+                // normalize to forward slashes for consistent display.
+                return Err(h0x_wt::git::GitError::WorktreeIncludeParseError {
+                    error: err.to_string().replace('\\', "/"),
+                }
+                .into());
+            }
+            builder.build().context("Failed to build include matcher")?
+        };
+        ignored_entries
+            .into_iter()
+            .filter(|(path, is_dir)| {
+                include_matcher
+                    .matched_path_or_any_parents(relative_entry(path, worktree_path), *is_dir)
+                    .is_ignore()
+            })
+            .collect()
+    } else {
+        ignored_entries
+    };
+
+    // Build exclude matcher for configured patterns (if any)
+    let exclude_matcher = if exclude_patterns.is_empty() {
+        None
+    } else {
+        let mut builder = GitignoreBuilder::new(worktree_path);
+        for pattern in exclude_patterns {
+            builder.add_line(None, pattern).map_err(|error| {
+                anyhow::anyhow!(
+                    "Invalid [step.copy-ignored].exclude pattern {:?}: {}",
+                    pattern,
+                    error
+                )
+            })?;
+        }
+        Some(
+            builder
+                .build()
+                .context("Failed to build copy-ignored exclude matcher")?,
+        )
+    };
+
+    // Filter out excluded patterns, VCS metadata directories, and nested worktrees
+    Ok(filtered
+        .into_iter()
+        .filter(|(path, is_dir)| {
+            // Skip entries matching configured exclude patterns
+            if let Some(ref matcher) = exclude_matcher
+                && matcher
+                    .matched_path_or_any_parents(relative_entry(path, worktree_path), *is_dir)
+                    .is_ignore()
+            {
+                return false;
+            }
+            // Skip built-in excluded directories (.jj, .hg, .worktrees, etc.)
+            if *is_dir
+                && path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| {
+                        BUILTIN_COPY_IGNORED_EXCLUDES
+                            .iter()
+                            .any(|pat| pat.trim_end_matches('/') == name)
+                    })
+            {
+                return false;
+            }
+            // Skip entries that contain other worktrees
+            !worktree_paths
+                .iter()
+                .any(|wt_path| wt_path != worktree_path && wt_path.starts_with(path))
+        })
+        .collect())
+}
+
+/// An entry's path relative to its worktree, for gitignore matching.
+///
+/// Matching walks the entry's parents (`matched_path_or_any_parents`) because
+/// `git ls-files --directory` lists an ignored file individually when its
+/// directory also holds tracked files, so a `config/` pattern has to reach
+/// `config/local.yml` through its parent, as it would in a `.gitignore`.
+/// Every entry is `worktree_path.join(..)` (see `list_ignored_entries`), so the
+/// strip always succeeds.
+fn relative_entry<'a>(path: &'a Path, worktree_path: &Path) -> &'a Path {
+    path.strip_prefix(worktree_path).unwrap_or(path)
+}
+
+/// List ignored entries using git ls-files
+///
+/// Uses `git ls-files -z --ignored --exclude-standard -o --directory` which:
+/// - Handles all gitignore sources (global, .gitignore, .git/info/exclude, nested)
+/// - Stops at directory boundaries (--directory) to avoid listing thousands of files
+///
+/// `-z` NUL-terminates the entries and, crucially, disables path quoting. Without
+/// it, `core.quotePath` (git's default) renders a non-ASCII name like
+/// `data/Report — Q1.txt` as `"data/Report \342\200\224 Q1.txt"` — surrounding
+/// quotes and octal escapes included — which is then treated as a literal path and
+/// never found on disk. NUL splitting also sidesteps the newline-in-filename edge
+/// case that line splitting can't represent.
+fn list_ignored_entries(
+    worktree_path: &Path,
+    context: &str,
+) -> anyhow::Result<Vec<(std::path::PathBuf, bool)>> {
+    let args = [
+        "ls-files",
+        "-z",
+        "--ignored",
+        "--exclude-standard",
+        "-o",
+        "--directory",
+    ];
+    let output = Cmd::new("git")
+        .args(args)
+        .current_dir(worktree_path)
+        .context(context)
+        .scrub_git_discovery_env()
+        .run()
+        .context("Failed to run git ls-files")?;
+
+    if !output.status.success() {
+        return Err(h0x_wt::git::CommandError::from_failed_output("git", &args, &output).into());
+    }
+
+    // Git's -z output contains path bytes, which need not be UTF-8 on Unix.
+    let entries = output
+        .stdout
+        .split(|&byte| byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            let (relative, is_dir) = match entry.strip_suffix(b"/") {
+                Some(relative) => (relative, true),
+                None => (entry, false),
+            };
+            (worktree_path.join(path_from_git_bytes(relative)), is_dir)
+        })
+        .collect();
+
+    Ok(entries)
+}
+
+#[cfg(unix)]
+fn path_from_git_bytes(bytes: &[u8]) -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    OsString::from_vec(bytes.to_vec()).into()
+}
+
+#[cfg(not(unix))]
+fn path_from_git_bytes(bytes: &[u8]) -> PathBuf {
+    String::from_utf8_lossy(bytes).into_owned().into()
+}
+
+#[cfg(test)]
+mod tests {
+    use h0x_wt::git::CommandError;
+    use h0x_wt::testing::TestRepo;
+
+    /// A hard `git ls-files` failure (here: a fatal config error) must
+    /// surface as a typed `CommandError`.
+    #[test]
+    fn list_ignored_entries_failure_is_command_error() {
+        let test = TestRepo::with_initial_commit();
+        std::fs::write(test.root_path().join(".git/config"), "[bad\n").unwrap();
+
+        let err = super::list_ignored_entries(test.root_path(), "test").unwrap_err();
+        let cmd_err = CommandError::find_in(&err).expect("error should carry a CommandError");
+        assert!(cmd_err.command_string().starts_with("git ls-files"));
+    }
+
+    /// An ignored file whose name contains non-ASCII characters must be
+    /// discovered with a real filesystem path. With `core.quotePath` (git's
+    /// default), `git ls-files` renders such a name as `"data/Report
+    /// \342\200\224 Q1.txt"` — quotes and octal escapes included — which does
+    /// not exist on disk. Discovery must return the actual path.
+    #[test]
+    fn list_ignored_entries_handles_non_ascii_names() {
+        let test = TestRepo::with_initial_commit();
+        let root = test.root_path();
+
+        // A tracked file in data/ keeps `--directory` from collapsing the
+        // directory into a single entry, so the individual filename is listed.
+        std::fs::create_dir(root.join("data")).unwrap();
+        std::fs::write(root.join("data/keep.md"), "tracked").unwrap();
+        std::fs::write(root.join(".gitignore"), "*.txt\n").unwrap();
+        test.run_git(&["add", "-A"]);
+        test.run_git(&["commit", "-m", "add tracked"]);
+
+        // Ignored file with an em dash (U+2014) in its name.
+        let ignored_name = "Report — Q1.txt";
+        let ignored_path = root.join("data").join(ignored_name);
+        std::fs::write(&ignored_path, "x").unwrap();
+
+        let entries = super::list_ignored_entries(root, "test").unwrap();
+        let (path, is_dir) = entries
+            .iter()
+            .find(|(path, _)| path.file_name().and_then(|n| n.to_str()) == Some(ignored_name))
+            .expect("non-ASCII ignored file should be discovered");
+        assert!(!is_dir);
+        assert!(
+            path.exists(),
+            "discovered path does not exist on disk: {path:?}"
+        );
+    }
+}

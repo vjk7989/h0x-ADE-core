@@ -1,0 +1,67 @@
+# worktrunk shell integration for fish
+#
+# This is the full function definition, output by `{{ cmd }} config shell init fish`.
+# It's sourced at runtime by the wrapper in ~/.config/fish/functions/{{ cmd }}.fish.
+
+# Override {{ cmd }} command so it can change the parent shell's directory.
+# H0X_WT_BIN can override the binary path (for testing dev builds).
+function {{ cmd }}
+    set -l use_source false
+    set -l args
+
+    for arg in $argv
+        if test "$arg" = "--source"; set use_source true; else; set -a args $arg; end
+    end
+
+    test -n "$H0X_WT_BIN"; or set -l H0X_WT_BIN (type -P {{ cmd }} 2>/dev/null)
+    if test -z "$H0X_WT_BIN"
+        echo "{{ cmd }}: command not found" >&2
+        return 127
+    end
+    set -l cd_file (mktemp)
+
+    # Older fish unwinds only the function that directly launched an interrupted
+    # child. This boundary lets ordinary cleanup run before its caller continues.
+    # Newer fish unwinds the whole input line; postexec owns cleanup in that case.
+    set -l cleanup_function _{{ cmd }}_cleanup_(string replace -a / _ -- "$cd_file")
+    set -l run_function "$cleanup_function"_run
+    function $run_function
+        command $argv
+    end
+    function $cleanup_function --on-event fish_postexec --inherit-variable cd_file --inherit-variable cleanup_function --inherit-variable run_function
+        set -l cd_exit 0
+        # cd file holds a raw path — read with fish builtin (no cat subprocess,
+        # safe even if CWD was removed by worktree removal).
+        if test -s "$cd_file"
+            set -l target (string trim < "$cd_file")
+            # `builtin cd` bypasses any user `cd` override (e.g. the zoxide.fish
+            # plugin replaces `cd` with a query function that mishandles the `--`
+            # separator). Matches the bash/zsh wrappers. (#3159)
+            builtin cd -- "$target"
+            set cd_exit $status
+        end
+
+        command rm -f "$cd_file"
+        functions -e $cleanup_function $run_function
+        return $cd_exit
+    end
+
+    # --source: use cargo run (builds from source)
+    if test $use_source = true
+        $run_function env H0X_WT_DIRECTIVE_CD_FILE=$cd_file \
+            cargo run --bin {{ cmd }} --quiet -- $args
+    else
+        $run_function env H0X_WT_DIRECTIVE_CD_FILE=$cd_file \
+            $H0X_WT_BIN $args
+    end
+    set -l exit_code $status
+
+    $cleanup_function
+    set -l cd_exit $status
+    if test $exit_code -eq 0
+        set exit_code $cd_exit
+    end
+    return $exit_code
+end
+
+# Completions are in ~/.config/fish/completions/{{ cmd }}.fish (installed by `{{ cmd }} config shell install`)

@@ -1,0 +1,1896 @@
+//! Git remote URL parsing.
+//!
+//! Parses git remote URLs into structured components (host, owner, repo).
+//! Supports HTTPS, SSH, and SCP-style SSH URL formats.
+
+use schemars::JsonSchema;
+use serde::Serialize;
+
+use super::ci_platform::{ForgeKind, host_is_within, normalized_hostname};
+
+/// Parsed, provider-neutral repository metadata.
+///
+/// This is the single shape behind the `repo` / `ci.repo` JSON objects of
+/// `wt list`; serde controls the field rename/skip rules so there is no
+/// parallel output-only struct.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, JsonSchema)]
+pub struct GitRepoInfo {
+    /// Repository web URL.
+    pub url: String,
+    /// Forge provider, or [`GitRepoProvider::Unknown`] for parseable URLs whose
+    /// host and config do not identify a supported provider.
+    pub provider: GitRepoProvider,
+    /// Web host for the repository URL.
+    pub host: String,
+    /// Repository owner, organization, or namespace path.
+    pub owner: String,
+    /// Repository name.
+    pub name: String,
+    /// Azure DevOps project name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Local git remote this metadata was derived from. Set only for the
+    /// top-level `repo` of `wt list`; absent for PR/MR-URL-derived metadata
+    /// such as `ci.repo`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+}
+
+/// Supported forge providers for repository metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, JsonSchema)]
+pub enum GitRepoProvider {
+    #[serde(rename = "github")]
+    GitHub,
+    #[serde(rename = "gitlab")]
+    GitLab,
+    #[serde(rename = "gitea")]
+    Gitea,
+    #[serde(rename = "azure-devops")]
+    AzureDevOps,
+    #[serde(rename = "unknown")]
+    Unknown,
+}
+
+impl From<ForgeKind> for GitRepoProvider {
+    fn from(platform: ForgeKind) -> Self {
+        match platform {
+            ForgeKind::GitHub => Self::GitHub,
+            ForgeKind::GitLab => Self::GitLab,
+            ForgeKind::Gitea => Self::Gitea,
+            ForgeKind::AzureDevOps => Self::AzureDevOps,
+        }
+    }
+}
+
+/// Parsed git remote URL with host, owner (namespace), and repository components.
+///
+/// # Supported URL formats
+///
+/// - `https://<host>/<namespace>/<repo>.git`
+/// - `http://<host>/<namespace>/<repo>.git`
+/// - `git://<host>/<namespace>/<repo>.git`
+/// - `<user>@<host>:<namespace>/<repo>.git`
+/// - `ssh://git@<host>/<namespace>/<repo>.git`
+/// - `ssh://git@<host>:<port>/<namespace>/<repo>.git`
+/// - `ssh://<host>/<namespace>/<repo>.git`
+/// - `ssh://<host>:<port>/<namespace>/<repo>.git`
+///
+/// Hosts may be bracketed IPv6 literals (`ssh://git@[2001:db8::1]/...`).
+///
+/// # Nested groups (GitLab subgroups)
+///
+/// GitLab supports arbitrary nesting depth: `gitlab.com/group/subgroup/subsubgroup/repo`
+/// The parser treats everything before the last path segment as the namespace:
+/// - `owner()` returns `"group/subgroup/subsubgroup"`
+/// - `repo()` returns `"repo"`
+/// - `project_identifier()` returns `"gitlab.com/group/subgroup/subsubgroup/repo"`
+///
+/// This ensures unique project identifiers for approval tracking security.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRemoteUrl {
+    /// Web-facing host: lowercased hostname or bracketed IPv6 literal, plus
+    /// the explicit port of an HTTP(S) or git URL.
+    host: String,
+    /// Explicit non-default port of an SSH remote. Part of the project
+    /// identity — two SSH servers on one host are different projects — but not
+    /// of [`host`](Self::host), which feeds web and API URLs.
+    ssh_port: Option<u16>,
+    /// Full namespace path (may include `/` for nested groups)
+    owner: String,
+    repo: String,
+}
+
+/// Split a path into namespace and repo components.
+///
+/// Takes everything before the last segment as namespace, last segment as repo.
+/// Handles trailing `.git` suffix and empty segments.
+///
+/// Returns `None` if there aren't at least 2 non-empty path segments.
+fn split_namespace_repo(path: &str) -> Option<(String, String)> {
+    // Filter out empty segments (handles trailing slashes, double slashes)
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    if segments.len() < 2 {
+        return None;
+    }
+
+    // Last segment is repo (possibly with .git suffix)
+    let repo_with_suffix = segments.last()?;
+    let repo = repo_with_suffix
+        .strip_suffix(".git")
+        .unwrap_or(repo_with_suffix);
+
+    // Everything else is the namespace
+    let namespace = segments[..segments.len() - 1].join("/");
+
+    if namespace.is_empty() || repo.is_empty() {
+        return None;
+    }
+
+    Some((namespace, repo.to_string()))
+}
+
+pub(crate) fn canonical_url_path_segment(segment: &str) -> String {
+    let decoded = urlencoding::decode(segment).unwrap_or(std::borrow::Cow::Borrowed(segment));
+    urlencoding::encode(decoded.as_ref()).into_owned()
+}
+
+pub(crate) fn url_path_segments_eq(left: &str, right: &str) -> bool {
+    canonical_url_path_segment(left).eq_ignore_ascii_case(&canonical_url_path_segment(right))
+}
+
+/// Extract the network host (plus a port, when present) from a URL authority,
+/// discarding userinfo at the final `@`.
+///
+/// The final separator matters for hostile or credential-bearing authorities:
+/// `github.com@attacker.example` connects to `attacker.example`, while
+/// `user:token@github.com:8443` connects to `github.com:8443`. Validation uses
+/// the same normalized hostname view as forge classification so an authority
+/// containing only userinfo and a port cannot produce an empty host.
+pub(crate) fn authority_host(authority: &str) -> Option<&str> {
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    (!host.is_empty() && !normalized_hostname(host).is_empty()).then_some(host)
+}
+
+/// Normalize a parsed host for display and identity, bracketing IPv6 literals.
+///
+/// `gix-url` strips the brackets from SSH and SCP hosts but keeps them on
+/// HTTP(S) and git hosts. Bracketing every IPv6 literal gives one spelling per
+/// address, and keeps the `:` inside an address from reading as a port
+/// separator in the `host[:port]/owner/repo` identifier. A host containing a
+/// `:` that is not an IPv6 address (e.g. the SCP `[host:port]:path` form) is
+/// rejected rather than guessed at.
+fn identity_host(host: &str) -> Option<String> {
+    let inner = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if !inner.contains(':') {
+        return (inner == host).then(|| host.to_string());
+    }
+    let address = inner
+        .split_once('%')
+        .map_or(inner, |(address, _zone)| address);
+    address.parse::<std::net::Ipv6Addr>().ok()?;
+    Some(format!("[{inner}]"))
+}
+
+impl GitRemoteUrl {
+    /// Parse a git remote URL into structured components.
+    ///
+    /// Returns `None` for malformed URLs or unsupported formats.
+    ///
+    /// Transport syntax — scheme, SCP form, userinfo, IPv6 literals, ports —
+    /// is delegated to `gix-url`, which splits userinfo at the final `@` of
+    /// the authority, the host git actually connects to. Worktrunk keeps the
+    /// namespace/repo split: everything but the last path segment is the
+    /// namespace, so GitLab nested groups yield unique project identifiers.
+    /// The path is taken in its original escaped spelling, so `%2F` stays
+    /// inside a segment instead of becoming a namespace boundary.
+    pub fn parse(url: &str) -> Option<Self> {
+        use gix_url::Scheme;
+
+        let parsed = gix_url::parse(url.trim()).ok()?;
+        let host = identity_host(parsed.host_argument_safe()?)?;
+        if normalized_hostname(&host).is_empty() {
+            return None;
+        }
+
+        let (host, ssh_port) = match parsed.scheme {
+            // Scheme URLs keep an explicit port in the host, as the web URL
+            // and API hosts derived from it need it too.
+            Scheme::Http | Scheme::Https | Scheme::Git => match parsed.port {
+                Some(port) => (format!("{host}:{port}"), None),
+                None => (host, None),
+            },
+            Scheme::Ssh => {
+                // SCP-style remotes require a user, so a bare `host:path`
+                // (indistinguishable from a local path with a colon) is not
+                // treated as a remote.
+                if parsed.serialize_alternative_form && parsed.user().is_none_or(str::is_empty) {
+                    return None;
+                }
+                // The SSH port is not the web port, so it stays out of
+                // `host`; the default port names the same server as no port.
+                (host, parsed.port.filter(|&port| port != 22))
+            }
+            _ => return None,
+        };
+
+        let path = std::str::from_utf8(parsed.original_path()).ok()?;
+        let (namespace, repo) = split_namespace_repo(path)?;
+
+        Some(Self {
+            host,
+            ssh_port,
+            owner: namespace,
+            repo,
+        })
+    }
+
+    /// The host (e.g., "github.com", "gitlab.example.com").
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// The repository owner, organization, or namespace path.
+    ///
+    /// For nested GitLab groups, returns the full namespace (e.g., "group/subgroup/team").
+    /// For standard repos, returns the owner (e.g., "owner", "company-org").
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    /// The repository name without .git suffix (e.g., "repo").
+    pub fn repo(&self) -> &str {
+        &self.repo
+    }
+
+    /// Project identifier in "host/owner/repo" format.
+    ///
+    /// Used for tracking approved commands and selecting `[projects]`
+    /// settings. An explicit SSH port joins the host (`host:2222/owner/repo`),
+    /// so servers on different ports never share approvals.
+    pub fn project_identifier(&self) -> String {
+        match self.ssh_port {
+            Some(port) => format!("{}:{port}/{}/{}", self.host, self.owner, self.repo),
+            None => format!("{}/{}/{}", self.host, self.owner, self.repo),
+        }
+    }
+
+    /// The known forge identified by this URL's hostname.
+    pub fn forge_kind(&self) -> Option<ForgeKind> {
+        ForgeKind::from_host(&self.host)
+    }
+
+    /// Check if this URL points to a GitHub host.
+    ///
+    /// Matches github.com and GitHub Enterprise hosts (e.g., github.mycompany.com).
+    pub fn is_github(&self) -> bool {
+        self.forge_kind() == Some(ForgeKind::GitHub)
+    }
+
+    /// Check if this URL points to a Gitea host.
+    ///
+    /// Matches gitea.com and self-hosted Gitea instances (e.g., gitea.example.com).
+    pub fn is_gitea(&self) -> bool {
+        self.forge_kind() == Some(ForgeKind::Gitea)
+    }
+
+    /// Check if this URL points to an Azure DevOps host.
+    ///
+    /// Matches `dev.azure.com`, `ssh.dev.azure.com`, and legacy `*.visualstudio.com` hosts.
+    pub fn is_azure_devops(&self) -> bool {
+        self.forge_kind() == Some(ForgeKind::AzureDevOps)
+    }
+
+    /// Extract the Azure DevOps organization from the URL.
+    ///
+    /// Azure DevOps URLs do not fit the standard `host/owner/repo` shape:
+    /// - `https://dev.azure.com/{org}/{project}/_git/{repo}` — owner is `{org}/{project}/_git`
+    /// - `git@ssh.dev.azure.com:v3/{org}/{project}/{repo}` — owner is `v3/{org}/{project}`
+    /// - `https://{org}.visualstudio.com/{project}/_git/{repo}` — org is in the hostname
+    pub fn azure_organization(&self) -> Option<&str> {
+        if !self.is_azure_devops() {
+            return None;
+        }
+        let parts: Vec<&str> = self.owner.split('/').collect();
+        let host = normalized_hostname(&self.host);
+        if host == "ssh.dev.azure.com" {
+            parts.get(1).copied()
+        } else if host_is_within(&host, "dev.azure.com") {
+            parts.first().copied()
+        } else {
+            self.host.split('.').next()
+        }
+    }
+
+    /// Extract the Azure DevOps project from the URL.
+    ///
+    /// See [`azure_organization`](Self::azure_organization) for URL shape details.
+    pub fn azure_project(&self) -> Option<&str> {
+        if !self.is_azure_devops() {
+            return None;
+        }
+        let parts: Vec<&str> = self.owner.split('/').collect();
+        let host = normalized_hostname(&self.host);
+        if host == "ssh.dev.azure.com" {
+            parts.get(2).copied()
+        } else if host_is_within(&host, "dev.azure.com") {
+            parts.get(1).copied()
+        } else {
+            parts.first().copied()
+        }
+    }
+
+    /// Build the repository web URL from the already-parsed components.
+    ///
+    /// Local-only: derives purely from the parsed remote, with no network
+    /// access. This is the single place that knows the per-forge "web URL from
+    /// a parsed remote" shape.
+    ///
+    /// - Standard forges (GitHub, GitLab incl. nested groups, Gitea, generic):
+    ///   `https://{host}/{owner}/{repo}`.
+    /// - Azure DevOps: `https://dev.azure.com/{org}/{project}/_git/{repo}`, or
+    ///   `https://{host}/{project}/_git/{repo}` for legacy `*.visualstudio.com`
+    ///   (where the org is in the hostname). The naive `host/owner/repo` form is
+    ///   wrong for the SSH (`ssh.dev.azure.com:v3/...`) remote shape, so the
+    ///   [`azure_organization`](Self::azure_organization) /
+    ///   [`azure_project`](Self::azure_project) accessors feed the canonical
+    ///   [`fork_remote_url`](crate::git::remote_ref::azure::fork_remote_url)
+    ///   builder. The SSH `ssh.dev.azure.com` host is normalized to the
+    ///   `dev.azure.com` web host.
+    ///
+    /// Returns `None` only when an Azure DevOps URL is missing its org/project.
+    pub fn web_url(&self) -> Option<String> {
+        if self.is_azure_devops() {
+            let organization = self.azure_organization()?;
+            let project = self.azure_project()?;
+            // `*.visualstudio.com` keeps the org in the hostname; every other
+            // Azure remote shape (including `ssh.dev.azure.com`) maps to the
+            // `dev.azure.com` web host.
+            let host = if host_is_within(&self.host, "visualstudio.com") {
+                self.host.as_str()
+            } else {
+                "dev.azure.com"
+            };
+            return Some(crate::git::remote_ref::azure::fork_remote_url(
+                host,
+                organization,
+                project,
+                &self.repo,
+            ));
+        }
+        Some(format!(
+            "https://{}/{}/{}",
+            self.host, self.owner, self.repo
+        ))
+    }
+
+    /// Build provider-neutral repository metadata from this parsed remote URL.
+    ///
+    /// `provider_override` is the optional `[forge].platform` value. A
+    /// recognized override refines provider detection for opaque or
+    /// non-canonical hosts; an absent or unrecognized value falls back to host
+    /// heuristics, then [`GitRepoProvider::Unknown`].
+    pub fn repo_info(&self, provider_override: Option<&str>) -> Option<GitRepoInfo> {
+        let provider_override = provider_override.and_then(|value| value.parse::<ForgeKind>().ok());
+        let provider_from_host = self.forge_kind();
+        let provider = provider_override
+            .or(provider_from_host)
+            .map(GitRepoProvider::from)
+            .unwrap_or(GitRepoProvider::Unknown);
+
+        if provider == GitRepoProvider::AzureDevOps {
+            if let Some((host, organization, project)) = self.azure_repo_info_parts() {
+                return Some(GitRepoInfo {
+                    url: crate::git::remote_ref::azure::fork_remote_url(
+                        &host,
+                        &organization,
+                        &project,
+                        &self.repo,
+                    ),
+                    provider,
+                    host,
+                    owner: organization,
+                    name: self.repo.clone(),
+                    project: Some(project),
+                    remote: None,
+                });
+            }
+
+            if provider_override == Some(ForgeKind::AzureDevOps)
+                && provider_from_host != Some(ForgeKind::AzureDevOps)
+            {
+                return Some(GitRepoInfo {
+                    url: self.web_url()?,
+                    provider: GitRepoProvider::Unknown,
+                    host: self.host.clone(),
+                    owner: self.owner.clone(),
+                    name: self.repo.clone(),
+                    project: None,
+                    remote: None,
+                });
+            }
+        }
+
+        Some(GitRepoInfo {
+            url: self.web_url()?,
+            provider,
+            host: self.host.clone(),
+            owner: self.owner.clone(),
+            name: self.repo.clone(),
+            project: None,
+            remote: None,
+        })
+    }
+
+    fn azure_repo_info_parts(&self) -> Option<(String, String, String)> {
+        if let (Some(organization), Some(project)) =
+            (self.azure_organization(), self.azure_project())
+        {
+            let host = if host_is_within(&self.host, "visualstudio.com") {
+                self.host.clone()
+            } else {
+                "dev.azure.com".to_string()
+            };
+            return Some((host, organization.to_string(), project.to_string()));
+        }
+
+        let parts: Vec<&str> = self.owner.split('/').collect();
+        if parts.len() >= 3 && parts[2] == "_git" {
+            return Some((
+                self.host.clone(),
+                parts[0].to_string(),
+                parts[1].to_string(),
+            ));
+        }
+        if parts.len() >= 3 && parts[0] == "v3" {
+            return Some((
+                self.host.clone(),
+                parts[1].to_string(),
+                parts[2].to_string(),
+            ));
+        }
+        None
+    }
+}
+
+/// The project identifier Worktrunk v0.80.0 and earlier derived from a remote
+/// URL, frozen so `approvals.toml` and `[projects."…"]` keys written under it
+/// keep applying (read by [`ProjectId`](crate::config::ProjectId)).
+///
+/// The release after v0.80.0 moved remote parsing to `gix-url`, which changed
+/// the identifier for three kinds of remote. Saved keys use the old spelling:
+///
+/// - `ssh://git@host:2222/o/r`: the port was dropped (`host/o/r`).
+/// - `git@GitHub.com:o/r`: the host kept its case (`GitHub.com/o/r`).
+/// - `git+ssh://` and `ssh+git://`: these didn't parse, so the identifier was
+///   the raw URL minus `.git`, as for any other unparsed URL.
+///
+/// Returns `None` for an `ssh://` URL with an IPv6 host, which the old parser
+/// truncated at its first `:` (`[2001/o/r`). That identifier was shared by
+/// every IPv6 server with the same leading group, the collision the `gix-url`
+/// parser fixed. The SCP form kept the rest of the address in the path, so
+/// its identifier stayed distinct and still counts.
+pub(crate) fn legacy_project_identifier(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let parse = || -> Option<(&str, String, String)> {
+        let (host, path) = if let Some(rest) = trimmed
+            .strip_prefix("https://")
+            .or_else(|| trimmed.strip_prefix("http://"))
+            .or_else(|| trimmed.strip_prefix("git://"))
+        {
+            let (authority, path) = rest.split_once('/')?;
+            (authority_host(authority)?, path)
+        } else if let Some(rest) = trimmed.strip_prefix("ssh://") {
+            let (authority, path) = rest.split_once('/')?;
+            let host = authority_host(authority)?;
+            (host.split(':').next().unwrap_or(host), path)
+        } else if let Some((authority, path)) = trimmed.split_once(':')
+            && !authority.contains('/')
+        {
+            let (user, host) = authority.rsplit_once('@')?;
+            if user.is_empty() {
+                return None;
+            }
+            (host, path)
+        } else {
+            return None;
+        };
+        if host.is_empty() {
+            return None;
+        }
+        let (namespace, repo) = split_namespace_repo(path)?;
+        Some((host, namespace, repo))
+    };
+    match parse() {
+        Some((host, _, _)) if trimmed.starts_with("ssh://") && host.starts_with('[') => None,
+        Some((host, namespace, repo)) => Some(format!("{host}/{namespace}/{repo}")),
+        None => Some(url.strip_suffix(".git").unwrap_or(url).to_string()),
+    }
+}
+
+/// Extract owner and repository name from a git remote URL.
+pub fn parse_owner_repo(url: &str) -> Option<(String, String)> {
+    GitRemoteUrl::parse(url).map(|u| (u.owner().to_string(), u.repo().to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_https_urls() {
+        let url = GitRemoteUrl::parse("https://github.com/owner/repo.git").unwrap();
+        assert_eq!(url.host(), "github.com");
+        assert_eq!(url.owner(), "owner");
+        assert_eq!(url.repo(), "repo");
+        assert_eq!(url.project_identifier(), "github.com/owner/repo");
+
+        // Without .git suffix
+        let url = GitRemoteUrl::parse("https://github.com/owner/repo").unwrap();
+        assert_eq!(url.repo(), "repo");
+
+        // With whitespace
+        let url = GitRemoteUrl::parse("  https://github.com/owner/repo.git\n").unwrap();
+        assert_eq!(url.owner(), "owner");
+    }
+
+    #[test]
+    fn test_http_urls() {
+        let url = GitRemoteUrl::parse("http://gitlab.internal.company.com/owner/repo.git").unwrap();
+        assert_eq!(
+            url.project_identifier(),
+            "gitlab.internal.company.com/owner/repo"
+        );
+    }
+
+    #[test]
+    fn test_scp_style_ssh_urls() {
+        let url = GitRemoteUrl::parse("git@github.com:owner/repo.git").unwrap();
+        assert_eq!(url.project_identifier(), "github.com/owner/repo");
+
+        // Without .git suffix
+        let url = GitRemoteUrl::parse("git@github.com:owner/repo").unwrap();
+        assert_eq!(url.repo(), "repo");
+
+        // GitLab
+        let url = GitRemoteUrl::parse("git@gitlab.example.com:owner/repo.git").unwrap();
+        assert!(url.project_identifier().starts_with("gitlab.example.com/"));
+
+        // Bitbucket
+        let url = GitRemoteUrl::parse("git@bitbucket.org:owner/repo.git").unwrap();
+        assert!(url.project_identifier().starts_with("bitbucket.org/"));
+
+        // GitHub organization-scoped SSH certificate user
+        let url = GitRemoteUrl::parse("org-14957082@github.com:openai/codex.git").unwrap();
+        assert_eq!(
+            url,
+            GitRemoteUrl {
+                host: "github.com".to_string(),
+                ssh_port: None,
+                owner: "openai".to_string(),
+                repo: "codex".to_string(),
+            }
+        );
+        assert_eq!(url.project_identifier(), "github.com/openai/codex");
+        assert_eq!(
+            url,
+            GitRemoteUrl::parse("https://github.com/openai/codex.git").unwrap()
+        );
+
+        // The final `@` separates the SSH user from the host.
+        let url = GitRemoteUrl::parse("alice@alias@github.com:owner/repo.git").unwrap();
+        assert_eq!(url.host(), "github.com");
+
+        // `@` in the repository path must not be treated as the user delimiter.
+        let url = GitRemoteUrl::parse("deploy@github.com:org@company/repo.git").unwrap();
+        assert_eq!(url.host(), "github.com");
+        assert_eq!(url.owner(), "org@company");
+    }
+
+    #[test]
+    fn test_ssh_urls() {
+        // With git@ user
+        let url = GitRemoteUrl::parse("ssh://git@github.com/owner/repo.git").unwrap();
+        assert_eq!(url.project_identifier(), "github.com/owner/repo");
+
+        // Without user
+        let url = GitRemoteUrl::parse("ssh://github.com/owner/repo.git").unwrap();
+        assert!(url.project_identifier().starts_with("github.com/"));
+        assert_eq!(url.owner(), "owner");
+    }
+
+    #[test]
+    fn test_ssh_urls_with_ports() {
+        // The default SSH port names the same server as no port
+        let url = GitRemoteUrl::parse("ssh://git@host:22/owner/repo.git").unwrap();
+        assert_eq!(url.host(), "host");
+        assert_eq!(url.owner(), "owner");
+        assert_eq!(url.repo(), "repo");
+        assert_eq!(url.project_identifier(), "host/owner/repo");
+
+        // Without user
+        let url = GitRemoteUrl::parse("ssh://host:2222/owner/repo.git").unwrap();
+        assert_eq!(url.host(), "host");
+        assert_eq!(url.owner(), "owner");
+        assert_eq!(url.repo(), "repo");
+        assert_eq!(url.project_identifier(), "host:2222/owner/repo");
+
+        // Nested groups with port: the SSH port stays out of the web host
+        let url =
+            GitRemoteUrl::parse("ssh://git@gitlab.internal:2222/group/subgroup/repo.git").unwrap();
+        assert_eq!(url.host(), "gitlab.internal");
+        assert_eq!(url.owner(), "group/subgroup");
+        assert_eq!(url.repo(), "repo");
+        assert_eq!(
+            url.project_identifier(),
+            "gitlab.internal:2222/group/subgroup/repo"
+        );
+        assert_eq!(
+            url.web_url().as_deref(),
+            Some("https://gitlab.internal/group/subgroup/repo")
+        );
+    }
+
+    /// Two SSH servers on one host are different projects, so they must not
+    /// share approvals or `[projects]` settings.
+    #[test]
+    fn test_ssh_ports_isolate_project_identity() {
+        let identifiers: Vec<String> = [
+            "ssh://git@host/owner/repo.git",
+            "ssh://git@host:2222/owner/repo.git",
+            "ssh://git@host:2223/owner/repo.git",
+        ]
+        .iter()
+        .map(|url| GitRemoteUrl::parse(url).unwrap().project_identifier())
+        .collect();
+        assert_eq!(
+            identifiers,
+            [
+                "host/owner/repo",
+                "host:2222/owner/repo",
+                "host:2223/owner/repo"
+            ]
+        );
+
+        // HTTP(S) keeps its explicit port in the host, as before
+        let url = GitRemoteUrl::parse("https://host:8443/owner/repo.git").unwrap();
+        assert_eq!(url.host(), "host:8443");
+        assert_eq!(url.project_identifier(), "host:8443/owner/repo");
+
+        // A port in hostile userinfo is not the connection port
+        let url =
+            GitRemoteUrl::parse("ssh://git@github.com:22@attacker.example:2222/owner/repo.git")
+                .unwrap();
+        assert_eq!(url.host(), "attacker.example");
+        assert_eq!(url.project_identifier(), "attacker.example:2222/owner/repo");
+    }
+
+    /// Splitting the authority at its first `:` truncated every IPv6 host to
+    /// `[2001`, so distinct servers shared one approval identity.
+    #[test]
+    fn test_ipv6_hosts() {
+        let first = GitRemoteUrl::parse("ssh://git@[2001:db8::1]/owner/repo.git").unwrap();
+        let second = GitRemoteUrl::parse("ssh://git@[2001:db8::2]/owner/repo.git").unwrap();
+        assert_eq!(first.host(), "[2001:db8::1]");
+        assert_eq!(first.project_identifier(), "[2001:db8::1]/owner/repo");
+        assert_eq!(second.project_identifier(), "[2001:db8::2]/owner/repo");
+
+        // Port, SCP, HTTPS, and git forms bracket the address the same way
+        let url = GitRemoteUrl::parse("ssh://git@[2001:db8::1]:2222/owner/repo.git").unwrap();
+        assert_eq!(url.host(), "[2001:db8::1]");
+        assert_eq!(url.project_identifier(), "[2001:db8::1]:2222/owner/repo");
+        let url = GitRemoteUrl::parse("[2001:DB8::1]:owner/repo.git");
+        assert!(url.is_none(), "SCP form without a user is not a remote");
+        let url = GitRemoteUrl::parse("https://[2001:db8::1]:8443/owner/repo.git").unwrap();
+        assert_eq!(url.project_identifier(), "[2001:db8::1]:8443/owner/repo");
+        assert_eq!(
+            url.web_url().as_deref(),
+            Some("https://[2001:db8::1]:8443/owner/repo")
+        );
+        let url = GitRemoteUrl::parse("git://[2001:db8::1]/owner/repo.git").unwrap();
+        assert_eq!(url.project_identifier(), "[2001:db8::1]/owner/repo");
+
+        // SSH strips brackets from any host, as git does when it connects;
+        // HTTPS accepts them only around an IPv6 address
+        let url = GitRemoteUrl::parse("ssh://git@[git.example]/owner/repo.git").unwrap();
+        assert_eq!(url.project_identifier(), "git.example/owner/repo");
+        assert!(GitRemoteUrl::parse("https://[git.example]/owner/repo.git").is_none());
+    }
+
+    #[test]
+    fn test_unsupported_transport_forms_are_rejected() {
+        // Hosts that would be read as an ssh option
+        assert!(GitRemoteUrl::parse("ssh://-oProxyCommand=evil/owner/repo.git").is_none());
+        // Out-of-range port
+        assert!(GitRemoteUrl::parse("ssh://git@host:70000/owner/repo.git").is_none());
+        // Remote helpers and local paths
+        assert!(GitRemoteUrl::parse("ext::ssh host/owner/repo.git").is_none());
+        assert!(GitRemoteUrl::parse("file:///srv/owner/repo.git").is_none());
+        assert!(GitRemoteUrl::parse("/srv/owner/repo.git").is_none());
+    }
+
+    #[test]
+    fn test_git_protocol_urls() {
+        let url = GitRemoteUrl::parse("git://github.com/owner/repo.git").unwrap();
+        assert_eq!(url.project_identifier(), "github.com/owner/repo");
+        assert!(url.is_github());
+
+        let url = GitRemoteUrl::parse("git://gitlab.example.com/owner/repo.git").unwrap();
+        assert_eq!(url.forge_kind(), Some(ForgeKind::GitLab));
+    }
+
+    /// URL-scheme authorities use the final `@` as the userinfo boundary, so
+    /// forge-looking credentials cannot impersonate the network host. Ports
+    /// remain part of HTTP(S)/git authorities while SSH keeps its established
+    /// transport-only port stripping.
+    #[test]
+    fn scheme_authorities_use_the_network_host_after_userinfo() {
+        for (input, expected_host) in [
+            (
+                "https://github.com@attacker.example/owner/repo.git",
+                "attacker.example",
+            ),
+            (
+                "http://gitlab.com@attacker.example:8443/owner/repo.git",
+                "attacker.example:8443",
+            ),
+            (
+                "git://gitea.com@attacker.example/owner/repo.git",
+                "attacker.example",
+            ),
+            (
+                "ssh://github.com@attacker.example/owner/repo.git",
+                "attacker.example",
+            ),
+            (
+                "git@github.com@attacker.example:owner/repo.git",
+                "attacker.example",
+            ),
+        ] {
+            let parsed = GitRemoteUrl::parse(input).expect("userinfo URL is structurally valid");
+            assert_eq!(parsed.host(), expected_host, "{input}");
+            assert_eq!(parsed.forge_kind(), None, "{input}");
+            assert_eq!(
+                parsed
+                    .repo_info(None)
+                    .expect("repository metadata")
+                    .provider,
+                GitRepoProvider::Unknown,
+                "{input}"
+            );
+        }
+
+        for (input, expected_host, expected_forge) in [
+            (
+                "https://user:token@github.com:8443/owner/repo.git",
+                "github.com:8443",
+                ForgeKind::GitHub,
+            ),
+            (
+                "http://build@gitlab.example.com/owner/repo.git",
+                "gitlab.example.com",
+                ForgeKind::GitLab,
+            ),
+            (
+                "git://deploy@gitea.example.com/owner/repo.git",
+                "gitea.example.com",
+                ForgeKind::Gitea,
+            ),
+            (
+                "ssh://git@gitlab.example.com:2222/owner/repo.git",
+                "gitlab.example.com",
+                ForgeKind::GitLab,
+            ),
+            (
+                "git@gitlab.example.com:owner/repo.git",
+                "gitlab.example.com",
+                ForgeKind::GitLab,
+            ),
+        ] {
+            let parsed = GitRemoteUrl::parse(input).expect("credentialed URL is supported");
+            assert_eq!(parsed.host(), expected_host, "{input}");
+            assert_eq!(parsed.forge_kind(), Some(expected_forge), "{input}");
+        }
+
+        for input in [
+            "https://github.com@/owner/repo.git",
+            "http://gitlab.com@/owner/repo.git",
+            "git://gitea.com@/owner/repo.git",
+            "ssh://github.com@/owner/repo.git",
+            "github.com@:owner/repo.git",
+        ] {
+            assert!(
+                GitRemoteUrl::parse(input).is_none(),
+                "empty network host must be rejected: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_malformed_urls() {
+        assert!(GitRemoteUrl::parse("").is_none());
+        assert!(GitRemoteUrl::parse("https://github.com/").is_none());
+        assert!(GitRemoteUrl::parse("https://github.com/owner/").is_none());
+        assert!(GitRemoteUrl::parse("git@github.com:").is_none());
+        assert!(GitRemoteUrl::parse("git@github.com:owner/").is_none());
+        assert!(GitRemoteUrl::parse("@github.com:owner/repo.git").is_none());
+        assert!(GitRemoteUrl::parse("user@:owner/repo.git").is_none());
+        assert!(GitRemoteUrl::parse("github.com:owner/repo.git").is_none());
+        assert!(GitRemoteUrl::parse("path/to/user@host:owner/repo.git").is_none());
+        assert!(GitRemoteUrl::parse("ftp://github.com/owner/repo.git").is_none());
+    }
+
+    #[test]
+    fn test_org_repos() {
+        let url = GitRemoteUrl::parse("https://github.com/company-org/project.git").unwrap();
+        assert_eq!(url.owner(), "company-org");
+        assert_eq!(url.repo(), "project");
+    }
+
+    #[test]
+    fn test_parse_owner_repo() {
+        assert_eq!(
+            parse_owner_repo("https://github.com/owner/repo.git"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
+        assert_eq!(
+            parse_owner_repo("https://github.com/owner/repo"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
+        assert_eq!(
+            parse_owner_repo("  https://github.com/owner/repo.git\n"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
+        assert_eq!(
+            parse_owner_repo("git@github.com:owner/repo.git"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
+        assert_eq!(
+            parse_owner_repo("git@github.com:owner/repo"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
+        assert_eq!(
+            parse_owner_repo("ssh://git@github.com/owner/repo.git"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
+        assert_eq!(
+            parse_owner_repo("https://gitlab.com/owner/repo.git"),
+            Some(("owner".to_string(), "repo".to_string()))
+        );
+        assert_eq!(parse_owner_repo("https://github.com/owner/"), None);
+        assert_eq!(parse_owner_repo("git@github.com:owner/"), None);
+        assert_eq!(parse_owner_repo(""), None);
+    }
+
+    #[test]
+    fn test_project_identifier() {
+        let cases = [
+            (
+                "https://github.com/vjk7989/h0x-ADE-core.git",
+                "github.com/vjk7989/h0x-ADE-core",
+            ),
+            ("git@github.com:owner/repo.git", "github.com/owner/repo"),
+            (
+                "ssh://git@gitlab.example.com/org/project.git",
+                "gitlab.example.com/org/project",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let url = GitRemoteUrl::parse(input).unwrap();
+            assert_eq!(url.project_identifier(), expected, "input: {input}");
+        }
+    }
+
+    /// The v0.80.0 identifier, for remotes whose identifier changed and for
+    /// ordinary ones where it didn't. Values are what the v0.80.0 binary's
+    /// `wt config show` printed, except the truncated `ssh://` IPv6 host
+    /// (`[2001/o/r`), which gets none.
+    #[test]
+    fn test_legacy_project_identifier() {
+        let cases = [
+            (
+                "ssh://git@host.example:2222/o/r.git",
+                Some("host.example/o/r"),
+            ),
+            ("git@GitHub.com:o/r.git", Some("GitHub.com/o/r")),
+            ("https://GitHub.com/O/R.git", Some("GitHub.com/O/R")),
+            (
+                "git+ssh://git@github.com/o/r.git",
+                Some("git+ssh://git@github.com/o/r"),
+            ),
+            (
+                "https://host.example:8443/o/r",
+                Some("host.example:8443/o/r"),
+            ),
+            ("git@github.com:o/r.git", Some("github.com/o/r")),
+            ("ssh://git@[2001:db8::1]/o/r.git", None),
+            ("git@[2001:db8::1]:o/r.git", Some("[2001/db8::1]:o/r")),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                legacy_project_identifier(input).as_deref(),
+                expected,
+                "input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_github() {
+        // GitHub.com
+        assert!(
+            GitRemoteUrl::parse("https://github.com/owner/repo.git")
+                .unwrap()
+                .is_github()
+        );
+        assert!(
+            GitRemoteUrl::parse("git@github.com:owner/repo.git")
+                .unwrap()
+                .is_github()
+        );
+        assert!(
+            GitRemoteUrl::parse("ssh://git@github.com/owner/repo.git")
+                .unwrap()
+                .is_github()
+        );
+
+        // GitHub Enterprise
+        assert!(
+            GitRemoteUrl::parse("https://github.mycompany.com/owner/repo.git")
+                .unwrap()
+                .is_github()
+        );
+
+        // Not GitHub
+        assert!(
+            !GitRemoteUrl::parse("https://gitlab.com/owner/repo.git")
+                .unwrap()
+                .is_github()
+        );
+        assert!(
+            !GitRemoteUrl::parse("https://bitbucket.org/owner/repo.git")
+                .unwrap()
+                .is_github()
+        );
+    }
+
+    #[test]
+    fn forge_detection_reads_the_brand_and_bounds_the_azure_domains() {
+        // A brand anywhere in the host classifies, ports included.
+        let supported = [
+            ("https://github.com:8443/owner/repo.git", ForgeKind::GitHub),
+            (
+                "https://gitlab.example.com:8443/owner/repo.git",
+                ForgeKind::GitLab,
+            ),
+            (
+                "https://gitea.example.com:8443/owner/repo.git",
+                ForgeKind::Gitea,
+            ),
+            (
+                "https://github-mirror.example/owner/repo.git",
+                ForgeKind::GitHub,
+            ),
+            (
+                "https://notgitlab.example/owner/repo.git",
+                ForgeKind::GitLab,
+            ),
+            (
+                "https://gitea-mirror.example/owner/repo.git",
+                ForgeKind::Gitea,
+            ),
+            (
+                "https://dev.azure.com:8443/org/project/_git/repo",
+                ForgeKind::AzureDevOps,
+            ),
+        ];
+        for (input, expected) in supported {
+            let parsed = GitRemoteUrl::parse(input).expect("supported forge URL");
+            assert_eq!(parsed.forge_kind(), Some(expected), "{input}");
+        }
+
+        // The Azure service domains are matched by suffix, so a host merely
+        // containing one is outside them and carries no brand to fall back on.
+        let outside_the_azure_domains = [
+            "https://dev.azure.com.attacker.example/org/project/_git/repo",
+            "https://evil-visualstudio.com/org/project/_git/repo",
+        ];
+        for input in outside_the_azure_domains {
+            let parsed = GitRemoteUrl::parse(input).expect("URL is structurally valid");
+            assert_eq!(parsed.forge_kind(), None, "{input}");
+            assert_eq!(
+                parsed
+                    .repo_info(None)
+                    .expect("repository metadata")
+                    .provider,
+                GitRepoProvider::Unknown,
+                "{input}"
+            );
+        }
+    }
+
+    // Security-critical tests for nested GitLab groups.
+    //
+    // GitLab supports nested groups (subgroups) with arbitrary depth:
+    // https://docs.gitlab.com/ee/user/group/subgroups/
+    //
+    // For approval security, project_identifier() MUST be unique per repo.
+    // Two repos in the same parent group must have different identifiers:
+    // - gitlab.com/group/subgroup/repo1 ≠ gitlab.com/group/subgroup/repo2
+    //
+    // If parsing fails or truncates the path, approvals for one repo
+    // could apply to another, bypassing security.
+
+    #[test]
+    fn test_nested_gitlab_groups_https() {
+        // Single subgroup
+        let url = GitRemoteUrl::parse("https://gitlab.com/group/subgroup/repo.git").unwrap();
+        assert_eq!(url.host(), "gitlab.com");
+        assert_eq!(url.owner(), "group/subgroup");
+        assert_eq!(url.repo(), "repo");
+        assert_eq!(
+            url.project_identifier(),
+            "gitlab.com/group/subgroup/repo",
+            "Security: nested group must be fully preserved in identifier"
+        );
+
+        // Multiple levels of nesting
+        let url =
+            GitRemoteUrl::parse("https://gitlab.com/org/team/project/subproject/repo.git").unwrap();
+        assert_eq!(url.host(), "gitlab.com");
+        assert_eq!(url.owner(), "org/team/project/subproject");
+        assert_eq!(url.repo(), "repo");
+        assert_eq!(
+            url.project_identifier(),
+            "gitlab.com/org/team/project/subproject/repo"
+        );
+
+        // Without .git suffix
+        let url = GitRemoteUrl::parse("https://gitlab.com/group/subgroup/repo").unwrap();
+        assert_eq!(url.repo(), "repo");
+        assert_eq!(url.owner(), "group/subgroup");
+    }
+
+    #[test]
+    fn test_nested_gitlab_groups_ssh() {
+        // git@ format with subgroup
+        let url = GitRemoteUrl::parse("git@gitlab.com:group/subgroup/repo.git").unwrap();
+        assert_eq!(url.host(), "gitlab.com");
+        assert_eq!(url.owner(), "group/subgroup");
+        assert_eq!(url.repo(), "repo");
+        assert_eq!(
+            url.project_identifier(),
+            "gitlab.com/group/subgroup/repo",
+            "Security: SSH URLs must handle nested groups identically to HTTPS"
+        );
+
+        // ssh:// format with subgroup
+        let url = GitRemoteUrl::parse("ssh://git@gitlab.com/group/subgroup/repo.git").unwrap();
+        assert_eq!(url.owner(), "group/subgroup");
+        assert_eq!(url.repo(), "repo");
+
+        // Deeply nested
+        let url = GitRemoteUrl::parse("git@gitlab.com:a/b/c/d/repo.git").unwrap();
+        assert_eq!(url.owner(), "a/b/c/d");
+        assert_eq!(url.repo(), "repo");
+    }
+
+    #[test]
+    fn test_nested_groups_self_hosted() {
+        // Self-hosted GitLab with subgroups
+        let url =
+            GitRemoteUrl::parse("https://gitlab.mycompany.com/team/frontend/repo.git").unwrap();
+        assert_eq!(url.host(), "gitlab.mycompany.com");
+        assert_eq!(url.owner(), "team/frontend");
+        assert_eq!(url.repo(), "repo");
+
+        let url = GitRemoteUrl::parse("git@gitlab.internal:org/dept/project/repo.git").unwrap();
+        assert_eq!(url.owner(), "org/dept/project");
+        assert_eq!(url.repo(), "repo");
+    }
+
+    #[test]
+    fn test_nested_groups_security_uniqueness() {
+        // CRITICAL: Two repos in the same parent group must have different identifiers
+        let repo1 = GitRemoteUrl::parse("https://gitlab.com/company/team/repo-a.git").unwrap();
+        let repo2 = GitRemoteUrl::parse("https://gitlab.com/company/team/repo-b.git").unwrap();
+
+        assert_ne!(
+            repo1.project_identifier(),
+            repo2.project_identifier(),
+            "Security: Different repos MUST have different project identifiers"
+        );
+
+        // The parent path alone is not sufficient
+        assert_eq!(repo1.owner(), "company/team");
+        assert_eq!(repo2.owner(), "company/team");
+        assert_ne!(repo1.repo(), repo2.repo());
+    }
+
+    #[test]
+    fn test_parse_owner_repo_nested() {
+        assert_eq!(
+            parse_owner_repo("https://gitlab.com/group/subgroup/repo.git"),
+            Some(("group/subgroup".to_string(), "repo".to_string()))
+        );
+        assert_eq!(
+            parse_owner_repo("git@gitlab.com:a/b/c/repo.git"),
+            Some(("a/b/c".to_string(), "repo".to_string()))
+        );
+    }
+
+    // Additional security edge cases for nested groups
+
+    #[test]
+    fn test_nested_groups_edge_cases() {
+        // Maximum reasonable nesting depth
+        let url = GitRemoteUrl::parse("https://gitlab.com/a/b/c/d/e/f/g/repo.git").unwrap();
+        assert_eq!(url.owner(), "a/b/c/d/e/f/g");
+        assert_eq!(url.repo(), "repo");
+        assert_eq!(url.project_identifier(), "gitlab.com/a/b/c/d/e/f/g/repo");
+
+        // Repo name with dots (valid GitLab repo names)
+        let url = GitRemoteUrl::parse("https://gitlab.com/group/repo.name.git").unwrap();
+        assert_eq!(url.owner(), "group");
+        assert_eq!(url.repo(), "repo.name");
+
+        // Repo name with hyphens and underscores
+        let url =
+            GitRemoteUrl::parse("https://gitlab.com/my-group/sub_group/my-repo_v2.git").unwrap();
+        assert_eq!(url.owner(), "my-group/sub_group");
+        assert_eq!(url.repo(), "my-repo_v2");
+    }
+
+    #[test]
+    fn test_nested_groups_similar_paths_are_distinct() {
+        // Security: Paths that look similar must have distinct identifiers
+        // This tests against potential truncation or normalization bugs
+
+        let cases = [
+            // Sibling repos in nested group
+            (
+                "https://gitlab.com/org/team/repo-a.git",
+                "gitlab.com/org/team/repo-a",
+            ),
+            (
+                "https://gitlab.com/org/team/repo-b.git",
+                "gitlab.com/org/team/repo-b",
+            ),
+            // Different nesting levels with similar names
+            ("https://gitlab.com/org/repo.git", "gitlab.com/org/repo"),
+            (
+                "https://gitlab.com/org/team/repo.git",
+                "gitlab.com/org/team/repo",
+            ),
+            (
+                "https://gitlab.com/org/team/sub/repo.git",
+                "gitlab.com/org/team/sub/repo",
+            ),
+            // Group name matches repo name at different level
+            (
+                "https://gitlab.com/project/repo.git",
+                "gitlab.com/project/repo",
+            ),
+            (
+                "https://gitlab.com/repo/project.git",
+                "gitlab.com/repo/project",
+            ),
+        ];
+
+        let identifiers: Vec<_> = cases
+            .iter()
+            .map(|(url, _)| GitRemoteUrl::parse(url).unwrap().project_identifier())
+            .collect();
+
+        // All identifiers must be unique
+        for (i, id) in identifiers.iter().enumerate() {
+            assert_eq!(
+                id, cases[i].1,
+                "URL {} should produce identifier {}",
+                cases[i].0, cases[i].1
+            );
+        }
+
+        // Verify no duplicates
+        let mut sorted = identifiers.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(
+            identifiers.len(),
+            sorted.len(),
+            "All project identifiers must be unique"
+        );
+    }
+
+    #[test]
+    fn test_nested_groups_malformed_paths() {
+        // These should fail to parse (security: don't accept garbage)
+
+        // Missing repo (only namespace)
+        assert!(GitRemoteUrl::parse("https://gitlab.com/group/").is_none());
+        assert!(GitRemoteUrl::parse("git@gitlab.com:group/").is_none());
+
+        // Just host
+        assert!(GitRemoteUrl::parse("https://gitlab.com/").is_none());
+        assert!(GitRemoteUrl::parse("git@gitlab.com:").is_none());
+
+        // Double slashes shouldn't create empty segments
+        let url = GitRemoteUrl::parse("https://gitlab.com/group//subgroup/repo.git");
+        // Should either fail or treat as group/subgroup/repo (no empty segment)
+        if let Some(parsed) = url {
+            assert!(!parsed.owner().contains("//"));
+            assert!(!parsed.owner().is_empty());
+        }
+
+        // Repo named exactly ".git" - stripping suffix produces empty string
+        // This should fail to parse (repo would be empty)
+        assert!(GitRemoteUrl::parse("https://gitlab.com/group/.git").is_none());
+
+        // But a repo named ".git.git" strips to ".git" which is valid (unusual but possible)
+        let url = GitRemoteUrl::parse("https://gitlab.com/group/.git.git").unwrap();
+        assert_eq!(url.repo(), ".git");
+    }
+
+    #[test]
+    fn test_all_url_formats_handle_nested_groups_identically() {
+        // Security: All URL formats for the same repo must produce identical identifiers
+        let formats = [
+            "https://gitlab.com/group/subgroup/repo.git",
+            "https://gitlab.com/group/subgroup/repo",
+            "git@gitlab.com:group/subgroup/repo.git",
+            "deploy@gitlab.com:group/subgroup/repo.git",
+            "git@gitlab.com:group/subgroup/repo",
+            "ssh://git@gitlab.com/group/subgroup/repo.git",
+            "ssh://gitlab.com/group/subgroup/repo.git",
+            "git://gitlab.com/group/subgroup/repo.git",
+            "http://gitlab.com/group/subgroup/repo.git",
+        ];
+
+        let expected_identifier = "gitlab.com/group/subgroup/repo";
+
+        for url in formats {
+            let parsed =
+                GitRemoteUrl::parse(url).unwrap_or_else(|| panic!("Failed to parse URL: {url}"));
+            assert_eq!(
+                parsed.project_identifier(),
+                expected_identifier,
+                "URL format '{url}' must produce consistent identifier"
+            );
+            assert_eq!(parsed.owner(), "group/subgroup");
+            assert_eq!(parsed.repo(), "repo");
+        }
+    }
+
+    // =========================================================================
+    // ADVERSARIAL SECURITY TESTS: Identifier Collision Attacks
+    // =========================================================================
+    //
+    // These tests verify that an attacker cannot craft a URL that produces
+    // the same project_identifier as a different repository they don't control.
+    //
+    // Attack model: Attacker controls repo A, wants approvals from repo A to
+    // apply to repo B (which they don't control).
+
+    #[test]
+    fn test_adversarial_different_nesting_levels_no_collision() {
+        // Attack: Can two repos at different nesting levels collide?
+        //
+        // Scenario: Attacker controls gitlab.com/a-b/c/repo
+        // Target victim: gitlab.com/a/b/c/repo
+        // These should NEVER collide.
+
+        let attacker = GitRemoteUrl::parse("https://gitlab.com/a-b/c/repo.git").unwrap();
+        let victim = GitRemoteUrl::parse("https://gitlab.com/a/b/c/repo.git").unwrap();
+
+        assert_ne!(
+            attacker.project_identifier(),
+            victim.project_identifier(),
+            "CRITICAL: Different group structures must have different identifiers"
+        );
+
+        // Verify the actual identifiers
+        assert_eq!(attacker.project_identifier(), "gitlab.com/a-b/c/repo");
+        assert_eq!(victim.project_identifier(), "gitlab.com/a/b/c/repo");
+    }
+
+    #[test]
+    fn test_adversarial_host_spoofing_no_collision() {
+        // Attack: Use a subdomain that looks like a different host
+
+        // gitlab.com.evil.com/owner/repo vs gitlab.com/owner/repo
+        let evil_host = GitRemoteUrl::parse("https://gitlab.com.evil.com/owner/repo.git").unwrap();
+        let real_host = GitRemoteUrl::parse("https://gitlab.com/owner/repo.git").unwrap();
+
+        assert_ne!(
+            evil_host.project_identifier(),
+            real_host.project_identifier(),
+            "Different hosts must produce different identifiers"
+        );
+
+        assert_eq!(evil_host.host(), "gitlab.com.evil.com");
+        assert_eq!(real_host.host(), "gitlab.com");
+    }
+
+    #[test]
+    fn test_adversarial_case_sensitivity() {
+        // Attack: Use different casing to create "different" repos that might
+        // collide after normalization.
+
+        // gitlab.com/Owner/Repo vs gitlab.com/owner/repo
+        let uppercase = GitRemoteUrl::parse("https://gitlab.com/Owner/Repo.git").unwrap();
+        let lowercase = GitRemoteUrl::parse("https://gitlab.com/owner/repo.git").unwrap();
+
+        // These SHOULD be different identifiers (case-sensitive)
+        // GitLab/GitHub treat these as different repos
+        assert_ne!(
+            uppercase.project_identifier(),
+            lowercase.project_identifier(),
+            "Case differences must produce different identifiers"
+        );
+    }
+
+    #[test]
+    fn test_adversarial_git_suffix_manipulation() {
+        // Attack: Use .git.git or other suffix manipulations
+
+        let double_git = GitRemoteUrl::parse("https://gitlab.com/owner/repo.git.git").unwrap();
+        let single_git = GitRemoteUrl::parse("https://gitlab.com/owner/repo.git").unwrap();
+        let no_git = GitRemoteUrl::parse("https://gitlab.com/owner/repo").unwrap();
+
+        // .git.git -> strip ONE .git -> repo is "repo.git"
+        assert_eq!(double_git.repo(), "repo.git");
+        assert_eq!(single_git.repo(), "repo");
+        assert_eq!(no_git.repo(), "repo");
+
+        // single_git and no_git should match (same repo)
+        assert_eq!(single_git.project_identifier(), no_git.project_identifier());
+
+        // double_git is actually a different repo (named "repo.git")
+        assert_ne!(
+            double_git.project_identifier(),
+            single_git.project_identifier()
+        );
+    }
+
+    #[test]
+    fn test_adversarial_ssh_user_injection() {
+        // CRITICAL: Attack via SSH user field with @ character
+        //
+        // ssh://user@legitimate.com@attacker.com/owner/repo.git
+        //
+        // The authority is everything before the first `/`, and its userinfo
+        // ends at the LAST `@` in it — the boundary git itself uses.
+        //
+        // Authority: "user@legitimate.com@attacker.com"
+        // rsplit_once('@'): ("user@legitimate.com", "attacker.com")
+        // Host becomes: "attacker.com"
+        //
+        // This means ssh://git@victim.com@attacker.com/owner/repo.git
+        // produces host = "attacker.com", not "victim.com" — which is the host
+        // the connection actually goes to.
+
+        // The URL parses successfully - last @ wins for user/host separation
+        let parsed =
+            GitRemoteUrl::parse("ssh://git@legitimate.com@attacker.com/owner/repo.git").unwrap();
+
+        // The parser extracts host from AFTER the last @
+        // So the host is "attacker.com", not "legitimate.com"
+        // This is consistent behavior - the URL is malformed but parseable
+        assert_eq!(
+            parsed.host(),
+            "attacker.com",
+            "SSH URLs with multiple @ signs: last @ determines host"
+        );
+
+        // The identifier correctly reflects attacker.com
+        assert!(parsed.project_identifier().starts_with("attacker.com/"));
+    }
+
+    #[test]
+    fn test_adversarial_ssh_at_in_path() {
+        // `@` is legal in a path, so the userinfo boundary is looked for inside
+        // the authority — everything before the first `/` — and never in the
+        // path. A namespace containing `@` therefore parses as itself.
+        let ssh_with_at = GitRemoteUrl::parse("ssh://git@host.com/org@company/repo.git").unwrap();
+        assert_eq!(ssh_with_at.host(), "host.com");
+        assert_eq!(ssh_with_at.owner(), "org@company");
+        assert_eq!(ssh_with_at.repo(), "repo");
+
+        // https:// and SCP-style URLs agree — all three scope the `@` search to
+        // the authority.
+        let https_with_at = GitRemoteUrl::parse("https://host.com/org@company/repo.git").unwrap();
+        assert_eq!(https_with_at.owner(), "org@company");
+        assert_eq!(https_with_at.repo(), "repo");
+    }
+
+    /// A path segment must not be able to pose as the SSH authority. Searching
+    /// the whole remainder for the last `@` let a crafted remote report a host
+    /// git never connects to — and `project_identifier` is what
+    /// `Approvals` keys a project's approved commands on, so a spoofed host
+    /// silently borrows another project's approvals.
+    #[test]
+    fn test_adversarial_ssh_host_spoofed_from_path() {
+        let parsed =
+            GitRemoteUrl::parse("ssh://git@attacker.example/owner/repo@github.com/org/repo.git")
+                .expect("structurally valid SSH URL");
+        assert_eq!(
+            parsed.host(),
+            "attacker.example",
+            "the host is the authority git connects to, not a later path segment"
+        );
+        assert_eq!(parsed.forge_kind(), None);
+        assert_eq!(
+            parsed.project_identifier(),
+            "attacker.example/owner/repo@github.com/org/repo"
+        );
+    }
+
+    #[test]
+    fn test_adversarial_empty_user_ssh() {
+        // ssh://user@/owner/repo.git - empty host after user@
+        // Authority: "user@" — rsplit_once('@') leaves nothing after the
+        // separator, so the host is empty and the URL is rejected
+        assert!(
+            GitRemoteUrl::parse("ssh://user@/owner/repo.git").is_none(),
+            "Empty host should be rejected"
+        );
+
+        // ssh://@host.com/owner/repo.git - empty user (@ with nothing before it)
+        // Authority: "@host.com" — rsplit_once('@') gives host "host.com"
+        // This parses correctly - the empty user is effectively ignored
+        let parsed = GitRemoteUrl::parse("ssh://@host.com/owner/repo.git").unwrap();
+        assert_eq!(parsed.host(), "host.com");
+        assert_eq!(parsed.owner(), "owner");
+        assert_eq!(parsed.repo(), "repo");
+    }
+
+    #[test]
+    fn test_adversarial_empty_segment_normalization() {
+        // Attack: Use empty segments to shift parsing
+        // gitlab.com/a//b/repo (double slash)
+
+        let with_double_slash = GitRemoteUrl::parse("https://gitlab.com/a//b/repo.git").unwrap();
+        let normal = GitRemoteUrl::parse("https://gitlab.com/a/b/repo.git").unwrap();
+
+        // Empty segments are filtered out, so these produce the same identifier
+        // This is SAFE because it's the same logical repo
+        assert_eq!(
+            with_double_slash.project_identifier(),
+            normal.project_identifier(),
+            "Empty segment normalization should produce consistent identifiers"
+        );
+
+        // Verify no empty segments in owner
+        assert!(!with_double_slash.owner().contains("//"));
+    }
+
+    #[test]
+    fn test_adversarial_dot_segments() {
+        // Attack: Use . or .. segments to manipulate path
+        // gitlab.com/owner/./repo vs gitlab.com/owner/repo
+        //
+        // The parser treats "." as a literal path segment (no special handling).
+        // This is safe because it produces a DIFFERENT identifier.
+
+        let with_dot = GitRemoteUrl::parse("https://gitlab.com/owner/./repo.git").unwrap();
+        let normal = GitRemoteUrl::parse("https://gitlab.com/owner/repo.git").unwrap();
+
+        // "." is preserved as literal segment - different identifier, no collision
+        assert_eq!(with_dot.owner(), "owner/.");
+        assert_eq!(with_dot.repo(), "repo");
+        assert_ne!(
+            with_dot.project_identifier(),
+            normal.project_identifier(),
+            "Literal . segment produces different identifier (no collision)"
+        );
+    }
+
+    #[test]
+    fn test_adversarial_parent_traversal() {
+        // Attack: Use .. to escape namespace
+        // gitlab.com/owner/../victim/repo -> should NOT resolve to gitlab.com/victim/repo
+        //
+        // The parser treats ".." as a literal path segment (no directory traversal).
+        // This is SAFE because it produces a different identifier than the "escaped" path.
+
+        let with_dotdot =
+            GitRemoteUrl::parse("https://gitlab.com/owner/../victim/repo.git").unwrap();
+        let victim = GitRemoteUrl::parse("https://gitlab.com/victim/repo.git").unwrap();
+
+        // ".." is treated literally, not as parent directory
+        assert_eq!(with_dotdot.owner(), "owner/../victim");
+        assert!(
+            with_dotdot.project_identifier().contains(".."),
+            "Parent traversal (..) must be treated literally"
+        );
+
+        // No collision with the "target" path
+        assert_ne!(
+            with_dotdot.project_identifier(),
+            victim.project_identifier(),
+            "Path traversal attack must not collide with target"
+        );
+    }
+
+    #[test]
+    fn test_adversarial_unicode_lookalikes() {
+        // Attack: Use Unicode characters that look like ASCII
+
+        let normal = GitRemoteUrl::parse("https://gitlab.com/owner/repo.git").unwrap();
+
+        // Using Greek omicron (\u{03BF}) instead of ASCII 'o'
+        let with_greek_o = GitRemoteUrl::parse("https://gitlab.com/\u{03BF}wner/repo.git").unwrap();
+
+        assert_ne!(
+            normal.project_identifier(),
+            with_greek_o.project_identifier(),
+            "Unicode lookalikes must produce different identifiers"
+        );
+    }
+
+    #[test]
+    fn test_adversarial_url_encoded_slash() {
+        // Attack: Can a repo name containing "/" (URL-encoded as %2F) collide
+        // with a nested group path?
+        //
+        // Note: GitLab does NOT allow "/" in repo names.
+        // But test parser behavior with URL-encoded content.
+        //
+        // The parser treats %2F literally (doesn't decode it).
+        // This is the SAFE behavior - no collision possible.
+
+        let parsed = GitRemoteUrl::parse("https://gitlab.com/attacker/evil%2Frepo.git").unwrap();
+
+        // The %2F stays in the repo name, so no collision with nested paths
+        assert_eq!(parsed.owner(), "attacker");
+        assert_eq!(parsed.repo(), "evil%2Frepo");
+
+        // No collision with what the attacker might want to target
+        let target = GitRemoteUrl::parse("https://gitlab.com/attacker/evil/repo.git").unwrap();
+        assert_ne!(
+            parsed.project_identifier(),
+            target.project_identifier(),
+            "URL-encoded slash must not collide with actual nested path"
+        );
+
+        // `gix-url` decodes URL paths; the identity uses the original spelling
+        // so every transport keeps the escape inside its segment.
+        for url in [
+            "ssh://git@gitlab.com/attacker/evil%2Frepo.git",
+            "git@gitlab.com:attacker/evil%2Frepo.git",
+            "git://gitlab.com/attacker/evil%2Frepo.git",
+        ] {
+            let parsed = GitRemoteUrl::parse(url).unwrap();
+            assert_eq!(parsed.owner(), "attacker", "{url}");
+            assert_eq!(parsed.repo(), "evil%2Frepo", "{url}");
+        }
+    }
+
+    #[test]
+    fn test_adversarial_comprehensive_uniqueness() {
+        // Exhaustive test: Many URLs that should all have DIFFERENT identifiers
+
+        let urls = [
+            "https://gitlab.com/a/repo.git",
+            "https://gitlab.com/a/b/repo.git",
+            "https://gitlab.com/a/b/c/repo.git",
+            "https://gitlab.com/a-b/repo.git",
+            "https://gitlab.com/a/b-repo.git",
+            "https://gitlab.com/A/repo.git", // case difference
+            "https://gitlab.com/a/Repo.git", // case difference
+            "https://github.com/a/repo.git", // different host
+            "https://gitlab.example.com/a/repo.git", // different host
+        ];
+
+        let identifiers: Vec<String> = urls
+            .iter()
+            .filter_map(|u| GitRemoteUrl::parse(u).map(|p| p.project_identifier()))
+            .collect();
+
+        // All should be unique
+        let mut unique = identifiers.clone();
+        unique.sort();
+        unique.dedup();
+
+        assert_eq!(
+            identifiers.len(),
+            unique.len(),
+            "All URLs must produce unique identifiers. Got duplicates in: {:?}",
+            identifiers
+        );
+    }
+
+    #[test]
+    fn test_is_azure_devops() {
+        // HTTPS dev.azure.com
+        let url = GitRemoteUrl::parse("https://dev.azure.com/myorg/myproject/_git/myrepo").unwrap();
+        assert!(url.is_azure_devops());
+        assert!(!url.is_github());
+
+        // SSH ssh.dev.azure.com
+        let url = GitRemoteUrl::parse("git@ssh.dev.azure.com:v3/myorg/myproject/myrepo").unwrap();
+        assert!(url.is_azure_devops());
+
+        // Legacy *.visualstudio.com
+        let url =
+            GitRemoteUrl::parse("https://myorg.visualstudio.com/myproject/_git/myrepo").unwrap();
+        assert!(url.is_azure_devops());
+
+        // GitHub and GitLab should not match
+        let url = GitRemoteUrl::parse("https://github.com/owner/repo").unwrap();
+        assert!(!url.is_azure_devops());
+        let url = GitRemoteUrl::parse("https://gitlab.com/owner/repo").unwrap();
+        assert!(!url.is_azure_devops());
+    }
+
+    #[test]
+    fn test_azure_organization_and_project() {
+        // HTTPS dev.azure.com — owner is "{org}/{project}/_git"
+        let url = GitRemoteUrl::parse("https://dev.azure.com/myorg/myproject/_git/myrepo").unwrap();
+        assert_eq!(url.azure_organization(), Some("myorg"));
+        assert_eq!(url.azure_project(), Some("myproject"));
+
+        // SSH ssh.dev.azure.com — owner is "v3/{org}/{project}"
+        let url = GitRemoteUrl::parse("git@ssh.dev.azure.com:v3/myorg/myproject/myrepo").unwrap();
+        assert_eq!(url.azure_organization(), Some("myorg"));
+        assert_eq!(url.azure_project(), Some("myproject"));
+
+        // Legacy *.visualstudio.com — org is in the hostname
+        let url =
+            GitRemoteUrl::parse("https://myorg.visualstudio.com/myproject/_git/myrepo").unwrap();
+        assert_eq!(url.azure_organization(), Some("myorg"));
+        assert_eq!(url.azure_project(), Some("myproject"));
+
+        // Non-Azure URL returns None
+        let url = GitRemoteUrl::parse("https://github.com/owner/repo").unwrap();
+        assert_eq!(url.azure_organization(), None);
+        assert_eq!(url.azure_project(), None);
+    }
+
+    #[test]
+    fn git_repo_provider_serializes_json_values() {
+        let cases = [
+            (GitRepoProvider::GitHub, "\"github\""),
+            (GitRepoProvider::GitLab, "\"gitlab\""),
+            (GitRepoProvider::Gitea, "\"gitea\""),
+            (GitRepoProvider::AzureDevOps, "\"azure-devops\""),
+            (GitRepoProvider::Unknown, "\"unknown\""),
+        ];
+
+        for (provider, expected) in cases {
+            assert_eq!(serde_json::to_string(&provider).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn repo_info_from_remote_github_https_and_ssh() {
+        for input in [
+            "https://github.com/owner/repo.git",
+            "git@github.com:owner/repo.git",
+        ] {
+            let info = GitRemoteUrl::parse(input).unwrap().repo_info(None).unwrap();
+            assert_eq!(info.url, "https://github.com/owner/repo");
+            assert_eq!(info.provider, GitRepoProvider::GitHub);
+            assert_eq!(info.host, "github.com");
+            assert_eq!(info.owner, "owner");
+            assert_eq!(info.name, "repo");
+            assert_eq!(info.project, None);
+        }
+    }
+
+    #[test]
+    fn repo_info_from_remote_gitlab_nested_namespace() {
+        let info = GitRemoteUrl::parse("git@gitlab.com:group/subgroup/repo.git")
+            .unwrap()
+            .repo_info(None)
+            .unwrap();
+        assert_eq!(info.url, "https://gitlab.com/group/subgroup/repo");
+        assert_eq!(info.provider, GitRepoProvider::GitLab);
+        assert_eq!(info.host, "gitlab.com");
+        assert_eq!(info.owner, "group/subgroup");
+        assert_eq!(info.name, "repo");
+        assert_eq!(info.project, None);
+    }
+
+    #[test]
+    fn repo_info_from_remote_gitea_host_and_configured_host() {
+        let info = GitRemoteUrl::parse("https://gitea.example.com/owner/repo.git")
+            .unwrap()
+            .repo_info(None)
+            .unwrap();
+        assert_eq!(info.url, "https://gitea.example.com/owner/repo");
+        assert_eq!(info.provider, GitRepoProvider::Gitea);
+        assert_eq!(info.host, "gitea.example.com");
+        assert_eq!(info.owner, "owner");
+        assert_eq!(info.name, "repo");
+
+        let info = GitRemoteUrl::parse("https://codeberg.org/owner/repo.git")
+            .unwrap()
+            .repo_info(Some("gitea"))
+            .unwrap();
+        assert_eq!(info.url, "https://codeberg.org/owner/repo");
+        assert_eq!(info.provider, GitRepoProvider::Gitea);
+        assert_eq!(info.host, "codeberg.org");
+        assert_eq!(info.owner, "owner");
+        assert_eq!(info.name, "repo");
+    }
+
+    #[test]
+    fn repo_info_from_remote_unknown_parseable_host() {
+        let info = GitRemoteUrl::parse("https://git.example.com/team/repo.git")
+            .unwrap()
+            .repo_info(None)
+            .unwrap();
+        assert_eq!(info.url, "https://git.example.com/team/repo");
+        assert_eq!(info.provider, GitRepoProvider::Unknown);
+        assert_eq!(info.host, "git.example.com");
+        assert_eq!(info.owner, "team");
+        assert_eq!(info.name, "repo");
+        assert_eq!(info.project, None);
+    }
+
+    #[test]
+    fn repo_info_from_remote_configured_azure_generic_host_is_unknown() {
+        let info = GitRemoteUrl::parse("https://git.example.com/myorg/myrepo.git")
+            .unwrap()
+            .repo_info(Some("azure-devops"))
+            .unwrap();
+        assert_eq!(info.url, "https://git.example.com/myorg/myrepo");
+        assert_eq!(info.provider, GitRepoProvider::Unknown);
+        assert_eq!(info.host, "git.example.com");
+        assert_eq!(info.owner, "myorg");
+        assert_eq!(info.name, "myrepo");
+        assert_eq!(info.project, None);
+    }
+
+    #[test]
+    fn repo_info_from_remote_platform_override_uses_ci_platform_parser() {
+        let info = GitRemoteUrl::parse("https://git.example.com/owner/repo.git")
+            .unwrap()
+            .repo_info(Some(" github "))
+            .unwrap();
+        assert_eq!(info.url, "https://git.example.com/owner/repo");
+        assert_eq!(info.provider, GitRepoProvider::Unknown);
+        assert_eq!(info.owner, "owner");
+        assert_eq!(info.name, "repo");
+
+        let info = GitRemoteUrl::parse("https://git.example.com/owner/repo.git")
+            .unwrap()
+            .repo_info(Some("gitlab"))
+            .unwrap();
+        assert_eq!(info.provider, GitRepoProvider::GitLab);
+    }
+
+    #[test]
+    fn repo_info_from_remote_azure_devops_urls() {
+        let cases = [
+            (
+                "https://dev.azure.com/myorg/myproject/_git/myrepo",
+                "dev.azure.com",
+                "https://dev.azure.com/myorg/myproject/_git/myrepo",
+            ),
+            (
+                "git@ssh.dev.azure.com:v3/myorg/myproject/myrepo",
+                "dev.azure.com",
+                "https://dev.azure.com/myorg/myproject/_git/myrepo",
+            ),
+            (
+                "https://myorg.visualstudio.com/myproject/_git/myrepo",
+                "myorg.visualstudio.com",
+                "https://myorg.visualstudio.com/myproject/_git/myrepo",
+            ),
+        ];
+
+        for (input, expected_host, expected_url) in cases {
+            let info = GitRemoteUrl::parse(input).unwrap().repo_info(None).unwrap();
+            assert_eq!(info.url, expected_url, "input: {input}");
+            assert_eq!(info.provider, GitRepoProvider::AzureDevOps);
+            assert_eq!(info.host, expected_host, "input: {input}");
+            assert_eq!(info.owner, "myorg", "input: {input}");
+            assert_eq!(info.name, "myrepo", "input: {input}");
+            assert_eq!(info.project.as_deref(), Some("myproject"), "input: {input}");
+        }
+    }
+
+    #[test]
+    fn repo_info_from_remote_configured_azure_noncanonical_host() {
+        let info = GitRemoteUrl::parse("https://git.example.com/myorg/myproject/_git/myrepo")
+            .unwrap()
+            .repo_info(Some("azure-devops"))
+            .unwrap();
+        assert_eq!(
+            info.url,
+            "https://git.example.com/myorg/myproject/_git/myrepo"
+        );
+        assert_eq!(info.provider, GitRepoProvider::AzureDevOps);
+        assert_eq!(info.host, "git.example.com");
+        assert_eq!(info.owner, "myorg");
+        assert_eq!(info.name, "myrepo");
+        assert_eq!(info.project.as_deref(), Some("myproject"));
+
+        let info = GitRemoteUrl::parse("https://git.example.com/myorg/myproject/_git/myrepo")
+            .unwrap()
+            .repo_info(Some("azuredevops"))
+            .unwrap();
+        assert_eq!(
+            info.url,
+            "https://git.example.com/myorg/myproject/_git/myrepo"
+        );
+        assert_eq!(info.provider, GitRepoProvider::AzureDevOps);
+        assert_eq!(info.host, "git.example.com");
+        assert_eq!(info.owner, "myorg");
+        assert_eq!(info.name, "myrepo");
+        assert_eq!(info.project.as_deref(), Some("myproject"));
+
+        let info = GitRemoteUrl::parse("git@git.example.com:v3/myorg/myproject/myrepo")
+            .unwrap()
+            .repo_info(Some("azure-devops"))
+            .unwrap();
+        assert_eq!(
+            info.url,
+            "https://git.example.com/myorg/myproject/_git/myrepo"
+        );
+        assert_eq!(info.provider, GitRepoProvider::AzureDevOps);
+        assert_eq!(info.host, "git.example.com");
+        assert_eq!(info.owner, "myorg");
+        assert_eq!(info.name, "myrepo");
+        assert_eq!(info.project.as_deref(), Some("myproject"));
+    }
+
+    #[test]
+    fn test_web_url() {
+        let web_url = |input: &str| GitRemoteUrl::parse(input).unwrap().web_url();
+
+        // github.com: SSH input produces HTTPS output (the core value).
+        assert_eq!(
+            web_url("git@github.com:owner/repo.git"),
+            Some("https://github.com/owner/repo".to_string())
+        );
+        assert_eq!(
+            web_url("https://github.com/owner/repo.git"),
+            Some("https://github.com/owner/repo".to_string())
+        );
+
+        // GitHub Enterprise host.
+        assert_eq!(
+            web_url("git@github.mycompany.com:owner/repo.git"),
+            Some("https://github.mycompany.com/owner/repo".to_string())
+        );
+
+        // GitLab nested group.
+        assert_eq!(
+            web_url("git@gitlab.com:group/subgroup/repo.git"),
+            Some("https://gitlab.com/group/subgroup/repo".to_string())
+        );
+
+        // Gitea.
+        assert_eq!(
+            web_url("git@gitea.example.com:owner/repo.git"),
+            Some("https://gitea.example.com/owner/repo".to_string())
+        );
+
+        // Azure DevOps: HTTPS dev.azure.com.
+        assert_eq!(
+            web_url("https://dev.azure.com/myorg/myproject/_git/myrepo"),
+            Some("https://dev.azure.com/myorg/myproject/_git/myrepo".to_string())
+        );
+
+        // Azure DevOps: SSH ssh.dev.azure.com normalizes to the dev.azure.com web host.
+        assert_eq!(
+            web_url("git@ssh.dev.azure.com:v3/myorg/myproject/myrepo"),
+            Some("https://dev.azure.com/myorg/myproject/_git/myrepo".to_string())
+        );
+
+        // Azure DevOps: legacy *.visualstudio.com keeps the org in the hostname.
+        assert_eq!(
+            web_url("https://myorg.visualstudio.com/myproject/_git/myrepo"),
+            Some("https://myorg.visualstudio.com/myproject/_git/myrepo".to_string())
+        );
+    }
+}

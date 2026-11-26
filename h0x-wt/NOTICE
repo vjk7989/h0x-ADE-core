@@ -1,0 +1,4 @@
+HyperOx Worktrees (h0x-wt) is a modified copy of worktrunk 0.81.0
+(https://github.com/max-sixty/worktrunk), Copyright (c) 2025 Maximilian Roos,
+licensed MIT OR Apache-2.0 and used here under the MIT option (see LICENSE).
+The changes are listed in PATCHES.md and applied by rebrand.sh.

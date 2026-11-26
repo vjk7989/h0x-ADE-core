@@ -1,0 +1,319 @@
+//! GitLab MR backend using the `glab` CLI.
+//!
+//! # API Differences from GitHub
+//!
+//! GitLab's MR API (`projects/:id/merge_requests/:iid`) only returns project IDs,
+//! not full project objects. To get clone URLs for fork MRs, we must make separate
+//! calls to the Projects API (`projects/:id`).
+//!
+//! In contrast, GitHub's PR API returns complete `head.repo` and `base.repo` objects
+//! with `clone_url` and `ssh_url` — everything in one call.
+//!
+//! # Deferred URL Fetching
+//!
+//! To avoid the ~1 second overhead of 2 extra API calls, we defer URL fetching:
+//!
+//! 1. `fetch_mr_info()` returns `RemoteRefInfo` with `fork_push_url: None`
+//! 2. Caller checks if branch already tracks the MR via `branch_tracks_ref()`
+//! 3. Only if a new branch is needed, call `fetch_gitlab_project_urls()`
+//!
+//! This saves ~1 second for the common case (switching to an existing MR branch).
+
+use std::path::Path;
+
+use anyhow::{Context, bail};
+use serde::Deserialize;
+
+use super::{
+    CliApiRequest, PlatformData, RemoteRefInfo, cli_api_error, cli_config_value, run_cli_api,
+};
+use crate::git::{ForgeKind, Repository};
+
+/// Raw JSON response from `glab api projects/:id/merge_requests/<number>`.
+#[derive(Debug, Deserialize)]
+struct GlabMrResponse {
+    title: String,
+    author: GlabAuthor,
+    state: String,
+    #[serde(default)]
+    draft: bool,
+    source_branch: String,
+    source_project_id: u64,
+    target_project_id: u64,
+    web_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GlabAuthor {
+    username: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GlabProject {
+    ssh_url_to_repo: Option<String>,
+    http_url_to_repo: Option<String>,
+}
+
+/// Fetch MR information from GitLab using the `glab` CLI.
+pub(super) fn fetch_mr_info(mr_number: u32, repo: &Repository) -> anyhow::Result<RemoteRefInfo> {
+    let repo_root = repo.repo_path()?;
+    let api_path = format!("projects/:id/merge_requests/{}", mr_number);
+    let args = ["api", api_path.as_str()];
+    let output = run_cli_api(CliApiRequest {
+        tool: "glab",
+        args: &args,
+        repo_root,
+        prompt_env: ("GLAB_NO_PROMPT", "1"),
+        install_hint: "GitLab CLI (glab) not installed; install from https://gitlab.com/gitlab-org/cli#installation",
+        run_context: "Failed to run glab api",
+    })?;
+
+    if !output.status.success() {
+        // GitLab puts the status only inside the message text
+        // (`{"message":"401 Unauthorized"}`), so classifying here would mean
+        // matching prose — and there is nothing to say afterwards that glab's own
+        // line doesn't already: `glab: 401 Unauthorized (HTTP 401)`. Forward it.
+        return Err(cli_api_error(
+            ForgeKind::GitLab.ref_type(),
+            format!("glab api failed for MR !{}", mr_number),
+            &output,
+        ));
+    }
+
+    let response: GlabMrResponse = serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "Failed to parse GitLab API response for MR !{}. \
+             This may indicate a GitLab API change.",
+            mr_number
+        )
+    })?;
+
+    if response.source_branch.is_empty() {
+        bail!(
+            "MR !{} has empty branch name; the MR may be in an invalid state",
+            mr_number
+        );
+    }
+
+    let is_cross_repo = response.source_project_id != response.target_project_id;
+
+    // Parse host/owner/repo from the web URL (always available from the MR API).
+    // e.g., "https://gitlab.com/owner/repo/-/merge_requests/101" → host/owner/repo
+    let (project_url, _) = response
+        .web_url
+        .split_once("/-/")
+        .with_context(|| format!("GitLab MR URL missing /-/ separator: {}", response.web_url))?;
+    let parsed_url = crate::git::GitRemoteUrl::parse(project_url).ok_or_else(|| {
+        anyhow::anyhow!("Failed to parse GitLab project from MR URL: {project_url}")
+    })?;
+
+    // Don't fetch project URLs here - defer until after branch_tracks_ref check
+    // in switch.rs, which often short-circuits (branch already configured).
+    // Use fetch_gitlab_project_urls() when URLs are actually needed.
+
+    Ok(RemoteRefInfo {
+        number: mr_number,
+        title: response.title,
+        author: response.author.username,
+        state: response.state,
+        draft: response.draft,
+        source_branch: response.source_branch,
+        is_cross_repo,
+        url: response.web_url,
+        fork_push_url: None, // Populated later by fetch_gitlab_project_urls if needed
+        platform_data: PlatformData::GitLab {
+            host: parsed_url.host().to_string(),
+            base_owner: parsed_url.owner().to_string(),
+            base_repo: parsed_url.repo().to_string(),
+            source_project_id: response.source_project_id,
+            target_project_id: response.target_project_id,
+        },
+    })
+}
+
+/// URLs for a GitLab fork MR.
+#[derive(Debug)]
+pub struct GitLabForkUrls {
+    /// URL to push to the fork (source project).
+    pub fork_push_url: Option<String>,
+    /// Target project URL (where MR refs live) - SSH or HTTPS based on config.
+    pub target_url: Option<String>,
+}
+
+/// Fetch project URLs for a GitLab fork MR.
+///
+/// This is deferred from `fetch_mr_info` because GitLab's MR API doesn't include
+/// project URLs (unlike GitHub's PR API which returns full repo objects). The 2
+/// extra API calls (~500ms each) are only needed when creating a new branch.
+///
+/// See module-level docs for the full explanation of this optimization.
+pub fn fetch_gitlab_project_urls(
+    info: &RemoteRefInfo,
+    repo_root: &Path,
+) -> anyhow::Result<GitLabForkUrls> {
+    let PlatformData::GitLab {
+        host,
+        source_project_id,
+        target_project_id,
+        ..
+    } = &info.platform_data
+    else {
+        bail!("fetch_gitlab_project_urls called on non-GitLab ref");
+    };
+
+    // Fetch source project URLs (for fork push)
+    let (source_ssh, source_http) = fetch_project_urls(*source_project_id, "source", repo_root)
+        .with_context(|| {
+            format!(
+                "Failed to fetch source project {} for MR !{}",
+                source_project_id, info.number
+            )
+        })?;
+
+    // Fetch target project URLs (where MR refs live)
+    let (target_ssh, target_http) = fetch_project_urls(*target_project_id, "target", repo_root)
+        .with_context(|| {
+            format!(
+                "Failed to fetch target project {} for MR !{}",
+                target_project_id, info.number
+            )
+        })?;
+
+    // Compute URLs based on protocol preference
+    let use_ssh = git_protocol(host) == "ssh";
+    let fork_push_url = if use_ssh {
+        source_ssh.or(source_http)
+    } else {
+        source_http.or(source_ssh)
+    };
+    let target_url = if use_ssh {
+        target_ssh.or(target_http)
+    } else {
+        target_http.or(target_ssh)
+    };
+
+    Ok(GitLabForkUrls {
+        fork_push_url,
+        target_url,
+    })
+}
+
+/// Fetch project URLs from GitLab API.
+///
+/// `role` is the caller's word for which of the two projects this is ("source"
+/// or "target"). It belongs in the CLI-failure message rather than in the
+/// caller's `with_context`, because that context is inert there: `cli_api_error`
+/// returns a `GitError`, and `format_command_error` renders only the first
+/// `Diagnostic` in the chain. A numeric project ID alone can't tell a user which
+/// of the two repos they're locked out of.
+fn fetch_project_urls(
+    project_id: u64,
+    role: &str,
+    repo_root: &Path,
+) -> anyhow::Result<(Option<String>, Option<String>)> {
+    let api_path = format!("projects/{}", project_id);
+    let args = ["api", api_path.as_str()];
+    let output = run_cli_api(CliApiRequest {
+        tool: "glab",
+        args: &args,
+        repo_root,
+        prompt_env: ("GLAB_NO_PROMPT", "1"),
+        install_hint: "GitLab CLI (glab) not installed; install from https://gitlab.com/gitlab-org/cli#installation",
+        run_context: "Failed to run glab api",
+    })?;
+
+    if !output.status.success() {
+        // Forward glab's own verdict, same as `fetch_mr_info` above — a bare
+        // "Failed to fetch project 456" hides whether the call was a 401, a
+        // 404, or a network failure.
+        return Err(cli_api_error(
+            ForgeKind::GitLab.ref_type(),
+            format!("glab api failed for {} project {}", role, project_id),
+            &output,
+        ));
+    }
+
+    let response: GlabProject = serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "Failed to parse GitLab API response for project {}. \
+             This may indicate a GitLab API change.",
+            project_id
+        )
+    })?;
+    Ok((response.ssh_url_to_repo, response.http_url_to_repo))
+}
+
+/// Whether `glab` has a token for `host`.
+///
+/// `glab config get token --host <host>` reads glab's config and its token
+/// environment variables — no network, unlike `glab auth status` — and prints
+/// nothing for a host without a token. Returns `false` if `glab` is not
+/// installed.
+pub fn is_authed_for(host: &str) -> bool {
+    cli_config_value("glab", &["token", "--host", host]).is_some_and(|token| !token.is_empty())
+}
+
+/// Get the git protocol configured in `glab` (GitLab CLI).
+fn git_protocol(host: &str) -> String {
+    cli_config_value("glab", &["git_protocol", "--host", host])
+        .filter(|p| p == "ssh" || p == "https")
+        .unwrap_or_else(|| "https".to_string())
+}
+
+/// Construct the remote URL for a GitLab project, respecting protocol preference.
+pub fn fork_remote_url(host: &str, owner: &str, repo: &str) -> String {
+    if git_protocol(host) == "ssh" {
+        format!("git@{host}:{owner}/{repo}.git")
+    } else {
+        format!("https://{host}/{owner}/{repo}.git")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::git::remote_ref::RemoteRefInfo;
+
+    #[test]
+    fn test_fork_remote_url_formats() {
+        // Protocol depends on `glab config get git_protocol`, so just check format
+        let url = fork_remote_url("gitlab.com", "contributor", "repo");
+        let valid_urls = [
+            "git@gitlab.com:contributor/repo.git",
+            "https://gitlab.com/contributor/repo.git",
+        ];
+        assert!(valid_urls.contains(&url.as_str()), "unexpected URL: {url}");
+
+        let url = fork_remote_url("gitlab.example.com", "org", "project");
+        let valid_urls = [
+            "git@gitlab.example.com:org/project.git",
+            "https://gitlab.example.com/org/project.git",
+        ];
+        assert!(valid_urls.contains(&url.as_str()), "unexpected URL: {url}");
+    }
+
+    #[test]
+    fn test_fetch_gitlab_project_urls_rejects_github_ref() {
+        let github_info = RemoteRefInfo {
+            number: 123,
+            title: "Test PR".to_string(),
+            author: "user".to_string(),
+            state: "open".to_string(),
+            draft: false,
+            source_branch: "feature".to_string(),
+            is_cross_repo: false,
+            url: "https://github.com/owner/repo/pull/123".to_string(),
+            fork_push_url: None,
+            platform_data: PlatformData::GitHub {
+                host: "github.com".to_string(),
+                head_owner: "user".to_string(),
+                head_repo: "repo".to_string(),
+                base_owner: "owner".to_string(),
+                base_repo: "repo".to_string(),
+            },
+        };
+
+        let result = fetch_gitlab_project_urls(&github_info, std::path::Path::new("."));
+        insta::assert_snapshot!(result.unwrap_err(), @"fetch_gitlab_project_urls called on non-GitLab ref");
+    }
+}

@@ -1,0 +1,208 @@
+mod alias;
+pub(crate) mod backup;
+pub(crate) mod command_approval;
+pub(crate) mod command_executor;
+pub(crate) mod commit;
+pub(crate) mod config;
+pub(crate) mod configure_shell;
+pub(crate) mod context;
+pub(crate) mod custom;
+mod eval;
+mod for_each;
+mod hook_announcement;
+mod hook_commands;
+mod hook_filter;
+pub(crate) mod hook_plan;
+pub(crate) mod hooks;
+pub(crate) mod init;
+pub(crate) mod list;
+pub(crate) mod merge;
+pub(crate) mod picker;
+pub(crate) mod process;
+pub(crate) mod project_config;
+mod relocate;
+pub(crate) mod remove;
+pub(crate) mod repository_ext;
+mod run_pipeline;
+pub(crate) mod statusline;
+pub(crate) mod step;
+pub(crate) mod template_vars;
+pub(crate) mod worktree;
+
+use h0x_wt::utils::did_you_mean;
+
+pub(crate) use alias::{
+    AliasMap, HelpContext, alias_names_for_suggestions, augment_help, load_aliases, step_alias,
+    try_alias,
+};
+pub(crate) use config::{
+    add_approvals, clear_approvals, handle_alias_dry_run, handle_alias_show, handle_cache_clear,
+    handle_cache_get, handle_claude_approve_enter_worktree, handle_claude_hook,
+    handle_claude_install, handle_claude_install_statusline, handle_claude_uninstall,
+    handle_codex_install, handle_codex_uninstall, handle_config_create, handle_config_show,
+    handle_config_update, handle_hints_clear, handle_hints_get, handle_logs_list,
+    handle_logs_profile, handle_omp_install, handle_omp_uninstall, handle_opencode_install,
+    handle_opencode_uninstall, handle_pi_install, handle_pi_uninstall, handle_state_clear,
+    handle_state_clear_all, handle_state_get, handle_state_set, handle_state_show,
+    handle_vars_clear, handle_vars_get, handle_vars_list, handle_vars_set, list_approvals,
+};
+pub(crate) use configure_shell::{
+    handle_configure_shell, handle_show_theme, handle_unconfigure_shell,
+};
+pub(crate) use custom::handle_custom_command;
+pub(crate) use eval::step_eval;
+pub(crate) use for_each::step_for_each;
+pub(crate) use hook_commands::{HookCliArgs, handle_hook_show, run_hook};
+pub(crate) use init::{handle_completions, handle_init};
+pub(crate) use list::handle_list;
+pub(crate) use merge::{MergeFlagOverrides, MergeOptions, handle_merge};
+pub(crate) use picker::handle_picker;
+pub(crate) use remove::handle_remove_command;
+pub(crate) use repository_ext::RemoveTarget;
+pub(crate) use run_pipeline::run_pipeline;
+pub(crate) use step::{
+    PreApprovedGuidance, PromoteResult, RebaseResult, SquashResult, handle_promote, handle_rebase,
+    handle_squash, step_commit, step_copy_ignored, step_diff, step_dry_run_squash, step_prune,
+    step_relocate, step_show_squash_prompt, step_tether,
+};
+pub(crate) use worktree::{
+    handle_switch_command, is_worktree_at_expected_path, worktree_display_name,
+};
+
+// Re-export Shell from the canonical location
+pub(crate) use h0x_wt::shell::Shell;
+
+use color_print::cformat;
+use h0x_wt::styling::{eprintln, format_with_gutter};
+
+pub(crate) fn flag_pair(positive: bool, negative: bool) -> Option<bool> {
+    match (positive, negative) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
+}
+
+/// Format command execution label with optional command name.
+///
+/// Examples:
+/// - `format_command_label("post-start", Some("install"))` → `"Running post-start install"` (with bold)
+/// - `format_command_label("post-start", None)` → `"Running post-start"`
+pub(crate) fn format_command_label(command_type: &str, name: Option<&str>) -> String {
+    match name {
+        Some(name) => cformat!("Running {command_type} <bold>{name}</>"),
+        None => format!("Running {command_type}"),
+    }
+}
+
+/// Return visible subcommand names of `parent` plus `alias_names`, filtered to
+/// those similar to `name`. Hidden subcommands (e.g., deprecated aliases) and
+/// clap's implicit `help` are excluded, and `name` itself never appears: some
+/// dispatch paths reach this error with the input present in the candidate
+/// pool (a user-config alias outside a repository, or one whose args skipped
+/// alias dispatch as non-UTF-8), and "did you mean the thing you typed" is
+/// never a useful tip. Shared by the top-level (`wt <typo>`) and
+/// `wt step <typo>` suggestion paths — both surfaces want "visible built-ins +
+/// configured aliases" as the candidate pool.
+pub(crate) fn similar_subcommands(
+    name: &str,
+    parent: &clap::Command,
+    alias_names: &[String],
+) -> Vec<String> {
+    let builtins = parent
+        .get_subcommands()
+        .filter(|c| !c.is_hide_set())
+        .map(|c| c.get_name().to_string())
+        .filter(|candidate| candidate != "help");
+    did_you_mean(
+        name,
+        builtins
+            .chain(alias_names.iter().cloned())
+            .filter(|candidate| candidate != name),
+    )
+}
+
+/// Build a clap `InvalidSubcommand` error anchored on `anchor`, populating the
+/// standard `InvalidSubcommand` / `SuggestedSubcommand` / `Usage` context so
+/// clap's native formatter produces the `error:` / `tip:` / `Usage:` block.
+///
+/// `anchor` must have its `bin_name` set before this call so the rendered
+/// `Usage:` line reads e.g. `wt step <COMMAND>` rather than the bare leaf
+/// name. Top-level callers can rely on `build_command()`'s display_name; nested
+/// anchors (`wt step`, `wt config alias <sub>`) need an explicit
+/// `anchor.set_bin_name(...)` first.
+pub(crate) fn build_invalid_subcommand_error(
+    anchor: &mut clap::Command,
+    name: &str,
+    suggestions: Vec<String>,
+) -> clap::Error {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+
+    let usage = anchor.render_usage();
+    let mut err = clap::Error::new(ErrorKind::InvalidSubcommand).with_cmd(anchor);
+    err.insert(
+        ContextKind::InvalidSubcommand,
+        ContextValue::String(name.to_string()),
+    );
+    if !suggestions.is_empty() {
+        err.insert(
+            ContextKind::SuggestedSubcommand,
+            ContextValue::Strings(suggestions),
+        );
+    }
+    err.insert(ContextKind::Usage, ContextValue::StyledStr(usage));
+    err
+}
+
+/// Force concurrent steps to run serially. Test-only escape hatch — set via
+/// `H0X_WT_TEST_SERIAL_CONCURRENT=1` to make output ordering deterministic
+/// for snapshot tests, mirroring how `RAYON_NUM_THREADS=1` is used elsewhere.
+///
+/// The background pipeline runner reads it through this helper; the
+/// foreground concurrent executor (`output::concurrent`, shared by hook and
+/// alias `HookStep::Concurrent` groups) reads the env var directly.
+pub(crate) fn force_serial_concurrent() -> bool {
+    std::env::var_os("H0X_WT_TEST_SERIAL_CONCURRENT").is_some()
+}
+
+/// Show detailed diffstat from `base` to `head`.
+///
+/// Displays the diff statistics (file changes, insertions, deletions) in a gutter format.
+/// Used after commit/squash to show what was included in the commit.
+pub(crate) fn show_diffstat(
+    repo: &h0x_wt::git::Repository,
+    base: &str,
+    head: &str,
+) -> anyhow::Result<()> {
+    let mut options = vec!["--color=always".to_string(), "--stat".to_string()];
+    // With no detectable width, omit the flag and let git use its default width.
+    if let Some(term_width) = h0x_wt::styling::terminal_width() {
+        let stat_width = term_width.saturating_sub(h0x_wt::styling::GUTTER_OVERHEAD);
+        options.push(format!("--stat-width={stat_width}"));
+    }
+    let diff_stat = repo
+        .prepare_diff(base, head)
+        .capture(options)?
+        .trim_end()
+        .to_string();
+
+    if !diff_stat.is_empty() {
+        eprintln!("{}", format_with_gutter(&diff_stat, None));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_command_label() {
+        use insta::assert_snapshot;
+        assert_snapshot!(format_command_label("post-start", Some("install")), @"Running post-start [1minstall[22m");
+        assert_snapshot!(format_command_label("pre-merge", None), @"Running pre-merge");
+        assert_snapshot!(format_command_label("post-start", Some("build")), @"Running post-start [1mbuild[22m");
+        assert_snapshot!(format_command_label("pre-commit", None), @"Running pre-commit");
+    }
+}

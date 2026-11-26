@@ -1,0 +1,6 @@
+---
+source: src/commands/picker/items.rs
+expression: "render_preview_tabs(PreviewMode::Pr, TabAvailability::listed_pr(), WIDE)"
+---
+1: [2mdiff[22m[0m[2m | [22m2: [2mworking[22m[0m[2m | [22m3: [2mcommitted[22m[0m[2m | [22m4: log[0m[2m | [22m5: [2mremote⇅[22m[0m[2m | [22m6: [2msummary[22m[0m[2m | [22m7: [1m[4mpr[22m[24m[0m[2m | [22m8: comments[0m
+[36m[2mEnter: switch | ctrl-u/d: scroll | Tab/alt-1…8: preview | alt-c: create | alt-x: remove | alt-y: copy | alt-o: open | alt-r: refresh | alt-p: toggle | Esc: cancel[39m[22m[0m

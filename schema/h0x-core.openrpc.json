@@ -85,6 +85,26 @@
         ],
         "type": "object"
       },
+      "Created": {
+        "properties": {
+          "branch": {
+            "type": "string"
+          },
+          "new_branch": {
+            "description": "False when the branch already existed and was checked out as it was.",
+            "type": "boolean"
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "branch",
+          "new_branch"
+        ],
+        "type": "object"
+      },
       "Display": {
         "description": "What a viewer's own terminal looks like, reported by the client.",
         "properties": {
@@ -467,6 +487,46 @@
         ],
         "type": "object"
       },
+      "Integrated": {
+        "description": "How a branch's work is already in the default branch (worktrunk's IntegrationReason).",
+        "oneOf": [
+          {
+            "const": "same_commit",
+            "description": "The branch is the same commit as the target.",
+            "type": "string"
+          },
+          {
+            "const": "ancestor",
+            "description": "The target has moved past the branch.",
+            "type": "string"
+          },
+          {
+            "const": "no_added_changes",
+            "description": "The branch changes no files beyond where it forked.",
+            "type": "string"
+          },
+          {
+            "const": "trees_match",
+            "description": "Different history, identical files.",
+            "type": "string"
+          },
+          {
+            "const": "merge_adds_nothing",
+            "description": "Merging it would not change the target (a squash merge landed).",
+            "type": "string"
+          },
+          {
+            "const": "patch_id_match",
+            "description": "Every change of it is in the target under other commits.",
+            "type": "string"
+          },
+          {
+            "const": "unknown",
+            "description": "The tool names a reason this core does not know (a newer tool): integrated, but why is unknown.",
+            "type": "string"
+          }
+        ]
+      },
       "InterruptResult": {
         "properties": {
           "key": {
@@ -530,6 +590,28 @@
           "terminals",
           "hidden_finished",
           "machines"
+        ],
+        "type": "object"
+      },
+      "Listing": {
+        "properties": {
+          "default_branch": {
+            "description": "The repository's default branch; null when none exists here.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "worktrees": {
+            "description": "The main checkout first, then the others, most recent commit first.",
+            "items": {
+              "$ref": "#/components/schemas/Worktree"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "worktrees"
         ],
         "type": "object"
       },
@@ -666,6 +748,27 @@
         ],
         "type": "object"
       },
+      "Merged": {
+        "properties": {
+          "merged": {
+            "description": "False when the work was already in the target, so nothing was merged.",
+            "type": "boolean"
+          },
+          "removed": {
+            "$ref": "#/components/schemas/Removed"
+          },
+          "target": {
+            "description": "The branch it was merged into.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target",
+          "merged",
+          "removed"
+        ],
+        "type": "object"
+      },
       "PutResult": {
         "properties": {
           "bytes": {
@@ -732,6 +835,39 @@
         },
         "required": [
           "removed"
+        ],
+        "type": "object"
+      },
+      "Removed": {
+        "properties": {
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "branch_deleted": {
+            "description": "The branch goes only when its work is in the target; otherwise it is kept.",
+            "type": "boolean"
+          },
+          "integrated": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Integrated"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why the branch counts as integrated; null when it does not."
+          },
+          "path": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "branch_deleted"
         ],
         "type": "object"
       },
@@ -1646,6 +1782,67 @@
           "reason",
           "turn",
           "children"
+        ],
+        "type": "object"
+      },
+      "Worktree": {
+        "description": "One checkout of a repository.",
+        "properties": {
+          "ahead": {
+            "description": "Commits it has that the default branch does not.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "at": {
+            "description": "When its head commit was made (Unix seconds).",
+            "format": "int64",
+            "type": "integer"
+          },
+          "behind": {
+            "description": "Commits the default branch has that it does not.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "branch": {
+            "description": "The branch it has checked out; null when detached.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "dirty": {
+            "description": "Uncommitted changes, untracked files included.",
+            "type": "boolean"
+          },
+          "integrated": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Integrated"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Why its work is already in the default branch; null when it is not (and for the main checkout)."
+          },
+          "main": {
+            "description": "The main checkout: the first in the list, the one that cannot be removed.",
+            "type": "boolean"
+          },
+          "path": {
+            "description": "Its folder, as git writes it (forward slashes, also on Windows).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "main",
+          "dirty",
+          "ahead",
+          "behind",
+          "at"
         ],
         "type": "object"
       }
@@ -4090,6 +4287,449 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/SessionTrashResult"
+        }
+      }
+    },
+    {
+      "description": "Every worktree of the repository a folder belongs to, here or on a machine (`on`): path, branch (null when detached), main checkout first, uncommitted changes, commits ahead of and behind the default branch, why its work is already in the default branch, and its last commit time. Done by h0x-wt, shipped next to h0x-core.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_git"
+          },
+          "message": "not_git"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "missing_tool"
+          },
+          "message": "missing_tool"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "failed"
+          },
+          "message": "failed"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "needs_update"
+          },
+          "message": "needs_update"
+        }
+      ],
+      "name": "worktree.list",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Any folder of the repository (a worktree or the main checkout): absolute, or from where\nh0x-core runs (through the API, the core's folder; with --on, that machine's home).",
+          "name": "folder",
+          "required": true,
+          "schema": {
+            "description": "Any folder of the repository (a worktree or the main checkout): absolute, or from where\nh0x-core runs (through the API, the core's folder; with --on, that machine's home).",
+            "type": "string"
+          }
+        },
+        {
+          "description": "On another machine (see `h0x-core machine ls`).",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "On another machine (see `h0x-core machine ls`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/Listing"
+        }
+      }
+    },
+    {
+      "description": "Make a worktree for a branch at `~/.h0x/worktrees/<repo>/<branch folder>`, here or on a machine (`on`): a new branch from `base` (default: the default branch), or the existing branch as it is. Never runs the repository's hooks. `checked_out` when the branch already has a worktree.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_git"
+          },
+          "message": "not_git"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "missing_tool"
+          },
+          "message": "missing_tool"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "checked_out"
+          },
+          "message": "checked_out"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "failed"
+          },
+          "message": "failed"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "needs_update"
+          },
+          "message": "needs_update"
+        }
+      ],
+      "name": "worktree.create",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Start a new branch from this commit or branch (default: the default branch).",
+          "name": "base",
+          "required": false,
+          "schema": {
+            "description": "Start a new branch from this commit or branch (default: the default branch).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "The branch to check out in the new worktree: made when it does not exist yet.",
+          "name": "branch",
+          "required": true,
+          "schema": {
+            "description": "The branch to check out in the new worktree: made when it does not exist yet.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Any folder of the repository (default: here).",
+          "name": "folder",
+          "required": false,
+          "schema": {
+            "default": ".",
+            "description": "Any folder of the repository (default: here).",
+            "type": "string"
+          }
+        },
+        {
+          "description": "On another machine (see `h0x-core machine ls`).",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "On another machine (see `h0x-core machine ls`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/Created"
+        }
+      }
+    },
+    {
+      "description": "Remove a worktree, here or on a machine (`on`). `unpushed` when a submodule has commits no remote has (unless `force`). The branch goes too only when its work is already in the default branch. `dirty` when it has uncommitted changes (unless `force`); `main_checkout` for the main checkout. Never runs hooks.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_git"
+          },
+          "message": "not_git"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "missing_tool"
+          },
+          "message": "missing_tool"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "dirty"
+          },
+          "message": "dirty"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unpushed"
+          },
+          "message": "unpushed"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "main_checkout"
+          },
+          "message": "main_checkout"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "failed"
+          },
+          "message": "failed"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "needs_update"
+          },
+          "message": "needs_update"
+        }
+      ],
+      "name": "worktree.remove",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Remove it even with uncommitted changes.",
+          "name": "force",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Remove it even with uncommitted changes.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "On another machine (see `h0x-core machine ls`).",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "On another machine (see `h0x-core machine ls`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "The worktree's folder.",
+          "name": "path",
+          "required": true,
+          "schema": {
+            "description": "The worktree's folder.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/Removed"
+        }
+      }
+    },
+    {
+      "description": "Merge a worktree's branch into the default branch (or `target`), squashed unless `squash` is false (then rebased and fast-forwarded), and remove the worktree and branch, here or on a machine (`on`). `conflict` lists the conflicting files and leaves both branches as they were. Never runs hooks.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_git"
+          },
+          "message": "not_git"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "missing_tool"
+          },
+          "message": "missing_tool"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "conflict"
+          },
+          "message": "conflict"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unpushed"
+          },
+          "message": "unpushed"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "main_checkout"
+          },
+          "message": "main_checkout"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "failed"
+          },
+          "message": "failed"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "needs_update"
+          },
+          "message": "needs_update"
+        }
+      ],
+      "name": "worktree.merge",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "On another machine (see `h0x-core machine ls`).",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "On another machine (see `h0x-core machine ls`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "The worktree's folder.",
+          "name": "path",
+          "required": true,
+          "schema": {
+            "description": "The worktree's folder.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Join its commits into one (the default); false rebases it and fast-forwards instead.",
+          "name": "squash",
+          "required": false,
+          "schema": {
+            "default": true,
+            "description": "Join its commits into one (the default); false rebases it and fast-forwards instead.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Merge into this branch (default: the default branch).",
+          "name": "target",
+          "required": false,
+          "schema": {
+            "description": "Merge into this branch (default: the default branch).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/Merged"
         }
       }
     },

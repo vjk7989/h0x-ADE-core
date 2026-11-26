@@ -6,7 +6,9 @@ out=crates/h0x-core/THIRD-PARTY-NOTICES
 work=$(mktemp -d "${TMPDIR:-/var/tmp}/h0x-core-notices.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 cargo metadata --format-version 1 --locked >"$work/metadata"
-jq -r '.packages[] | select(.source != null) | "\(.name) \(.version)\t\(.license)\t\(.manifest_path)"' "$work/metadata" | sort >"$work/crates"
+# h0x-wt (a separate workspace, shipped beside h0x-core) brings its own crates.
+cargo metadata --format-version 1 --locked --manifest-path h0x-wt/Cargo.toml >"$work/metadata-wt"
+jq -r '.packages[] | select(.source != null) | "\(.name) \(.version)\t\(.license)\t\(.manifest_path)"' "$work/metadata" "$work/metadata-wt" | sort -u -t"$(printf '	')" -k1,1 >"$work/crates"
 {
     echo "h0x-core (HyperOx) is Apache-2.0. It includes the software below."
     echo "Not all components are used on every platform. See distribution/notices/README.md in the source."

@@ -1,0 +1,820 @@
+//! Progressive table renderer using crossterm for direct terminal control.
+//!
+//! This module provides a progressive table renderer that updates rows in-place
+//! as data arrives, using crossterm for cursor control. Unlike indicatif's
+//! MultiProgress, this renderer:
+//!
+//! - Uses our own escape-aware width calculations (StyledLine, truncate_visible)
+//! - Supports OSC-8 hyperlinks correctly
+//! - Has predictable cursor behavior based on our rendering logic
+//! - Reserves blank rows below the table ([`PROMPT_RESERVE_LINES`]) so the
+//!   shell prompt printed after exit doesn't scroll the settled table
+//!
+//! # Presentation vs. mechanics
+//!
+//! This is the one stdout writer that cannot route through an anstream stream:
+//! anstream's strip adapter drops every escape sequence, including the crossterm
+//! cursor-control CSI ([`MoveUp`], [`Clear`]) the in-place redraw is built on. So
+//! the table splits the two itself. Content — the row, header, and footer strings,
+//! which arrive with color and OSC-8 hyperlinks already baked in by the shared
+//! render code — is stripped when color is off; the cursor-control sequences this
+//! module emits are always written.
+//!
+//! "Color is off" is not re-derived from `NO_COLOR` and friends here. The decision
+//! comes from [`anstream::AutoStream::choice`] — the single resolution the anstream
+//! macros already use for every other stdout surface (process-global `ColorChoice`
+//! first, then tty plus the environment) — read once in [`ProgressiveTable::new`].
+//! Stripping uses [`anstream::adapter::strip_str`], the exact transform an anstream
+//! stream in `Never` mode applies, so progressive output matches the buffered path
+//! by construction rather than by approximation.
+//!
+//! # Row-count invariant
+//!
+//! Incremental redraw addresses entries by physical row, so the header, every
+//! data row, and the loading footer must each remain single-line. Only the final
+//! summary may span rows: [`ProgressiveTable::finalize`] installs it after all
+//! incremental redraws are complete, through a redraw path that clears and
+//! rebuilds the region below the last data row.
+
+use crossterm::{
+    ExecutableCommand,
+    cursor::{MoveToColumn, MoveUp},
+    terminal::{Clear, ClearType},
+};
+use std::io::{IsTerminal, Write, stdout};
+
+use h0x_wt::styling::truncate_visible;
+
+/// Blank rows kept below the table so the shell prompt printed after exit
+/// renders into pre-scrolled rows instead of scrolling the settled table.
+///
+/// The table sits on screen for the whole progressive phase, so a scroll at
+/// exit — the terminal making room for the shell's multi-line prompt — reads
+/// as a jarring jump at an unpredictable moment. Emitting the blank rows with
+/// the skeleton moves that scroll to command start, where output is expected
+/// to scroll. The prompt's height is unknowable, but the failure modes are
+/// asymmetric: extra reserved rows are consumed invisibly by whatever prints
+/// next, while a prompt taller than `PROMPT_RESERVE_LINES + 1` rows scrolls
+/// by just the difference. Two rows absorb prompts up to three rows tall
+/// (fish default 1, starship default 2, tide/powerlevel10k typically 3).
+const PROMPT_RESERVE_LINES: u16 = 2;
+
+/// Emit the prompt-reserve rows and move the cursor back up over them,
+/// returning it to the resting position (the line after the last content
+/// line). Callers emit this after the last content write, so the reserve
+/// always sits between the table and the shell prompt.
+fn write_prompt_reserve(stdout: &mut std::io::Stdout) -> std::io::Result<()> {
+    for _ in 0..PROMPT_RESERVE_LINES {
+        writeln!(stdout)?;
+    }
+    stdout.execute(MoveUp(PROMPT_RESERVE_LINES))?;
+    Ok(())
+}
+
+/// Progressive table that updates rows in-place using crossterm cursor control.
+///
+/// The table structure is:
+/// - Header row (column labels)
+/// - N data rows (one per worktree/branch)
+/// - Spacer (blank line)
+/// - Footer (loading status / summary)
+///
+/// Below the footer sit [`PROMPT_RESERVE_LINES`] pre-scrolled blank rows.
+/// The cursor rests on the line after the footer (the first reserved row)
+/// between flushes, so all redraw math is relative to that fixed resting
+/// position and the reserve stays invisible to it.
+///
+/// Data mutation (`update_row`, `update_footer`) is separate from rendering (`flush`).
+/// Call `flush()` after updates to write changes to the terminal.
+///
+/// Every content string passes through [`ProgressiveTable::prepare`], which
+/// truncates and — when color is off — strips the escapes the render code baked
+/// in. The crossterm cursor-control sequences written alongside them are never
+/// stripped; see the module docs for that split.
+pub struct ProgressiveTable {
+    /// Previously rendered single-line entries (header + rows + spacer + loading
+    /// footer), each already passed through [`ProgressiveTable::prepare`]. The
+    /// final footer may replace the last entry with multiline content only after
+    /// incremental redraw is finished.
+    lines: Vec<String>,
+    /// Maximum width for content (terminal width - safety margin)
+    max_width: usize,
+    /// Number of data rows visible in skeleton (not counting header, spacer, footer).
+    /// May be less than `total_row_count` when terminal is too short.
+    row_count: usize,
+    /// Total number of data rows (including those not shown in skeleton)
+    total_row_count: usize,
+    /// Lines that have been modified since last flush
+    dirty: Vec<usize>,
+    /// Whether the skeleton was printed. Tests skip `render_skeleton` to keep
+    /// this false and suppress stdout output.
+    rendered: bool,
+    /// Whether content escapes are stripped, resolved once from
+    /// `anstream::AutoStream::choice` at construction.
+    strip_content: bool,
+}
+
+impl ProgressiveTable {
+    /// Create a new progressive table with the given structure.
+    ///
+    /// Call `render_skeleton()` after construction to print the skeleton table.
+    ///
+    /// # Arguments
+    /// * `header` - The header line content
+    /// * `skeletons` - Initial content for each data row (skeleton with known data)
+    /// * `initial_footer` - Initial footer message
+    /// * `max_width` - Maximum content width (for truncation)
+    pub fn new(
+        header: String,
+        skeletons: Vec<String>,
+        initial_footer: String,
+        max_width: usize,
+    ) -> Self {
+        // Only check terminal height when stdout is a TTY. terminal_size() falls
+        // back to stderr/stdin, so it can return Some even for piped stdout.
+        let term_height = if stdout().is_terminal() {
+            terminal_size::terminal_size().map(|(_, h)| h.0 as usize)
+        } else {
+            None
+        };
+        let strip_content = anstream::AutoStream::choice(&stdout()) == anstream::ColorChoice::Never;
+        Self::new_with_height(
+            header,
+            skeletons,
+            initial_footer,
+            max_width,
+            term_height,
+            strip_content,
+        )
+    }
+
+    fn new_with_height(
+        header: String,
+        skeletons: Vec<String>,
+        initial_footer: String,
+        max_width: usize,
+        terminal_height: Option<usize>,
+        strip_content: bool,
+    ) -> Self {
+        let total_row_count = skeletons.len();
+
+        // Limit visible rows to fit in terminal: header + rows + spacer + footer
+        // = rows + 3, plus the prompt-reserve rows and one line for the cursor.
+        // Only limit when we have height info — None means non-TTY or unknown.
+        let visible_row_count = terminal_height
+            .map(|h| total_row_count.min(h.saturating_sub(4 + PROMPT_RESERVE_LINES as usize)))
+            .unwrap_or(total_row_count);
+
+        let mut table = Self {
+            lines: Vec::with_capacity(visible_row_count + 3),
+            max_width,
+            row_count: visible_row_count,
+            total_row_count,
+            dirty: Vec::new(),
+            rendered: false,
+            strip_content,
+        };
+
+        // Build initial lines: header + visible rows + spacer + footer
+        let header_line = table.prepare(&header);
+        table.lines.push(header_line);
+
+        for skeleton in skeletons.into_iter().take(visible_row_count) {
+            let row = table.prepare(&skeleton);
+            table.lines.push(row);
+        }
+
+        // Spacer (blank line)
+        table.lines.push(String::new());
+
+        // Footer
+        let footer_line = table.prepare(&initial_footer);
+        table.lines.push(footer_line);
+
+        table
+    }
+
+    /// Fit a content string to the table's width and, when color is off, strip
+    /// the escapes the render code baked into it.
+    ///
+    /// Each physical row gets its own width budget. Truncation runs first because
+    /// the width math is escape-aware, and a cut through styled content appends
+    /// its own reset; stripping afterwards removes that reset along with the rest.
+    /// Every content line — header, rows, footer, on both the in-place and
+    /// overflow paths — goes through here, so no other content path calls
+    /// [`truncate_visible`] directly.
+    fn prepare(&self, content: &str) -> String {
+        content
+            .split('\n')
+            .map(|row| {
+                let truncated = truncate_visible(row, self.max_width);
+                if self.strip_content {
+                    anstream::adapter::strip_str(&truncated).to_string()
+                } else {
+                    truncated
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Print the skeleton table to stdout.
+    ///
+    /// Idempotent: calling multiple times has no effect after the first render.
+    pub fn render_skeleton(&mut self) -> std::io::Result<()> {
+        if !self.rendered {
+            self.print_all()?;
+            self.rendered = true;
+        }
+        Ok(())
+    }
+
+    /// Number of data rows displayed during progressive rendering.
+    pub fn visible_row_count(&self) -> usize {
+        self.row_count
+    }
+
+    /// Print all lines to stdout, followed by the prompt-reserve rows.
+    fn print_all(&self) -> std::io::Result<()> {
+        let mut stdout = stdout();
+        for line in &self.lines {
+            writeln!(stdout, "{}", line)?;
+        }
+        write_prompt_reserve(&mut stdout)?;
+        stdout.flush()
+    }
+
+    /// Update a data row at the given index.
+    ///
+    /// This only updates the internal state. Call `flush()` to render changes.
+    ///
+    /// # Arguments
+    /// * `row_idx` - Index of the data row (0-based, not counting header)
+    /// * `content` - New content for the row
+    ///
+    /// # Returns
+    /// `true` if the content changed, `false` if unchanged or out of bounds.
+    pub fn update_row(&mut self, row_idx: usize, content: String) -> bool {
+        if row_idx >= self.row_count {
+            return false;
+        }
+
+        let prepared = self.prepare(&content);
+        debug_assert!(
+            !prepared.contains('\n'),
+            "incrementally redrawn table rows must occupy one physical line"
+        );
+
+        // Line index: header (0) + row_idx
+        let line_idx = row_idx + 1;
+
+        // Skip if content hasn't changed
+        if self.lines[line_idx] == prepared {
+            return false;
+        }
+
+        self.lines[line_idx] = prepared;
+        // Only mark dirty if we've rendered (otherwise nothing on screen to redraw)
+        if self.rendered {
+            self.dirty.push(line_idx);
+        }
+        true
+    }
+
+    /// Update the footer message.
+    ///
+    /// This only updates the internal state. Call `flush()` to render changes.
+    ///
+    /// # Returns
+    /// `true` if the content changed, `false` if unchanged.
+    pub fn update_footer(&mut self, content: String) -> bool {
+        let prepared = self.prepare(&content);
+        debug_assert!(
+            !prepared.contains('\n'),
+            "incrementally redrawn table footers must occupy one physical line"
+        );
+
+        // Footer is the last line
+        let footer_idx = self.lines.len() - 1;
+
+        // Skip if content hasn't changed
+        if self.lines[footer_idx] == prepared {
+            return false;
+        }
+
+        self.lines[footer_idx] = prepared;
+        // Only mark dirty if we've rendered (otherwise nothing on screen to redraw)
+        if self.rendered {
+            self.dirty.push(footer_idx);
+        }
+        true
+    }
+
+    /// Flush pending changes to the terminal.
+    ///
+    /// Redraws all lines that have been modified since the last flush.
+    /// No-op if nothing is dirty (which includes the case where we haven't rendered yet).
+    pub fn flush(&mut self) -> std::io::Result<()> {
+        if self.dirty.is_empty() {
+            return Ok(());
+        }
+
+        // Defense-in-depth: dirty is only populated after render_skeleton has run.
+        debug_assert!(
+            self.rendered,
+            "dirty list should only be non-empty after render_skeleton"
+        );
+
+        // Take ownership of dirty indices to avoid borrow conflict with redraw_line
+        for line_idx in std::mem::take(&mut self.dirty) {
+            self.redraw_line(line_idx)?;
+        }
+
+        Ok(())
+    }
+
+    /// Redraw a specific line by moving cursor up, clearing, and printing.
+    fn redraw_line(&self, line_idx: usize) -> std::io::Result<()> {
+        let mut stdout = stdout();
+
+        // Calculate how many lines up from current position
+        // Current position is after the footer (last line)
+        let lines_up = self.lines.len() - line_idx;
+
+        // Move cursor up to the target line
+        if lines_up > 0 {
+            stdout.execute(MoveUp(lines_up as u16))?;
+        }
+
+        // Move to column 0 and clear the line
+        stdout.execute(MoveToColumn(0))?;
+        stdout.execute(Clear(ClearType::CurrentLine))?;
+
+        // Print the new content
+        write!(stdout, "{}", self.lines[line_idx])?;
+
+        // Move cursor back to the end (after footer)
+        // We need to move down (lines_up) lines, but since we printed one line
+        // without newline, we need to print newlines to get back
+        for _ in 0..lines_up {
+            writeln!(stdout)?;
+        }
+
+        stdout.flush()
+    }
+
+    /// Replace the final footer after every data row has settled.
+    ///
+    /// The summary is the only content that can span physical rows. Nothing is
+    /// redrawn after it, so the renderer can clear through the prompt reserve,
+    /// write the complete footer, and establish a fresh reserve below it.
+    fn redraw_final_footer(&self) -> std::io::Result<()> {
+        let mut stdout = stdout();
+        let footer_idx = self.lines.len() - 1;
+
+        stdout.execute(MoveUp(1))?;
+        stdout.execute(MoveToColumn(0))?;
+        stdout.execute(Clear(ClearType::FromCursorDown))?;
+        writeln!(stdout, "{}", self.lines[footer_idx])?;
+        write_prompt_reserve(&mut stdout)?;
+        stdout.flush()
+    }
+
+    /// Finalize the table with final row content and footer.
+    ///
+    /// For the normal case, updates rows in-place and redraws the footer.
+    /// When overflowing (skeleton showed a subset of rows), erases the skeleton
+    /// and prints the complete table — the output scrolls naturally, avoiding
+    /// the `MoveUp`-into-scrollback problem.
+    ///
+    /// The footer (summary) is written to stdout here even though the buffered
+    /// path (`print_buffered_table`) narrates it on stderr: progressive mode
+    /// repaints the footer as a row of the table region, and only runs when
+    /// stdout is a TTY (`RenderTarget::detect`), so this stdout never feeds a
+    /// pipe. A future non-TTY progressive mode must move the summary to stderr
+    /// with the buffered path.
+    pub fn finalize(
+        &mut self,
+        final_rows: Vec<String>,
+        final_footer: String,
+    ) -> std::io::Result<()> {
+        if self.row_count < self.total_row_count {
+            // Overflow: erase skeleton, print complete table (scrolls naturally)
+            debug_assert!(
+                self.rendered,
+                "overflow finalize should only be called after render_skeleton"
+            );
+            let mut stdout = stdout();
+            stdout.execute(MoveUp(self.lines.len() as u16))?;
+            stdout.execute(MoveToColumn(0))?;
+            stdout.execute(Clear(ClearType::FromCursorDown))?;
+            writeln!(stdout, "{}", self.lines[0])?; // header (already prepared)
+            for row in &final_rows {
+                writeln!(stdout, "{}", self.prepare(row))?;
+            }
+            writeln!(stdout)?;
+            writeln!(stdout, "{}", self.prepare(&final_footer))?;
+            write_prompt_reserve(&mut stdout)?;
+            stdout.flush()
+        } else {
+            // Redraw rows while the on-screen footer still occupies one physical
+            // row, then replace it with the final summary, which may wrap.
+            for (idx, row) in final_rows.into_iter().enumerate() {
+                self.update_row(idx, row);
+            }
+            self.flush()?;
+
+            let footer_idx = self.lines.len() - 1;
+            let final_footer = self.prepare(&final_footer);
+            if self.lines[footer_idx] != final_footer {
+                self.lines[footer_idx] = final_footer;
+                if self.rendered {
+                    self.redraw_final_footer()?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builds_and_updates_rows() {
+        let header = "header".to_string();
+        let skeletons = vec!["row0".to_string(), "row1".to_string()];
+        let footer = "loading".to_string();
+
+        let mut table =
+            ProgressiveTable::new(header.clone(), skeletons.clone(), footer.clone(), 80);
+
+        // header + 2 rows + spacer + footer
+        assert_eq!(table.lines.len(), 5);
+        assert_eq!(table.lines[0], header);
+        assert_eq!(table.lines[1], skeletons[0]);
+        assert_eq!(table.lines[2], skeletons[1]);
+        assert!(table.lines[3].is_empty());
+        assert_eq!(table.lines[4], footer);
+
+        // No-op when index out of bounds (returns false)
+        assert!(!table.update_row(5, "ignored".into()));
+
+        // Update row content and verify it changed
+        assert!(table.update_row(1, "row1-updated".into()));
+        assert_eq!(table.lines[2], "row1-updated");
+
+        // Updating with identical content returns false (no change)
+        let before = table.lines[2].clone();
+        assert!(!table.update_row(1, before.clone()));
+        assert_eq!(table.lines[2], before);
+
+        // Footer update
+        assert!(table.update_footer("done".into()));
+        assert_eq!(table.lines.last().unwrap(), "done");
+    }
+
+    #[test]
+    fn test_truncation_applied() {
+        let long_header = "this is a very long header that exceeds width".to_string();
+        let skeletons = vec!["short".to_string()];
+        let footer = "loading...".to_string();
+
+        let table = ProgressiveTable::new(long_header.clone(), skeletons, footer, 20);
+
+        // Header should be truncated (shorter than original)
+        assert!(
+            table.lines[0].len() < long_header.len(),
+            "Header '{}' should be shorter than '{}'",
+            table.lines[0],
+            long_header
+        );
+    }
+
+    #[test]
+    fn test_update_footer_no_change() {
+        let header = "header".to_string();
+        let skeletons = vec!["row0".to_string()];
+        let footer = "loading".to_string();
+
+        let mut table = ProgressiveTable::new(header, skeletons, footer.clone(), 80);
+
+        // First footer should match
+        assert_eq!(table.lines.last().unwrap(), &footer);
+
+        // Update with same content returns false (no change)
+        assert!(!table.update_footer(footer.clone()));
+        assert_eq!(table.lines.last().unwrap(), &footer);
+    }
+
+    #[test]
+    fn test_row_count_tracking() {
+        let table = ProgressiveTable::new(
+            "h".to_string(),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            "f".to_string(),
+            80,
+        );
+
+        assert_eq!(table.row_count, 3);
+        assert_eq!(table.total_row_count, 3);
+        assert_eq!(table.row_count, table.total_row_count);
+    }
+
+    #[test]
+    fn test_update_row_bounds_check() {
+        let mut table = ProgressiveTable::new(
+            "header".to_string(),
+            vec!["row0".to_string(), "row1".to_string()],
+            "footer".to_string(),
+            80,
+        );
+
+        // Out-of-bounds update returns false
+        assert!(!table.update_row(10, "should be ignored".to_string()));
+
+        // Original rows should be unchanged
+        assert_eq!(table.lines[1], "row0");
+        assert_eq!(table.lines[2], "row1");
+    }
+
+    #[test]
+    fn test_finalize_without_render() {
+        let mut table = ProgressiveTable::new(
+            "header".to_string(),
+            vec!["row".to_string()],
+            "loading...".to_string(),
+            80,
+        );
+
+        // Without render_skeleton(), finalize updates footer but doesn't print
+        table
+            .finalize(vec!["row-final".to_string()], "Complete!".to_string())
+            .unwrap();
+
+        // Footer IS updated (the data changes), but no output since not rendered
+        assert_eq!(table.lines.last().unwrap(), "Complete!");
+        assert_eq!(table.lines[1], "row-final");
+    }
+
+    #[test]
+    fn test_dirty_tracking_before_render() {
+        let mut table = ProgressiveTable::new(
+            "header".to_string(),
+            vec!["row0".to_string(), "row1".to_string()],
+            "footer".to_string(),
+            80,
+        );
+
+        // Initially no dirty lines
+        assert!(table.dirty.is_empty());
+
+        // Before render_skeleton, updates modify data but don't mark dirty
+        // (nothing on screen to redraw)
+        assert!(table.update_row(0, "updated".into()));
+        assert!(table.dirty.is_empty());
+        assert_eq!(table.lines[1], "updated"); // Data IS updated
+
+        assert!(table.update_footer("new footer".into()));
+        assert!(table.dirty.is_empty());
+        assert_eq!(table.lines.last().unwrap(), "new footer"); // Data IS updated
+
+        // Flush is a no-op (nothing dirty)
+        table.flush().unwrap();
+        assert!(table.dirty.is_empty());
+    }
+
+    #[test]
+    fn test_dirty_tracking_after_render() {
+        let mut table = ProgressiveTable::new(
+            "header".to_string(),
+            vec!["row0".to_string(), "row1".to_string()],
+            "footer".to_string(),
+            80,
+        );
+
+        // Simulate post-render state without actually printing the skeleton.
+        table.rendered = true;
+
+        // After render, updates mark lines as dirty
+        table.update_row(0, "updated".into());
+        assert_eq!(table.dirty, vec![1]); // line_idx = row_idx + 1
+
+        table.update_footer("new footer".into());
+        assert_eq!(table.dirty, vec![1, 4]); // footer is last line
+    }
+
+    #[test]
+    fn overflow_limits_visible_rows() {
+        // 10 rows, terminal height 10 → visible = 10 - 4 - PROMPT_RESERVE_LINES = 4
+        let skeletons: Vec<String> = (0..10).map(|i| format!("row{i}")).collect();
+        let table = ProgressiveTable::new_with_height(
+            "header".into(),
+            skeletons,
+            "loading".into(),
+            80,
+            Some(10),
+            false,
+        );
+
+        assert_eq!(table.row_count, 4);
+        assert_eq!(table.total_row_count, 10);
+        assert!(table.row_count < table.total_row_count);
+        // header + 4 visible rows + spacer + footer = 7 lines
+        assert_eq!(table.lines.len(), 7);
+        assert_eq!(table.lines[0], "header");
+        assert_eq!(table.lines[1], "row0");
+        assert_eq!(table.lines[4], "row3");
+        assert_eq!(table.lines[5], ""); // spacer
+        assert_eq!(table.lines[6], "loading");
+    }
+
+    #[test]
+    fn no_overflow_when_fits() {
+        // 3 rows, terminal height 20 → visible = 3 (fits easily)
+        let skeletons = vec!["a".into(), "b".into(), "c".into()];
+        let table = ProgressiveTable::new_with_height(
+            "header".into(),
+            skeletons,
+            "loading".into(),
+            80,
+            Some(20),
+            false,
+        );
+
+        assert_eq!(table.row_count, 3);
+        assert_eq!(table.total_row_count, 3);
+        assert_eq!(table.row_count, table.total_row_count);
+    }
+
+    #[test]
+    fn overflow_boundary_exact_fit() {
+        // 5 rows need height 5+4+PROMPT_RESERVE_LINES=11 → fits exactly, no overflow
+        let skeletons: Vec<String> = (0..5).map(|i| format!("row{i}")).collect();
+        let table = ProgressiveTable::new_with_height(
+            "header".into(),
+            skeletons,
+            "loading".into(),
+            80,
+            Some(11),
+            false,
+        );
+
+        assert_eq!(table.row_count, 5);
+        assert_eq!(table.row_count, table.total_row_count);
+    }
+
+    #[test]
+    fn overflow_boundary_one_short() {
+        // 5 rows need height 5+4+PROMPT_RESERVE_LINES=11, height 10 → overflow, visible = 4
+        let skeletons: Vec<String> = (0..5).map(|i| format!("row{i}")).collect();
+        let table = ProgressiveTable::new_with_height(
+            "header".into(),
+            skeletons,
+            "loading".into(),
+            80,
+            Some(10),
+            false,
+        );
+
+        assert_eq!(table.row_count, 4);
+        assert_eq!(table.total_row_count, 5);
+        assert!(table.row_count < table.total_row_count);
+    }
+
+    #[test]
+    fn overflow_hidden_rows_are_noop() {
+        let skeletons: Vec<String> = (0..10).map(|i| format!("row{i}")).collect();
+        let mut table = ProgressiveTable::new_with_height(
+            "header".into(),
+            skeletons,
+            "loading".into(),
+            80,
+            Some(10),
+            false,
+        );
+
+        // Can update visible rows (0..4)
+        assert!(table.update_row(0, "updated0".into()));
+        assert_eq!(table.lines[1], "updated0");
+
+        // Hidden rows (4..10) are no-ops
+        assert!(!table.update_row(4, "should-be-ignored".into()));
+        assert!(!table.update_row(9, "should-be-ignored".into()));
+    }
+
+    #[test]
+    fn overflow_very_small_terminal() {
+        // Terminal too small for any rows: height 3 → visible = 0
+        let skeletons: Vec<String> = (0..5).map(|i| format!("row{i}")).collect();
+        let table = ProgressiveTable::new_with_height(
+            "header".into(),
+            skeletons,
+            "loading".into(),
+            80,
+            Some(3),
+            false,
+        );
+
+        assert_eq!(table.row_count, 0);
+        assert_eq!(table.total_row_count, 5);
+        assert!(table.row_count < table.total_row_count);
+        // header + 0 rows + spacer + footer = 3 lines
+        assert_eq!(table.lines.len(), 3);
+    }
+
+    #[test]
+    fn no_height_info_shows_all_rows() {
+        // No terminal height info → show all rows (non-TTY or unknown)
+        let skeletons: Vec<String> = (0..10).map(|i| format!("row{i}")).collect();
+        let table = ProgressiveTable::new_with_height(
+            "header".into(),
+            skeletons,
+            "loading".into(),
+            80,
+            None,
+            false,
+        );
+
+        assert_eq!(table.row_count, 10);
+        assert_eq!(table.total_row_count, 10);
+        assert_eq!(table.row_count, table.total_row_count);
+    }
+
+    // Styled header, skeleton row, and footer, plus an OSC-8 hyperlink — one
+    // per content path, so a path that skipped `prepare` shows up here.
+    const STYLED_HEADER: &str = "\u{1b}[1mBRANCH\u{1b}[0m";
+    const STYLED_ROW: &str = "\u{1b}[31mrow0\u{1b}[0m";
+    const STYLED_FOOTER: &str = "\u{1b}[2mloading\u{1b}[0m";
+    const LINKED_FOOTER: &str =
+        "\u{1b}]8;;https://example.com\u{1b}\\4 worktrees\u{1b}]8;;\u{1b}\\";
+
+    #[test]
+    fn strip_content_removes_escapes_from_every_content_path() {
+        let mut table = ProgressiveTable::new_with_height(
+            STYLED_HEADER.into(),
+            vec![STYLED_ROW.into()],
+            STYLED_FOOTER.into(),
+            80,
+            None,
+            true,
+        );
+
+        assert!(table.update_row(0, "\u{1b}[32mrow0-done\u{1b}[0m".into()));
+        assert!(table.update_footer(LINKED_FOOTER.into()));
+
+        assert!(
+            !table.lines.iter().any(|line| line.contains('\u{1b}')),
+            "escape survived stripping: {:?}",
+            table.lines
+        );
+        insta::assert_debug_snapshot!(table.lines, @r#"
+        [
+            "BRANCH",
+            "row0-done",
+            "",
+            "4 worktrees",
+        ]
+        "#);
+    }
+
+    #[test]
+    fn escapes_survive_when_strip_content_is_off() {
+        let mut table = ProgressiveTable::new_with_height(
+            STYLED_HEADER.into(),
+            vec![STYLED_ROW.into()],
+            STYLED_FOOTER.into(),
+            80,
+            None,
+            false,
+        );
+
+        assert_eq!(table.lines[0], STYLED_HEADER);
+        assert_eq!(table.lines[1], STYLED_ROW);
+        assert_eq!(table.lines[3], STYLED_FOOTER);
+
+        assert!(table.update_row(0, "\u{1b}[32mrow0-done\u{1b}[0m".into()));
+        assert!(table.update_footer(LINKED_FOOTER.into()));
+        assert_eq!(table.lines[1], "\u{1b}[32mrow0-done\u{1b}[0m");
+        assert_eq!(table.lines[3], LINKED_FOOTER);
+    }
+
+    #[test]
+    fn stripping_removes_the_reset_a_styled_truncation_appends() {
+        // Cutting styled content leaves a style open, so truncate_visible closes
+        // it with ESC[0m; stripping takes that with the rest, leaving the
+        // ellipsis as the only trace of the truncation.
+        let styled_header = || "\u{1b}[31mtwelve chars here\u{1b}[0m".to_string();
+
+        let kept =
+            ProgressiveTable::new_with_height(styled_header(), vec![], "f".into(), 8, None, false);
+        // The color ansi_cut closes at the cut sits between the kept text and
+        // the ellipsis, so the whitespace trim can't reach past it.
+        assert_eq!(kept.lines[0], "\u{1b}[31mtwelve \u{1b}[39m…\u{1b}[0m");
+
+        let stripped =
+            ProgressiveTable::new_with_height(styled_header(), vec![], "f".into(), 8, None, true);
+        assert_eq!(stripped.lines[0], "twelve …");
+    }
+}

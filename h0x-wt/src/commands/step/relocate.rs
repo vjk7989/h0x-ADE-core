@@ -1,0 +1,197 @@
+//! `wt step relocate` — move worktrees to expected paths based on the `worktree-path` template.
+//!
+//! See `src/commands/relocate.rs` for the implementation details and algorithm.
+
+use anyhow::Context;
+use color_print::cformat;
+
+use std::path::PathBuf;
+
+use h0x_wt::config::UserConfig;
+use h0x_wt::git::Repository;
+
+use crate::output::print_json;
+
+/// Move worktrees to their expected paths based on the `worktree-path` template.
+///
+/// See `src/commands/relocate.rs` for the implementation details and algorithm.
+///
+/// # Flags
+///
+/// | Flag | Purpose |
+/// |------|---------|
+/// | `--dry-run` | Show what would be moved without moving |
+/// | `--commit` | Auto-commit dirty worktrees with LLM-generated messages before relocating |
+/// | `--clobber` | Move non-worktree paths out of the way (`<path>.bak.<timestamp>`) |
+/// | `[branches...]` | Specific branches to relocate (default: all mismatched) |
+pub fn step_relocate(
+    branches: Vec<String>,
+    dry_run: bool,
+    commit: bool,
+    clobber: bool,
+    format: crate::cli::SwitchFormat,
+) -> anyhow::Result<()> {
+    use super::super::relocate::{
+        GatherResult, RelocationExecutor, ValidationResult, gather_candidates, show_all_skipped,
+        show_dry_run_preview, show_no_relocations_needed, show_summary, validate_candidates,
+    };
+
+    let json_mode = format == crate::cli::SwitchFormat::Json;
+
+    let repo = Repository::current()?;
+    let config = UserConfig::load().context("Failed to load config")?;
+    let default_branch = repo.default_branch().unwrap_or_default();
+
+    // Validate default branch early - needed for main worktree relocation
+    if default_branch.is_empty() {
+        anyhow::bail!(cformat!(
+            "Cannot determine default branch; to configure one, run <bold>h0x-wt config state default-branch set BRANCH</>"
+        ));
+    }
+    let repo_path = repo.repo_path()?.to_path_buf();
+
+    // Phase 1: Gather candidates (worktrees not at expected paths)
+    let GatherResult {
+        candidates,
+        template_error_branches,
+    } = gather_candidates(&repo, &config, &branches)?;
+
+    let template_skips: Vec<super::super::relocate::SkippedEntry> = template_error_branches
+        .iter()
+        .map(|b| super::super::relocate::SkippedEntry {
+            branch: b.clone(),
+            reason: "template_error",
+        })
+        .collect();
+
+    if candidates.is_empty() {
+        if json_mode {
+            print_relocate_json(&[], &template_skips, dry_run)?;
+        } else {
+            show_no_relocations_needed(template_error_branches.len());
+        }
+        return Ok(());
+    }
+
+    // Dry run: show preview and exit
+    if dry_run {
+        if json_mode {
+            let planned: Vec<_> = candidates
+                .iter()
+                .map(|c| RelocatedEntryView {
+                    branch: c.branch().to_string(),
+                    from: c.wt.path.clone(),
+                    to: c.expected_path.clone(),
+                })
+                .collect();
+            print_relocate_json(&planned, &template_skips, true)?;
+        } else {
+            show_dry_run_preview(&candidates);
+        }
+        return Ok(());
+    }
+
+    // Phase 2: Validate candidates (check locked/dirty, optionally auto-commit)
+    // Approve the project commit append once for the whole batch so per-worktree
+    // commits share a single approval prompt rather than one per worktree.
+    // Skip approval when the LLM isn't configured for this project — the
+    // fallback message generator doesn't render the prompt template.
+    let project_append = if commit {
+        use super::super::command_approval::approve_commit_template_append;
+        use super::super::command_executor::CommandContext;
+        let project_id = repo.project_identifier().ok();
+        let commit_config = config.commit_generation(project_id.as_ref());
+        if commit_config.is_configured() {
+            let ctx = CommandContext::new(&repo, &config, None, &repo_path, false);
+            approve_commit_template_append(&ctx)?
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let ValidationResult {
+        validated,
+        skipped: validation_skipped,
+    } = validate_candidates(
+        &repo,
+        &config,
+        candidates,
+        commit,
+        &repo_path,
+        project_append.as_deref(),
+    )?;
+
+    if validated.is_empty() {
+        if json_mode {
+            let mut all_skipped = template_skips;
+            all_skipped.extend(validation_skipped);
+            print_relocate_json(&[], &all_skipped, false)?;
+        } else {
+            // Include template-error branches — the JSON path folds them into
+            // `all_skipped`, so the human count must match.
+            show_all_skipped(validation_skipped.len() + template_skips.len());
+        }
+        return Ok(());
+    }
+
+    // Phase 3 & 4: Create executor (classifies targets) and execute relocations
+    let mut executor = RelocationExecutor::new(&repo, validated, clobber)?;
+    // Where the user's shell stands — inherited from the parent `wt` when this
+    // runs inside an alias or hook body, whose process cwd is the worktree
+    // root (#3723).
+    let cwd = h0x_wt::shell_exec::shell_cwd();
+    executor.execute(&default_branch, cwd.as_deref())?;
+
+    if json_mode {
+        let relocated_views: Vec<RelocatedEntryView> = executor
+            .relocated_entries
+            .iter()
+            .map(|e| RelocatedEntryView {
+                branch: e.branch.clone(),
+                from: e.from.clone(),
+                to: e.to.clone(),
+            })
+            .collect();
+        let mut all_skipped = template_skips;
+        all_skipped.extend(validation_skipped);
+        all_skipped.extend(executor.skipped_entries);
+        print_relocate_json(&relocated_views, &all_skipped, false)?;
+    } else {
+        // Template-error branches count as skips too — the JSON path folds
+        // them into `all_skipped`, so keep the human total consistent.
+        let total_skipped =
+            template_skips.len() + validation_skipped.len() + executor.skipped_count();
+        show_summary(executor.relocated_count(), total_skipped);
+    }
+
+    Ok(())
+}
+
+/// Internal projection of a relocation event for JSON output.
+struct RelocatedEntryView {
+    branch: String,
+    from: PathBuf,
+    to: PathBuf,
+}
+
+fn print_relocate_json(
+    entries: &[RelocatedEntryView],
+    skipped: &[super::super::relocate::SkippedEntry],
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let payload = serde_json::json!({
+        "dry_run": dry_run,
+        "entries": entries.iter().map(|e| serde_json::json!({
+            "branch": e.branch,
+            "from": e.from,
+            "to": e.to,
+        })).collect::<Vec<_>>(),
+        "skipped": skipped.iter().map(|s| serde_json::json!({
+            "branch": s.branch,
+            "reason": s.reason,
+        })).collect::<Vec<_>>(),
+    });
+    print_json(&payload)?;
+    Ok(())
+}

@@ -1,0 +1,2 @@
+✗ Branch feat/ahead already exists
+↳ To switch to the existing branch, run without --create: h0x-wt switch feat/ahead

@@ -1,0 +1,4 @@
+✗ Cannot remove worktree: fix/ünï-dirty has uncommitted changes
+   M f
+  ?? u.txt
+↳ Commit or run git stash -u in the dirty worktree first, or to lose uncommitted changes, run h0x-wt remove --force 'fix/ünï-dirty'

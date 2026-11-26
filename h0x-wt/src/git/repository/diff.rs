@@ -1,0 +1,694 @@
+//! Diff, history, and commit operations for Repository.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use anyhow::{Context, bail};
+use dashmap::mapref::entry::Entry;
+
+use crate::git::{CommandError, PlumbingDiff};
+use crate::shell_exec::Cmd;
+
+use super::working_tree::{TempIndex, WorkingTree, path_to_logging_context};
+use super::{DiffStats, LineDiff, Repository};
+
+enum DiffSource<'a> {
+    Repository { repo: &'a Repository, path: PathBuf },
+    TempIndex(&'a TempIndex),
+}
+
+enum DiffSides {
+    /// A tree-ish against the worktree's files, seen through the source's index.
+    WorkingTree(String),
+    /// A tree-ish against the source's index.
+    Staged(String),
+    /// One tree-ish against another.
+    Commits(String, String),
+}
+
+/// A fully specified diff that `wt` captures to parse, render, cache, or send
+/// to an LLM.
+///
+/// Captures run git's plumbing (`diff-index`, `diff-tree`), which ignores
+/// `diff.external`, `diff.relative`, `color.ui=always`, and the prefix
+/// settings. Captures restore the `git diff` defaults plumbing lacks: rename
+/// detection, textconv filters, and hiding intent-to-add entries from a staged
+/// diff. They also override `submodule.<name>.ignore`, which plumbing still
+/// honors and which would hide a submodule bump. Plumbing's default output is
+/// the raw format, so every capture names the format it wants (`--patch`,
+/// `--stat`).
+///
+/// A diff prepared from a [`TempIndex`] borrows it, so every read — a stat,
+/// then a patch — observes the same index state.
+#[must_use]
+pub struct PreparedDiff<'a> {
+    source: DiffSource<'a>,
+    sides: DiffSides,
+}
+
+impl<'a> PreparedDiff<'a> {
+    fn new(repo: &'a Repository, path: PathBuf, sides: DiffSides) -> Self {
+        Self {
+            source: DiffSource::Repository { repo, path },
+            sides,
+        }
+    }
+
+    fn command(&self, args: &[String]) -> Cmd {
+        match &self.source {
+            DiffSource::Repository { repo, path } => repo.with_object_store_env(
+                Cmd::new("git")
+                    .args(args.iter().cloned())
+                    .current_dir(path)
+                    .context(path_to_logging_context(path)),
+            ),
+            DiffSource::TempIndex(index) => index.command(args.iter().cloned()),
+        }
+    }
+
+    fn run(&self, args: &[String]) -> anyhow::Result<String> {
+        let output = self
+            .command(args)
+            .run()
+            .with_context(|| format!("Failed to execute: git {}", args.join(" ")))?;
+        if !output.status.success() {
+            return Err(CommandError::from_failed_output("git", args, &output).into());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn revisions(&self) -> Vec<String> {
+        match &self.sides {
+            DiffSides::WorkingTree(base) | DiffSides::Staged(base) => vec![base.clone()],
+            DiffSides::Commits(from, to) => vec![from.clone(), to.clone()],
+        }
+    }
+
+    /// Capture one plumbing diff invocation with `options` placed before the
+    /// revisions.
+    ///
+    /// Revisions sit between `--end-of-options`, so a ref beginning with `-`
+    /// stays a revision, and `--`, so a path sharing a ref's name can't make
+    /// the argument ambiguous.
+    pub fn capture(
+        &self,
+        options: impl IntoIterator<Item = impl Into<String>>,
+    ) -> anyhow::Result<String> {
+        let command = match &self.sides {
+            DiffSides::WorkingTree(_) => PlumbingDiff::Index.args(&[]),
+            DiffSides::Staged(_) => {
+                PlumbingDiff::Index.args(&["--cached", "--ita-invisible-in-index"])
+            }
+            DiffSides::Commits(..) => PlumbingDiff::Tree.args(&["-r"]),
+        };
+        let mut args = vec!["--no-optional-locks".to_string()];
+        args.extend(command.into_iter().map(String::from));
+        args.extend(["--find-renames".into(), "--textconv".into()]);
+        args.extend(options.into_iter().map(Into::into));
+        args.push("--end-of-options".into());
+        args.extend(self.revisions());
+        args.push("--".into());
+        self.run(&args)
+    }
+
+    /// Summarize the diff for display, like `["3 files", "+45", "-12"]`.
+    ///
+    /// Empty when the diff fails or has no changes.
+    pub fn stats_summary(&self) -> Vec<String> {
+        self.capture(["--shortstat"])
+            .map(|output| DiffStats::from_shortstat(&output).format_summary())
+            .unwrap_or_default()
+    }
+
+    /// Capture a stat header followed by the colored patch.
+    ///
+    /// Returns `None` when the stat is empty, avoiding the second git command.
+    pub fn capture_stat_and_patch(&self, width: usize) -> anyhow::Result<Option<String>> {
+        let stat = self.capture([
+            "--stat".to_string(),
+            "--color=always".to_string(),
+            format!("--stat-width={width}"),
+        ])?;
+        if stat.trim().is_empty() {
+            return Ok(None);
+        }
+
+        let patch = self.capture(["--patch", "--color=always"])?;
+        Ok(Some(format!("{stat}{patch}")))
+    }
+}
+
+impl Repository {
+    /// Prepare an immutable diff from one tree-ish to another in this
+    /// repository's context.
+    ///
+    /// For `git diff A...B`, pass the merge base as `from`: `diff-tree` reads
+    /// a literal `A...B` as no revisions, and its `--merge-base` fails when
+    /// there are several merge bases.
+    pub fn prepare_diff(&self, from: impl Into<String>, to: impl Into<String>) -> PreparedDiff<'_> {
+        PreparedDiff::new(
+            self,
+            self.discovery_path().to_path_buf(),
+            DiffSides::Commits(from.into(), to.into()),
+        )
+    }
+}
+
+impl<'repo> WorkingTree<'repo> {
+    /// Prepare a diff from `base` to this worktree's tracked index and files.
+    pub fn prepare_diff(&self, base: impl Into<String>) -> PreparedDiff<'repo> {
+        PreparedDiff::new(
+            self.repo,
+            self.path.clone(),
+            DiffSides::WorkingTree(base.into()),
+        )
+    }
+
+    /// A temporary copy of this worktree's index with untracked files
+    /// registered, so a diff prepared from it includes them without changing
+    /// the real index.
+    pub fn temp_index_with_untracked(&self) -> anyhow::Result<TempIndex> {
+        let index = self.temp_index()?;
+        index.register_untracked()?;
+        Ok(index)
+    }
+
+    /// Prepare a diff from one tree-ish to another, resolved in this worktree
+    /// so that `HEAD` names this worktree's HEAD.
+    pub fn prepare_commit_diff(
+        &self,
+        from: impl Into<String>,
+        to: impl Into<String>,
+    ) -> PreparedDiff<'repo> {
+        PreparedDiff::new(
+            self.repo,
+            self.path.clone(),
+            DiffSides::Commits(from.into(), to.into()),
+        )
+    }
+
+    /// Prepare a diff from `base` to this worktree's staged changes.
+    ///
+    /// For the changes a commit would record, `base` is [`Self::index_base`].
+    pub fn prepare_staged_diff(&self, base: impl Into<String>) -> PreparedDiff<'repo> {
+        PreparedDiff::new(self.repo, self.path.clone(), DiffSides::Staged(base.into()))
+    }
+}
+
+impl TempIndex {
+    /// Prepare a diff from `base` to the worktree's files, seen through this
+    /// index.
+    pub fn prepare_diff(&self, base: impl Into<String>) -> PreparedDiff<'_> {
+        PreparedDiff {
+            source: DiffSource::TempIndex(self),
+            sides: DiffSides::WorkingTree(base.into()),
+        }
+    }
+
+    /// Prepare a diff from `base` to what this index has staged.
+    pub fn prepare_staged_diff(&self, base: impl Into<String>) -> PreparedDiff<'_> {
+        PreparedDiff {
+            source: DiffSource::TempIndex(self),
+            sides: DiffSides::Staged(base.into()),
+        }
+    }
+
+    /// Stream porcelain `git diff <base> <extra_args>` from the worktree's
+    /// files, seen through this index.
+    ///
+    /// Porcelain, unlike [`PreparedDiff`]: `wt step diff` hands the user git's
+    /// own view, so git owns paging, coloring, and the caller's arguments.
+    pub fn stream_diff(&self, base: &str, extra_args: &[String]) -> anyhow::Result<()> {
+        let mut args = vec!["diff".to_string(), base.to_string()];
+        args.extend_from_slice(extra_args);
+        self.command(args).stream()
+    }
+}
+
+impl<'repo> WorkingTree<'repo> {
+    /// Get recent commit subjects for style reference.
+    ///
+    /// Returns up to `count` commit subjects (first line of message), excluding merges.
+    /// If `start_ref` is provided, gets commits starting from that ref.
+    /// Returns `None` if no commits are found or the command fails.
+    ///
+    /// Lives on the worktree, not the repository: without `start_ref` this
+    /// walks back from HEAD, and HEAD is per-worktree. Asking the repository
+    /// would answer for whichever worktree it was discovered from — the
+    /// invoking one, which is the wrong branch's history whenever the command
+    /// acts on another worktree (`wt step commit --branch <b>`).
+    pub fn recent_commit_subjects(
+        &self,
+        start_ref: Option<&str>,
+        count: usize,
+    ) -> Option<Vec<String>> {
+        let count_str = count.to_string();
+        let mut args = vec![
+            "log",
+            "--pretty=format:%s",
+            "--no-show-signature",
+            "-n",
+            &count_str,
+            "--no-merges",
+        ];
+        if let Some(ref_name) = start_ref {
+            args.push("--end-of-options");
+            args.push(ref_name);
+        }
+        self.run_command(&args).ok().and_then(|output| {
+            if output.trim().is_empty() {
+                None
+            } else {
+                Some(output.lines().map(String::from).collect())
+            }
+        })
+    }
+}
+
+/// Subject and body for one commit in a range.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct CommitMessageDetail {
+    /// Commit subject from git's `%s` pretty format.
+    pub subject: String,
+    /// Commit body from git's `%b` pretty format, including trailer-like lines.
+    pub body: String,
+}
+
+fn parse_commit_message_details_output(output: &str) -> anyhow::Result<Vec<CommitMessageDetail>> {
+    if output.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let parts = output.split('\0').collect::<Vec<_>>();
+    if parts.len() % 2 != 0 {
+        bail!(
+            "Malformed git log output: expected NUL-separated subject/body pairs, got {} field(s)",
+            parts.len()
+        );
+    }
+
+    Ok(parts
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| CommitMessageDetail {
+            subject: pair[0].to_string(),
+            body: pair[1].to_string(),
+        })
+        .collect())
+}
+
+impl Repository {
+    /// Count commits between base and head.
+    pub fn count_commits(&self, base: &str, head: &str) -> anyhow::Result<usize> {
+        // Limit concurrent rev-list operations to reduce mmap thrash on commit-graph
+        let _guard = super::super::HEAVY_OPS_SEMAPHORE.acquire();
+
+        let range = format!("{}..{}", base, head);
+        let stdout = self.run_command(&["rev-list", "--count", "--end-of-options", &range])?;
+
+        stdout
+            .trim()
+            .parse()
+            .context("Failed to parse commit count")
+    }
+
+    /// Get files changed between base and head, as repository-root-relative
+    /// raw path bytes.
+    ///
+    /// `diff-tree` detects no renames, so a moved file lists both its old and
+    /// new path — what overlap detection needs (e.g., detecting conflicts when
+    /// a file is renamed in one branch but has uncommitted changes under the
+    /// old name).
+    pub fn changed_files(&self, base: &str, head: &str) -> anyhow::Result<Vec<Vec<u8>>> {
+        let args = PlumbingDiff::Tree.args(&[
+            "-r",
+            "--name-only",
+            "-z",
+            "--end-of-options",
+            base,
+            head,
+            "--",
+        ]);
+        Ok(self
+            .run_command_bytes(&args)?
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect())
+    }
+
+    /// Get short SHA, commit timestamp and subject for multiple commits in a
+    /// single git command.
+    ///
+    /// Returns a map from full commit SHA to `(short_sha, timestamp, subject)`.
+    /// `%h` is the abbreviated SHA — same machinery as `git rev-parse --short`,
+    /// so it honors `core.abbrev` and auto-extends for ambiguous prefixes.
+    /// Uses NUL separators between fields so subjects containing spaces or
+    /// other whitespace parse unambiguously. `%s` is the subject line only, so
+    /// no multi-line handling is needed.
+    ///
+    /// **Primes the commit→tree cache.** The format also reads `%T` (the
+    /// commit's tree SHA) and stores it in the in-memory `commit_tree` cache
+    /// that `commit_to_tree_sha` reads. git resolves the commit object
+    /// to read `%ct` anyway, so the tree SHA rides along for free in the same
+    /// round trip — turning the `wt list` per-row `CommittedTreesMatch` /
+    /// `WouldMergeAdd` tree lookups (every item head + the default-branch tip
+    /// are in this batch) from one `rev-parse <sha>^{tree}` fork each into
+    /// memory hits. The mapping is content-addressed (a commit's tree is
+    /// immutable), so priming it from the authoritative batch is never stale.
+    ///
+    /// Fails if any SHA is invalid — `git log --no-walk` refuses the whole
+    /// batch on a single bad ref. Callers should surface the error rather
+    /// than fall back to per-SHA fetches: the batch is the only commit-detail
+    /// fetch path left, and quietly swallowing the failure produces empty
+    /// cells without telling the user why.
+    pub fn commit_details_many(
+        &self,
+        commits: &[&str],
+    ) -> anyhow::Result<HashMap<String, (String, i64, String)>> {
+        if commits.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // --no-walk shows exactly the named commits without DAG walking.
+        // --no-show-signature suppresses GPG verification output that otherwise
+        // contaminates stdout when log.showSignature is set.
+        // %T (tree SHA) rides along to prime the commit→tree cache; it's placed
+        // before %s so the variable-length subject stays the final field.
+        let mut args = vec![
+            "log",
+            "--no-walk",
+            "--no-show-signature",
+            "--format=%H%x00%h%x00%ct%x00%T%x00%s",
+        ];
+        args.extend(commits);
+
+        let stdout = self.run_command(&args)?;
+
+        let mut result = HashMap::with_capacity(commits.len());
+        for line in stdout.lines() {
+            let mut parts = line.splitn(5, '\0');
+            let (Some(sha), Some(short_sha), Some(timestamp_str), Some(tree_sha), Some(subject)) = (
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+                parts.next(),
+            ) else {
+                bail!(
+                    "Malformed git log output: expected '<sha>\\0<short>\\0<ts>\\0<tree>\\0<subject>', got {line:?}"
+                );
+            };
+            let timestamp: i64 = timestamp_str
+                .parse()
+                .with_context(|| format!("Failed to parse timestamp {timestamp_str:?}"))?;
+            // Prime the content-addressed commit→tree cache (get-or-insert; a
+            // concurrent resolver's entry wins, both are authoritative).
+            self.cache
+                .commit_tree
+                .entry(sha.to_string())
+                .or_insert_with(|| tree_sha.to_string());
+            result.insert(
+                sha.to_string(),
+                (short_sha.to_owned(), timestamp, subject.to_owned()),
+            );
+        }
+
+        Ok(result)
+    }
+
+    /// Get commit subjects and bodies from a range.
+    pub fn commit_message_details(&self, range: &str) -> anyhow::Result<Vec<CommitMessageDetail>> {
+        // Git pretty-format placeholders:
+        // - `%s`: subject
+        // - `%x00`: literal NUL delimiter
+        // - `%b`: body as Git reports it; trailer-like lines remain part of this text
+        let output = self.run_command(&[
+            "log",
+            "-z",
+            "--no-show-signature",
+            "--pretty=format:%s%x00%b",
+            "--end-of-options",
+            range,
+        ])?;
+        parse_commit_message_details_output(&output)
+    }
+
+    /// Get the merge base between two commits.
+    ///
+    /// Returns `Ok(Some(sha))` if a merge base exists, `Ok(None)` for orphan branches
+    /// with no common ancestor (git exit code 1), or `Err` for invalid refs.
+    ///
+    /// Results are cached in the shared repo cache to avoid redundant git commands
+    /// when multiple tasks need the same merge-base (e.g., parallel `wt list` tasks).
+    /// Inputs are resolved to commit SHAs (the resolver short-circuits on
+    /// hex-shaped inputs and otherwise spawns `git rev-parse`) before keying
+    /// the cache, so equivalent forms (e.g., `"main"` vs the SHA `main` points
+    /// to) hit the same entry. The key is also order-normalized since
+    /// merge-base is symmetric: `merge-base(A, B) == merge-base(B, A)`.
+    pub fn merge_base(&self, commit1: &str, commit2: &str) -> anyhow::Result<Option<String>> {
+        // Resolve to SHAs so different forms of the same commit dedupe in the cache.
+        // `resolve_to_commit_sha` is a no-op for inputs that already look like SHAs.
+        let sha1 = self.resolve_to_commit_sha(commit1)?;
+        let sha2 = self.resolve_to_commit_sha(commit2)?;
+        self.merge_base_by_sha(&sha1, &sha2)
+    }
+
+    /// SHA-keyed variant of [`Self::merge_base`].
+    ///
+    /// Inputs are commit SHAs, so no ref names are resolved; cache key is `(min(sha1, sha2), max(sha1, sha2))`.
+    ///
+    /// In-memory front over a persistent disk back
+    /// (`merge-base/{min}-{max}.json`): the `DashMap` dedups within one
+    /// process, the disk cache serves re-runs without re-forking. The
+    /// `wt list` orphan check calls this once per row
+    /// even when the ahead/behind counts are themselves cache-warm, so on a
+    /// repo with many branches the disk back turns that per-row
+    /// `git merge-base` fork into a file read. Content-addressed, never
+    /// stale. The `sha1 == sha2` short-circuit (a commit is its own
+    /// merge-base) skips both git and the cache for items sitting exactly at
+    /// the base tip — the common "freshly branched" case.
+    pub fn merge_base_by_sha(&self, sha1: &str, sha2: &str) -> anyhow::Result<Option<String>> {
+        if sha1 == sha2 {
+            return Ok(Some(sha1.to_string()));
+        }
+
+        // Normalize key order since merge-base is symmetric.
+        let key = if sha1 <= sha2 {
+            (sha1.to_string(), sha2.to_string())
+        } else {
+            (sha2.to_string(), sha1.to_string())
+        };
+
+        match self.cache.merge_base.entry(key) {
+            Entry::Occupied(e) => Ok(e.get().clone()),
+            Entry::Vacant(e) => {
+                // Disk back: a prior run's result, served without forking git.
+                if let Some(cached) = super::sha_cache::merge_base(self, sha1, sha2) {
+                    return Ok(e.insert(cached).clone());
+                }
+
+                // Exit codes: 0 = found, 1 = no common ancestor, 128+ = invalid ref
+                let args = ["merge-base", sha1, sha2];
+                let output = self.run_command_output(&args)?;
+
+                let result = if output.status.success() {
+                    Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                } else if output.status.code() == Some(1) {
+                    None
+                } else {
+                    return Err(crate::git::CommandError::from_failed_output(
+                        "git", &args, &output,
+                    )
+                    .into());
+                };
+
+                super::sha_cache::put_merge_base(self, sha1, sha2, &result);
+                Ok(e.insert(result).clone())
+            }
+        }
+    }
+
+    /// SHA-keyed ahead/behind counts.
+    ///
+    /// Inputs are commit SHAs. Backed by the persistent SHA-keyed cache
+    /// (`ahead-behind/{base_sha}-{head_sha}.json`) — content-addressed, so
+    /// the entry is never stale. `wt list` populates this per branch (and
+    /// in bulk from a `for-each-ref %(ahead-behind)` batch when most
+    /// entries are cold); subsequent runs are pure cache reads. Returns
+    /// `(ahead, behind)` where ahead is commits in head not in base;
+    /// orphan branches (no common ancestor) yield `(0, 0)` — caller should
+    /// distinguish via [`Self::merge_base_by_sha`].
+    pub fn ahead_behind_by_sha(
+        &self,
+        base_sha: &str,
+        head_sha: &str,
+    ) -> anyhow::Result<(usize, usize)> {
+        if let Some(cached) = super::sha_cache::ahead_behind(self, base_sha, head_sha) {
+            return Ok(cached);
+        }
+        let result = self.compute_ahead_behind(base_sha, head_sha)?;
+        super::sha_cache::put_ahead_behind(self, base_sha, head_sha, result);
+        Ok(result)
+    }
+
+    fn compute_ahead_behind(&self, base: &str, head: &str) -> anyhow::Result<(usize, usize)> {
+        // Get merge-base (cached in shared repo cache)
+        let Some(merge_base) = self.merge_base_by_sha(base, head)? else {
+            // Orphan branch - no common ancestor
+            return Ok((0, 0));
+        };
+
+        // Count commits using two-dot syntax (faster when merge-base is cached).
+        // ahead = commits in head but not in merge_base.
+        // behind = commits in base but not in merge_base.
+        //
+        // Skip rev-list when merge_base equals either side (count would be 0).
+        // Both inputs are SHAs (the only caller is `ahead_behind_by_sha`), and
+        // `merge_base_by_sha` returns a SHA, so the equality check is sound on
+        // both sides.
+        let count = |range: String| -> anyhow::Result<usize> {
+            let output = self.run_command(&["rev-list", "--count", &range])?;
+            output
+                .trim()
+                .parse()
+                .context("Failed to parse rev-list count")
+        };
+        let ahead = if merge_base == head {
+            0
+        } else {
+            count(format!("{merge_base}..{head}"))?
+        };
+        let behind = if merge_base == base {
+            0
+        } else {
+            count(format!("{merge_base}..{base}"))?
+        };
+
+        Ok((ahead, behind))
+    }
+
+    /// Get line diff statistics between two refs.
+    ///
+    /// Uses merge-base (cached) to find common ancestor, then two-dot diff
+    /// to get the stats. This allows the merge-base result to be reused
+    /// across multiple operations.
+    ///
+    /// For orphan branches with no common ancestor, returns zeros.
+    pub fn branch_diff_stats(&self, base: &str, head: &str) -> anyhow::Result<LineDiff> {
+        let base_sha = self.rev_parse_commit(base)?;
+        let head_sha = self.rev_parse_commit(head)?;
+        self.branch_diff_stats_by_sha(&base_sha, &head_sha)
+    }
+
+    /// SHA-keyed variant of [`Self::branch_diff_stats`].
+    ///
+    /// Inputs are commit SHAs, so no ref names are resolved.
+    pub fn branch_diff_stats_by_sha(
+        &self,
+        base_sha: &str,
+        head_sha: &str,
+    ) -> anyhow::Result<LineDiff> {
+        use dashmap::mapref::entry::Entry;
+
+        // Sparse checkout filters the diff by path, making the result
+        // environment-dependent rather than purely SHA-determined. Skip
+        // caches when sparse checkout is active.
+        let sparse_paths = self.sparse_checkout_paths();
+        let use_cache = sparse_paths.is_empty();
+
+        if use_cache {
+            // In-memory entry lock prevents parallel tasks from racing through
+            // the file-based cache for the same SHA pair.
+            match self
+                .cache
+                .diff_stats
+                .entry((base_sha.to_string(), head_sha.to_string()))
+            {
+                Entry::Occupied(e) => return Ok(*e.get()),
+                Entry::Vacant(e) => {
+                    let result =
+                        self.compute_branch_diff_stats(base_sha, head_sha, sparse_paths)?;
+                    return Ok(*e.insert(result));
+                }
+            }
+        }
+
+        self.compute_branch_diff_stats(base_sha, head_sha, sparse_paths)
+    }
+
+    fn compute_branch_diff_stats(
+        &self,
+        base_sha: &str,
+        head_sha: &str,
+        sparse_paths: &[String],
+    ) -> anyhow::Result<LineDiff> {
+        let use_cache = sparse_paths.is_empty();
+
+        if use_cache && let Some(cached) = super::sha_cache::diff_stats(self, base_sha, head_sha) {
+            return Ok(cached);
+        }
+
+        // Limit concurrent diff operations to reduce mmap thrash on pack files.
+        // Acquired after cache check to avoid holding the semaphore on cache hits.
+        let _guard = super::super::HEAVY_OPS_SEMAPHORE.acquire();
+
+        // Get merge-base (cached in shared repo cache). Inputs are already
+        // SHAs here (both callers resolve first), so use the SHA-keyed
+        // variant directly and skip the redundant ref→SHA resolution — same
+        // path `compute_ahead_behind` takes.
+        let Some(merge_base) = self.merge_base_by_sha(base_sha, head_sha)? else {
+            if use_cache {
+                super::sha_cache::put_diff_stats(self, base_sha, head_sha, LineDiff::default());
+            }
+            return Ok(LineDiff::default());
+        };
+
+        // Sparse paths are root-relative, but git resolves pathspecs against
+        // the cwd, which is the user's subdirectory when run from one.
+        let sparse_pathspecs: Vec<String> = sparse_paths
+            .iter()
+            .map(|path| format!(":(top){path}"))
+            .collect();
+        let mut args = PlumbingDiff::Tree.args(&[
+            "-r",
+            "--shortstat",
+            "--find-renames",
+            &merge_base,
+            head_sha,
+            "--",
+        ]);
+        args.extend(sparse_pathspecs.iter().map(String::as_str));
+
+        let stdout = self.run_command(&args)?;
+        let result = LineDiff::from_shortstat(&stdout);
+        if use_cache {
+            super::sha_cache::put_diff_stats(self, base_sha, head_sha, result);
+        }
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::testing::TestRepo;
+
+    #[test]
+    fn recent_commit_subjects_with_zero_count_is_none() {
+        let test_repo = TestRepo::with_initial_commit();
+        let wt = test_repo.repo.current_worktree();
+
+        assert_eq!(wt.recent_commit_subjects(None, 0), None);
+    }
+
+    #[test]
+    fn parse_commit_message_details_output_rejects_odd_field_count() {
+        let err =
+            super::parse_commit_message_details_output("subject\0body\0dangling").unwrap_err();
+        assert!(
+            err.to_string().contains("subject/body pairs"),
+            "unexpected error: {err}"
+        );
+    }
+}

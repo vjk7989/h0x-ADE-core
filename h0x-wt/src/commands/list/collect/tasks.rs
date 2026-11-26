@@ -1,0 +1,1008 @@
+//! Task computations and their shared context.
+//!
+//! Each [`TaskKind`] dispatches here to one private computation over a shared
+//! [`TaskContext`].
+
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use std::sync::Arc;
+
+use h0x_wt::git::{
+    ErrorExt, IntegrationTargets, LineDiff, RefSnapshot, Repository, select_comparison_base,
+};
+
+use super::super::ci_status::{CiBranchName, PrStatus};
+use super::super::model::{AheadBehind, BranchDiffTotals, UpstreamStatus, WorkingTreeStatus};
+use super::types::{ErrorCause, TaskError, TaskKind, TaskResult};
+
+// ============================================================================
+// Task Context
+// ============================================================================
+
+/// Context for task computation. Cloned and moved into spawned threads.
+///
+/// Contains all data needed by any task. The `repo` field shares its cache
+/// across all clones via `Arc<RepoCache>`, so parallel tasks benefit from
+/// cached merge-base results, ahead/behind counts, default branch, and
+/// integration targets.
+///
+/// # Comparison bases
+///
+/// Three accessors expose "the mainline ref" a task compares against, and
+/// which one to use is decided by the question the task answers:
+///
+/// - [`default_branch`](Self::default_branch) is the local ref. Conflict
+///   prediction (`WouldConflict`) and the `wt merge` / `wt switch --base`
+///   writes use it, since that is the branch the merge actually updates and
+///   a remote-tracking ref is not writable.
+/// - [`comparison_base`](Self::comparison_base) is the upstream-aware
+///   superset tip. The ahead/behind (`main↕`) and branch-diff (`main…±`)
+///   columns measure against it, so a local default that lags its upstream
+///   does not inflate the distance from the real mainline.
+/// - [`integration_targets`](Self::integration_targets) is that superset
+///   plus, when local and upstream diverge, both sides. Integration status
+///   checks whether the work has landed in the mainline on either.
+///
+/// All three resolve the upstream from the default branch's configured
+/// `@{upstream}` alone ([`RefSnapshot::upstream_of`]); there is no
+/// remote-name heuristic. The superset selection itself lives on
+/// [`Repository::integration_targets`].
+#[derive(Clone)]
+pub struct TaskContext {
+    /// Shared repository handle. All clones share the same cache via Arc.
+    pub repo: Repository,
+    /// The branch this task operates on. Contains branch name, commit SHA,
+    /// and optional worktree path.
+    ///
+    /// For worktree-specific operations, use `self.worktree()` which returns
+    /// `Some(WorkingTree)` only when this ref has a worktree path.
+    pub branch_ref: h0x_wt::git::BranchRef,
+    pub item_idx: usize,
+    /// Expanded URL for this item (from project config template).
+    /// The URL-status task uses this to check if the port is listening.
+    pub item_url: Option<String>,
+    /// LLM command for summary generation (from commit.generation config).
+    pub llm_command: Option<String>,
+    /// Default branch resolved for this list invocation. Populated from
+    /// the collect-phase check that verifies the persisted value still
+    /// resolves locally; `None` when unset or stale. Tasks read this
+    /// instead of `repo.default_branch()` so a stale persisted value
+    /// degrades silently (empty cells) here rather than emitting a cascade
+    /// of "ambiguous argument" errors.
+    pub default_branch: Option<String>,
+    /// Integration targets for this list invocation. Carries the primary
+    /// ref the column is reported against, plus an optional secondary ref
+    /// to also check (only set when local and upstream have diverged). A
+    /// branch is treated as integrated if it is integrated against either
+    /// — same OR semantics as `Repository::integration_reason`. `None`
+    /// when the default branch is unset or stale, keeping the same
+    /// silent-skip contract as `default_branch`.
+    pub integration_targets: Option<IntegrationTargets>,
+    /// Captured ref state for this list invocation. Tasks resolve ref
+    /// names to commit SHAs through this snapshot before calling
+    /// `_by_sha` methods on `Repository`, so every task reads the same
+    /// point-in-time ref state. `None` when snapshot capture failed (degraded
+    /// mode — tasks fall back to ref-taking methods).
+    pub snapshot: Option<Arc<RefSnapshot>>,
+}
+
+impl TaskContext {
+    fn error(&self, kind: TaskKind, err: &anyhow::Error) -> TaskError {
+        // Check if any error in the chain is a timeout
+        let is_timeout = err.chain().any(|e| {
+            e.downcast_ref::<std::io::Error>()
+                .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::TimedOut)
+        });
+
+        let cause = if is_timeout {
+            let kind_str: &'static str = kind.into();
+            let sha = &self.branch_ref.commit_sha;
+            let short_sha = &sha[..sha.len().min(8)];
+            let branch = self.branch_ref.short_name().unwrap_or(short_sha);
+            tracing::debug!(kind = %kind_str, branch = %branch, "Task {} timed out for {}", kind_str, branch);
+            ErrorCause::Timeout
+        } else {
+            ErrorCause::Other
+        };
+        // Prefer the typed leaf's captured stderr/stdout when present so the
+        // user sees git's actual error message (e.g., "fatal: bad object
+        // HEAD") rather than our single-line `CommandError` summary
+        // ("git status --porcelain failed (exit 128)").
+        let message = err.display_message();
+        TaskError::new(self.item_idx, kind, message, cause)
+    }
+
+    /// Get the default branch resolved for this list invocation: the local
+    /// ref, used by conflict prediction and the merge/`--base` writes (see
+    /// the type-level "Comparison bases" note). Returns `None` if the default
+    /// branch cannot be determined, or if the persisted value is stale (see
+    /// the `default_branch` field docs).
+    fn default_branch(&self) -> Option<String> {
+        self.default_branch.clone()
+    }
+
+    /// The base ref the informational comparison columns — ahead/behind
+    /// (`main↕`) and branch diff (`main…±`) — measure a branch against.
+    ///
+    /// This is the same upstream-aware "superset" mainline ref the
+    /// integration column already uses ([`IntegrationTargets::primary`]):
+    /// the local default branch when it is up to date with (or ahead of)
+    /// its upstream or has no upstream, and the upstream ref when the local
+    /// default *lags* it. The lagging case is the one that matters — a fork
+    /// whose local `master` sits dozens of commits behind `origin/master`
+    /// would otherwise make every feature read as dozens of commits and
+    /// thousands of lines ahead of "main", measuring each branch against a
+    /// stale base instead of the real mainline tip. Routing these columns
+    /// through `primary` keeps them consistent with the integration symbol
+    /// and immune to a stale local default.
+    ///
+    /// Resolved via the shared `select_comparison_base` rule — the same one the
+    /// diff/summary preview panes use — so the column number and the pane can't
+    /// drift onto different bases. Falls back to the raw default branch name
+    /// when integration targets could not be resolved (snapshot capture failed)
+    /// so the columns still render in that degraded mode.
+    fn comparison_base(&self) -> Option<&str> {
+        select_comparison_base(
+            self.integration_targets.as_ref(),
+            self.default_branch.as_deref(),
+        )
+    }
+
+    /// Get the integration targets resolved for this list invocation.
+    ///
+    /// Used for integration checks (status symbols, safe deletion).
+    /// Returns `None` if default branch cannot be determined or is stale.
+    fn integration_targets(&self) -> Option<&IntegrationTargets> {
+        self.integration_targets.as_ref()
+    }
+
+    /// Captured ref state for this list invocation. Returns `None` when
+    /// snapshot capture failed during pre-skeleton.
+    fn snapshot(&self) -> Option<&RefSnapshot> {
+        self.snapshot.as_deref()
+    }
+
+    /// Resolve a ref name to its commit SHA via the snapshot, falling back
+    /// to an uncached `git rev-parse` when the snapshot doesn't carry the
+    /// ref (e.g., HEAD, raw SHAs, tags) or when no snapshot was captured.
+    fn resolve_sha(&self, name: &str) -> anyhow::Result<String> {
+        if let Some(snap) = self.snapshot()
+            && let Some(sha) = snap.resolve(name)
+        {
+            return Ok(sha.to_string());
+        }
+        Ok(self
+            .repo
+            .run_command(&["rev-parse", "--verify", "--end-of-options", name])?
+            .trim()
+            .to_string())
+    }
+
+    /// Commit SHA used to compare the branch's content. Prefers the SHA
+    /// the branch's full ref points at (so a rebase-in-progress doesn't
+    /// compare against the transient HEAD); falls back to
+    /// `branch_ref.commit_sha` for detached-HEAD items.
+    fn branch_check_sha(&self) -> anyhow::Result<String> {
+        if let Some(full_ref) = self.branch_ref.full_ref() {
+            self.resolve_sha(full_ref)
+        } else {
+            Ok(self.branch_ref.commit_sha.clone())
+        }
+    }
+}
+
+// ============================================================================
+// Task Computations
+// ============================================================================
+
+impl TaskKind {
+    /// Compute this task for one list item.
+    pub(super) fn compute(self, ctx: TaskContext) -> Result<TaskResult, TaskError> {
+        let result = match self {
+            Self::AheadBehind => compute_ahead_behind(&ctx),
+            Self::CommittedTreesMatch => compute_committed_trees_match(&ctx),
+            Self::HasFileChanges => compute_has_file_changes(&ctx),
+            Self::WouldMergeAdd => compute_would_merge_add(&ctx),
+            Self::IsAncestor => compute_is_ancestor(&ctx),
+            Self::BranchDiff => compute_branch_diff(&ctx),
+            Self::WorkingTreeDiff => compute_working_tree_diff(&ctx),
+            Self::MergeTreeConflicts => compute_merge_tree_conflicts(&ctx),
+            Self::WorkingTreeConflicts => compute_working_tree_conflicts(&ctx),
+            Self::GitOperation => compute_git_operation(&ctx),
+            Self::UserMarker => compute_user_marker(&ctx),
+            Self::Upstream => compute_upstream(&ctx),
+            Self::CiStatus => compute_ci_status(&ctx),
+            Self::UrlStatus => compute_url_status(&ctx),
+            Self::SummaryGenerate => compute_summary_generate(&ctx),
+        };
+        result.map_err(|error| ctx.error(self, &error))
+    }
+}
+
+/// Ahead/behind counts vs the mainline tip (informational stats).
+///
+/// Measures against [`TaskContext::comparison_base`] — the upstream-aware
+/// default-branch tip — so a stale local default doesn't inflate the counts.
+fn compute_ahead_behind(ctx: &TaskContext) -> anyhow::Result<TaskResult> {
+    // When no comparison base resolves, return zero counts (cells show empty)
+    let Some(base) = ctx.comparison_base() else {
+        return Ok(TaskResult::AheadBehind {
+            item_idx: ctx.item_idx,
+            counts: AheadBehind::default(),
+            is_orphan: false,
+        });
+    };
+    let repo = &ctx.repo;
+
+    let base_sha = ctx.resolve_sha(base)?;
+    // Compare against the branch tip via its full ref when present —
+    // see `branch_check_sha` for the rebase-in-progress rationale.
+    let head_sha = ctx.branch_check_sha()?;
+
+    // Check for orphan branch (no common ancestor with default branch).
+    let is_orphan = repo.merge_base_by_sha(&base_sha, &head_sha)?.is_none();
+
+    if is_orphan {
+        return Ok(TaskResult::AheadBehind {
+            item_idx: ctx.item_idx,
+            counts: AheadBehind::default(),
+            is_orphan: true,
+        });
+    }
+
+    // Snapshot's ahead/behind batch is keyed by ref names — try the
+    // batched answer first, fall back to a per-pair query keyed by SHA.
+    let head_ref = ctx
+        .branch_ref
+        .full_ref()
+        .unwrap_or(&ctx.branch_ref.commit_sha);
+    let counts = ctx
+        .snapshot()
+        .and_then(|s| s.ahead_behind(base, head_ref))
+        .map(Ok)
+        .unwrap_or_else(|| repo.ahead_behind_by_sha(&base_sha, &head_sha))?;
+
+    Ok(TaskResult::AheadBehind {
+        item_idx: ctx.item_idx,
+        counts: AheadBehind {
+            ahead: counts.0,
+            behind: counts.1,
+        },
+        is_orphan: false,
+    })
+}
+
+/// Tree identity check (does the item's commit tree match the integration target's tree?).
+///
+/// Uses target for integration detection (squash merge, rebase). When local
+/// and upstream have diverged, ORs across both — a tree match against either
+/// counts as integrated, matching `Repository::integration_reason`.
+fn compute_committed_trees_match(ctx: &TaskContext) -> anyhow::Result<TaskResult> {
+    // When integration_targets is None, return false (conservative: don't mark as integrated)
+    let Some(targets) = ctx.integration_targets() else {
+        return Ok(TaskResult::CommittedTreesMatch {
+            item_idx: ctx.item_idx,
+            committed_trees_match: false,
+        });
+    };
+    let repo = &ctx.repo;
+    // Resolve via snapshot — see `branch_check_sha` for the
+    // rebase-in-progress rationale.
+    let branch_sha = ctx.branch_check_sha()?;
+    let primary_sha = ctx.resolve_sha(&targets.primary)?;
+    let mut committed_trees_match = repo.trees_match_by_sha(&branch_sha, &primary_sha)?;
+    if !committed_trees_match && let Some(secondary) = targets.secondary.as_deref() {
+        let secondary_sha = ctx.resolve_sha(secondary)?;
+        committed_trees_match = repo.trees_match_by_sha(&branch_sha, &secondary_sha)?;
+    }
+    Ok(TaskResult::CommittedTreesMatch {
+        item_idx: ctx.item_idx,
+        committed_trees_match,
+    })
+}
+
+/// File changes check (does the branch have file changes beyond merge-base?).
+///
+/// Uses three-dot diff (`target...branch`) to detect if the branch has any file
+/// changes relative to the merge-base with target. Returns false when the diff
+/// is empty, indicating the branch content is already integrated.
+///
+/// This catches branches where commits exist (ahead > 0) but those commits
+/// don't add any file changes - e.g., squash-merged branches, merge commits
+/// that pulled in main, or commits whose changes were reverted.
+///
+/// Uses target for integration detection.
+fn compute_has_file_changes(ctx: &TaskContext) -> anyhow::Result<TaskResult> {
+    // No branch name (detached HEAD) - return conservative default (assume has changes)
+    if ctx.branch_ref.full_ref().is_none() {
+        return Ok(TaskResult::HasFileChanges {
+            item_idx: ctx.item_idx,
+            has_file_changes: true,
+        });
+    }
+    // When integration_targets is None, return true (conservative: assume has changes)
+    let Some(targets) = ctx.integration_targets() else {
+        return Ok(TaskResult::HasFileChanges {
+            item_idx: ctx.item_idx,
+            has_file_changes: true,
+        });
+    };
+    let repo = &ctx.repo;
+    // Resolve via snapshot. The branch is integrated (no added changes)
+    // if it has none against EITHER target — AND the per-target
+    // booleans so the combined value is false as soon as one side has
+    // nothing to add.
+    let branch_sha = ctx.branch_check_sha()?;
+    let primary_sha = ctx.resolve_sha(&targets.primary)?;
+    let mut has_file_changes = repo.has_added_changes_by_sha(&branch_sha, &primary_sha)?;
+    if has_file_changes && let Some(secondary) = targets.secondary.as_deref() {
+        let secondary_sha = ctx.resolve_sha(secondary)?;
+        has_file_changes = repo.has_added_changes_by_sha(&branch_sha, &secondary_sha)?;
+    }
+
+    Ok(TaskResult::HasFileChanges {
+        item_idx: ctx.item_idx,
+        has_file_changes,
+    })
+}
+
+/// Merge simulation + patch-id fallback.
+///
+/// Delegates to [`Repository::merge_integration_probe_by_sha()`], which runs:
+///
+/// 1. `merge-tree --write-tree` — simulates merging branch into target. If the
+///    result tree equals target's tree, the branch is integrated (`MergeAddsNothing`).
+/// 2. `patch-id` fallback — only when merge-tree conflicts (returns `None`).
+///    Computes the branch's entire diff as a single patch-id and checks if any
+///    target commit matches (`PatchIdMatch`). Detects squash merges where target
+///    later modified the same files.
+///
+/// These are bundled in one task because patch-id only runs when merge-tree
+/// conflicts — it needs the merge-tree result first. Splitting them into separate
+/// parallel tasks would either waste work (running patch-id unconditionally) or
+/// require two-phase scheduling.
+fn compute_would_merge_add(ctx: &TaskContext) -> anyhow::Result<TaskResult> {
+    // No branch name (detached HEAD) - return conservative default (assume would add)
+    if ctx.branch_ref.full_ref().is_none() {
+        return Ok(TaskResult::WouldMergeAdd {
+            item_idx: ctx.item_idx,
+            would_merge_add: true,
+            is_patch_id_match: false,
+        });
+    }
+    // When integration_targets is None, return true (conservative: assume would add)
+    let Some(targets) = ctx.integration_targets() else {
+        return Ok(TaskResult::WouldMergeAdd {
+            item_idx: ctx.item_idx,
+            would_merge_add: true,
+            is_patch_id_match: false,
+        });
+    };
+    // Combine probes the same way `compute_integration_reason_uncached`
+    // ORs the two `check_integration` calls: a branch is integrated if
+    // merging would add nothing OR a patch-id matches against EITHER
+    // side. So `would_merge_add` ANDs (false on either ⇒ integrated)
+    // and `is_patch_id_match` ORs.
+    let branch_sha = ctx.branch_check_sha()?;
+    let primary_sha = ctx.resolve_sha(&targets.primary)?;
+    let probe = ctx
+        .repo
+        .merge_integration_probe_by_sha(&branch_sha, &primary_sha)?;
+    let mut would_merge_add = probe.would_merge_add;
+    let mut is_patch_id_match = probe.is_patch_id_match;
+    if let Some(secondary) = targets.secondary.as_deref()
+        && (would_merge_add && !is_patch_id_match)
+    {
+        let secondary_sha = ctx.resolve_sha(secondary)?;
+        let alt = ctx
+            .repo
+            .merge_integration_probe_by_sha(&branch_sha, &secondary_sha)?;
+        would_merge_add = would_merge_add && alt.would_merge_add;
+        is_patch_id_match = is_patch_id_match || alt.is_patch_id_match;
+    }
+    Ok(TaskResult::WouldMergeAdd {
+        item_idx: ctx.item_idx,
+        would_merge_add,
+        is_patch_id_match,
+    })
+}
+
+/// Ancestor check (is branch HEAD an ancestor of the integration target?).
+///
+/// Checks if branch is an ancestor of target - runs `git merge-base --is-ancestor`.
+/// Returns true when the branch HEAD is in target's history (merged via fast-forward
+/// or rebase).
+///
+/// Uses target (target) for the Ancestor integration reason in `⊂`.
+/// The `_` symbol uses ahead/behind counts (vs default_branch) instead.
+fn compute_is_ancestor(ctx: &TaskContext) -> anyhow::Result<TaskResult> {
+    // When integration_targets is None, return false (conservative: don't mark as ancestor)
+    let Some(targets) = ctx.integration_targets() else {
+        return Ok(TaskResult::IsAncestor {
+            item_idx: ctx.item_idx,
+            is_ancestor: false,
+        });
+    };
+    let repo = &ctx.repo;
+    // Resolve via snapshot — see `branch_check_sha` for the
+    // rebase-in-progress rationale.
+    let branch_sha = ctx.branch_check_sha()?;
+    let primary_sha = ctx.resolve_sha(&targets.primary)?;
+    let mut is_ancestor = repo.is_ancestor_by_sha(&branch_sha, &primary_sha)?;
+    if !is_ancestor && let Some(secondary) = targets.secondary.as_deref() {
+        let secondary_sha = ctx.resolve_sha(secondary)?;
+        is_ancestor = repo.is_ancestor_by_sha(&branch_sha, &secondary_sha)?;
+    }
+
+    Ok(TaskResult::IsAncestor {
+        item_idx: ctx.item_idx,
+        is_ancestor,
+    })
+}
+
+/// Branch diff stats vs the mainline tip (informational stats).
+///
+/// Measures against [`TaskContext::comparison_base`] — the upstream-aware
+/// default-branch tip — so a stale local default doesn't inflate the diff.
+fn compute_branch_diff(ctx: &TaskContext) -> anyhow::Result<TaskResult> {
+    // When no comparison base resolves, return empty diff (cells show empty)
+    let Some(base) = ctx.comparison_base() else {
+        return Ok(TaskResult::BranchDiff {
+            item_idx: ctx.item_idx,
+            branch_diff: BranchDiffTotals::default(),
+        });
+    };
+    let repo = &ctx.repo;
+    // Resolve via snapshot — see `branch_check_sha` for the
+    // rebase-in-progress rationale.
+    let base_sha = ctx.resolve_sha(base)?;
+    let head_sha = ctx.branch_check_sha()?;
+    let diff = repo.branch_diff_stats_by_sha(&base_sha, &head_sha)?;
+
+    Ok(TaskResult::BranchDiff {
+        item_idx: ctx.item_idx,
+        branch_diff: BranchDiffTotals { diff },
+    })
+}
+
+/// Working tree diff + status flags (worktree only).
+///
+/// Runs `git status --porcelain` to get working tree status and computes diff stats.
+fn compute_working_tree_diff(ctx: &TaskContext) -> anyhow::Result<TaskResult> {
+    // This task is only spawned for worktree items, so worktree path is always present.
+    let wt = ctx
+        .branch_ref
+        .working_tree(&ctx.repo)
+        .ok_or_else(|| anyhow::anyhow!("requires a worktree"))?;
+
+    // Shared cache: the working-tree conflict task also needs porcelain. First
+    // accessor spawns the subprocess; second hits the cache. Uses
+    // --no-optional-locks to avoid index lock contention with `git write-tree`.
+    let status_output = wt.status_porcelain_cached()?;
+
+    let (working_tree_status, is_dirty, has_conflicts) = parse_working_tree_status(&status_output);
+
+    // Only untracked entries need the temporary index. Tracked-only
+    // changes keep the ordinary tracked diff fast path.
+    let working_tree_diff = if !is_dirty {
+        LineDiff::default()
+    } else if working_tree_status.untracked {
+        wt.working_tree_diff_stats_with_untracked()?
+    } else {
+        wt.working_tree_diff_stats()?
+    };
+
+    Ok(TaskResult::WorkingTreeDiff {
+        item_idx: ctx.item_idx,
+        working_tree_diff,
+        working_tree_status,
+        has_conflicts,
+    })
+}
+
+/// Potential merge conflicts check (merge-tree vs the local default branch).
+///
+/// Uses default_branch (local main) for consistency with other Main subcolumn symbols.
+/// Shows whether merging to your local main would conflict.
+///
+/// **Skip-when-tracked-dirty optimization:** for worktree items, peek at the
+/// shared porcelain cache. When the worktree has tracked changes (and has no
+/// unmerged entries), the working-tree conflict task will produce a
+/// `Some(Some(_))` tracked-tree result that is authoritative for the WouldConflict tier
+/// (`tier_would_conflict` short-circuits on `Some(Some(_))` and ignores the
+/// HEAD probe). Returning
+/// the redundant HEAD probe in that case would mean a second `git merge-tree`
+/// call against HEAD for the same row. Skip with a sentinel `false` —
+/// the value is ignored by the gate, and seeding `Some(false)` keeps the
+/// "loaded" invariant other gates expect.
+///
+/// Branch-only items have no working tree, so they fall through to the
+/// normal HEAD-vs-base merge-tree call.
+fn compute_merge_tree_conflicts(ctx: &TaskContext) -> anyhow::Result<TaskResult> {
+    // When default_branch is None, return false (no conflicts can be detected)
+    let Some(base) = ctx.default_branch() else {
+        return Ok(TaskResult::MergeTreeConflicts {
+            item_idx: ctx.item_idx,
+            has_merge_tree_conflicts: false,
+        });
+    };
+    // Skip when tracked changes let the working-tree conflict task provide the
+    // authoritative result. The unmerged path
+    // returns `Some(None)` from that task, which falls
+    // back to this HEAD probe.
+    if let Some(wt) = ctx.branch_ref.working_tree(&ctx.repo) {
+        let porcelain = wt.status_porcelain_cached()?;
+        if has_tracked_changes(&porcelain) && !has_unmerged_entries(&porcelain) {
+            return Ok(TaskResult::MergeTreeConflicts {
+                item_idx: ctx.item_idx,
+                has_merge_tree_conflicts: false,
+            });
+        }
+    }
+    let repo = &ctx.repo;
+    // Resolve via snapshot — see `branch_check_sha` for the
+    // rebase-in-progress rationale.
+    let base_sha = ctx.resolve_sha(&base)?;
+    let head_sha = ctx.branch_check_sha()?;
+    let has_merge_tree_conflicts = repo.has_merge_conflicts_by_sha(&base_sha, &head_sha)?;
+    Ok(TaskResult::MergeTreeConflicts {
+        item_idx: ctx.item_idx,
+        has_merge_tree_conflicts,
+    })
+}
+
+/// Working tree conflict check (worktree only).
+///
+/// For worktrees with tracked changes, builds a tree SHA from the index plus
+/// unstaged tracked changes, then checks for merge conflicts against the
+/// default branch. Untracked files remain visible in status but do not
+/// participate in this best-effort conflict estimate.
+///
+/// Returns None if the working tree has no usable tracked snapshot (caller
+/// falls back to MergeTreeConflicts).
+fn compute_working_tree_conflicts(ctx: &TaskContext) -> anyhow::Result<TaskResult> {
+    // When default_branch is None, return None (skip conflict check)
+    let Some(base) = ctx.default_branch() else {
+        return Ok(TaskResult::WorkingTreeConflicts {
+            item_idx: ctx.item_idx,
+            has_working_tree_conflicts: None,
+        });
+    };
+    // This task is only spawned for worktree items, so worktree path is always present.
+    let wt = ctx
+        .branch_ref
+        .working_tree(&ctx.repo)
+        .ok_or_else(|| anyhow::anyhow!("requires a worktree"))?;
+
+    // Shared cache with the working-tree diff task — single subprocess per worktree.
+    let status_output = wt.status_porcelain_cached()?;
+
+    if !has_tracked_changes(&status_output) {
+        // A clean or untracked-only worktree uses the commit-based check.
+        return Ok(TaskResult::WorkingTreeConflicts {
+            item_idx: ctx.item_idx,
+            has_working_tree_conflicts: None,
+        });
+    }
+
+    // Unmerged entries (UU, AU, UA, DU, UD, DD, AA) mean a merge/rebase
+    // conflict is in progress. Fall back to the commit-based check to
+    // preserve prior behavior — write-tree on unmerged entries would
+    // produce a tree with conflict markers as content.
+    let has_unmerged = has_unmerged_entries(&status_output);
+    if has_unmerged {
+        return Ok(TaskResult::WorkingTreeConflicts {
+            item_idx: ctx.item_idx,
+            has_working_tree_conflicts: None,
+        });
+    }
+
+    // A staged-only snapshot needs only `write-tree` against a copy of the
+    // index. Unstaged tracked changes also run `add -u` against that copy so
+    // the user's staging state stays untouched. Untracked entries are
+    // ignored.
+    let has_unstaged_tracked_changes = status_output
+        .lines()
+        .any(|line| !line.starts_with("??") && line.as_bytes().get(1) != Some(&b' '));
+    let tree_sha = if has_unstaged_tracked_changes {
+        wt.write_tracked_worktree_tree()?
+    } else {
+        wt.write_index_tree()?
+    };
+
+    let base_sha = ctx.resolve_sha(&base)?;
+    let has_conflicts = ctx.repo.has_merge_conflicts_by_tree_with_base_sha(
+        &base_sha,
+        &ctx.branch_ref.commit_sha,
+        &tree_sha,
+    )?;
+
+    Ok(TaskResult::WorkingTreeConflicts {
+        item_idx: ctx.item_idx,
+        has_working_tree_conflicts: Some(has_conflicts),
+    })
+}
+
+/// Git operation state detection (rebase, merge, …; worktree only).
+fn compute_git_operation(ctx: &TaskContext) -> anyhow::Result<TaskResult> {
+    // This task is only spawned for worktree items, so worktree path is always present.
+    let wt = ctx
+        .branch_ref
+        .working_tree(&ctx.repo)
+        .ok_or_else(|| anyhow::anyhow!("requires a worktree"))?;
+    let git_operation = wt.operation_in_progress()?;
+    Ok(TaskResult::GitOperation {
+        item_idx: ctx.item_idx,
+        git_operation,
+    })
+}
+
+/// User-defined status from git config (worktree only).
+fn compute_user_marker(ctx: &TaskContext) -> anyhow::Result<TaskResult> {
+    let repo = &ctx.repo;
+    let user_marker = repo.user_marker(ctx.branch_ref.short_name());
+    Ok(TaskResult::UserMarker {
+        item_idx: ctx.item_idx,
+        user_marker,
+    })
+}
+
+/// Upstream tracking status.
+fn compute_upstream(ctx: &TaskContext) -> anyhow::Result<TaskResult> {
+    let repo = &ctx.repo;
+
+    // No branch means no upstream
+    let Some(branch) = ctx.branch_ref.short_name() else {
+        return Ok(TaskResult::Upstream {
+            item_idx: ctx.item_idx,
+            upstream: UpstreamStatus::default(),
+        });
+    };
+
+    // Get upstream branch (None is valid - just means no upstream configured)
+    let upstream_branch = repo.branch(branch).upstream()?;
+    let Some(upstream_branch) = upstream_branch else {
+        return Ok(TaskResult::Upstream {
+            item_idx: ctx.item_idx,
+            upstream: UpstreamStatus::default(),
+        });
+    };
+
+    let remote = upstream_branch.split_once('/').map(|(r, _)| r.to_string());
+    // Resolve upstream ref to a SHA via the snapshot, then compute
+    // ahead/behind by SHA. Branch SHA is taken from `branch_ref.commit_sha`
+    // — for the upstream comparison we want the branch's actual tip,
+    // which `branch_ref.commit_sha` carries (snapshot tracks the same
+    // value for branch items via the for-each-ref scan).
+    //
+    // `ahead_behind_by_sha` is persistently cached (`ahead-behind/`
+    // SHA-keyed), so warm runs are pure reads. Cold runs are also
+    // primed up front: `Repository::prime_upstream_ahead_behind_cache`
+    // runs in the same post-skeleton `rayon::scope` as the snapshot
+    // capture and pre-fills the cache via one `for-each-ref
+    // %(ahead-behind:UPSTREAM_SHA)` walk per unique upstream — same
+    // shared-graph-traversal win that `capture_ahead_behind` uses for
+    // the `main↕` column. This per-row call then falls through to a
+    // cache read.
+    let upstream_sha = ctx.resolve_sha(&upstream_branch)?;
+    let (ahead, behind) = repo.ahead_behind_by_sha(&upstream_sha, &ctx.branch_ref.commit_sha)?;
+
+    Ok(TaskResult::Upstream {
+        item_idx: ctx.item_idx,
+        upstream: UpstreamStatus {
+            remote,
+            upstream_short: Some(upstream_branch),
+            ahead,
+            behind,
+        },
+    })
+}
+
+/// CI/PR status.
+///
+/// Always checks for open PRs/MRs regardless of upstream tracking.
+/// For branch workflow/pipeline fallback (no PR), requires upstream tracking
+/// to prevent false matches from similarly-named branches on the remote.
+///
+/// Remote branches (e.g., "origin/feature") are treated as having upstream
+/// by definition - they ARE the upstream. This enables workflow/pipeline
+/// fallback for remote-only branches shown via `wt list --remotes`.
+fn compute_ci_status(ctx: &TaskContext) -> anyhow::Result<TaskResult> {
+    let repo = &ctx.repo;
+    let pr_status = CiBranchName::from_branch_ref(&ctx.branch_ref)
+        .and_then(|ci_branch| PrStatus::detect(repo, &ci_branch, &ctx.branch_ref.commit_sha));
+
+    Ok(TaskResult::CiStatus {
+        item_idx: ctx.item_idx,
+        pr_status,
+    })
+}
+
+/// URL health check (port availability).
+///
+/// The URL itself is sent immediately after template expansion (in spawning code)
+/// so it appears in normal styling right away. This task only checks if the port
+/// is listening, and if not, the URL dims.
+fn compute_url_status(ctx: &TaskContext) -> anyhow::Result<TaskResult> {
+    // URL already sent in spawning code; this task only checks port availability
+    let Some(ref url) = ctx.item_url else {
+        return Ok(TaskResult::UrlStatus {
+            item_idx: ctx.item_idx,
+            url: None,
+            active: None,
+        });
+    };
+
+    // Parse port from URL and check if it's listening
+    // Skip health check in tests to avoid flaky results from random local processes
+    let active = if std::env::var("H0X_WT_TEST_SKIP_URL_HEALTH_CHECK").is_ok() {
+        Some(false)
+    } else {
+        parse_port_from_url(url).map(|port| {
+            // Quick TCP connect check with 50ms timeout
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            h0x_wt::shell_exec::stream_socket(socket2::Domain::IPV4)
+                .and_then(|socket| socket.connect_timeout(&addr.into(), Duration::from_millis(50)))
+                .is_ok()
+        })
+    };
+
+    // Return only active status (url=None to avoid overwriting the already-sent URL)
+    Ok(TaskResult::UrlStatus {
+        item_idx: ctx.item_idx,
+        url: None,
+        active,
+    })
+}
+
+/// LLM-generated branch summary (`--full` + `[list] summary = true` + LLM command).
+fn compute_summary_generate(ctx: &TaskContext) -> anyhow::Result<TaskResult> {
+    let Some(ref llm_command) = ctx.llm_command else {
+        anyhow::bail!("summary generation requires an LLM command");
+    };
+
+    let branch = ctx.branch_ref.short_name().unwrap_or("(detached)");
+    let worktree_path = ctx.branch_ref.worktree_path();
+
+    let summary = crate::summary::generate_summary_core(
+        branch,
+        &ctx.branch_ref.commit_sha,
+        worktree_path,
+        llm_command,
+        &ctx.repo,
+    )?;
+
+    // Extract subject line (first line) for the table column
+    let subject = summary.as_deref().map(first_line);
+
+    Ok(TaskResult::SummaryGenerate {
+        item_idx: ctx.item_idx,
+        summary: subject,
+    })
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// Extract the first non-empty line from a string (the subject line of a summary).
+fn first_line(s: &str) -> String {
+    s.lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or(s)
+        .to_string()
+}
+
+/// Parse port number from a URL string (e.g., "http://localhost:12345" -> 12345)
+pub(crate) fn parse_port_from_url(url: &str) -> Option<u16> {
+    // Strip scheme
+    let url = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    // Extract host:port (before path, query, or fragment)
+    let host_port = url.split(&['/', '?', '#'][..]).next()?;
+    let (_host, port_str) = host_port.rsplit_once(':')?;
+    port_str.parse().ok()
+}
+
+/// Parse git status output to extract working tree status and conflict state.
+/// Returns (WorkingTreeStatus, is_dirty, has_conflicts).
+pub(super) fn parse_working_tree_status(status_output: &str) -> (WorkingTreeStatus, bool, bool) {
+    let mut has_untracked = false;
+    let mut has_modified = false;
+    let mut has_staged = false;
+    let mut has_renamed = false;
+    let mut has_deleted = false;
+    let mut has_conflicts = false;
+
+    for line in status_output.lines() {
+        if line.len() < 2 {
+            continue;
+        }
+
+        let bytes = line.as_bytes();
+        let index_status = bytes[0] as char;
+        let worktree_status = bytes[1] as char;
+
+        if index_status == '?' && worktree_status == '?' {
+            has_untracked = true;
+        }
+
+        // Worktree changes: M = modified, A = intent-to-add (git add -N), T = type change (file↔symlink)
+        if matches!(worktree_status, 'M' | 'A' | 'T') {
+            has_modified = true;
+        }
+
+        // Index changes: A = added, M = modified, C = copied, T = type change (file↔symlink)
+        if matches!(index_status, 'A' | 'M' | 'C' | 'T') {
+            has_staged = true;
+        }
+
+        if index_status == 'R' || worktree_status == 'R' {
+            has_renamed = true;
+        }
+
+        if index_status == 'D' || worktree_status == 'D' {
+            has_deleted = true;
+        }
+
+        // Detect unmerged/conflicting paths (porcelain v1 two-letter codes)
+        // Only U codes and AA/DD indicate actual merge conflicts.
+        // AD/DA are normal staging states (staged then deleted, or deleted then restored).
+        let is_unmerged_pair = matches!(
+            (index_status, worktree_status),
+            ('U', _) | (_, 'U') | ('A', 'A') | ('D', 'D')
+        );
+        if is_unmerged_pair {
+            has_conflicts = true;
+        }
+    }
+
+    let working_tree_status = WorkingTreeStatus::new(
+        has_staged,
+        has_modified,
+        has_untracked,
+        has_renamed,
+        has_deleted,
+    );
+
+    let is_dirty = working_tree_status.is_dirty();
+
+    (working_tree_status, is_dirty, has_conflicts)
+}
+
+/// Check if `git status --porcelain` output contains unmerged entries.
+///
+/// All seven unmerged status codes: UU, AU, UA, DU, UD, DD, AA.
+/// Five contain `U`; `DD` and `AA` do not and must be matched explicitly.
+fn has_unmerged_entries(status_output: &str) -> bool {
+    status_output.lines().any(|l| {
+        l.len() >= 2 && {
+            let xy = &l.as_bytes()[0..2];
+            xy.contains(&b'U') || xy == b"AA" || xy == b"DD"
+        }
+    })
+}
+
+/// Whether porcelain status contains a staged or unstaged tracked path.
+fn has_tracked_changes(status_output: &str) -> bool {
+    status_output.lines().any(|line| !line.starts_with("??"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use h0x_wt::git::BranchRef;
+    use h0x_wt::testing::TestRepo;
+
+    fn task_context(test: &TestRepo) -> TaskContext {
+        TaskContext {
+            repo: test.repo.clone(),
+            branch_ref: BranchRef::local_branch("feature", "deadbeef"),
+            item_idx: 3,
+            item_url: None,
+            llm_command: None,
+            default_branch: None,
+            integration_targets: None,
+            snapshot: None,
+        }
+    }
+
+    #[test]
+    fn url_status_without_url_is_inert() {
+        let test = TestRepo::new();
+
+        let result = TaskKind::UrlStatus.compute(task_context(&test)).unwrap();
+
+        assert!(matches!(
+            result,
+            TaskResult::UrlStatus {
+                item_idx: 3,
+                url: None,
+                active: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn summary_without_command_keeps_task_identity() {
+        let test = TestRepo::new();
+
+        let error = TaskKind::SummaryGenerate
+            .compute(task_context(&test))
+            .unwrap_err();
+
+        assert_eq!(error.item_idx, 3);
+        assert_eq!(error.kind, TaskKind::SummaryGenerate);
+        assert_eq!(error.message, "summary generation requires an LLM command");
+    }
+
+    #[test]
+    fn test_first_line_simple() {
+        assert_eq!(first_line("Add feature\n\nDetails here"), "Add feature");
+    }
+
+    #[test]
+    fn test_first_line_skips_empty() {
+        assert_eq!(first_line("\n\nAdd feature\nMore"), "Add feature");
+    }
+
+    #[test]
+    fn test_first_line_single_line() {
+        assert_eq!(first_line("Single line"), "Single line");
+    }
+
+    #[test]
+    fn test_first_line_empty_string() {
+        assert_eq!(first_line(""), "");
+    }
+
+    #[test]
+    fn unmerged_entries_detected_with_u() {
+        assert!(has_unmerged_entries("UU src/main.rs"));
+        assert!(has_unmerged_entries("AU src/main.rs"));
+        assert!(has_unmerged_entries("UA src/main.rs"));
+        assert!(has_unmerged_entries("DU src/main.rs"));
+        assert!(has_unmerged_entries("UD src/main.rs"));
+    }
+
+    #[test]
+    fn unmerged_entries_detected_aa_dd() {
+        assert!(has_unmerged_entries("AA src/main.rs"));
+        assert!(has_unmerged_entries("DD src/main.rs"));
+    }
+
+    #[test]
+    fn unmerged_entries_mixed_status() {
+        assert!(has_unmerged_entries("M  src/lib.rs\nAA src/main.rs"));
+        assert!(has_unmerged_entries("?? untracked.txt\nDD deleted.rs"));
+    }
+
+    #[test]
+    fn unmerged_entries_not_detected_for_normal_status() {
+        assert!(!has_unmerged_entries("M  src/main.rs"));
+        assert!(!has_unmerged_entries("A  src/new.rs"));
+        assert!(!has_unmerged_entries("D  src/old.rs"));
+        assert!(!has_unmerged_entries("?? untracked.txt"));
+        assert!(!has_unmerged_entries(""));
+    }
+
+    #[test]
+    fn tracked_changes_ignore_untracked_porcelain_entries() {
+        assert!(!has_tracked_changes("?? artifact.bin"));
+        assert!(has_tracked_changes("?? artifact.bin\n M src/main.rs"));
+    }
+
+    #[test]
+    fn worktree_rename_is_reported_as_dirty() {
+        let (status, is_dirty, has_conflicts) = parse_working_tree_status(" R old.txt -> new.txt");
+
+        assert_eq!(
+            status,
+            WorkingTreeStatus::new(false, false, false, true, false)
+        );
+        assert!(is_dirty);
+        assert!(!has_conflicts);
+    }
+}

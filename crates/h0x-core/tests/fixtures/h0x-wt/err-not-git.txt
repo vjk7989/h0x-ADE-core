@@ -1,0 +1,2 @@
+✗ git rev-parse --git-common-dir failed (exit code 128)
+  fatal: not a git repository (or any of the parent directories): .git

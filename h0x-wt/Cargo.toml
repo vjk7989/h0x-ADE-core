@@ -1,0 +1,279 @@
+[workspace]
+
+[package]
+name = "h0x-wt"
+version = "0.81.0"
+edition = "2024"
+rust-version = "1.96"
+build = "build.rs"
+repository = "https://github.com/max-sixty/worktrunk"
+homepage = "https://worktrunk.dev"
+description = "A CLI for Git worktree management, designed for parallel AI agent workflows"
+license = "MIT OR Apache-2.0"
+default-run = "h0x-wt"
+exclude = [".agents/skills/**"]
+
+[package.metadata.release]
+# Allow releases from any branch (GitHub Actions uses detached HEAD)
+allow-branch = ["*"]
+consolidate-commits = true
+
+[package.metadata.cargo-udeps.ignore]
+# `which` is used only on Windows (#[cfg(windows)] in src/shell_exec.rs).
+# `petname-macros` is not referenced in code — its exact pin keeps the proc
+# macro version aligned with `petname` (see the dependency comment below).
+normal = ["which", "petname-macros"]
+
+[features]
+# Disabled: Enable testing for shells that require extra installation steps (nushell, powershell, elvish, xonsh, oil)
+# tier-2-integration-tests = []
+# Enable syntax highlighting for bash commands in output (requires tree-sitter)
+# This is optional to avoid C compilation issues on some platforms
+default = ["cli", "syntax-highlighting"]
+# Enables the `wt` binary and everything specific to the CLI: argument parsing,
+# interactive picker, rich terminal rendering, and the markdown help pager.
+# Library consumers (e.g. `worktrunk-sync`) should depend on worktrunk with
+# `default-features = false` to avoid pulling these in.
+cli = [
+    "dep:clap",
+    "dep:clap_complete",
+    "dep:crossterm",
+    "dep:humantime",
+    "dep:skim",
+    "dep:ratatui",
+    "dep:ansi-to-tui",
+    "dep:tokio",
+    "dep:arboard",
+    "dep:open",
+    "dep:termimad",
+    "dep:tracing-log",
+    "dep:tracing-subscriber",
+]
+syntax-highlighting = ["dep:tree-sitter-bash", "dep:tree-sitter-highlight"]
+# Enable shell/PTY integration tests (needs bash, zsh, fish, nu, pwsh, and jq on PATH)
+# Includes: shell wrapper tests, PTY-based approval prompts, TUI select, progressive rendering
+shell-integration-tests = []
+# Enable benchmarks whose fixture is too large for hosted CI: the
+# large-repository prune fixture (multi-gigabyte linked worktrees, cached under
+# target/wt-perf/bench-repos). The daily benchmarks workflow runs plain `cargo bench`
+# and must never build it; opt in locally with
+# `cargo bench --bench prune --features large-repository-benches`.
+large-repository-benches = []
+
+[lib]
+name = "h0x_wt"
+path = "src/lib.rs"
+
+[[bin]]
+name = "h0x-wt"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[dependencies]
+anyhow = "1.0.102"
+anstream = "1.0"
+anstyle = "1.0.13"
+ansi-str = "0.9"
+color-print = "0.3.7"
+askama = { version = "0.16", default-features = false, features = ["derive", "std"] }
+# Floor is 0.4.31, not 0.4: `DateTime::from_timestamp` (utils.rs, statusline.rs,
+# backup.rs) landed in chrono 0.4.31. `-Z minimal-versions` otherwise resolves
+# 0.4.0 and our own lib fails to compile.
+chrono = "0.4.31"
+# `unstable-markdown` renders our `///` doc-comments as styled help (bold inline
+# code, literal `[experimental]`). skim 0.20 pulled it in transitively; skim 4
+# (default-features = false) does not, so depend on it explicitly to keep help
+# output stable rather than reverting to raw text.
+clap = { version = "4.6", features = ["derive", "unstable-ext", "wrap_help", "unstable-markdown"], optional = true }
+clap_complete = { version = "4.6", features = ["unstable-dynamic"], optional = true }
+crossbeam-channel = "0.5"
+crossterm = { version = "0.29", optional = true }
+indexmap = { version = "2.14", features = ["serde"] }
+etcetera = "0.11"
+# `log` is still used pervasively for application logging; events flow into
+# `tracing` via `tracing-log::LogTracer` (CLI binary only).
+log = "0.4.31"
+# 0.1.30 added the `enabled!` macro `src/trace/emit.rs::Span::drop` uses to
+# elide span emission when the subscriber doesn't care. Older versions only
+# expose the per-level macros and dispatcher checks.
+tracing = "0.1.35"
+# Compatibility shim: forward `log::*` macros into `tracing`. ~100 call sites
+# across the codebase keep using `log::debug!` etc.; only the routing layer
+# moved.
+tracing-log = { version = "0.2.0", optional = true }
+# Layered subscribers do the routing today's `Route` enum used to. `env-filter`
+# replaces env_logger's RUST_LOG parsing; `fmt` provides the writer + format
+# scaffolding; `registry` composes layers. Pinned to ≥ 0.3.17: that's when
+# `EnvFilter::builder().with_default_directive(...).from_env_lossy()` (used in
+# `src/logging.rs`) stabilized on top of the per-layer filtering rework.
+tracing-subscriber = { version = "0.3.17", default-features = false, features = ["ansi", "env-filter", "fmt", "registry"], optional = true }
+# Only enable needed features; macros and multi-template loading remain disabled.
+# `unstable_machinery` supplies syntax analysis for migrations and diagnostics;
+# `debug` supplies error source spans, including release builds.
+# `json` supplies the `tojson` filter for passing structured vars to commands.
+minijinja = { version = "3.0", default-features = false, features = [
+    "builtins",
+    "debug",
+    "json",
+    "serde",
+    "std_collections",
+    "unstable_machinery",
+] }
+rayon = "1.12"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.150", features = ["preserve_order"] }
+shell-escape = "0.1"
+shellexpand = "3.1"
+strsim = "0.11.1"
+strum = { version = "0.28", features = ["derive"] }
+synoptic = "2"
+terminal_size = "0.4.3"
+toml = { version = "1.0", features = ["preserve_order"] }
+toml_edit = { version = "0.25", features = ["serde"] }
+# tree-sitter-bash may lag behind tree-sitter-highlight (0.25.x works with
+# tree-sitter-highlight 0.27.x).
+# These are optional dependencies controlled by the "syntax-highlighting" feature.
+# To build without C compilation requirements, use: cargo install worktrunk --no-default-features --features cli
+tree-sitter-bash = { version = "0.25.1", optional = true }
+tree-sitter-highlight = { version = "0.27", optional = true }
+unicode-width = "0.2.1"
+wrap-ansi = "0.1"
+osc8 = "0.1.0"
+supports-hyperlinks = "3"
+home = "0.5.12"
+humantime = { version = "2.2", optional = true }
+once_cell = "1.21.4"
+normalize-path = "0.2.1"
+path-slash = "0.2"
+pathdiff = "0.2"
+which = "8.0.2"
+# Cross-platform path canonicalization that avoids Windows verbatim paths (\\?\)
+# which external tools like git cannot handle. On Unix, it's a no-op wrapper.
+dunce = "1.0"
+termimad = { version = "0.35.1", optional = true }
+urlencoding = "2.1"
+# Git transport URL syntax (scheme, SCP, userinfo, IPv6, ports) for
+# `GitRemoteUrl`; Worktrunk keeps only the namespace/repo and forge policy.
+gix-url = "0.40"
+regex = "1.12.3"
+ignore = "0.4"
+reflink-copy = "0.1"
+# Atomic, no-overwrite rename (renameat2 / renamex_np / MoveFileExW) for
+# `--clobber` backups — closes the check-then-rename TOCTOU. Keeps the FFI
+# (and its `unsafe`) out of this crate.
+renamore = "0.3"
+dashmap = "6.2.1"
+fs2 = "0.4.3"
+sanitize-filename = "0.6.0"
+schemars = { version = "1.2.1", features = ["derive"] }
+# SHA-256 is used for persistent cache keys (e.g., summary diff hashes in
+# `.git/wt/cache/summary/`). stdlib's `DefaultHasher` is not guaranteed
+# stable across Rust versions, so we need a deterministic algorithm on disk.
+sha2 = "0.11"
+# Wordlists for the `codename` template filter. PINNED EXACT — bumping this
+# can silently shift every existing user's codename-derived worktree path,
+# orphaning their on-disk worktrees. Coordinate any version change as a
+# breaking-change rollout (see `test_codename_outputs_are_stable` and
+# `src/config/expansion.rs::codename`). We use only the static wordlists,
+# not the random-name generator, so `default-rng` and `clap` stay off.
+petname = { version = "=3.2.0", default-features = false, features = ["default-words"] }
+# PINNED EXACT to match `petname`: its caret dependency otherwise permits a
+# different proc-macro version, but the generated code and runtime re-exports
+# require an exact match. Keep both pins in lockstep.
+petname-macros = "=3.2.0"
+
+tempfile = "3.27"
+
+# Timed waits on child processes (`Cmd::timeout`, `Cmd::delayed_stream`, the
+# picker's pager). Replaced `wait-timeout`, whose SIGCHLD handler aborts the
+# process when its self-pipe write fails — see "Timed waits" in `shell_exec`.
+shared_child = "1.1"
+# Socket construction separate from connection waits under the spawn guard.
+socket2 = "0.6.4"
+
+# Interactive picker (`wt switch`) TUI stack, pulled in only by the `cli`
+# feature's `dep:` entries. These are platform-neutral (skim 4.x is the
+# ratatui/crossterm rewrite, which supports Windows), so they live in the main
+# table — not under `[target.'cfg(unix)']` — or the picker fails to compile on
+# Windows.
+#
+# skim 4.x is the ratatui-based rewrite; the 0.20 line used the now-abandoned
+# tuikit backend (we previously vendored a patched skim-tuikit fork). The
+# picker feeds rows as a custom `SkimItem` whose `display()` returns a ratatui
+# `Line`, so `ratatui` + `ansi-to-tui` below convert the picker's pre-rendered
+# ANSI rows into styled lines.
+#
+# `default-features = false` drops skim's own CLI (`clap` / `clap_mangen` / …):
+# worktrunk embeds the picker as a library and never shells out to the `sk`
+# binary. `frizbee` keeps skim's default fuzzy matcher.
+# Floor is 4.8, not 4: the picker is written against 4.8's `ratatui 0.30.1`
+# API, and earlier 4.x compile against an incompatible ratatui (`-Z
+# minimal-versions` otherwise resolves skim 4.6 against ratatui 0.30.1 and fails
+# to build).
+# skim 5.3.1 (bumped in #3526) regressed the picker on the legacy Windows
+# console — every picker PTY test failed with "Keyboard progressive enhancement
+# not implemented for the legacy Windows API", reddening the Windows test job,
+# so the pin held at the last-Windows-green 5.1.0. 5.5.0 guards that path ("Do
+# not panic on push/pop keyboard enhancement flags failure") and is
+# Windows-green again. Kept as an exact pin; it can relax to a range now that
+# the keyboard-enhancement path no longer regresses the legacy console.
+skim = { version = "=5.7.2", optional = true, default-features = false, features = ["frizbee"] }
+# Pinned to skim's ratatui line so the `Line` type `display()` returns is the
+# same one skim consumes. `ansi-to-tui` parses ANSI SGR codes into ratatui spans.
+# Floor is 0.30.1: 0.30.0 is a broken release (its `#[instability::unstable]`
+# attribute fails to compile).
+ratatui = { version = "0.30.1", optional = true }
+ansi-to-tui = { version = "8.0.1", optional = true }
+# Already in the tree via skim (its event loop is tokio-based). The picker drives
+# skim through the public `Skim::init`/`run` API rather than the all-in-one
+# `Skim::run_with` so it can grab `event_sender()` and push `Event::Render` while
+# collect mutates rows in place — skim 4.x renders on demand, not on a heartbeat.
+# `Runtime::new()` needs `rt-multi-thread`; `event_sender()` is a `sync::mpsc`.
+tokio = { version = "1.52.3", optional = true, default-features = false, features = ["rt-multi-thread", "sync"] }
+# Picker row shortcuts: `alt-y` copies the selected branch to the system
+# clipboard, `alt-o` opens its PR/MR URL in the browser. Both are cross-platform
+# (so they sit in the main table alongside the picker stack, not under
+# `[target.'cfg(unix)']`). `arboard` drops `default-features` to skip the `image`
+# crate — the picker only copies text — while keeping `wayland-data-control` so
+# Linux Wayland clipboards work alongside X11 and macOS.
+arboard = { version = "3.4", optional = true, default-features = false, features = ["wayland-data-control"] }
+open = { version = "5.3", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# Unix-only syscall crates: `nix` backs process waits and pipe readiness;
+# `signal-hook` observes native job interrupts and relays PID-targeted TERM.
+# Gating keeps both out of the Windows dependency graph.
+nix = { version = "0.31.3", default-features = false, features = ["event", "fs", "poll", "process", "signal"] }
+signal-hook = "0.4.1"
+# Safe FIONREAD snapshots bound cancellation drains even with continuous writers;
+# directory-relative `*at` calls let tree removal never follow a symlink.
+rustix = { version = "1.1.4", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+# The localized Documents folder that holds PowerShell profiles.
+dirs = "7.0"
+
+[build-dependencies]
+vergen-gitcl = { version = "10.0.0", features = ["build"] }
+
+[dev-dependencies]
+insta = { version = "1.47.2", features = ["yaml", "redactions", "filters"] }
+insta-cmd = "0.7"
+rstest = "0.27"
+tempfile = "3.27"
+toml = "1.0"
+portable-pty = "0.9"
+regex = "1.12.3"
+vt100 = "0.16.2"
+similar = "3.1.1"
+jsonschema = { version = "0.58", default-features = false }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(coverage)"] }
+# Native signal inspection and coverage flushing permit scoped runtime calls.
+unsafe_code = "deny"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

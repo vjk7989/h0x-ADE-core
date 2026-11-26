@@ -831,3 +831,40 @@ fn login_retries_back_off_to_ten_minutes_and_stay_there() {
     assert_eq!((secs(0), secs(1), secs(2)), (120, 300, 600));
     assert_eq!((secs(3), secs(1000), secs(u32::MAX)), (600, 600, 600));
 }
+
+#[tokio::test]
+async fn worktree_calls_go_to_the_machine_named_by_on_without_it() {
+    let root = crate::platform::test_scratch().join(format!("h0x-core-wt-route-{}", crate::platform::random_hex()));
+    let paths = Paths {
+        socket: root.join("core.sock"),
+        holder_socket: root.join("holder.sock"),
+        state: root.clone(),
+        config: root.join("config.toml"),
+    };
+    paths.create_dirs().unwrap();
+    let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
+    let machine: Machine = serde_json::from_value(json!({
+        "name": "away", "target": "away", "id": "away-id", "host": "away", "version": "test"
+    }))
+    .unwrap();
+    core.lock().machines.push(machine);
+    for method in ["worktree.list", "worktree.create", "worktree.remove", "worktree.merge"] {
+        let params = json!({"folder": "srv", "path": r"C:\w\x é", "branch": "feat/x", "on": "away"});
+        let Some((To::Machine(m), sent)) = route(&core, method, &params).unwrap() else {
+            panic!("{method} is not routed to the machine")
+        };
+        assert_eq!(m.name, "away", "{method}");
+        // Sent as it is, `on` dropped: relative and Windows paths are the machine's to read.
+        assert_eq!(sent, json!({"folder": "srv", "path": r"C:\w\x é", "branch": "feat/x"}), "{method}");
+        // By id, too; no `on` or this core's own name: here.
+        assert!(route(&core, method, &json!({"folder": "/r", "on": "away-id"})).unwrap().is_some(), "{method}");
+        assert!(route(&core, method, &json!({"folder": "/r"})).unwrap().is_none(), "{method}");
+        assert!(route(&core, method, &json!({"folder": "/r", "on": "here"})).unwrap().is_none(), "{method}");
+        let Err(e) = route(&core, method, &json!({"folder": "/r", "on": "nope"})) else { panic!("{method}") };
+        assert_eq!(e.kind, "machine_unknown", "{method}");
+    }
+    // A verb that is not in the list is never sent anywhere.
+    assert!(route(&core, "worktree.prune", &json!({"on": "nope"})).unwrap().is_none());
+    drop(core);
+    let _ = std::fs::remove_dir_all(root);
+}

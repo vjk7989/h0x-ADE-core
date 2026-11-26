@@ -1,0 +1,1505 @@
+use clap::FromArgMatches;
+use clap::error::ErrorKind as ClapErrorKind;
+use color_print::cformat;
+use std::process;
+use h0x_wt::config::{set_config_overrides, set_config_path};
+use h0x_wt::git::{
+    ErrorExt, Repository, WorktrunkError, current_or_recover, cwd_removed_hint,
+    require_minimum_git, set_base_path,
+};
+use h0x_wt::styling::{
+    eprintln, error_message, format_with_gutter, hint_message, info_message, warning_message,
+};
+
+use commands::hooks::HookAnnouncer;
+
+mod cli;
+mod commands;
+mod completion;
+mod diagnostic;
+mod display;
+mod help;
+pub(crate) mod help_pager;
+mod invocation;
+mod llm;
+mod log_files;
+mod logging;
+mod md_help;
+mod output;
+mod pager;
+mod summary;
+
+// Re-export invocation utilities at crate level for use by other modules
+pub(crate) use invocation::{
+    binary_name, invocation_path, is_git_subcommand, was_invoked_with_explicit_path,
+};
+
+pub(crate) use crate::cli::{OutputFormat, StatuslineFormat};
+
+use crate::output::print_json;
+
+use commands::commit::HookGate;
+use commands::handle_picker;
+use commands::worktree::{PushKind, PushOutcome, PushResult, handle_no_ff_merge, handle_push};
+use commands::{
+    HookCliArgs, MergeFlagOverrides, MergeOptions, RebaseResult, SquashResult, add_approvals,
+    clear_approvals, flag_pair, handle_alias_dry_run, handle_alias_show, handle_cache_clear,
+    handle_cache_get, handle_claude_approve_enter_worktree, handle_claude_hook, handle_completions,
+    handle_config_create, handle_config_show, handle_config_update, handle_custom_command,
+    handle_hints_clear, handle_hints_get, handle_hook_show, handle_init, handle_list,
+    handle_logs_list, handle_logs_profile, handle_merge, handle_promote, handle_rebase, handle_remove_command, handle_show_theme, handle_squash,
+    handle_state_clear, handle_state_clear_all, handle_state_get, handle_state_set,
+    handle_state_show, handle_switch_command, handle_vars_clear, handle_vars_get, handle_vars_list, handle_vars_set, list_approvals, run_hook, step_commit,
+    step_copy_ignored, step_diff, step_eval, step_for_each, step_prune, step_relocate, step_tether,
+};
+
+use cli::{
+    ApprovalsCommand, CacheAction, CiStatusAction, Cli, Commands, ConfigAliasCommand,
+    ConfigCommand, ConfigPluginsClaudeCommand, ConfigPluginsCodexCommand, ConfigPluginsCommand,
+    ConfigPluginsOmpCommand, ConfigPluginsOpencodeCommand, ConfigPluginsPiCommand,
+    ConfigShellCommand, DefaultBranchAction, GlobalFormatFlag, HintsAction, HookCommand,
+    HookOptions, ListArgs, ListSubcommand, LogsAction, MarkerAction, MergeArgs,
+    PreviousBranchAction, StateCommand, StateWrite, StepCommand, SwitchFormat, VarsAction,
+};
+
+/// Render a clap error to stderr, appending a wt-specific nested-subcommand
+/// tip when the unknown name matches something under `wt step` / `wt hook`
+/// (e.g., `wt squash` → `wt step squash`). Shared between the diverging
+/// `enhance_and_exit_error` (pre-dispatch) and the non-diverging
+/// `enhance_clap_error` (post-dispatch).
+fn print_enhanced_clap_error(err: &clap::Error) {
+    if err.kind() == ClapErrorKind::InvalidSubcommand
+        && let Some(unknown) = err.get(clap::error::ContextKind::InvalidSubcommand)
+    {
+        let cmd = cli::build_command();
+        if let Some(suggestion) = cli::suggest_nested_subcommand(&cmd, &unknown.to_string()) {
+            // anstream's eprintln, so the stream's resolved color choice
+            // governs cformat's escapes.
+            eprintln!(
+                "{}",
+                cformat!(
+                    "{}
+  <yellow>tip:</>  perhaps <cyan,bold>{suggestion}</cyan,bold>?",
+                    err.render().ansi()
+                )
+            );
+            return;
+        }
+    }
+    let _ = err.print();
+}
+
+/// Enhance clap errors with command-specific hints, then exit.
+///
+/// Used by the pre-dispatch parse path, where no `finish_command` cleanup has
+/// been set up yet — `process::exit` directly is fine. Post-dispatch callers
+/// (e.g. alias typos from `wt step <typo>` / `wt <typo>`) use
+/// [`enhance_clap_error`] so they flow back through `handle_command_failure`
+/// and run the diagnostic/output-reset cleanup.
+pub(crate) fn enhance_and_exit_error(err: clap::Error) -> ! {
+    print_enhanced_clap_error(&err);
+    process::exit(err.exit_code());
+}
+
+/// Print an enhanced clap error and return `AlreadyDisplayed` so the caller
+/// can propagate it through normal error handling, letting `finish_command`
+/// run (diagnostic writes, ANSI reset for shell integration).
+pub(crate) fn enhance_clap_error(err: clap::Error) -> anyhow::Error {
+    let exit_code = err.exit_code();
+    print_enhanced_clap_error(&err);
+    WorktrunkError::AlreadyDisplayed { exit_code }.into()
+}
+
+fn warn_select_deprecated() {
+    eprintln!(
+        "{}",
+        warning_message(cformat!(
+            "wt select is deprecated; use <bold>h0x-wt switch</> instead"
+        ))
+    );
+}
+
+/// Emit the deprecation notice for a `wt config state` subcommand that has
+/// moved under `wt config state cache` (ci-status, hints, previous-branch).
+/// These still work — the warning nudges callers toward `cache`.
+fn warn_state_subcommand_deprecated(name: &str) {
+    eprintln!(
+        "{}",
+        warning_message(cformat!(
+            "wt config state {name} is deprecated; use <bold>h0x-wt config state cache</> instead"
+        ))
+    );
+}
+
+/// Emit the canonical `--no-verify` deprecation warning to stderr.
+///
+/// Single source of this warning text. `HookFlags::resolve` (switch, remove,
+/// step commit, step squash) and `handle_merge_command` both call here, so the
+/// message stays identical across every command that accepts `--no-verify`.
+pub(crate) fn warn_no_verify_deprecated() {
+    eprintln!(
+        "{}",
+        warning_message(cformat!(
+            "--no-verify is deprecated; use <bold>--no-hooks</> instead"
+        ))
+    );
+}
+
+fn handle_hook_command(action: HookCommand, yes: bool) -> anyhow::Result<()> {
+    match action {
+        HookCommand::Show {
+            hook_type,
+            expanded,
+            format,
+        } => handle_hook_show(hook_type.as_deref(), expanded, format),
+        HookCommand::RunPipeline => commands::run_pipeline(),
+        HookCommand::Approvals { action } => {
+            eprintln!(
+                "{}",
+                warning_message(cformat!(
+                    "wt hook approvals is deprecated; use <bold>h0x-wt config approvals</> instead"
+                ))
+            );
+            match action {
+                ApprovalsCommand::List { format } => list_approvals(format),
+                ApprovalsCommand::Add { all } => add_approvals(all, yes),
+                ApprovalsCommand::Clear { global, stale } => clear_approvals(global, stale),
+            }
+        }
+        HookCommand::Run(args) => {
+            // `--help` / `-h` is handled upstream in `maybe_handle_help_with_pager`,
+            // which parses against a clap tree augmented with hook-type
+            // subcommand stubs and renders their help directly. Execution flow
+            // only reaches here for non-help invocations.
+            let opts = HookOptions::parse(&args)?;
+            run_hook(
+                opts.hook_type,
+                yes || opts.yes,
+                opts.foreground,
+                opts.dry_run,
+                HookCliArgs {
+                    name_filters: &opts.name_filters,
+                    explicit_vars: &opts.explicit_vars,
+                    shorthand_vars: &opts.shorthand_vars,
+                    forwarded_args: &opts.forwarded_args,
+                },
+            )
+        }
+    }
+}
+
+fn handle_step_command(
+    action: StepCommand,
+    working_dir: Option<std::path::PathBuf>,
+    yes: bool,
+) -> anyhow::Result<()> {
+    match action {
+        StepCommand::Commit(args) => {
+            let verify = args.hooks.resolve();
+            let format = args.format;
+            // `--show-prompt` and `--dry-run` emit raw text (rendered prompt or LLM
+            // preview), which would corrupt a JSON consumer's stdout. Refuse the
+            // combination rather than silently emit non-JSON.
+            if format == SwitchFormat::Json && (args.show_prompt || args.dry_run) {
+                anyhow::bail!("--show-prompt / --dry-run cannot be combined with --format=json");
+            }
+            let outcome = step_commit(
+                args.branch,
+                yes,
+                verify,
+                args.stage,
+                args.show_prompt,
+                args.dry_run,
+            )?;
+            if format == SwitchFormat::Json
+                && let Some(outcome) = outcome
+            {
+                let payload = serde_json::json!({
+                    "commit": outcome.sha,
+                    "message": outcome.message,
+                    "stage_mode": outcome.stage_mode,
+                });
+                print_json(&payload)?;
+            }
+            Ok(())
+        }
+        StepCommand::Squash(args) => {
+            let verify = args.hooks.resolve();
+            // `--show-prompt` and `--dry-run` emit raw text (rendered prompt or LLM
+            // preview), which would corrupt a JSON consumer's stdout.
+            if args.format == SwitchFormat::Json && (args.show_prompt || args.dry_run) {
+                anyhow::bail!("--show-prompt / --dry-run cannot be combined with --format=json");
+            }
+            // --show-prompt and --dry-run skip the squash and exit after preview output.
+            if args.show_prompt {
+                commands::step_show_squash_prompt(args.target.as_deref(), args.stage)
+            } else if args.dry_run {
+                commands::step_dry_run_squash(args.target.as_deref(), args.stage, yes)
+            } else {
+                // Approval is handled inside handle_squash (like step_commit).
+                let repo = Repository::current()?;
+                let hooks = if verify {
+                    HookGate::Run
+                } else {
+                    HookGate::NoHooksFlag
+                };
+                let mut announcer = HookAnnouncer::new(&repo, false);
+                let format = args.format;
+                let result = handle_squash(
+                    args.target.as_deref(),
+                    yes,
+                    hooks,
+                    args.stage,
+                    &mut announcer,
+                    commands::PreApprovedGuidance::RunOwnGate,
+                )?;
+                announcer.flush()?;
+                if format == SwitchFormat::Json {
+                    let payload = match &result {
+                        SquashResult::Squashed {
+                            sha,
+                            message,
+                            stage_mode,
+                        } => serde_json::json!({
+                            "outcome": "squashed",
+                            "commit": sha,
+                            "message": message,
+                            "stage_mode": stage_mode,
+                        }),
+                        SquashResult::NoCommitsAhead(target) => serde_json::json!({
+                            "outcome": "no_commits_ahead",
+                            "target": target,
+                        }),
+                        SquashResult::AlreadySingleCommit => serde_json::json!({
+                            "outcome": "already_single_commit",
+                        }),
+                        SquashResult::NoNetChanges => serde_json::json!({
+                            "outcome": "no_net_changes",
+                        }),
+                    };
+                    print_json(&payload)?;
+                } else {
+                    match result {
+                        SquashResult::Squashed { .. } | SquashResult::NoNetChanges => {}
+                        SquashResult::NoCommitsAhead(branch) => {
+                            eprintln!(
+                                "{}",
+                                info_message(cformat!(
+                                    "Nothing to squash; no commits ahead of <bold>{branch}</>"
+                                ))
+                            );
+                        }
+                        SquashResult::AlreadySingleCommit => {
+                            eprintln!(
+                                "{}",
+                                info_message("Nothing to squash; already a single commit")
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }
+        }
+        StepCommand::Push {
+            target,
+            no_ff,
+            format,
+            ..
+        } => {
+            let repo = Repository::current()?;
+            let result = if no_ff {
+                let current_branch = repo.require_selected_branch("@", "step push --no-ff")?;
+                handle_no_ff_merge(&repo, target.as_deref(), None, &current_branch)?
+            } else {
+                handle_push(&repo, target.as_deref(), PushKind::Standalone, None)?
+            };
+            if format == SwitchFormat::Json {
+                let PushResult {
+                    target,
+                    commit_count,
+                    outcome,
+                } = result;
+                let mut payload = serde_json::json!({
+                    "target": target,
+                    "outcome": match outcome {
+                        PushOutcome::FastForwarded => "fast_forwarded",
+                        PushOutcome::UpToDate => "up_to_date",
+                        PushOutcome::MergeCommit { .. } => "merge_commit",
+                    },
+                    "commits": commit_count,
+                });
+                if let PushOutcome::MergeCommit { merge_sha } = outcome {
+                    payload["merge_sha"] = serde_json::Value::String(merge_sha);
+                }
+                print_json(&payload)?;
+            }
+            Ok(())
+        }
+        StepCommand::Rebase { target, format } => {
+            let result = handle_rebase(&Repository::current()?, target.as_deref())?;
+            if format == SwitchFormat::Json {
+                let output = match &result {
+                    RebaseResult::Rebased {
+                        target,
+                        fast_forward,
+                    } => serde_json::json!({
+                        "target": target,
+                        "outcome": if *fast_forward { "fast_forwarded" } else { "rebased" },
+                    }),
+                    RebaseResult::UpToDate(target) => serde_json::json!({
+                        "target": target,
+                        "outcome": "up_to_date",
+                    }),
+                };
+                print_json(&output)?;
+            } else if let RebaseResult::UpToDate(branch) = &result {
+                eprintln!(
+                    "{}",
+                    info_message(cformat!("Already up to date with <bold>{branch}</>"))
+                );
+            }
+            Ok(())
+        }
+        StepCommand::Diff {
+            target,
+            branch,
+            extra_args,
+        } => step_diff(branch.as_deref(), target.as_deref(), &extra_args),
+        StepCommand::CopyIgnored {
+            from,
+            to,
+            dry_run,
+            force,
+            require_include,
+            format,
+        } => step_copy_ignored(
+            from.as_deref(),
+            to.as_deref(),
+            dry_run,
+            force,
+            require_include,
+            format,
+        ),
+        StepCommand::Eval { template, format } => step_eval(&template, format),
+        StepCommand::ForEach { format, args } => step_for_each(args, format),
+        StepCommand::Promote { branch, format } => {
+            let result = handle_promote(branch.as_deref())?;
+            if format == SwitchFormat::Json {
+                let output = match &result {
+                    commands::PromoteResult::Promoted {
+                        target,
+                        main_branch,
+                        swapped,
+                        mismatch,
+                    } => serde_json::json!({
+                        "outcome": "promoted",
+                        "target": target,
+                        "main_branch": main_branch,
+                        "swapped": swapped,
+                        "mismatch": mismatch,
+                    }),
+                    commands::PromoteResult::AlreadyInMain(branch) => serde_json::json!({
+                        "outcome": "already_in_main",
+                        "branch": branch,
+                    }),
+                };
+                print_json(&output)?;
+            } else if let commands::PromoteResult::AlreadyInMain(branch) = &result {
+                eprintln!(
+                    "{}",
+                    info_message(cformat!(
+                        "Branch <bold>{branch}</> is already in main worktree"
+                    ))
+                );
+            }
+            Ok(())
+        }
+        StepCommand::Prune {
+            dry_run,
+            min_age,
+            foreground,
+            format,
+        } => step_prune(dry_run, yes, &min_age, foreground, format),
+        StepCommand::Relocate {
+            branches,
+            dry_run,
+            commit,
+            clobber,
+            format,
+        } => step_relocate(branches, dry_run, commit, clobber, format),
+        StepCommand::Tether { command } => step_tether(&command, working_dir.as_deref()),
+        StepCommand::External(args) => commands::step_alias(args, yes),
+    }
+}
+
+/// Return a clap-style `ArgumentConflict` error when `--format` is combined
+/// with a write action (set/clear) on the state subcommands where it has no
+/// effect. Clap accepts the flag because `--format` is declared `global = true`
+/// on the parent so the bareword and `get` forms work, but write actions don't
+/// emit structured output — silent acceptance is a surprise.
+///
+/// Populates `InvalidArg` / `PriorArg` context rather than passing a raw
+/// message so clap renders the arg name and subcommand with its own `invalid`
+/// style, matching native conflict errors byte-for-byte.
+fn guard_format_on_write(action_name: &str, format: SwitchFormat) -> anyhow::Result<()> {
+    if format == SwitchFormat::Text {
+        return Ok(());
+    }
+    let mut cmd = cli::build_command();
+    let usage = cmd.render_usage();
+    let mut err = clap::Error::new(ClapErrorKind::ArgumentConflict).with_cmd(&cmd);
+    err.insert(
+        clap::error::ContextKind::InvalidArg,
+        clap::error::ContextValue::String("--format <FORMAT>".to_owned()),
+    );
+    err.insert(
+        clap::error::ContextKind::PriorArg,
+        clap::error::ContextValue::String(action_name.to_owned()),
+    );
+    err.insert(
+        clap::error::ContextKind::Usage,
+        clap::error::ContextValue::StyledStr(usage),
+    );
+    Err(enhance_clap_error(err))
+}
+
+fn handle_state_command(action: StateCommand, yes: bool) -> anyhow::Result<()> {
+    match action {
+        StateCommand::Cache {
+            action,
+            format: GlobalFormatFlag { format },
+        } => {
+            if let Some(verb) = action.as_ref().and_then(StateWrite::write_verb) {
+                guard_format_on_write(verb, format)?;
+            }
+            match action {
+                Some(CacheAction::Get) | None => handle_cache_get(format),
+                Some(CacheAction::Clear) => handle_cache_clear(),
+            }
+        }
+        StateCommand::DefaultBranch { action } => match action {
+            Some(DefaultBranchAction::Get) | None => {
+                handle_state_get("default-branch", None, SwitchFormat::Text)
+            }
+            Some(DefaultBranchAction::Set { branch }) => {
+                handle_state_set("default-branch", branch, None)
+            }
+            Some(DefaultBranchAction::Clear) => handle_state_clear("default-branch", None, false),
+        },
+        StateCommand::PreviousBranch { action } => {
+            warn_state_subcommand_deprecated("previous-branch");
+            match action {
+                Some(PreviousBranchAction::Get) | None => {
+                    handle_state_get("previous-branch", None, SwitchFormat::Text)
+                }
+                Some(PreviousBranchAction::Set { branch }) => {
+                    handle_state_set("previous-branch", branch, None)
+                }
+                Some(PreviousBranchAction::Clear) => {
+                    handle_state_clear("previous-branch", None, false)
+                }
+            }
+        }
+        StateCommand::CiStatus {
+            action,
+            format: GlobalFormatFlag { format },
+        } => {
+            warn_state_subcommand_deprecated("ci-status");
+            if let Some(verb) = action.as_ref().and_then(StateWrite::write_verb) {
+                guard_format_on_write(verb, format)?;
+            }
+            match action {
+                Some(CiStatusAction::Get { branch }) => {
+                    handle_state_get("ci-status", branch, format)
+                }
+                None => handle_state_get("ci-status", None, format),
+                Some(CiStatusAction::Clear { branch, all }) => {
+                    handle_state_clear("ci-status", branch, all)
+                }
+            }
+        }
+        StateCommand::Marker {
+            action,
+            format: GlobalFormatFlag { format },
+        } => {
+            if let Some(verb) = action.as_ref().and_then(StateWrite::write_verb) {
+                guard_format_on_write(verb, format)?;
+            }
+            match action {
+                Some(MarkerAction::Get { branch }) => handle_state_get("marker", branch, format),
+                None => handle_state_get("marker", None, format),
+                Some(MarkerAction::Set { value, branch }) => {
+                    handle_state_set("marker", value, branch)
+                }
+                Some(MarkerAction::Clear { branch, all }) => {
+                    handle_state_clear("marker", branch, all)
+                }
+            }
+        }
+        StateCommand::Logs {
+            action,
+            format: GlobalFormatFlag { format },
+        } => {
+            if let Some(verb) = action.as_ref().and_then(StateWrite::write_verb) {
+                guard_format_on_write(verb, format)?;
+            }
+            match action {
+                Some(LogsAction::Get) | None => handle_logs_list(format),
+                Some(LogsAction::Profile { file }) => handle_logs_profile(file, format),
+                Some(LogsAction::Clear) => handle_state_clear("logs", None, false),
+            }
+        }
+        StateCommand::Hints {
+            action,
+            format: GlobalFormatFlag { format },
+        } => {
+            warn_state_subcommand_deprecated("hints");
+            if let Some(verb) = action.as_ref().and_then(StateWrite::write_verb) {
+                guard_format_on_write(verb, format)?;
+            }
+            match action {
+                Some(HintsAction::Get) | None => handle_hints_get(format),
+                Some(HintsAction::Clear { name }) => handle_hints_clear(name),
+            }
+        }
+        StateCommand::Vars { action } => match action {
+            VarsAction::Get { key, branch } => handle_vars_get(&key, branch),
+            VarsAction::Set {
+                assignment: (key, value),
+                branch,
+            } => handle_vars_set(&key, &value, branch),
+            VarsAction::List { branch, format } => handle_vars_list(branch, format),
+            VarsAction::Clear { key, all, branch } => {
+                handle_vars_clear(key.as_deref(), all, branch)
+            }
+        },
+        StateCommand::Get { format } => handle_state_show(format),
+        StateCommand::Clear => handle_state_clear_all(yes),
+    }
+}
+
+/// HyperOx Worktrees refuses the global installers: they write outside HyperOx's scope (PATCHES.md).
+fn unavailable(what: &str) -> anyhow::Result<()> {
+    anyhow::bail!("`{what}` is not available in HyperOx Worktrees")
+}
+
+fn handle_config_shell_command(action: ConfigShellCommand, _yes: bool) -> anyhow::Result<()> {
+    match action {
+        ConfigShellCommand::Init { shell, cmd } => {
+            // Generate shell code to stdout
+            let cmd = cmd.unwrap_or_else(binary_name);
+            handle_init(shell, cmd).map_err(|e| anyhow::anyhow!("{}", e))
+        }
+        // HyperOx: never writes shell rc files (ADR-129); see PATCHES.md.
+        ConfigShellCommand::Install { .. } => unavailable("config shell install"),
+        ConfigShellCommand::Uninstall { .. } => unavailable("config shell uninstall"),
+        ConfigShellCommand::ShowTheme => {
+            handle_show_theme();
+            Ok(())
+        }
+        ConfigShellCommand::Completions { shell } => handle_completions(shell),
+    }
+}
+
+fn handle_config_command(action: ConfigCommand, yes: bool) -> anyhow::Result<()> {
+    match action {
+        ConfigCommand::Shell { action } => handle_config_shell_command(action, yes),
+        ConfigCommand::Create { project } => handle_config_create(project),
+        ConfigCommand::Show { full, format } => handle_config_show(full, format),
+        ConfigCommand::Update { output } => handle_config_update(yes, output),
+        ConfigCommand::Approvals { action } => match action {
+            ApprovalsCommand::List { format } => list_approvals(format),
+            ApprovalsCommand::Add { all } => add_approvals(all, yes),
+            ApprovalsCommand::Clear { global, stale } => clear_approvals(global, stale),
+        },
+        ConfigCommand::Alias { action } => match action {
+            ConfigAliasCommand::Show { name } => handle_alias_show(name),
+            ConfigAliasCommand::DryRun { name, args } => handle_alias_dry_run(name, args),
+        },
+        ConfigCommand::Plugins { action } => handle_plugins_command(action, yes),
+        ConfigCommand::State { action } => handle_state_command(action, yes),
+    }
+}
+
+fn handle_plugins_command(action: ConfigPluginsCommand, _yes: bool) -> anyhow::Result<()> {
+    match action {
+        ConfigPluginsCommand::Claude { action } => match action {
+            ConfigPluginsClaudeCommand::Install => unavailable("config plugins claude install"),
+            ConfigPluginsClaudeCommand::Uninstall => unavailable("config plugins claude uninstall"),
+            ConfigPluginsClaudeCommand::InstallStatusline => {
+                unavailable("config plugins claude install-statusline")
+            },
+            ConfigPluginsClaudeCommand::Hook => handle_claude_hook(),
+            ConfigPluginsClaudeCommand::ApproveEnterWorktree => {
+                handle_claude_approve_enter_worktree()
+            }
+        },
+        ConfigPluginsCommand::Codex { action } => match action {
+            ConfigPluginsCodexCommand::Install => unavailable("config plugins codex install"),
+            ConfigPluginsCodexCommand::Uninstall => unavailable("config plugins codex uninstall"),
+        },
+        ConfigPluginsCommand::Omp { action } => match action {
+            ConfigPluginsOmpCommand::Install => unavailable("config plugins omp install"),
+            ConfigPluginsOmpCommand::Uninstall => unavailable("config plugins omp uninstall"),
+        },
+        ConfigPluginsCommand::Opencode { action } => match action {
+            ConfigPluginsOpencodeCommand::Install => unavailable("config plugins opencode install"),
+            ConfigPluginsOpencodeCommand::Uninstall => unavailable("config plugins opencode uninstall"),
+        },
+        ConfigPluginsCommand::Pi { action } => match action {
+            ConfigPluginsPiCommand::Install => unavailable("config plugins pi install"),
+            ConfigPluginsPiCommand::Uninstall => unavailable("config plugins pi uninstall"),
+        },
+    }
+}
+
+fn handle_list_command(args: ListArgs) -> anyhow::Result<()> {
+    match args.subcommand {
+        Some(ListSubcommand::Statusline {
+            format,
+            claude_code,
+        }) => {
+            if claude_code {
+                eprintln!(
+                    "{}",
+                    warning_message(
+                        "--claude-code is deprecated; use --format=claude-code instead"
+                    )
+                );
+            }
+            // Hidden --claude-code flag only applies when format is default (Table)
+            // Explicit --format=json takes precedence over --claude-code
+            let effective_format = if claude_code && matches!(format, StatuslineFormat::Table) {
+                StatuslineFormat::ClaudeCode
+            } else {
+                format
+            };
+            commands::statusline::run(effective_format)
+        }
+        None => {
+            let (repo, _recovered) = current_or_recover()?;
+            handle_list(
+                repo,
+                args.format,
+                args.branches,
+                args.remotes,
+                args.full,
+                flag_pair(args.progressive, args.no_progressive),
+            )
+        }
+    }
+}
+
+fn handle_select_command(branches: bool, remotes: bool) -> anyhow::Result<()> {
+    // Deprecated: show warning and delegate to handle_picker
+    warn_select_deprecated();
+    h0x_wt::config::suppress_warnings();
+    handle_picker(
+        branches,
+        remotes,
+        false,
+        None,
+        SwitchFormat::Text,
+        None,
+        &[],
+    )
+}
+
+/// Rayon thread count sized for mixed git+network I/O workloads.
+///
+/// `wt list` and the picker's preview pre-compute both run git subprocesses
+/// (often blocked on pipe reads) alongside occasional network requests. 2x CPU
+/// cores lets threads waiting on I/O overlap with compute work without excessive
+/// context-switch overhead.
+///
+/// 3x CPU was benchmarked against `divergent_branches/warm` (branch-heavy) and
+/// `worktree_scaling/warm/8` (worktree-heavy) on packed fixtures. 3x is at or
+/// within noise of the optimum on both workloads; 2x trails by 0-5% (divergent:
+/// 259ms vs 257ms, CIs overlap; worktree: 86.6ms vs 82.4ms, ~5% gap). 4x
+/// regresses on branch-heavy workloads. We stay at 2x because the win is small
+/// in absolute terms (≤ 5ms) and 2x has been validated in production across
+/// hardware we haven't benchmarked.
+pub(crate) fn rayon_thread_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get() * 2)
+        .unwrap_or(8)
+}
+
+fn init_rayon_thread_pool() {
+    // Override with RAYON_NUM_THREADS=N for benchmarking.
+    let num_threads = if std::env::var_os("RAYON_NUM_THREADS").is_some() {
+        0 // Let Rayon handle the env var (includes validation)
+    } else {
+        rayon_thread_count()
+    };
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global();
+}
+
+fn parse_cli() -> Cli {
+    // Apply -C / --config before help handling so `wt -C other --help`
+    // and `wt --config custom.toml step --help` resolve aliases against the
+    // requested repo and user config (not the process cwd / default config).
+    // The same early parse also names the command and tells us whether this is
+    // help for the top level or `wt step`, so neither the splice path in
+    // `augment_help` nor the doc-generation entry points has its own arg
+    // scanner.
+    let EarlyGlobals {
+        directory,
+        config,
+        config_overrides,
+        alias_help_context,
+        subcommand,
+    } = parse_early_globals();
+    apply_global_options(directory, config, config_overrides);
+
+    // Handle --help with pager before clap processes it.
+    // Exits the process on a help/version/doc request; otherwise returns.
+    help::maybe_handle_help_with_pager(alias_help_context, subcommand.as_deref());
+
+    // TODO: Enhance error messages to show possible values for missing enum arguments
+    // Currently `wt config shell init` doesn't show available shells, but `wt config shell init invalid` does.
+    // Clap doesn't support this natively yet - see https://github.com/clap-rs/clap/issues/3320
+    // When available, use built-in setting. Until then, could use try_parse() to intercept
+    // MissingRequiredArgument errors and print custom messages with ValueEnum::value_variants().
+    let cmd = cli::build_command();
+    let matches = cmd
+        .try_get_matches_from(std::env::args_os())
+        .unwrap_or_else(|e| {
+            enhance_and_exit_error(e);
+        });
+    Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
+}
+
+fn apply_global_options(
+    directory: Option<std::path::PathBuf>,
+    config: Option<std::path::PathBuf>,
+    config_overrides: Vec<String>,
+) {
+    // Initialize base path from -C flag if provided
+    if let Some(path) = directory {
+        set_base_path(path);
+    }
+
+    // Initialize config path from --config flag if provided
+    if let Some(path) = config {
+        set_config_path(path);
+    }
+
+    // Record any --config-set overrides for the config loader.
+    if !config_overrides.is_empty() {
+        set_config_overrides(config_overrides);
+    }
+}
+
+/// What the pre-clap pass reads off the real argv.
+#[derive(Default)]
+struct EarlyGlobals {
+    directory: Option<std::path::PathBuf>,
+    config: Option<std::path::PathBuf>,
+    config_overrides: Vec<String>,
+    alias_help_context: Option<commands::HelpContext>,
+    /// The top-level command, for the doc-generation entry points
+    /// (`--help-page`, `--help-description`, `--print-schema`); `None` when
+    /// argv names none. A name the `Cli` definition doesn't declare still
+    /// arrives, through the `external_subcommand` arm that carries user
+    /// aliases, so those entry points can name it back in their own errors.
+    subcommand: Option<String>,
+}
+
+/// Parse global options (`-C`, `--config`, `--config-set`), name the command,
+/// and detect whether this invocation renders help that should include the
+/// configured aliases — in a single pass against the real `Cli` definition.
+///
+/// Uses `ignore_errors(true)` so unknown args, missing values, and `--help`
+/// don't abort parsing — we just read what matched. This lets `wt -C other
+/// --help` apply `-C` before the help path renders, so `augment_help`
+/// resolves aliases against the requested repo instead of the process cwd.
+/// It's also what lets the doc-generation flags, which the `Cli` definition
+/// doesn't declare, ride along without derailing the parse.
+///
+/// Using `cli::build_command()` rather than a hand-rolled mini-command keeps
+/// the global-flag definitions in one place (the derive on `Cli`), so renaming
+/// `-C` or adding a value-taking global doesn't silently desync this path.
+fn parse_early_globals() -> EarlyGlobals {
+    let cmd = cli::build_command()
+        .ignore_errors(true)
+        .disable_help_flag(true);
+    let Ok(matches) = cmd.try_get_matches_from(std::env::args_os()) else {
+        return EarlyGlobals::default();
+    };
+    let directory = matches.get_one::<std::path::PathBuf>("directory").cloned();
+    let config = matches.get_one::<std::path::PathBuf>("config").cloned();
+    let config_overrides = matches
+        .get_many::<String>("config_override")
+        .map(|values| values.cloned().collect())
+        .unwrap_or_default();
+    // Top-level help: `wt --help` (or `-h`, or bare `wt` via `arg_required_else_help`)
+    // lands here with no subcommand matched. Step help: `wt step --help` (or
+    // `-h`, or bare `wt step`) matches `step` with nothing past it. Other
+    // subcommands' help renders plain clap output without the aliases splice.
+    let alias_help_context = match matches.subcommand() {
+        None => Some(commands::HelpContext::TopLevel),
+        Some(("step", sub)) if sub.subcommand_name().is_none() => Some(commands::HelpContext::Step),
+        _ => None,
+    };
+    EarlyGlobals {
+        directory,
+        config,
+        config_overrides,
+        alias_help_context,
+        subcommand: matches.subcommand_name().map(str::to_owned),
+    }
+}
+
+fn init_command_log(command_line: &str) {
+    // Initialize command log for always-on logging of hooks and LLM commands.
+    // Directory and file are created lazily on first log_command() call.
+    if let Ok(repo) = h0x_wt::git::Repository::current() {
+        h0x_wt::command_log::init(&repo.wt_logs_dir(), command_line);
+    }
+}
+
+fn handle_merge_command(args: MergeArgs, yes: bool) -> anyhow::Result<()> {
+    if args.no_verify {
+        warn_no_verify_deprecated();
+    }
+    handle_merge(MergeOptions {
+        target: args.target.as_deref(),
+        branch: args.branch.as_deref(),
+        flags: MergeFlagOverrides::from_cli(&args),
+        yes,
+        stage: args.stage,
+        format: args.format,
+    })
+}
+
+/// True when the parsed command should silence prewarm-time deprecation
+/// warnings. Two reasons qualify:
+///
+/// - **TUI / stderr-sensitive output** (`select`, `switch` picker mode,
+///   `list statusline`) — warnings on stderr would land above the picker
+///   or shell prompt and visually break it.
+/// - **`config update`** — the handler renders the deprecations and a diff
+///   itself, so the prewarm-time warning + `wt config update` hint is
+///   redundant noise above its own UI.
+///
+/// Read from `Cli::command` before `Repository::prewarm` so the suppress
+/// latch beats `prewarm_user_config`'s warning-emission path. The handler
+/// for each of these commands also calls `suppress_warnings()` locally;
+/// both calls hit the same `OnceLock` so the second is a no-op.
+fn command_suppresses_warnings(command: Option<&Commands>) -> bool {
+    match command {
+        Some(Commands::Select { .. }) => true,
+        Some(Commands::Switch(args)) => args.branch.is_none(),
+        Some(Commands::List(args)) => {
+            matches!(args.subcommand, Some(ListSubcommand::Statusline { .. }))
+        }
+        Some(Commands::Config {
+            action: ConfigCommand::Update { .. },
+        }) => true,
+        _ => false,
+    }
+}
+
+/// Shell setup is Git-independent and may be evaluated or redirected during
+/// shell startup, so it remains available while the user upgrades Git.
+fn command_requires_supported_git(command: Option<&Commands>) -> bool {
+    !matches!(
+        command,
+        None | Some(Commands::Config {
+            action: ConfigCommand::Shell { .. },
+        })
+    )
+}
+
+fn dispatch_command(
+    command: Commands,
+    working_dir: Option<std::path::PathBuf>,
+    yes: bool,
+) -> anyhow::Result<()> {
+    match command {
+        Commands::Config { action } => handle_config_command(action, yes),
+        Commands::Step { action } => handle_step_command(action, working_dir, yes),
+        Commands::Hook { action } => handle_hook_command(action, yes),
+        Commands::Select { branches, remotes } => handle_select_command(branches, remotes),
+        Commands::List(args) => handle_list_command(args),
+        Commands::Switch(args) => handle_switch_command(args, yes),
+        Commands::Remove(args) => handle_remove_command(args, yes),
+        Commands::Merge(args) => handle_merge_command(args, yes),
+        Commands::InternalDeleteBranchIfSafe {
+            branch,
+            target,
+            expected_tip,
+            force_delete,
+        } => output::handlers::delete_branch_from_detached_fallback(
+            &branch,
+            &target,
+            expected_tip.as_deref(),
+            force_delete,
+        ),
+        Commands::InternalDrainTrash { trash_dir } => h0x_wt::git::drain_trash(&trash_dir),
+        // `working_dir` is the top-level `-C <path>` flag, applied as the
+        // child's current directory so global `-C` works for custom
+        // subcommands the same way it does for built-ins.
+        Commands::Custom(args) => handle_custom_command(args, working_dir, yes),
+    }
+}
+
+fn print_command_error(error: &anyhow::Error) {
+    let formatted = format_command_error(error);
+    if !formatted.is_empty() {
+        // Route through `h0x_wt::styling::eprintln` (anstream) so ANSI
+        // codes are stripped when stderr isn't a TTY. Building a String
+        // and using `std::eprint!` would bypass the strip stream and leak
+        // raw escape sequences into snapshots.
+        eprintln!("{}", formatted.trim_end_matches('\n'));
+    }
+}
+
+/// Render an error for terminal display. Returns the full formatted output
+/// (including a trailing newline when non-empty) so tests can assert on it
+/// without capturing stderr.
+fn format_command_error(error: &anyhow::Error) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+
+    // Locate the first error in the chain that implements `Diagnostic`.
+    // Most typed errors render directly even when wrapped in
+    // `.context(...)`: their styled block is self-contained and the
+    // wrapping context (if any) was added to enrich logs, not the
+    // user-facing message. The exception is `CommandError`: its captured
+    // stderr/stdout pairs naturally with the wrapping context to form a
+    // header + body block (e.g., header `"running prune"`, body git's
+    // actual error).
+    let diagnostic_hit = error.chain().enumerate().find_map(|(i, cause)| {
+        h0x_wt::git::try_render_diagnostic(cause)
+            .map(|r| (i, r, cause.is::<h0x_wt::git::CommandError>()))
+    });
+
+    let wrapped_command_error = matches!(diagnostic_hit, Some((pos, _, true)) if pos > 0);
+
+    match diagnostic_hit {
+        Some((_, rendered, _)) if !wrapped_command_error => {
+            // The type's `render()` produces a complete styled block —
+            // emit it directly. Empty rendering (AlreadyDisplayed,
+            // CommandNotApproved) is a signal to skip output entirely.
+            if !rendered.is_empty() {
+                let _ = writeln!(out, "{rendered}");
+            }
+        }
+        Some(_) => {
+            // Wrapped `CommandError`: outermost context becomes the
+            // header, intermediate contexts plus the captured
+            // stderr/stdout join the gutter so wrapped failures like
+            // `.context("listing worktrees").context("running prune")`
+            // keep their diagnostic context while still surfacing git's
+            // actual stderr.
+            let _ = writeln!(out, "{}", error_message(error.to_string()));
+            let mut gutter_parts: Vec<String> = Vec::new();
+            let mut command_handled = false;
+            for cause in error.chain().skip(1) {
+                if !command_handled
+                    && let Some(cmd_err) = cause.downcast_ref::<h0x_wt::git::CommandError>()
+                {
+                    let body = cmd_err.combined_output();
+                    gutter_parts.push(if body.is_empty() {
+                        cmd_err.to_string()
+                    } else {
+                        body
+                    });
+                    command_handled = true;
+                } else {
+                    gutter_parts.push(cause.to_string());
+                }
+            }
+            if !gutter_parts.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    format_with_gutter(&gutter_parts.join("\n"), None)
+                );
+            }
+        }
+        None => {
+            // Anyhow error formatting:
+            // - With context: show context as header, root cause in gutter
+            // - Simple error: inline with emoji
+            // - Empty error: skip (errors already printed elsewhere)
+            let msg = error.to_string();
+            if !msg.is_empty() {
+                let chain: Vec<String> = error.chain().skip(1).map(|e| e.to_string()).collect();
+                if !chain.is_empty() {
+                    let _ = writeln!(out, "{}", error_message(&msg));
+                    let chain_text = chain.join("\n");
+                    let _ = writeln!(out, "{}", format_with_gutter(&chain_text, None));
+                } else if msg.contains('\n') || msg.contains('\r') {
+                    // A multi-line error reached this branch without being wrapped
+                    // in a typed `CommandError` and without `.context(...)` on top.
+                    // Buffered command failures should always surface as
+                    // `CommandError`; if you hit this assert, route the failing
+                    // path through `Repository::run_command` /
+                    // `WorkingTree::run_command` (or construct a
+                    // `h0x_wt::git::CommandError` directly) instead of
+                    // `bail!("{stderr}")`.
+                    debug_assert!(
+                        false,
+                        "Multiline error without CommandError or context: {msg}"
+                    );
+                    tracing::warn!("Multiline error without CommandError or context: {msg}");
+                    let normalized = msg.replace("\r\n", "\n").replace('\r', "\n");
+                    let _ = writeln!(out, "{}", error_message("Command failed"));
+                    let _ = writeln!(out, "{}", format_with_gutter(&normalized, None));
+                } else {
+                    let _ = writeln!(out, "{}", error_message(&msg));
+                }
+            }
+        }
+    }
+    out
+}
+
+fn print_cwd_removed_hint_if_needed() {
+    // If the CWD has been deleted, hint the user about recovery options.
+    // Check both: (1) explicit flag set by merge/remove when it knows the CWD
+    // worktree was removed (reliable on all platforms), and (2) OS-level detection
+    // for cases not covered by the flag (e.g., external worktree removal).
+    let cwd_gone = output::was_cwd_removed() || std::env::current_dir().is_err();
+    if cwd_gone {
+        if let Some(hint) = cwd_removed_hint() {
+            eprintln!("{}", hint_message(hint));
+        } else {
+            eprintln!("{}", info_message("Current directory was removed"));
+        }
+    }
+}
+
+fn finish_command(verbose_level: u8, command_line: &str, error: Option<&anyhow::Error>) {
+    let error_text = error.map(|err| err.to_string());
+    diagnostic::write_if_verbose(verbose_level, command_line, error_text.as_deref());
+    let _ = output::terminate_output();
+}
+
+fn handle_command_failure(error: anyhow::Error, verbose_level: u8, command_line: &str) -> ! {
+    print_command_error(&error);
+    print_cwd_removed_hint_if_needed();
+
+    // Cancellation governs exit independently of the error's diagnostic and
+    // recovery hints. A parallel sibling may have failed before cancellation.
+    let signal = error.interrupt_signal();
+    #[cfg(unix)]
+    let signal = h0x_wt::signal_forwarder::operation_interrupt_signal().or(signal);
+    let code = signal
+        .map(|signal| 128 + signal)
+        .or_else(|| error.exit_code())
+        .unwrap_or(1);
+    finish_command(verbose_level, command_line, Some(&error));
+    // Preserve the canonical OS signal through nested wt invocations. Converting
+    // it to an ordinary 128+signal exit makes Warn pipelines continue afterward.
+    #[cfg(unix)]
+    if let Some(signal) = signal {
+        match h0x_wt::signal_forwarder::should_reraise(signal) {
+            Ok(true) => {
+                // Native signal death skips LLVM's atexit writer. Dump once
+                // before handing control back to the OS, only in coverage builds.
+                #[cfg(coverage)]
+                #[expect(unsafe_code, reason = "LLVM provides this no-argument profiling API")]
+                // SAFETY: cargo-llvm-cov links LLVM's profiling runtime. This
+                // no-argument API runs on the main thread, outside signal handlers.
+                unsafe {
+                    unsafe extern "C" {
+                        fn __llvm_profile_dump() -> std::ffi::c_int;
+                    }
+                    let _ = __llvm_profile_dump();
+                }
+                let _ = signal_hook::low_level::emulate_default_handler(signal);
+            }
+            Ok(false) => {}
+            Err(error) => eprintln!("{}", error_message(error.to_string())),
+        }
+    }
+    process::exit(code);
+}
+
+fn print_help_to_stderr() {
+    // No subcommand provided - print help to stderr (stdout is eval'd by shell wrapper)
+    let mut cmd = cli::build_command();
+    let help = cmd.render_help().ansi().to_string();
+    eprintln!("{help}");
+}
+
+fn main() {
+    // Mock-command playback for the test suite: when the harness linked this
+    // binary onto PATH under another name (`gh`, `glab`, …), play back the
+    // mock config and exit instead of running wt. Inert without
+    // H0X_WT_TEST_MOCK_CONFIG_DIR; see `h0x_wt::testing::mock_stub`.
+    h0x_wt::testing::mock_stub::maybe_run();
+
+    // Capture startup state before anything else: the working directory
+    // (used by shell_exec to resolve relative `GIT_*` path variables
+    // inherited from a parent `git` — e.g. when invoked via `git wt ...`
+    // with `alias.wt = "!wt"` — against a stable reference, rather than
+    // against each child command's `current_dir`; see issue #1914) and the
+    // foreground thread (exempt from the command semaphore).
+    //
+    // `[wt-trace]` spans before the logger is registered would silently
+    // no-op, so the prelude up to `init_logging` — `init_startup`,
+    // `init_rayon_thread_pool`, `force_color_output`, `parse_cli` — isn't
+    // attributed. If startup itself becomes the suspect, capture it as
+    // wall-clock minus the sum of post-init spans.
+    h0x_wt::shell_exec::init_startup();
+
+    // Shell completion answers and exits without running a command, and no
+    // code it reaches uses rayon — so it returns before the pool below is
+    // built rather than after. That pool is `available_parallelism() * 2`
+    // OS threads (36 on an M-series Mac), spawned eagerly by `build_global`,
+    // and a completion is the one wt invocation a user waits on with a
+    // finger still on Tab.
+    if completion::maybe_handle_env_completion() {
+        return;
+    }
+
+    init_rayon_thread_pool();
+
+    // Tell crossterm to always emit ANSI sequences
+    crossterm::style::force_color_output(true);
+
+    let cli = parse_cli();
+
+    let Cli {
+        directory,
+        config,
+        config_override,
+        verbose,
+        yes,
+        command,
+    } = cli;
+    // `H0X_WT_VERBOSE` provides a baseline verbosity the `-v`/`-vv` flags
+    // raise but never lower (`max`). It also drives shell completion, which
+    // answers and returns above, before `parse_cli` — see
+    // `completion::maybe_handle_env_completion`.
+    let verbose = verbose.max(logging::env_verbose_level());
+    // Globals were already applied in `parse_cli` before help rendering;
+    // OnceLock makes this call a no-op, but keeping it avoids touching the
+    // existing destructure pattern.
+    apply_global_options(directory.clone(), config, config_override);
+
+    // Latch warning suppression for commands whose UX is broken by stderr
+    // noise — TUI pickers (`switch` without a branch, `select`) and
+    // statusline output rendered above each shell prompt. Must fire before
+    // `Repository::prewarm` since `prewarm_user_config` loads `UserConfig`
+    // eagerly and would otherwise emit deprecation warnings before the
+    // command handler's own `suppress_warnings()` call could latch.
+    // Handlers keep their `suppress_warnings()` calls — `OnceLock` is
+    // idempotent and the local call documents the intent at the use site.
+    if command_suppresses_warnings(command.as_ref()) {
+        h0x_wt::config::suppress_warnings();
+    }
+
+    // `logging::init` registers the tracing subscriber. Run it before
+    // `init_command_log` so the latter's `Repository::current()` →
+    // `git rev-parse --git-common-dir` subprocess is visible in
+    // `[wt-trace]` output. With the previous order the rev-parse fired
+    // before any subscriber was registered, leaving a 4ms hole in the
+    // trace where the subprocess actually ran. Same reason `logging::init`
+    // itself opens the per-file log sinks before installing the layers:
+    // the open's `Repository::current()` would otherwise emit into a
+    // half-built pipeline.
+    {
+        let _span = h0x_wt::trace::Span::new("init_logging");
+        logging::init(verbose);
+    }
+
+    let command_line = std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let git_version_result = std::thread::scope(|scope| {
+        let git_version_check = command_requires_supported_git(command.as_ref())
+            .then(|| scope.spawn(require_minimum_git));
+
+        // Fold the two cold-path rev-parses (`--git-common-dir` from
+        // `init_command_log`, the `prewarm_info` batch from `try_alias` →
+        // `project_config_path`) into one fork. Best-effort — failure leaves
+        // both on-demand callers unchanged. The independent version probe
+        // runs alongside it so the minimum-version gate adds no serial fork.
+        Repository::prewarm();
+
+        git_version_check.map(|check| match check.join() {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        })
+    });
+    if let Some(Err(error)) = git_version_result {
+        handle_command_failure(error, verbose, &command_line);
+    }
+
+    {
+        let _span = h0x_wt::trace::Span::new("init_command_log");
+        init_command_log(&command_line);
+    }
+
+    let Some(command) = command else {
+        print_help_to_stderr();
+        return;
+    };
+
+    // Cancellation belongs to this command, including work admitted by a
+    // parallel worker after another child's interruption was already observed.
+    // The guard leaves idle terminal defaults enabled between foreground waits.
+    #[cfg(unix)]
+    let operation = match h0x_wt::signal_forwarder::CommandOperation::start() {
+        Ok(operation) => operation,
+        Err(error) => handle_command_failure(error.into(), verbose, &command_line),
+    };
+    let result = dispatch_command(command, directory, yes);
+    #[cfg(unix)]
+    let result = result.and_then(|()| match operation.interrupt_signal() {
+        Some(signal) => Err(WorktrunkError::Interrupted { signal, hint: None }.into()),
+        None => Ok(()),
+    });
+
+    match result {
+        Ok(()) => finish_command(verbose, &command_line, None),
+        Err(error) => handle_command_failure(error, verbose, &command_line),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Context;
+    use h0x_wt::git::CommandError;
+
+    fn permission_denied_command_error() -> CommandError {
+        // Faithful reproduction of the failure shape from issue #2564:
+        // git emits a multi-line stderr (warning + fatal) and exits 128.
+        CommandError {
+            program: "git".into(),
+            args: vec!["worktree".into(), "list".into()],
+            stderr: "warning: unable to access '.git/config': Permission denied\nfatal: unknown error occurred while reading the configuration files".into(),
+            stdout: String::new(),
+            exit_code: Some(128),
+            signal: None,
+        }
+    }
+
+    /// Regression for #2564: a buffered `git` failure surfaces as a typed
+    /// `CommandError`. The single-line summary becomes the header and the
+    /// multi-line stderr lands in the gutter — no `debug_assert!` panic.
+    #[test]
+    fn renders_command_error_without_context() {
+        let err: anyhow::Error = permission_denied_command_error().into();
+        let out = format_command_error(&err);
+        assert!(out.contains("git worktree list failed (exit code 128)"));
+        assert!(out.contains("Permission denied"));
+        assert!(out.contains("unknown error occurred while reading"));
+    }
+
+    /// One `.context(...)` layer above the `CommandError` — the context is
+    /// the header, captured stderr is the body.
+    #[test]
+    fn renders_command_error_with_one_context() {
+        let err: anyhow::Error = Err::<(), _>(permission_denied_command_error())
+            .context("listing worktrees")
+            .unwrap_err();
+        let out = format_command_error(&err);
+        assert!(out.contains("listing worktrees"));
+        assert!(out.contains("Permission denied"));
+    }
+
+    /// Codex P3: when a `CommandError` is wrapped by *multiple*
+    /// `.context(...)` layers, intermediate context entries must appear in
+    /// the gutter — they were dropped by an earlier rev that only used the
+    /// top-level message.
+    #[test]
+    fn renders_command_error_preserves_intermediate_context() {
+        let err: anyhow::Error = Err::<(), _>(permission_denied_command_error())
+            .context("listing worktrees")
+            .context("running prune")
+            .unwrap_err();
+        let out = format_command_error(&err);
+        // Outer context is the header
+        assert!(
+            out.contains("running prune"),
+            "missing outer context: {out}"
+        );
+        // Intermediate context survives — the bug Codex flagged
+        assert!(
+            out.contains("listing worktrees"),
+            "intermediate context dropped: {out}",
+        );
+        // Stderr body still rendered
+        assert!(out.contains("Permission denied"), "stderr lost: {out}",);
+        // The `CommandError` summary itself shouldn't appear when its
+        // body replaced its slot — we want git's actual error, not our
+        // wrapper.
+        assert!(
+            !out.contains("git worktree list failed"),
+            "summary surfaced alongside stderr: {out}",
+        );
+    }
+
+    /// A `CommandError` with empty stderr/stdout (e.g., a child killed by
+    /// a signal before producing output) wrapped in context: the gutter
+    /// should fall back to the `CommandError` summary so the user sees
+    /// something more than just the outer context. Exercises the
+    /// empty-body branch of the renderer's gutter assembly.
+    #[test]
+    fn renders_command_error_with_empty_body() {
+        let empty = CommandError {
+            program: "git".into(),
+            args: vec!["fetch".into()],
+            stderr: String::new(),
+            stdout: String::new(),
+            exit_code: None,
+            signal: None,
+        };
+        let err: anyhow::Error = Err::<(), _>(empty).context("syncing remotes").unwrap_err();
+        let out = format_command_error(&err);
+        assert!(out.contains("syncing remotes"));
+        // No body to render, so the summary is what we surface.
+        assert!(out.contains("git fetch failed"));
+    }
+
+    /// Typed `GitError` wrappers (e.g., `PushFailed`) embed a stringified
+    /// sub-error into their `error`
+    /// field. With `display_message`, that field carries git's stderr
+    /// rather than our `CommandError` summary.
+    #[test]
+    fn display_message_prefers_command_error_stderr_over_summary() {
+        let err: anyhow::Error = Err::<(), _>(permission_denied_command_error())
+            .context("creating worktree")
+            .unwrap_err();
+        let detail = err.display_message();
+        assert!(detail.contains("Permission denied"));
+        assert!(detail.contains("unknown error occurred while reading"));
+        // Without `CommandError::find_in` this would be "creating worktree".
+        assert!(!detail.starts_with("creating worktree"));
+    }
+
+    /// When a `CommandError` has empty stderr/stdout (signal-killed before
+    /// output, or git silent on a non-zero exit), `display_message` falls
+    /// back to the command summary so the embedding error doesn't end up
+    /// with a blank detail.
+    #[test]
+    fn display_message_falls_back_to_summary_when_capture_empty() {
+        let empty = CommandError {
+            program: "git".into(),
+            args: vec!["fetch".into()],
+            stderr: String::new(),
+            stdout: String::new(),
+            exit_code: None,
+            signal: None,
+        };
+        let err: anyhow::Error = empty.into();
+        assert_eq!(err.display_message(), "git fetch failed");
+    }
+
+    /// HyperOx Worktrees refuses the global installers (PATCHES.md): each one fails with the
+    /// message before it reads or writes anything.
+    #[test]
+    fn global_installers_are_refused() {
+        let refused = |r: anyhow::Result<()>, what: &str| {
+            let message = r.expect_err(what).to_string();
+            assert!(
+                message.contains("not available in HyperOx Worktrees"),
+                "{what}: {message}"
+            );
+            assert!(message.contains(what), "{what}: {message}");
+        };
+        refused(
+            handle_config_shell_command(
+                ConfigShellCommand::Install {
+                    shell: None,
+                    dry_run: false,
+                    cmd: None,
+                },
+                true,
+            ),
+            "config shell install",
+        );
+        refused(
+            handle_config_shell_command(
+                ConfigShellCommand::Uninstall {
+                    shell: None,
+                    dry_run: true,
+                },
+                true,
+            ),
+            "config shell uninstall",
+        );
+        let plugins = [
+            (
+                ConfigPluginsCommand::Claude {
+                    action: ConfigPluginsClaudeCommand::Install,
+                },
+                "config plugins claude install",
+            ),
+            (
+                ConfigPluginsCommand::Claude {
+                    action: ConfigPluginsClaudeCommand::Uninstall,
+                },
+                "config plugins claude uninstall",
+            ),
+            (
+                ConfigPluginsCommand::Claude {
+                    action: ConfigPluginsClaudeCommand::InstallStatusline,
+                },
+                "config plugins claude install-statusline",
+            ),
+            (
+                ConfigPluginsCommand::Codex {
+                    action: ConfigPluginsCodexCommand::Install,
+                },
+                "config plugins codex install",
+            ),
+            (
+                ConfigPluginsCommand::Codex {
+                    action: ConfigPluginsCodexCommand::Uninstall,
+                },
+                "config plugins codex uninstall",
+            ),
+            (
+                ConfigPluginsCommand::Omp {
+                    action: ConfigPluginsOmpCommand::Install,
+                },
+                "config plugins omp install",
+            ),
+            (
+                ConfigPluginsCommand::Omp {
+                    action: ConfigPluginsOmpCommand::Uninstall,
+                },
+                "config plugins omp uninstall",
+            ),
+            (
+                ConfigPluginsCommand::Opencode {
+                    action: ConfigPluginsOpencodeCommand::Install,
+                },
+                "config plugins opencode install",
+            ),
+            (
+                ConfigPluginsCommand::Opencode {
+                    action: ConfigPluginsOpencodeCommand::Uninstall,
+                },
+                "config plugins opencode uninstall",
+            ),
+            (
+                ConfigPluginsCommand::Pi {
+                    action: ConfigPluginsPiCommand::Install,
+                },
+                "config plugins pi install",
+            ),
+            (
+                ConfigPluginsCommand::Pi {
+                    action: ConfigPluginsPiCommand::Uninstall,
+                },
+                "config plugins pi uninstall",
+            ),
+        ];
+        for (action, what) in plugins {
+            refused(handle_plugins_command(action, true), what);
+        }
+    }
+}

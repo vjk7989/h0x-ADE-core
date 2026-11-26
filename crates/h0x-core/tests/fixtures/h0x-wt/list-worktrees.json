@@ -1,0 +1,236 @@
+{
+  "schema": 2,
+  "repo": {
+    "default_branch": "main"
+  },
+  "collected": {
+    "ci": false,
+    "summary": false
+  },
+  "items": [
+    {
+      "branch": "main",
+      "head": {
+        "sha": "385badbcf5b0916b997b44de2b3e45824c39220e",
+        "short_sha": "385badb",
+        "subject": "m",
+        "committed_at": "2026-11-26T08:14:28Z"
+      },
+      "worktree": {
+        "path": "C:/Users/dev/my repo é",
+        "main": true,
+        "current": true,
+        "previous": true,
+        "detached": false,
+        "branch_mismatch": false,
+        "duplicate_branch": false,
+        "changes": {
+          "staged": false,
+          "modified": false,
+          "untracked": false,
+          "renamed": false,
+          "deleted": false,
+          "conflicted": false,
+          "diff": {
+            "added": 0,
+            "deleted": 0
+          }
+        }
+      },
+      "display": {
+        "state": "is_main",
+        "symbols": "^",
+        "statusline": "main  \u001b[2m^\u001b[22m"
+      }
+    },
+    {
+      "branch": null,
+      "head": {
+        "sha": "385badbcf5b0916b997b44de2b3e45824c39220e",
+        "short_sha": "385badb",
+        "subject": "m",
+        "committed_at": "2026-11-26T08:14:28Z"
+      },
+      "worktree": {
+        "path": "C:/Users/dev/.h0x/worktrees/my repo é/detached",
+        "main": false,
+        "current": false,
+        "previous": false,
+        "detached": true,
+        "branch_mismatch": false,
+        "duplicate_branch": false,
+        "changes": {
+          "staged": false,
+          "modified": false,
+          "untracked": false,
+          "renamed": false,
+          "deleted": false,
+          "conflicted": false,
+          "diff": {
+            "added": 0,
+            "deleted": 0
+          }
+        }
+      },
+      "default_branch": {
+        "ahead": 0,
+        "behind": 0,
+        "diff": {
+          "added": 0,
+          "deleted": 0
+        },
+        "orphan": false,
+        "integration": {
+          "reason": "same_commit"
+        },
+        "merge_conflicts": false
+      },
+      "display": {
+        "state": "empty",
+        "symbols": "⊘_",
+        "statusline": "385badb  \u001b[33m⊘\u001b[39m\u001b[2m_\u001b[22m"
+      }
+    },
+    {
+      "branch": "feat/ahead",
+      "head": {
+        "sha": "b374cceafb36692a2c7a155a88694cf2244044b5",
+        "short_sha": "b374cce",
+        "subject": "b",
+        "committed_at": "2026-11-26T08:14:28Z"
+      },
+      "worktree": {
+        "path": "C:/Users/dev/.h0x/worktrees/my repo é/feat-ahead",
+        "main": false,
+        "current": false,
+        "previous": false,
+        "detached": false,
+        "branch_mismatch": false,
+        "duplicate_branch": false,
+        "changes": {
+          "staged": false,
+          "modified": false,
+          "untracked": false,
+          "renamed": false,
+          "deleted": false,
+          "conflicted": false,
+          "diff": {
+            "added": 0,
+            "deleted": 0
+          }
+        }
+      },
+      "default_branch": {
+        "ahead": 2,
+        "behind": 1,
+        "diff": {
+          "added": 2,
+          "deleted": 0
+        },
+        "orphan": false,
+        "merge_conflicts": false
+      },
+      "display": {
+        "state": "diverged",
+        "symbols": "↕",
+        "statusline": "feat/ahead  \u001b[2m↕\u001b[22m  \u001b[32m↑2\u001b[0m \u001b[2m\u001b[31m↓1\u001b[0m  ^\u001b[32m+2\u001b[0m"
+      }
+    },
+    {
+      "branch": "fix/ünï-dirty",
+      "head": {
+        "sha": "7cd7dc4a95ce9b09045701a4f455b7762a39fb91",
+        "short_sha": "7cd7dc4",
+        "subject": "init",
+        "committed_at": "2026-11-26T08:14:25Z"
+      },
+      "worktree": {
+        "path": "C:/Users/dev/.h0x/worktrees/my repo é/fix-ünï-dirty",
+        "main": false,
+        "current": false,
+        "previous": false,
+        "detached": false,
+        "branch_mismatch": false,
+        "duplicate_branch": false,
+        "changes": {
+          "staged": false,
+          "modified": true,
+          "untracked": true,
+          "renamed": false,
+          "deleted": false,
+          "conflicted": false,
+          "diff": {
+            "added": 2,
+            "deleted": 0
+          }
+        }
+      },
+      "default_branch": {
+        "ahead": 0,
+        "behind": 1,
+        "diff": {
+          "added": 0,
+          "deleted": 0
+        },
+        "orphan": false,
+        "integration": {
+          "reason": "ancestor"
+        },
+        "merge_conflicts": false
+      },
+      "display": {
+        "state": "behind",
+        "symbols": "!?↓",
+        "statusline": "fix/ünï-dirty  \u001b[36m!\u001b[39m\u001b[36m?\u001b[39m\u001b[2m↓\u001b[22m  @\u001b[32m+2\u001b[0m  \u001b[2m\u001b[31m↓1\u001b[0m"
+      }
+    },
+    {
+      "branch": "inmain",
+      "head": {
+        "sha": "7cd7dc4a95ce9b09045701a4f455b7762a39fb91",
+        "short_sha": "7cd7dc4",
+        "subject": "init",
+        "committed_at": "2026-11-26T08:14:25Z"
+      },
+      "worktree": {
+        "path": "C:/Users/dev/.h0x/worktrees/my repo é/inmain",
+        "main": false,
+        "current": false,
+        "previous": false,
+        "detached": false,
+        "branch_mismatch": false,
+        "duplicate_branch": false,
+        "changes": {
+          "staged": false,
+          "modified": false,
+          "untracked": false,
+          "renamed": false,
+          "deleted": false,
+          "conflicted": false,
+          "diff": {
+            "added": 0,
+            "deleted": 0
+          }
+        }
+      },
+      "default_branch": {
+        "ahead": 0,
+        "behind": 1,
+        "diff": {
+          "added": 0,
+          "deleted": 0
+        },
+        "orphan": false,
+        "integration": {
+          "reason": "ancestor"
+        },
+        "merge_conflicts": false
+      },
+      "display": {
+        "state": "integrated",
+        "symbols": "⊂",
+        "statusline": "inmain  \u001b[2m⊂\u001b[22m  \u001b[2m\u001b[31m↓1\u001b[0m"
+      }
+    }
+  ]
+}

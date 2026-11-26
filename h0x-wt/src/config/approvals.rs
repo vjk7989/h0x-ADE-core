@@ -1,0 +1,1322 @@
+//! Approval state management.
+//!
+//! Approved commands are stored in `~/.config/h0x-wt/approvals.toml`, separate
+//! from portable user configuration in `config.toml`. This allows dotfile management
+//! of config.toml without machine-local trust state.
+//!
+//! File format:
+//! ```toml
+//! [projects."github.com/user/repo"]
+//! approved-commands = [
+//!     "npm install",
+//!     "npm test",
+//! ]
+//! ```
+//!
+//! **Fallback**: When `approvals.toml` doesn't exist, `approved-commands` are
+//! silently read from `config.toml` for backward compatibility. Once any approval
+//! is saved (creating `approvals.toml`), it becomes the authoritative source.
+//! Users can then remove stale `approved-commands` from `config.toml` at their
+//! convenience.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use super::{ConfigError, ProjectId};
+
+use crate::config::deprecation::normalize_template_vars;
+use crate::path::format_path_for_display;
+use crate::utils::write_atomically;
+
+/// Approved commands, stored in `approvals.toml`.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Approvals {
+    #[serde(default)]
+    projects: BTreeMap<String, ApprovedProject>,
+}
+
+/// Per-project approved commands.
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+struct ApprovedProject {
+    #[serde(
+        default,
+        rename = "approved-commands",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    approved_commands: Vec<String>,
+}
+
+// =========================================================================
+// Path resolution
+// =========================================================================
+
+/// Resolve the approvals file path.
+///
+/// Priority:
+/// 1. `H0X_WT_APPROVALS_PATH` environment variable
+/// 2. Lib-crate test builds with the variable unset: panic (see below)
+/// 3. Production: `approvals.toml` beside `config.toml`
+///
+/// Called by [`Approvals::load`] and [`require_approvals_path`]. The mutation
+/// methods take an explicit `&Path`, so they never resolve here.
+///
+/// The step-2 guard is `#[cfg(test)]`, so it fires only when the `worktrunk`
+/// lib crate is itself compiled as a test target. A unit test in the `wt` bin
+/// crate (anything under `src/commands/`) links the lib in non-test mode, so
+/// the guard is compiled out and step 3 resolves the real user config
+/// directory. In-process unit tests must not resolve here, directly or via
+/// [`Approvals::load`]; they pass tempdir-backed paths instead. See
+/// `tests/AGENTS.md`.
+pub fn approvals_path() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("H0X_WT_APPROVALS_PATH") {
+        return Some(PathBuf::from(path));
+    }
+
+    #[cfg(test)]
+    panic!(
+        "H0X_WT_APPROVALS_PATH not set in test. Subprocess tests set it via TestRepo. \
+         An in-process unit test must pass explicit tempdir paths to the mutation \
+         methods and must not resolve the approvals path globally. See tests/AGENTS.md."
+    );
+
+    #[cfg(not(test))]
+    {
+        super::user::config_path().map(|p| p.with_file_name("approvals.toml"))
+    }
+}
+
+/// Resolve the approvals path, erroring when no location can be determined.
+///
+/// The `Result`-returning counterpart of [`approvals_path`], for the callers
+/// that save approvals and need a concrete path.
+pub fn require_approvals_path() -> Result<PathBuf, ConfigError> {
+    approvals_path().ok_or_else(|| {
+        ConfigError::Message(
+            "Cannot determine approvals path. Set $HOME or $XDG_CONFIG_HOME".to_string(),
+        )
+    })
+}
+
+// =========================================================================
+// Loading
+// =========================================================================
+
+impl Approvals {
+    /// Load approvals from `approvals.toml`, with silent fallback to `config.toml`.
+    ///
+    /// 1. If `approvals.toml` exists → load from it (authoritative)
+    /// 2. If not → silently read `approved-commands` from `config.toml`
+    /// 3. If none found → return empty
+    ///
+    /// The fallback is silent (no file writes, no warnings). Once any approval is
+    /// saved via mutation methods, `approvals.toml` is created and becomes the
+    /// source of truth. Users can clean up stale `approved-commands` in config.toml
+    /// at their convenience.
+    pub fn load() -> Result<Self, ConfigError> {
+        let Some(path) = approvals_path() else {
+            return Ok(Self::default());
+        };
+
+        Self::load_with_fallback(&path)
+    }
+
+    /// Load approvals from a specific file path.
+    fn load_from_file(path: &Path) -> Result<Self, ConfigError> {
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            ConfigError::Message(format!(
+                "Failed to read approvals file {}: {}",
+                format_path_for_display(path),
+                e
+            ))
+        })?;
+        let approvals: Self = toml::from_str(&content)
+            .map_err(|e| ConfigError::Parse(super::ConfigParseError::approvals(path, e)))?;
+        Ok(approvals)
+    }
+
+    /// Load approvals from an approvals file, falling back to config.toml.
+    ///
+    /// 1. If the approvals file exists → load from it (authoritative)
+    /// 2. If not → read `approved-commands` from sibling `config.toml`
+    /// 3. If neither exists → return empty
+    ///
+    /// The fallback uses sibling derivation (`path.with_file_name("config.toml")`)
+    /// which is correct because `approvals_path()` derives approvals.toml as
+    /// a sibling of config.toml.
+    fn load_with_fallback(path: &Path) -> Result<Self, ConfigError> {
+        if path.exists() {
+            return Self::load_from_file(path);
+        }
+
+        let config_path = path.with_file_name("config.toml");
+        if config_path.exists() {
+            return Self::load_from_config_file(&config_path);
+        }
+
+        Ok(Self::default())
+    }
+}
+
+// =========================================================================
+// Saving
+// =========================================================================
+
+impl Approvals {
+    /// Save approvals to a specific file path.
+    pub fn save_to(&self, path: &Path) -> Result<(), ConfigError> {
+        let parent = save_parent(path);
+        std::fs::create_dir_all(parent).map_err(|e| {
+            ConfigError::Message(format!("Failed to create approvals directory: {e}"))
+        })?;
+
+        let mut doc = toml_edit::DocumentMut::new();
+
+        if !self.projects.is_empty() {
+            let mut projects_table = toml_edit::Table::new();
+            projects_table.set_implicit(true);
+
+            for (project_id, project_config) in &self.projects {
+                if project_config.approved_commands.is_empty() {
+                    continue;
+                }
+                let mut project_table = toml_edit::Table::new();
+                let commands = format_multiline_array(project_config.approved_commands.iter());
+                project_table["approved-commands"] = toml_edit::value(commands);
+                projects_table[project_id] = toml_edit::Item::Table(project_table);
+            }
+
+            doc["projects"] = toml_edit::Item::Table(projects_table);
+        }
+
+        let output = doc.to_string();
+        // If all projects were empty, write empty file
+        let output = if output.trim().is_empty() {
+            String::new()
+        } else {
+            output
+        };
+
+        write_atomically(path, &output)
+            .map_err(|e| ConfigError::Message(format!("Failed to write approvals file: {e}")))?;
+
+        Ok(())
+    }
+}
+
+fn save_parent(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+// =========================================================================
+// Queries
+// =========================================================================
+
+impl Approvals {
+    /// Check if a command is approved for the given project.
+    ///
+    /// Normalizes template variables before comparing, so approvals match
+    /// regardless of whether they were saved with deprecated variable names.
+    ///
+    /// A `*` pattern key approves its commands for every project it matches,
+    /// the same keys `[projects."…"]` settings use. Only a hand-written entry
+    /// is ever a pattern: [`Self::approve_commands`] records under the exact
+    /// project identifier and refuses one that contains `*`, so approving a
+    /// command in one repository never widens to another.
+    pub fn is_command_approved(&self, project: &ProjectId, command: &str) -> bool {
+        let normalized_command = normalize_template_vars(command);
+        crate::config::matching_project_keys(&self.projects, project)
+            .into_iter()
+            .any(|p| {
+                p.approved_commands
+                    .iter()
+                    .any(|c| normalize_template_vars(c) == normalized_command)
+            })
+    }
+
+    /// Iterate over projects and their approved commands.
+    pub fn projects(&self) -> impl Iterator<Item = (&str, &[String])> {
+        self.projects
+            .iter()
+            .map(|(id, p)| (id.as_str(), p.approved_commands.as_slice()))
+    }
+
+    /// Pattern keys whose approved commands cover `project` — the entries
+    /// [`Self::is_command_approved`] consults beyond the exact ones. Always
+    /// hand-written (the write paths refuse `*`), so mutations never touch
+    /// them; `wt config approvals clear` names them in a hint, making an
+    /// approval that survives a clear traceable to the entry that supplies it.
+    pub fn matching_pattern_keys(&self, project: &ProjectId) -> Vec<&str> {
+        self.projects
+            .iter()
+            .filter(|(key, p)| {
+                key.contains('*')
+                    && !p.approved_commands.is_empty()
+                    && project
+                        .exact_keys()
+                        .any(|id| super::user::project_match::matches(key, id))
+            })
+            .map(|(key, _)| key.as_str())
+            .collect()
+    }
+
+    /// Approved commands for `project` that match none of `templates` (after
+    /// template-variable normalization) — approvals left behind when a config
+    /// command was edited or removed.
+    ///
+    /// Reads the exact keys only (the current and legacy identifiers),
+    /// unlike [`Self::is_command_approved`]. A pattern entry's commands are
+    /// shared with every repository it matches, and this drives `wt config
+    /// approvals clear --stale`, so judging them against one repository's
+    /// config would let that repository revoke approvals the others still
+    /// rely on.
+    pub fn stale_approvals<'a>(&'a self, project: &ProjectId, templates: &[&str]) -> Vec<&'a str> {
+        let normalized: Vec<_> = templates
+            .iter()
+            .map(|t| normalize_template_vars(t))
+            .collect();
+        let mut stale: Vec<&str> = Vec::new();
+        for command in project
+            .exact_keys()
+            .filter_map(|key| self.projects.get(key))
+            .flat_map(|p| &p.approved_commands)
+        {
+            if !normalized.contains(&normalize_template_vars(command))
+                && !stale.contains(&command.as_str())
+            {
+                stale.push(command);
+            }
+        }
+        stale
+    }
+}
+
+// =========================================================================
+// Mutations (with file locking)
+// =========================================================================
+
+impl Approvals {
+    /// Execute a mutation under an exclusive file lock.
+    ///
+    /// Acquires lock, reloads from disk, calls the mutator, and saves if mutator returns true.
+    fn with_locked_mutation<F>(
+        &mut self,
+        approvals_path: &Path,
+        mutate: F,
+    ) -> Result<(), ConfigError>
+    where
+        F: FnOnce(&mut Self) -> bool,
+    {
+        let _lock = super::user::mutation::acquire_config_lock(approvals_path)?;
+        self.reload_from(approvals_path)?;
+
+        if mutate(self) {
+            self.save_to(approvals_path)?;
+        }
+        Ok(())
+    }
+
+    /// Reload approvals from disk (under lock), with config.toml fallback.
+    fn reload_from(&mut self, path: &Path) -> Result<(), ConfigError> {
+        let fresh = Self::load_with_fallback(path)?;
+        self.projects = fresh.projects;
+        Ok(())
+    }
+
+    /// Extract approved-commands from a specific config file.
+    pub(crate) fn load_from_config_file(config_path: &Path) -> Result<Self, ConfigError> {
+        let content = std::fs::read_to_string(config_path).map_err(|e| {
+            ConfigError::Message(format!(
+                "Failed to read config file {}: {}",
+                format_path_for_display(config_path),
+                e
+            ))
+        })?;
+
+        let config: super::UserConfig = toml::from_str(&content).map_err(|e| {
+            ConfigError::Parse(super::ConfigParseError::new(
+                crate::config::ConfigFileKind::User,
+                config_path,
+                e,
+            ))
+        })?;
+
+        let mut approvals = Approvals::default();
+        for (project_id, project_config) in &config.projects {
+            if !project_config.approved_commands.is_empty() {
+                approvals.projects.insert(
+                    project_id.clone(),
+                    ApprovedProject {
+                        approved_commands: project_config.approved_commands.clone(),
+                    },
+                );
+            }
+        }
+
+        Ok(approvals)
+    }
+
+    /// Add multiple approved commands in a single locked operation.
+    ///
+    /// Refuses a `project` containing `*`: reads treat such a key as a pattern
+    /// (see `config::user::project_match`), so a persisted entry would approve
+    /// the commands for every repository the pattern matches. Refusing here is
+    /// what makes pattern entries hand-written only — the guarantee
+    /// [`Self::is_command_approved`] documents. The caller's approval still
+    /// covers the current run; it just isn't remembered.
+    pub fn approve_commands(
+        &mut self,
+        project: String,
+        commands: Vec<String>,
+        approvals_path: &Path,
+    ) -> Result<(), ConfigError> {
+        if project.contains('*') {
+            return Err(ConfigError::Message(format!(
+                "Cannot save approvals for `{project}`: `*` in the identifier reads as a \
+                 pattern, so the entry would apply to every repository it matches"
+            )));
+        }
+        self.with_locked_mutation(approvals_path, |approvals| {
+            let entry = approvals.projects.entry(project).or_default();
+            let mut changed = false;
+            for command in commands {
+                let normalized = normalize_template_vars(&command);
+                if !entry
+                    .approved_commands
+                    .iter()
+                    .any(|c| normalize_template_vars(c) == normalized)
+                {
+                    entry.approved_commands.push(command);
+                    changed = true;
+                }
+            }
+            changed
+        })
+    }
+
+    /// Remove all approvals for a project and save, including any saved under
+    /// its legacy identifier.
+    pub fn revoke_project(
+        &mut self,
+        project: &ProjectId,
+        approvals_path: &Path,
+    ) -> Result<(), ConfigError> {
+        self.with_locked_mutation(approvals_path, |approvals| {
+            let mut changed = false;
+            for key in project.exact_keys() {
+                changed |= approvals
+                    .projects
+                    .remove(key)
+                    .is_some_and(|p| !p.approved_commands.is_empty());
+            }
+            changed
+        })
+    }
+
+    /// The number of approvals saved for `project` under its exact keys —
+    /// what [`Self::revoke_project`] removes.
+    pub fn exact_approval_count(&self, project: &ProjectId) -> usize {
+        project
+            .exact_keys()
+            .filter_map(|key| self.projects.get(key))
+            .map(|p| p.approved_commands.len())
+            .sum()
+    }
+
+    /// Remove approvals for `project` that match none of `templates` (the
+    /// project's current command set) and save. Returns the removed commands.
+    ///
+    /// Staleness is recomputed under the file lock via [`Self::stale_approvals`],
+    /// so an approval another process records between the caller's read and
+    /// this call is never removed by mistake.
+    pub fn revoke_stale(
+        &mut self,
+        project: &ProjectId,
+        templates: &[&str],
+        approvals_path: &Path,
+    ) -> Result<Vec<String>, ConfigError> {
+        let mut removed = Vec::new();
+        self.with_locked_mutation(approvals_path, |approvals| {
+            let stale: Vec<String> = approvals
+                .stale_approvals(project, templates)
+                .into_iter()
+                .map(String::from)
+                .collect();
+            if stale.is_empty() {
+                return false;
+            }
+            for key in project.exact_keys() {
+                let Some(project_config) = approvals.projects.get_mut(key) else {
+                    continue;
+                };
+                project_config
+                    .approved_commands
+                    .retain(|c| !stale.contains(c));
+                if project_config.approved_commands.is_empty() {
+                    approvals.projects.remove(key);
+                }
+            }
+            removed = stale;
+            true
+        })?;
+        Ok(removed)
+    }
+
+    /// Clear all approvals for all projects and save.
+    pub fn clear_all(&mut self, approvals_path: &Path) -> Result<(), ConfigError> {
+        self.with_locked_mutation(approvals_path, |approvals| {
+            if approvals.projects.is_empty() {
+                return false;
+            }
+            approvals.projects.clear();
+            true
+        })
+    }
+}
+
+// =========================================================================
+// TOML formatting helpers
+// =========================================================================
+
+/// Format a string array as multiline TOML for readability.
+fn format_multiline_array<'a>(items: impl Iterator<Item = &'a String>) -> toml_edit::Array {
+    let mut array: toml_edit::Array = items.collect();
+    for item in array.iter_mut() {
+        item.decor_mut().set_prefix("\n    ");
+    }
+    array.set_trailing("\n");
+    array.set_trailing_comma(true);
+    array
+}
+
+// =========================================================================
+// Tests
+// =========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn test_dir() -> (TempDir, PathBuf) {
+        let temp_dir = TempDir::new().unwrap();
+        let approvals_path = temp_dir.path().join("approvals.toml");
+        (temp_dir, approvals_path)
+    }
+
+    /// Load approvals from a specific path (no fallback).
+    fn load_from_path(path: &Path) -> Result<Approvals, ConfigError> {
+        if !path.exists() {
+            return Ok(Approvals::default());
+        }
+        Approvals::load_from_file(path)
+    }
+
+    #[cfg(unix)]
+    struct WritableOnDrop(PathBuf);
+
+    #[cfg(unix)]
+    impl Drop for WritableOnDrop {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[test]
+    fn test_empty_approvals() {
+        let approvals = Approvals::default();
+        assert!(!approvals.is_command_approved(&"any/project".into(), "any command"));
+    }
+
+    #[test]
+    fn test_pattern_key_approves_every_project_it_matches() {
+        // A hand-written pattern entry — the only way one appears, since every
+        // write path keys by the exact identifier.
+        let approvals: Approvals = toml::from_str(
+            r#"
+[projects."git.company.example/*"]
+approved-commands = ["npm install"]
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            approvals.is_command_approved(&"git.company.example/owner/repo".into(), "npm install")
+        );
+        assert!(
+            approvals
+                .is_command_approved(&"git.company.example/group/team/repo".into(), "npm install")
+        );
+        assert!(!approvals.is_command_approved(&"github.com/owner/repo".into(), "npm install"));
+        assert!(
+            !approvals.is_command_approved(&"git.company.example/owner/repo".into(), "npm test")
+        );
+    }
+
+    #[test]
+    fn test_matching_pattern_keys_names_covering_entries() {
+        let approvals: Approvals = toml::from_str(
+            r#"
+[projects."git.company.example/*"]
+approved-commands = ["npm install"]
+
+[projects."git.company.example/owner/repo"]
+approved-commands = ["npm test"]
+
+[projects."git.company.example/owner/*"]
+approved-commands = []
+
+[projects."github.com/*"]
+approved-commands = ["make"]
+"#,
+        )
+        .unwrap();
+
+        // The exact key, a non-matching pattern, and a matching pattern with
+        // no commands are all excluded — only entries actually supplying
+        // approvals are worth naming.
+        assert_eq!(
+            approvals.matching_pattern_keys(&"git.company.example/owner/repo".into()),
+            vec!["git.company.example/*"]
+        );
+        assert!(
+            approvals
+                .matching_pattern_keys(&"codeberg.org/owner/repo".into())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_approving_a_starred_identifier_is_refused() {
+        // An identifier can itself contain `*` (a remote URL or no-remote
+        // path-fallback with a star in it). Persisting it verbatim would
+        // create an entry reads treat as a pattern — approving the command
+        // for every repository the star matches — so the write is refused
+        // and the caller's approval covers the current run only.
+        let (_temp_dir, path) = test_dir();
+        let mut approvals = Approvals::default();
+
+        let err = approvals
+            .approve_commands(
+                "git.company.example/owner/re*po".to_string(),
+                vec!["npm install".to_string()],
+                &path,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("pattern"), "got: {err}");
+        assert!(
+            !approvals
+                .is_command_approved(&"git.company.example/owner/re*po".into(), "npm install"),
+            "nothing may be recorded in memory"
+        );
+        assert!(!path.exists(), "nothing may be written to disk");
+    }
+
+    #[test]
+    fn test_approving_under_a_pattern_writes_the_exact_key() {
+        // Approving in one repository must not widen an existing pattern entry
+        // to cover a command the user was only asked about once.
+        let (_temp_dir, path) = test_dir();
+        let mut approvals: Approvals = toml::from_str(
+            r#"
+[projects."git.company.example/*"]
+approved-commands = ["npm install"]
+"#,
+        )
+        .unwrap();
+        // Mutations reload under the file lock, so the fixture has to be on
+        // disk for the pattern entry to survive into the mutation.
+        approvals.save_to(&path).unwrap();
+
+        approvals
+            .approve_commands(
+                "git.company.example/owner/repo".to_string(),
+                vec!["npm test".to_string()],
+                &path,
+            )
+            .unwrap();
+
+        assert!(
+            approvals.is_command_approved(&"git.company.example/owner/repo".into(), "npm test")
+        );
+        assert!(
+            !approvals.is_command_approved(&"git.company.example/other/repo".into(), "npm test"),
+            "the pattern entry must not have absorbed the new approval"
+        );
+    }
+
+    #[test]
+    fn test_clearing_one_project_leaves_a_matching_pattern_intact() {
+        let (_temp_dir, path) = test_dir();
+        let mut approvals: Approvals = toml::from_str(
+            r#"
+[projects."git.company.example/*"]
+approved-commands = ["npm install"]
+
+[projects."git.company.example/owner/repo"]
+approved-commands = ["npm test"]
+"#,
+        )
+        .unwrap();
+        approvals.save_to(&path).unwrap();
+
+        approvals
+            .revoke_project(&"git.company.example/owner/repo".into(), &path)
+            .unwrap();
+
+        assert!(
+            !approvals.is_command_approved(&"git.company.example/owner/repo".into(), "npm test"),
+            "the repository's own approval is gone"
+        );
+        assert!(
+            approvals.is_command_approved(&"git.company.example/owner/repo".into(), "npm install"),
+            "the pattern entry other repositories share is untouched"
+        );
+    }
+
+    #[test]
+    fn test_approve_and_check() {
+        let (_temp_dir, path) = test_dir();
+
+        let mut approvals = Approvals::default();
+        approvals
+            .approve_commands(
+                "github.com/user/repo".to_string(),
+                vec!["npm install".to_string()],
+                &path,
+            )
+            .unwrap();
+
+        assert!(approvals.is_command_approved(&"github.com/user/repo".into(), "npm install"));
+        assert!(!approvals.is_command_approved(&"github.com/user/repo".into(), "npm test"));
+        assert!(!approvals.is_command_approved(&"github.com/other/repo".into(), "npm install"));
+    }
+
+    #[test]
+    fn test_approve_duplicate_is_noop() {
+        let (_temp_dir, path) = test_dir();
+
+        let mut approvals = Approvals::default();
+        approvals
+            .approve_commands(
+                "github.com/user/repo".to_string(),
+                vec!["npm install".to_string()],
+                &path,
+            )
+            .unwrap();
+        approvals
+            .approve_commands(
+                "github.com/user/repo".to_string(),
+                vec!["npm install".to_string()],
+                &path,
+            )
+            .unwrap();
+
+        let count = approvals
+            .projects
+            .get("github.com/user/repo")
+            .unwrap()
+            .approved_commands
+            .len();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_approve_commands_batch() {
+        let (_temp_dir, path) = test_dir();
+
+        let mut approvals = Approvals::default();
+        approvals
+            .approve_commands(
+                "github.com/user/repo".to_string(),
+                vec!["npm install".to_string(), "npm test".to_string()],
+                &path,
+            )
+            .unwrap();
+
+        assert!(approvals.is_command_approved(&"github.com/user/repo".into(), "npm install"));
+        assert!(approvals.is_command_approved(&"github.com/user/repo".into(), "npm test"));
+    }
+
+    #[test]
+    fn test_revoke_project() {
+        let (_temp_dir, path) = test_dir();
+
+        let mut approvals = Approvals::default();
+        approvals
+            .approve_commands(
+                "github.com/user/repo1".to_string(),
+                vec!["npm install".to_string(), "npm test".to_string()],
+                &path,
+            )
+            .unwrap();
+        approvals
+            .approve_commands(
+                "github.com/user/repo2".to_string(),
+                vec!["cargo build".to_string()],
+                &path,
+            )
+            .unwrap();
+
+        approvals
+            .revoke_project(&"github.com/user/repo1".into(), &path)
+            .unwrap();
+        assert!(!approvals.projects.contains_key("github.com/user/repo1"));
+        assert!(approvals.projects.contains_key("github.com/user/repo2"));
+    }
+
+    /// A project's approvals saved under its v0.80.0 identifier count toward
+    /// it, show as stale, and go with it on revoke, so `wt config approvals
+    /// clear` leaves nothing of its own approving commands.
+    #[test]
+    fn test_revoke_project_includes_legacy_identifier() {
+        let (_temp_dir, path) = test_dir();
+        let project = ProjectId::with_legacy(
+            "github.com/user/repo".to_string(),
+            Some("GitHub.com/user/repo".to_string()),
+        );
+
+        let mut approvals = Approvals::default();
+        for (key, command) in [
+            ("GitHub.com/user/repo", "npm install"),
+            ("github.com/user/repo", "npm test"),
+            ("github.com/user/other", "cargo build"),
+        ] {
+            approvals
+                .approve_commands(key.to_string(), vec![command.to_string()], &path)
+                .unwrap();
+        }
+        assert!(approvals.is_command_approved(&project, "npm install"));
+        assert_eq!(approvals.exact_approval_count(&project), 2);
+        assert_eq!(
+            approvals.stale_approvals(&project, &["npm test"]),
+            ["npm install"]
+        );
+
+        let removed = approvals
+            .revoke_stale(&project, &["npm test"], &path)
+            .unwrap();
+        assert_eq!(removed, ["npm install"]);
+        assert!(!approvals.projects.contains_key("GitHub.com/user/repo"));
+        assert!(approvals.is_command_approved(&project, "npm test"));
+
+        approvals.revoke_project(&project, &path).unwrap();
+        assert!(!approvals.is_command_approved(&project, "npm test"));
+        assert_eq!(
+            approvals.projects.keys().collect::<Vec<_>>(),
+            ["github.com/user/other"]
+        );
+    }
+
+    #[test]
+    fn test_clear_all() {
+        let (_temp_dir, path) = test_dir();
+
+        let mut approvals = Approvals::default();
+        approvals
+            .approve_commands(
+                "github.com/user/repo1".to_string(),
+                vec!["npm install".to_string()],
+                &path,
+            )
+            .unwrap();
+        approvals
+            .approve_commands(
+                "github.com/user/repo2".to_string(),
+                vec!["cargo build".to_string()],
+                &path,
+            )
+            .unwrap();
+
+        approvals.clear_all(&path).unwrap();
+        assert!(approvals.projects.is_empty());
+    }
+
+    #[test]
+    fn test_save_and_load() {
+        let (_temp_dir, path) = test_dir();
+
+        let mut approvals = Approvals::default();
+        approvals
+            .approve_commands(
+                "github.com/user/repo".to_string(),
+                vec!["npm install".to_string(), "npm test".to_string()],
+                &path,
+            )
+            .unwrap();
+
+        // Load from disk
+        let loaded = load_from_path(&path).unwrap();
+        assert!(loaded.is_command_approved(&"github.com/user/repo".into(), "npm install"));
+        assert!(loaded.is_command_approved(&"github.com/user/repo".into(), "npm test"));
+    }
+
+    /// Failure to create the approvals directory must leave the blocking file
+    /// untouched and must not report that any approvals were saved.
+    #[test]
+    fn test_save_to_blocked_parent_preserves_file() {
+        let dir = TempDir::new().unwrap();
+        let parent = dir.path().join("blocked");
+        std::fs::write(&parent, "keep this file").unwrap();
+        let path = parent.join("approvals.toml");
+
+        let err = Approvals::default().save_to(&path).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("Failed to create approvals directory"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(parent).unwrap(), "keep this file");
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_failure_preserves_existing_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let approvals_dir = temp_dir.path().join("readonly");
+        std::fs::create_dir(&approvals_dir).unwrap();
+        let path = approvals_dir.join("approvals.toml");
+
+        let mut original = Approvals::default();
+        original.projects.insert(
+            "github.com/user/repo".to_string(),
+            super::ApprovedProject {
+                approved_commands: vec!["npm install".to_string()],
+            },
+        );
+        original.save_to(&path).unwrap();
+        let original_content = std::fs::read_to_string(&path).unwrap();
+
+        std::fs::set_permissions(&approvals_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let _restore = WritableOnDrop(approvals_dir.clone());
+        let test_file = approvals_dir.join("test_write");
+        if std::fs::write(&test_file, "test").is_ok() {
+            let _ = std::fs::remove_file(test_file);
+            return;
+        }
+
+        let mut replacement = Approvals::default();
+        replacement.projects.insert(
+            "github.com/user/repo".to_string(),
+            super::ApprovedProject {
+                approved_commands: vec!["npm test".to_string()],
+            },
+        );
+        let err = replacement.save_to(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("Failed to write approvals file"),
+            "Expected a write error, got: {}",
+            err
+        );
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original_content);
+        let loaded = Approvals::load_from_file(&path).unwrap();
+        assert!(loaded.is_command_approved(&"github.com/user/repo".into(), "npm install"));
+        assert!(!loaded.is_command_approved(&"github.com/user/repo".into(), "npm test"));
+    }
+
+    #[test]
+    fn test_save_format() {
+        let (_temp_dir, path) = test_dir();
+
+        let mut approvals = Approvals::default();
+        approvals
+            .approve_commands(
+                "github.com/user/repo".to_string(),
+                vec!["npm install".to_string(), "npm test".to_string()],
+                &path,
+            )
+            .unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        insta::assert_snapshot!(content, @r#"
+        [projects."github.com/user/repo"]
+        approved-commands = [
+            "npm install",
+            "npm test",
+        ]
+        "#);
+    }
+
+    #[test]
+    fn test_normalized_approval_matching() {
+        let (_temp_dir, path) = test_dir();
+
+        let mut approvals = Approvals::default();
+        // Approve with deprecated variable name
+        approvals
+            .approve_commands(
+                "project".to_string(),
+                vec!["echo {{ repo_root }}".to_string()],
+                &path,
+            )
+            .unwrap();
+
+        // Should match with canonical variable name
+        assert!(approvals.is_command_approved(&"project".into(), "echo {{ repo_path }}"));
+    }
+
+    #[test]
+    fn test_literal_command_text_is_not_normalized_for_approval_matching() {
+        let (_temp_dir, path) = test_dir();
+
+        let mut approvals = Approvals::default();
+        approvals
+            .approve_commands(
+                "project".to_string(),
+                vec!["echo repo_root".to_string()],
+                &path,
+            )
+            .unwrap();
+
+        assert!(!approvals.is_command_approved(&"project".into(), "echo repo_path"));
+    }
+
+    #[test]
+    fn test_concurrent_approve_preserves_all() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let (_temp_dir, path) = test_dir();
+
+        let num_threads = 10;
+        let barrier = Arc::new(Barrier::new(num_threads));
+        let config_path = Arc::new(path);
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|i| {
+                let barrier = Arc::clone(&barrier);
+                let config_path = Arc::clone(&config_path);
+                thread::spawn(move || {
+                    let mut approvals = Approvals::default();
+                    barrier.wait();
+                    approvals
+                        .approve_commands(
+                            "github.com/user/repo".to_string(),
+                            vec![format!("command_{i}")],
+                            &config_path,
+                        )
+                        .unwrap();
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let content = std::fs::read_to_string(&*config_path).unwrap();
+        for i in 0..num_threads {
+            assert!(
+                content.contains(&format!("command_{i}")),
+                "command_{i} should be preserved"
+            );
+        }
+    }
+
+    /// `load_from_config_file` extracts approved-commands from a config.toml file.
+    #[test]
+    fn test_load_from_config_file() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+
+        std::fs::write(
+            &config_path,
+            r#"
+[projects."github.com/user/repo"]
+approved-commands = ["npm install", "npm test"]
+
+[projects."github.com/other/repo"]
+approved-commands = ["cargo build"]
+"#,
+        )
+        .unwrap();
+
+        let approvals = Approvals::load_from_config_file(&config_path).unwrap();
+        assert!(approvals.is_command_approved(&"github.com/user/repo".into(), "npm install"));
+        assert!(approvals.is_command_approved(&"github.com/user/repo".into(), "npm test"));
+        assert!(approvals.is_command_approved(&"github.com/other/repo".into(), "cargo build"));
+    }
+
+    /// When `approvals.toml` doesn't exist but `config.toml` is a sibling with
+    /// `approved-commands`, the first mutation reads the fallback and preserves
+    /// existing commands alongside the new one.
+    #[test]
+    fn test_mutation_picks_up_config_toml_fallback() {
+        let temp_dir = TempDir::new().unwrap();
+        let approvals_path = temp_dir.path().join("approvals.toml");
+        let config_path = temp_dir.path().join("config.toml");
+
+        // Write config.toml with existing approved-commands (no approvals.toml yet)
+        std::fs::write(
+            &config_path,
+            r#"
+[projects."github.com/user/repo"]
+approved-commands = ["npm install"]
+"#,
+        )
+        .unwrap();
+
+        // Approve a new command — reload_from should pick up config.toml fallback
+        let mut approvals = Approvals::default();
+        approvals
+            .approve_commands(
+                "github.com/user/repo".to_string(),
+                vec!["npm test".to_string()],
+                &approvals_path,
+            )
+            .unwrap();
+
+        // Both the fallback command and the new one should be present
+        assert!(approvals.is_command_approved(&"github.com/user/repo".into(), "npm install"));
+        assert!(approvals.is_command_approved(&"github.com/user/repo".into(), "npm test"));
+
+        // approvals.toml should now exist with both commands
+        let content = std::fs::read_to_string(&approvals_path).unwrap();
+        assert!(content.contains("npm install"));
+        assert!(content.contains("npm test"));
+    }
+
+    #[test]
+    fn test_load_from_path_nonexistent() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("nonexistent.toml");
+        let approvals = load_from_path(&path).unwrap();
+        assert!(approvals.projects.is_empty());
+    }
+
+    #[test]
+    fn test_load_from_file_invalid_toml() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("approvals.toml");
+        std::fs::write(&path, "this is { not valid toml").unwrap();
+        let err = Approvals::load_from_file(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("Approvals @"),
+            "Expected parse error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_load_from_file_rejects_unknown_top_level_key() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("approvals.toml");
+        std::fs::write(
+            &path,
+            r#"
+[project."github.com/user/repo"]
+approved-commands = ["npm test"]
+"#,
+        )
+        .unwrap();
+        let err = Approvals::load_from_file(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("Approvals @"),
+            "Expected parse error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_load_from_file_rejects_unknown_project_key() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("approvals.toml");
+        std::fs::write(
+            &path,
+            r#"
+[projects."github.com/user/repo"]
+approved-command = ["npm test"]
+"#,
+        )
+        .unwrap();
+        let err = Approvals::load_from_file(&path).unwrap_err();
+        assert!(
+            err.to_string().contains("Approvals @"),
+            "Expected parse error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_load_from_config_file_invalid_toml() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.toml");
+        std::fs::write(&config_path, "not { valid toml here").unwrap();
+        let err = Approvals::load_from_config_file(&config_path).unwrap_err();
+        assert!(
+            err.to_string().contains("User config @"),
+            "Expected parse error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_revoke_project_nonexistent() {
+        let (_temp_dir, path) = test_dir();
+        let mut approvals = Approvals::default();
+        approvals
+            .approve_commands("project-a".to_string(), vec!["cmd1".to_string()], &path)
+            .unwrap();
+        // Revoke a project that doesn't exist — should be a no-op
+        approvals
+            .revoke_project(&"nonexistent".into(), &path)
+            .unwrap();
+        assert!(approvals.is_command_approved(&"project-a".into(), "cmd1"));
+    }
+
+    #[test]
+    fn test_clear_all_when_empty() {
+        let (_temp_dir, path) = test_dir();
+        let mut approvals = Approvals::default();
+        // Clear when there's nothing — should be a no-op
+        approvals.clear_all(&path).unwrap();
+        assert!(approvals.projects.is_empty());
+    }
+
+    #[test]
+    fn test_save_skips_empty_project() {
+        let (_temp_dir, path) = test_dir();
+        let mut approvals = Approvals::default();
+        // Manually insert a project with empty commands
+        approvals.projects.insert(
+            "empty-project".to_string(),
+            super::ApprovedProject {
+                approved_commands: vec![],
+            },
+        );
+        approvals.projects.insert(
+            "real-project".to_string(),
+            super::ApprovedProject {
+                approved_commands: vec!["cmd1".to_string()],
+            },
+        );
+        // Call save_to directly so the empty project reaches the save logic
+        approvals.save_to(&path).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(!content.contains("empty-project"));
+        assert!(content.contains("real-project"));
+    }
+
+    #[test]
+    fn test_revoke_project_with_empty_commands() {
+        let (_temp_dir, path) = test_dir();
+        let mut approvals = Approvals::default();
+        approvals
+            .approve_commands("project-a".to_string(), vec!["cmd1".to_string()], &path)
+            .unwrap();
+        // Manually clear the commands (without removing the project entry)
+        approvals
+            .projects
+            .get_mut("project-a")
+            .unwrap()
+            .approved_commands
+            .clear();
+        // Write this state to disk
+        approvals.save_to(&path).unwrap();
+        // Now revoke_project should find the project but see empty commands → no-op
+        approvals
+            .revoke_project(&"project-a".into(), &path)
+            .unwrap();
+    }
+
+    /// Stale = approved but matching no config template, with the same
+    /// normalization as `is_command_approved`: an approval saved with a
+    /// deprecated variable name still matches its canonical config command.
+    #[test]
+    fn test_stale_approvals() {
+        let (_temp_dir, path) = test_dir();
+
+        let mut approvals = Approvals::default();
+        approvals
+            .approve_commands(
+                "project".to_string(),
+                vec![
+                    "npm test".to_string(),
+                    "echo {{ repo_root }}".to_string(),
+                    "removed command".to_string(),
+                ],
+                &path,
+            )
+            .unwrap();
+
+        let stale =
+            approvals.stale_approvals(&"project".into(), &["npm test", "echo {{ repo_path }}"]);
+        assert_eq!(stale, vec!["removed command"]);
+        assert!(
+            approvals
+                .stale_approvals(&"other-project".into(), &["npm test"])
+                .is_empty()
+        );
+    }
+
+    /// `revoke_stale` removes only approvals matching no template (same
+    /// normalization as `stale_approvals`), keeps the rest, and drops the
+    /// project entry entirely when nothing remains.
+    #[test]
+    fn test_revoke_stale() {
+        let (_temp_dir, path) = test_dir();
+
+        let mut approvals = Approvals::default();
+        approvals
+            .approve_commands(
+                "project".to_string(),
+                vec![
+                    "npm test".to_string(),
+                    "echo {{ repo_root }}".to_string(),
+                    "removed command".to_string(),
+                ],
+                &path,
+            )
+            .unwrap();
+
+        let templates = ["npm test", "echo {{ repo_path }}"];
+        let removed = approvals
+            .revoke_stale(&"project".into(), &templates, &path)
+            .unwrap();
+        assert_eq!(removed, vec!["removed command"]);
+        assert!(approvals.is_command_approved(&"project".into(), "npm test"));
+        assert!(approvals.is_command_approved(&"project".into(), "echo {{ repo_root }}"));
+
+        // Nothing stale left — a second call is a no-op.
+        let removed = approvals
+            .revoke_stale(&"project".into(), &templates, &path)
+            .unwrap();
+        assert!(removed.is_empty());
+
+        // Every remaining approval stale — the project entry disappears.
+        let removed = approvals
+            .revoke_stale(&"project".into(), &[], &path)
+            .unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(!approvals.projects.contains_key("project"));
+    }
+
+    #[test]
+    fn test_projects_accessor() {
+        let (_temp_dir, path) = test_dir();
+
+        let mut approvals = Approvals::default();
+        approvals
+            .approve_commands("project1".to_string(), vec!["cmd1".to_string()], &path)
+            .unwrap();
+        approvals
+            .approve_commands("project2".to_string(), vec!["cmd2".to_string()], &path)
+            .unwrap();
+
+        let projects: Vec<_> = approvals.projects().collect();
+        assert_eq!(projects.len(), 2);
+    }
+}
