@@ -1,14 +1,17 @@
 #!/bin/sh
-# Package a built Unix binary with its redistribution notices.
+# Package a built Unix binary and its h0x-wt tool with their redistribution notices.
 set -eu
-if [ "$#" -ne 2 ]; then
-    echo "usage: scripts/package <h0x-core binary> <output.tar.gz>" >&2
+if [ "$#" -ne 3 ]; then
+    echo "usage: scripts/package <h0x-core binary> <h0x-wt binary> <output.tar.gz>" >&2
     exit 2
 fi
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d "${TMPDIR:-/var/tmp}/h0x-core-package.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 cp "$1" "$work/h0x-core"
+# Where the core looks for it: h0x-core-tools/ beside h0x-core.
+mkdir "$work/h0x-core-tools"
+cp "$2" "$work/h0x-core-tools/h0x-wt"
 cp "$root/LICENSE" "$work/LICENSE"
 cp "$root/crates/h0x-core/THIRD-PARTY-NOTICES" "$work/THIRD-PARTY-NOTICES"
-tar -czf "$2" -C "$work" h0x-core LICENSE THIRD-PARTY-NOTICES
+tar -czf "$3" -C "$work" h0x-core h0x-core-tools LICENSE THIRD-PARTY-NOTICES

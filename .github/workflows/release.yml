@@ -23,6 +23,8 @@ concurrency:
 
 env:
   RUST_TOOLCHAIN: 1.95.0
+  # h0x-wt has its own toolchain (h0x-wt/rust-toolchain.toml); core builds stay on RUST_TOOLCHAIN.
+  WT_RUST_TOOLCHAIN: 1.96.1
   # Where scripts/zig-fetch puts the packages and cargo's `zig build` finds them.
   ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-cache
   # SQLite (rusqlite's bundled C source) builds against musl's own headers on Linux.
@@ -70,6 +72,12 @@ jobs:
         with:
           submodules: true
           persist-credentials: false
+      # h0x-wt's toolchain goes in first: the core's, installed next, stays the default, and
+      # h0x-wt/rust-toolchain.toml picks this one inside h0x-wt/.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.WT_RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -101,6 +109,9 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}-release
+          workspaces: |
+            .
+            h0x-wt
           cache-workspace-crates: true
           cache-bin: false
           # Tags can't share their caches; only manual builds on main save one.
@@ -109,21 +120,29 @@ jobs:
         # A stuck build fails here, not at the job's limit.
         timeout-minutes: 30
         run: cargo build --release --locked --target ${{ matrix.target }} -p h0x-core
+      - name: Build h0x-wt
+        working-directory: h0x-wt
+        timeout-minutes: 30
+        run: cargo build --release --locked --target ${{ matrix.target }}
       # Ad-hoc signed unless the release environment holds an Apple certificate.
       - name: Sign macOS binary
         if: runner.os == 'macOS'
         env:
           APPLE_CERTIFICATE_P12: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_CERTIFICATE_P12 || '' }}
           APPLE_CERTIFICATE_PASSWORD: ${{ github.event_name == 'push' && github.ref_type == 'tag' && secrets.APPLE_CERTIFICATE_PASSWORD || '' }}
-        run: scripts/mac-sign target/${{ matrix.target }}/release/h0x-core
+        run: |
+          scripts/mac-sign target/${{ matrix.target }}/release/h0x-core
+          scripts/mac-sign h0x-wt/target/${{ matrix.target }}/release/h0x-wt
       - name: Pack
         if: runner.os != 'Windows'
         run: |
           bin=target/${{ matrix.target }}/release/h0x-core
+          wt=h0x-wt/target/${{ matrix.target }}/release/h0x-wt
           "$bin" --version # it runs on its own platform
-          if [ "${{ runner.os }}" = Linux ]; then file "$bin" | grep -q 'static' || { file "$bin"; echo "not static"; exit 1; }; fi
+          "$wt" --version
+          if [ "${{ runner.os }}" = Linux ]; then file "$bin" | grep -q static || { file "$bin"; echo "not static"; exit 1; }; file "$wt" | grep -q static || { file "$wt"; echo "h0x-wt is not static"; exit 1; }; fi
           mkdir -p dist
-          sh scripts/package "$bin" dist/h0x-core-${{ matrix.name }}.tar.gz
+          sh scripts/package "$bin" "$wt" dist/h0x-core-${{ matrix.name }}.tar.gz
       # Windows: a zip of the exe, Microsoft's ConPTY (Windows' own swallows
       # answers to programs) and its notices. Zipped by Windows' tar, which
       # is also what unpacks it.
@@ -132,18 +151,25 @@ jobs:
         shell: pwsh
         run: |
           $bin = "target/${{ matrix.target }}/release/h0x-core.exe"
+          $wt = "h0x-wt/target/${{ matrix.target }}/release/h0x-wt.exe"
           & $bin --version
           if ($LASTEXITCODE) { throw "it does not run" }
+          & $wt --version
+          if ($LASTEXITCODE) { throw "h0x-wt does not run" }
           # A clean Windows has no Visual C++ runtime.
-          $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($bin)).ToLower()
-          foreach ($dll in "vcruntime140", "msvcp140", "api-ms-win-crt-") { if ($text.Contains($dll)) { throw "h0x-core.exe imports $dll" } }
+          foreach ($exe in $bin, $wt) {
+          $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($exe)).ToLower()
+          foreach ($dll in "vcruntime140", "msvcp140", "api-ms-win-crt-") { if ($text.Contains($dll)) { throw "$exe imports $dll" } }
+          }
           New-Item -ItemType Directory -Force stage/THIRD-PARTY-NOTICES, dist | Out-Null
           Copy-Item $bin stage/
+          New-Item -ItemType Directory stage/h0x-core-tools | Out-Null
+          Copy-Item $wt stage/h0x-core-tools/
           Copy-Item LICENSE stage/
           Copy-Item crates/h0x-core/THIRD-PARTY-NOTICES stage/THIRD-PARTY-NOTICES/h0x-core.txt
           scripts/fetch-conpty.ps1 -Dest stage
           Copy-Item distribution/windows/* stage/THIRD-PARTY-NOTICES/
-          tar -a -cf dist/h0x-core-${{ matrix.name }}.zip -C stage h0x-core.exe conpty LICENSE THIRD-PARTY-NOTICES
+          tar -a -cf dist/h0x-core-${{ matrix.name }}.zip -C stage h0x-core.exe h0x-core-tools conpty LICENSE THIRD-PARTY-NOTICES
           if ($LASTEXITCODE) { throw "zip failed" }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
