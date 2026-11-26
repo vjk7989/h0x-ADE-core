@@ -1,0 +1,817 @@
+use clap::{Args, Subcommand};
+
+#[derive(Args)]
+pub struct CommitArgs {
+    /// Branch to operate on (defaults to current worktree)
+    #[arg(short, long, add = crate::completion::worktree_only_completer(), value_parser = crate::cli::non_empty_branch)]
+    pub(crate) branch: Option<String>,
+
+    #[command(flatten)]
+    pub(crate) hooks: crate::cli::HookFlags,
+
+    /// What to stage before committing [default: all]
+    #[arg(long)]
+    pub(crate) stage: Option<crate::commands::commit::StageMode>,
+
+    /// Preview prompt, command, and generated message without committing
+    #[arg(long, conflicts_with = "show_prompt")]
+    pub(crate) dry_run: bool,
+
+    /// Render prompt to stdout without running LLM
+    #[arg(long, hide = true)]
+    pub(crate) show_prompt: bool,
+
+    /// Output format
+    ///
+    /// JSON prints structured result to stdout after the commit completes.
+    #[arg(long, default_value = "text", help_heading = "Automation")]
+    pub(crate) format: crate::cli::SwitchFormat,
+}
+
+#[derive(Args)]
+pub struct SquashArgs {
+    /// Target branch
+    ///
+    /// Defaults to default branch.
+    #[arg(add = crate::completion::branch_value_completer(), value_parser = crate::cli::non_empty_branch)]
+    pub(crate) target: Option<String>,
+
+    #[command(flatten)]
+    pub(crate) hooks: crate::cli::HookFlags,
+
+    /// What to stage before committing [default: all]
+    #[arg(long)]
+    pub(crate) stage: Option<crate::commands::commit::StageMode>,
+
+    /// Preview prompt, command, and generated message without squashing
+    #[arg(long, conflicts_with = "show_prompt")]
+    pub(crate) dry_run: bool,
+
+    /// Render prompt to stdout without running LLM
+    #[arg(long, hide = true)]
+    pub(crate) show_prompt: bool,
+
+    /// Output format
+    ///
+    /// JSON prints structured result to stdout after the squash completes.
+    #[arg(long, default_value = "text", help_heading = "Automation")]
+    pub(crate) format: crate::cli::SwitchFormat,
+}
+
+// Ordering: `h0x-wt merge` pipeline steps first (commit → squash → rebase → push),
+// then standalone utilities (diff, copy-ignored), then the rest, alphabetical
+// (eval, for-each, promote, prune, relocate, tether). Keep this enum, the
+// `## Operations` bullet list in `src/cli/mod.rs`, and the
+// `<!-- subdoc: -->` markers in the same relative order.
+/// Run individual operations
+#[derive(Subcommand)]
+#[command(allow_external_subcommands = true)]
+pub enum StepCommand {
+    /// Stage and commit with LLM-generated message
+    #[command(
+        after_long_help = r#"See [LLM-generated commit messages](/llm-commits/) for configuration and prompt customization. Without a `[commit.generation]` command configured, the commit still happens — the message is built from the staged file names instead (`Changes to README.md`).
+
+## Operating on another worktree
+
+`--branch` commits in another worktree's branch without leaving the current one:
+
+```console
+$ h0x-wt step commit --branch feature
+```
+
+The branch must have a checked-out worktree; staging, hooks, and the commit all happen there.
+
+## Hooks
+
+`pre-commit` hooks run before the commit and abort it on failure; `post-commit` hooks run after it, in the background with their output logged. `--no-hooks` skips both. See [`h0x-wt hook`](/hook/).
+
+## Options
+
+### Staging
+
+Controls what to stage before committing:
+
+| Value | Behavior |
+|-------|----------|
+| `all` | Stage all changes including untracked files (default) |
+| `tracked` | Stage only modified tracked files |
+| `none` | Don't stage anything, commit only what's already staged |
+
+```console
+$ h0x-wt step commit --stage=tracked
+```
+
+Configure the default in user config:
+
+```toml
+# ~/.config/h0x-wt/config.toml
+[commit]
+stage = "tracked"
+```
+
+### Dry run
+
+Render the prompt, print the LLM command, generate the message, and exit without staging, running hooks, or committing:
+
+```console
+$ h0x-wt step commit --dry-run
+```
+
+Three sections are printed: the rendered prompt, the shell command that would invoke the LLM, and the message returned. The LLM call still happens — only the commit is skipped.
+"#
+    )]
+    Commit(CommitArgs),
+
+    /// Squash commits since branching
+    ///
+    /// Stages changes and generates message with LLM.
+    #[command(
+        after_long_help = r#"See [LLM-generated commit messages](/llm-commits/) for configuration and prompt customization. Without a `[commit.generation]` command configured, the squash still happens — the message lists the squashed commits' subjects under `Squash commits from <branch>` instead.
+
+## Hooks
+
+`pre-commit` hooks run before the squash commit and abort it on failure; `post-commit` hooks run after it, in the background with their output logged. `--no-hooks` skips both. See [`h0x-wt hook`](/hook/).
+
+The squash commit is made on a detached HEAD, as `git rebase` does, so git's own commit hooks run and see no current branch.
+
+## Recovering staged changes
+
+Before squashing, Worktrunk saves the uncommitted changes the squash includes (everything staged, by hand or by `--stage`) to `refs/wt-backup/<branch>`. Changes left out of the squash stay in the working tree and aren't backed up.
+
+The output prints a command to recover the saved changes in a new worktree, including after `h0x-wt merge` removes the original.
+
+## Options
+
+### Staging
+
+Controls what to stage before squashing:
+
+| Value | Behavior |
+|-------|----------|
+| `all` | Stage all changes including untracked files (default) |
+| `tracked` | Stage only modified tracked files |
+| `none` | Don't stage anything; squash commits plus what's already staged |
+
+```console
+$ h0x-wt step squash --stage=none
+```
+
+Configure the default in user config:
+
+```toml
+# ~/.config/h0x-wt/config.toml
+[commit]
+stage = "tracked"
+```
+
+### Dry run
+
+Render the prompt, print the LLM command, generate the squash message, and exit without staging, running hooks, or squashing:
+
+```console
+$ h0x-wt step squash --dry-run
+```
+
+Three sections are printed: the rendered prompt, the shell command that would invoke the LLM, and the message returned. The LLM call still happens — only the squash is skipped.
+"#
+    )]
+    Squash(SquashArgs),
+
+    /// Rebase onto target
+    #[command(
+        after_long_help = r#"A rebase puts the branch's commits on top of the target, which is what [`h0x-wt step push`](#wt-step-push) needs — a push fast-forwards only if the target is an ancestor of the branch. `h0x-wt merge` runs this step as part of its pipeline; on its own it brings a branch up to date with a target that has moved, without merging into it.
+
+The target is any commit: a branch, a tag, a SHA.
+
+## Examples
+
+```console
+$ h0x-wt step rebase            # Rebase onto default branch
+$ h0x-wt step rebase develop    # Rebase onto develop
+$ h0x-wt step rebase v1.2.0     # Rebase onto a tag
+```
+
+## Outcomes
+
+The first matching row wins:
+
+| Branch and target | Result |
+|-------------------|--------|
+| The target is already an ancestor of the branch, with no merge commit in between | Nothing runs — `Already up to date` |
+| The branch is an ancestor of the target, so it has no commits of its own | `Fast-forwarded to <target>` |
+| Otherwise | The branch's commits replay onto the target's tip — refused outright if the two share no history |
+
+## Conflicts
+
+A conflicting commit leaves the rebase open rather than undoing it. The worktree keeps git's conflict markers, and the ways out are `git rebase --continue` once the conflict is resolved, `git rebase --skip`, or `git rebase --abort`. Until the rebase is settled, `h0x-wt step rebase`, `h0x-wt step squash`, `h0x-wt step push`, and `h0x-wt merge` refuse to run.
+"#
+    )]
+    Rebase {
+        /// Target branch, tag, or commit
+        ///
+        /// Defaults to default branch.
+        #[arg(add = crate::completion::branch_value_completer(), value_parser = crate::cli::non_empty_branch)]
+        target: Option<String>,
+
+        /// Output format
+        ///
+        /// JSON prints structured result to stdout after the rebase completes.
+        #[arg(long, default_value = "text", help_heading = "Automation")]
+        format: crate::cli::SwitchFormat,
+    },
+
+    /// Fast-forward target to current branch
+    #[command(
+        after_long_help = r#"Despite the name, no commits leave the repository. The target branch's ref moves forward locally, and a worktree holding that branch is updated along with it. Publishing is a separate `git push` to the remote afterward.
+
+The target is a branch, and must already be an ancestor of the current branch. One that has moved ahead is refused, and there is no force variant — [`h0x-wt step rebase`](#wt-step-rebase) puts the branch back on top of it first.
+
+## Examples
+
+```console
+$ h0x-wt step push             # Fast-forward main to current branch
+$ h0x-wt step push develop     # Fast-forward develop instead
+$ h0x-wt step push --no-ff     # Merge commit instead of a fast-forward
+```
+
+## Target worktree
+
+When the target branch has a worktree of its own, that worktree's files move to the new commits too. Uncommitted changes there never move: the update carries any file the push doesn't touch — staged or not — exactly where it is, and a change touching a file the push does change is refused upfront, naming the file. If the update can't be applied, it is rolled back, leaving branch and worktree as they were.
+"#
+    )]
+    Push {
+        /// Target branch
+        ///
+        /// Defaults to default branch.
+        #[arg(add = crate::completion::branch_value_completer(), value_parser = crate::cli::non_empty_branch)]
+        target: Option<String>,
+
+        /// Create a merge commit (no fast-forward)
+        #[arg(long = "no-ff", overrides_with = "ff")]
+        no_ff: bool,
+
+        /// Allow fast-forward (default)
+        #[arg(long, overrides_with = "no_ff", hide = true)]
+        ff: bool,
+
+        /// Output format
+        ///
+        /// JSON prints structured result to stdout after the push completes.
+        #[arg(long, default_value = "text", help_heading = "Automation")]
+        format: crate::cli::SwitchFormat,
+    },
+
+    /// Show all changes since branching
+    ///
+    /// Includes committed, staged, unstaged, and untracked files.
+    #[command(
+        after_long_help = r#"This is what `h0x-wt merge` would include — a single diff against the merge base.
+
+## Operating on another worktree
+
+`--branch` diffs another worktree's branch without leaving the current one:
+
+```console
+$ h0x-wt step diff --branch feature
+```
+
+The branch must have a checked-out worktree.
+
+## Extra git diff arguments
+
+Arguments after `--` are forwarded to `git diff`:
+
+```console
+$ h0x-wt step diff -- --stat
+$ h0x-wt step diff -- --name-only
+$ h0x-wt step diff -- -- '*.rs'
+```
+
+The diff is pipeable to tools like `delta`:
+
+```console
+$ h0x-wt step diff | delta
+```
+"#
+    )]
+    Diff {
+        /// Target branch
+        ///
+        /// Defaults to default branch.
+        #[arg(add = crate::completion::branch_value_completer(), value_parser = crate::cli::non_empty_branch)]
+        target: Option<String>,
+
+        /// Branch to operate on (defaults to current worktree)
+        #[arg(short, long, add = crate::completion::worktree_only_completer(), value_parser = crate::cli::non_empty_branch)]
+        branch: Option<String>,
+
+        /// Extra arguments forwarded to `git diff`
+        #[arg(last = true)]
+        extra_args: Vec<String>,
+    },
+
+    /// Copy gitignored files to another worktree
+    ///
+    /// Eliminates cold starts by copying build caches and dependencies.
+    #[command(after_long_help = r#"## Setup
+
+Add to the project config:
+
+```toml
+# .config/h0x-wt.toml
+[post-start]
+copy = "wt step copy-ignored"
+```
+
+## Choosing source and destination
+
+By default the copy runs from the primary worktree into the current one — what a `post-start` hook needs, since the new worktree is where the hook runs. `--from` and `--to` name either end by branch, so a copy can run between two worktrees from anywhere:
+
+```console
+$ h0x-wt step copy-ignored --from main --to feature   # between two named worktrees
+$ h0x-wt step copy-ignored --from feature             # from feature into the current worktree
+```
+
+A branch named by `--from` or `--to` must have a worktree.
+
+## What gets copied
+
+All gitignored files are copied by default, except for built-in excluded directories: VCS metadata (`.bzr/`, `.hg/`, `.jj/`, `.pijul/`, `.sl/`, `.svn/`), tool-state (`.conductor/`, `.entire/`, `.worktrees/`), and nested worktrees. Tracked files are never touched. Discovery handles nested `.gitignore` files, global excludes, and `.git/info/exclude`. Existing files in the destination are skipped, so re-running is safe; `--force` overwrites them.
+
+To limit what gets copied further, create `.worktreeinclude` with gitignore-style patterns. Files must be **both** gitignored **and** in `.worktreeinclude`:
+
+```text
+# .worktreeinclude
+.env
+node_modules/
+target/
+```
+
+After `.worktreeinclude` selects entries, you can add more gitignore-style excludes in user config, per-project user overrides, or project config:
+
+```toml
+# ~/.config/h0x-wt/config.toml
+[step.copy-ignored]
+exclude = [".cache/", ".turbo/"]
+```
+
+To copy nothing unless `.worktreeinclude` exists — matching Claude Code desktop, where the file is required — pass `--require-include`:
+
+```console
+$ h0x-wt step copy-ignored --require-include
+```
+
+Without `.worktreeinclude`, the command is a no-op (it reports that nothing was copied and why). With the file present, only matching files copy as above. To apply this across every repository, put the flag in a user-config hook: `post-start = "wt step copy-ignored --require-include"`.
+
+## Common patterns
+
+| Type | Patterns |
+|------|----------|
+| Dependencies | `node_modules/`, `.venv/`, `target/`, `vendor/`, `Pods/` |
+| Build caches | `.cache/`, `.next/`, `.parcel-cache/`, `.turbo/` |
+| Generated assets | Images, ML models, binaries too large for git |
+| Environment files | `.env` (if not generated per-worktree) |
+
+## Copy-on-write
+
+Files are reflinked where the filesystem supports it: APFS (macOS), btrfs and XFS (Linux), ReFS (Windows). A reflinked copy shares the source's disk blocks until one side writes. For a 14GB `target/` directory:
+
+| Command | Time | Disk |
+|---------|------|------|
+| `cp -R` (full copy) | 2m | 14GB |
+| `cp -Rc` / `h0x-wt step copy-ignored` | 20s | ~0 |
+
+On ext4 and NTFS, which have no reflink, every file is copied in full; the summary says `(reflinked, no extra disk)` or `(full copy)`.
+
+Reflinks are per file (like `cp -Rc`), so copy time scales with file count.
+
+Use the `post-start` hook so the copy runs in the background. Use `pre-start` instead if subsequent hooks or `--execute` command need the copied files immediately.
+
+## Language-specific notes
+
+### Rust
+
+The `target/` directory is huge (often 1-10GB). Copying with reflink cuts first build from ~68s to ~3s by reusing compiled dependencies.
+
+### Node.js
+
+`node_modules/` is large but mostly static. If the project has no native dependencies, symlinks are even faster:
+
+```toml
+# .config/h0x-wt.toml
+[pre-start]
+deps = "ln -sf {{ primary_worktree_path }}/node_modules ."
+```
+
+### Python
+
+Virtual environments contain absolute paths and can't be copied. Use `uv sync` instead — it's fast enough that copying isn't worth it.
+
+## Behavior vs Claude Code on desktop
+
+The `.worktreeinclude` pattern is shared with [Claude Code on desktop](https://code.claude.com/docs/en/desktop), which copies matching files when creating worktrees. Differences:
+
+- worktrunk copies all gitignored files by default; Claude Code requires `.worktreeinclude`. Pass `--require-include` to match Claude Code (copy nothing without `.worktreeinclude`)
+- worktrunk runs as a configurable hook in the worktree lifecycle
+"#)]
+    CopyIgnored {
+        /// Source worktree branch
+        ///
+        /// Defaults to primary worktree.
+        #[arg(long, add = crate::completion::worktree_only_completer(), value_parser = crate::cli::non_empty_branch)]
+        from: Option<String>,
+
+        /// Destination worktree branch
+        ///
+        /// Defaults to current worktree.
+        #[arg(long, add = crate::completion::worktree_only_completer(), value_parser = crate::cli::non_empty_branch)]
+        to: Option<String>,
+
+        /// Show what would be copied
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Overwrite existing files in destination
+        #[arg(long)]
+        force: bool,
+
+        /// Require .worktreeinclude to copy anything
+        #[arg(long)]
+        require_include: bool,
+
+        /// Output format
+        ///
+        /// JSON prints structured result to stdout after the copy completes.
+        #[arg(long, default_value = "text", help_heading = "Automation")]
+        format: crate::cli::SwitchFormat,
+    },
+
+    /// Evaluate a template expression
+    ///
+    /// Prints the result to stdout for use in scripts and shell substitutions.
+    #[command(
+        after_long_help = r#"All [hook template variables and filters](/hook/#template-variables) are available.
+
+## Examples
+
+Get the port for the current branch:
+
+```console
+$ h0x-wt step eval '{{ branch | hash_port }}'
+16066
+```
+
+Use in shell substitution:
+
+```console
+$ curl http://localhost:$(wt step eval '{{ branch | hash_port }}')/health
+```
+
+Combine multiple values:
+
+```console
+$ h0x-wt step eval '{{ branch | hash_port }},{{ ("supabase-api-" ~ branch) | hash_port }}'
+16066,16739
+```
+
+Use conditionals and filters:
+
+```console
+$ h0x-wt step eval '{{ branch | sanitize_db }}'
+feature_auth_oauth2_a1b
+```
+
+List the available template variables with `-v` (alongside the expansion, on stderr). The real block prints every variable in scope; this one is abridged:
+
+```console
+$ h0x-wt step eval -v '{{ branch }}'
+○ eval template variables:
+  branch                = feature/auth
+  worktree_path         = /home/user/code/myproject.feature-auth
+  …
+  cwd                   = /home/user/code/myproject.feature-auth
+○ eval source
+  {{ branch }}
+○ eval result
+  feature/auth
+
+feature/auth
+```
+"#
+    )]
+    Eval {
+        /// Template expression to evaluate
+        template: String,
+
+        /// Output format
+        ///
+        /// JSON prints `{name, template, result}` to stdout instead of the bare result.
+        #[arg(long, default_value = "text", help_heading = "Automation")]
+        format: crate::cli::SwitchFormat,
+    },
+
+    /// Run command in each worktree
+    ///
+    /// Executes sequentially with real-time output; continues past command failures.
+    #[command(
+        after_long_help = r#"A summary of successes and failures is shown at the end. Context JSON — a flat object of every template variable — is provided on stdin for scripts that need structured data.
+
+## Arguments
+
+Arguments after `--` are the program and its arguments — run directly, no shell.
+
+```console
+$ h0x-wt step for-each -- git status --short
+$ h0x-wt step for-each -- npm install
+```
+
+For pipes, redirects, variables, or globs, wrap in `sh -c`:
+
+```console
+$ h0x-wt step for-each -- sh -c 'git status | wc -l'
+$ h0x-wt step for-each -- sh -c 'echo $HOME && git pull'
+```
+
+## Template variables
+
+Variables substitute into each argv element before exec. See [`h0x-wt hook` template variables](/hook/#template-variables) for the complete list and filters.
+
+```console
+$ h0x-wt step for-each -- echo 'Branch: {{ branch }}'
+```
+
+Each element is expanded fresh in every worktree, so `{{ branch }}` is that worktree's branch. An alias wrapping for-each renders templates earlier, in the invoking worktree; [nesting templates](/extending/#nesting-templates) shows how to keep a variable per-worktree.
+
+## Examples
+
+Pull updates in worktrees with upstreams (skips others):
+
+```console
+$ git fetch --prune && wt step for-each -- sh -c '[ "$(git rev-parse @{u} 2>/dev/null)" ] || exit 0; git pull --autostash'
+```
+"#
+    )]
+    ForEach {
+        /// Output format
+        #[arg(long, default_value = "text")]
+        format: crate::cli::SwitchFormat,
+
+        /// Command template (see --help for all variables)
+        #[arg(required = true, last = true, num_args = 1..)]
+        args: Vec<String>,
+    },
+
+    /// \[experimental\] Swap a branch into the main worktree
+    ///
+    /// Exchanges branches and gitignored files between two worktrees.
+    #[command(
+        after_long_help = r#"**Experimental.** Use promote for temporary testing when the main worktree has special significance (Docker Compose, IDE configs, heavy build artifacts anchored to project root), and hooks & tools aren't yet set up to run on arbitrary worktrees. The idiomatic Worktrunk workflow does not use `promote`; instead each worktree has a full environment. `promote` is the only Worktrunk command which changes a branch in an existing worktree.
+
+## Example
+
+```console
+# from ~/project (main worktree)
+$ h0x-wt step promote feature
+```
+
+Before:
+
+```
+  Branch   Path
+@ main     ~/project
++ feature  ~/project.feature
+```
+
+After:
+
+```
+  Branch   Path
+@ feature  ~/project
++ main     ~/project.feature
+```
+
+To restore: `h0x-wt step promote main` from anywhere, or just `h0x-wt step promote` from the main worktree.
+
+Without an argument, promotes the current branch — or restores the default branch if run from the main worktree.
+
+## Requirements
+
+- Both worktrees must be clean
+- The branch must have an existing worktree
+
+## Gitignored files
+
+Gitignored files (build artifacts, `node_modules/`, `.env`) are swapped along with the branches so each worktree keeps the artifacts that belong to its branch. Files are discovered using the same mechanism as [`copy-ignored`](#wt-step-copy-ignored) and can be filtered with `.worktreeinclude`.
+"#
+    )]
+    Promote {
+        /// Branch to promote to main worktree
+        ///
+        /// Defaults to current branch, or default branch from main worktree.
+        #[arg(add = crate::completion::worktree_only_completer(), value_parser = crate::cli::non_empty_branch)]
+        branch: Option<String>,
+
+        /// Output format
+        ///
+        /// JSON prints structured result to stdout after the promote completes.
+        /// The mismatch warning still appears on stderr in JSON mode (safety signal).
+        #[arg(long, default_value = "text", help_heading = "Automation")]
+        format: crate::cli::SwitchFormat,
+    },
+
+    /// Remove worktrees and branches merged into the default branch
+    #[command(
+        after_long_help = r#"Bulk-removes worktrees and branches that are integrated into the default branch, using the same criteria as `h0x-wt remove`'s branch cleanup. Stale worktree entries are cleaned up too, except one whose git metadata holds staged changes or an operation in progress; `git worktree repair` can still restore those.
+
+In `h0x-wt list`, candidates show `_` (same commit) or `⊂` (content integrated). Run `--dry-run` to preview. See `h0x-wt remove --help` for the full integration criteria.
+
+Locked worktrees, worktrees with uncommitted changes, and the main worktree are always skipped. The current worktree is removed last, triggering cd to the primary worktree. Pre-remove and post-remove hooks run for each removal; a candidate whose hooks include an unapproved project command is skipped with `(approval required)` (pre-approve with `h0x-wt config approvals add`, or pass `--yes`).
+
+Prune removes worktrees concurrently, so hooks that write shared resources must coordinate those writes.
+
+## Min-age guard
+
+Candidates younger than `--min-age` (default: 1 day) are skipped, so a worktree just created from the default branch isn't removed for looking "merged" (its branch points at the same commit). A worktree's age is its creation time; a branch with no worktree takes its age from its reflog. A branch with no reflog, which is common in bare repositories, can look new again after Git maintenance or a branch deletion, and is then skipped until `--min-age` passes.
+
+```console
+$ h0x-wt step prune --min-age=0s     # no age guard
+$ h0x-wt step prune --min-age=2d     # skip candidates younger than 2 days
+```
+
+## JSON output
+
+`--format=json` prints one object per candidate to stdout. A live run reports `branch_outcome`, as [`h0x-wt remove`](/remove/#json-output) does. `--dry-run` reports `branch_deleted` (whether the removal would delete the branch), `reason` (why the candidate qualifies), and `target` (what it was measured against).
+
+## Examples
+
+Preview what would be removed:
+
+```console
+$ h0x-wt step prune --dry-run
+```
+
+Remove all merged worktrees:
+
+```console
+$ h0x-wt step prune
+```
+"#
+    )]
+    Prune {
+        /// Show what would be removed
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip worktrees and branches younger than this
+        #[arg(long, default_value = "1d")]
+        min_age: String,
+
+        /// Run removal in foreground (block until complete)
+        #[arg(long)]
+        foreground: bool,
+
+        /// Output format
+        #[arg(long, default_value = "text")]
+        format: crate::cli::SwitchFormat,
+    },
+
+    /// \[experimental\] Move worktrees to expected paths
+    ///
+    /// Relocates worktrees whose path doesn't match the `worktree-path` template.
+    #[command(after_long_help = r#"## Examples
+
+Preview what would be moved:
+
+```console
+$ h0x-wt step relocate --dry-run
+```
+
+Move all mismatched worktrees:
+
+```console
+$ h0x-wt step relocate
+```
+
+Auto-commit and clobber blockers (never fails):
+
+```console
+$ h0x-wt step relocate --commit --clobber
+```
+
+Move specific worktrees:
+
+```console
+$ h0x-wt step relocate feature bugfix
+```
+
+## Swap handling
+
+When worktrees are at each other's expected locations (e.g., `alpha` at
+`repo.beta` and `beta` at `repo.alpha`), relocate automatically resolves
+this by using a temporary location.
+
+## Clobbering
+
+With `--clobber`, non-worktree paths at target locations are moved to
+`<path>.bak.<timestamp>` before relocating, never overwriting an existing
+backup.
+
+## Main worktree behavior
+
+The main worktree can't be moved with `git worktree move`. Instead, relocate
+switches it to the default branch and creates a new linked worktree at the
+expected path. Untracked and gitignored files remain at the original location.
+
+## Dirty worktrees
+
+Linked worktrees relocate as-is — `git worktree move` carries uncommitted
+changes along. Only the main worktree skips when dirty (its `git switch`
+refuses), unless `--commit` is passed.
+
+## Skipped worktrees
+
+- **Dirty main worktree** (without `--commit`) — use `--commit` to auto-commit first
+- **Locked** — unlock with `git worktree unlock`
+- **Target blocked** (without `--clobber`) — use `--clobber` to backup blocker
+- **Detached HEAD** — no branch to compute expected path
+"#)]
+    Relocate {
+        /// Worktrees to relocate (defaults to all mismatched)
+        #[arg(add = crate::completion::worktree_only_completer(), value_parser = crate::cli::non_empty_branch)]
+        branches: Vec<String>,
+
+        /// Show what would be moved
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Commit uncommitted changes before relocating
+        #[arg(long)]
+        commit: bool,
+
+        /// Backup non-worktree paths at target locations
+        ///
+        /// Moves blocking paths to `<path>.bak.<timestamp>`.
+        #[arg(long)]
+        clobber: bool,
+
+        /// Output format
+        ///
+        /// JSON prints structured result to stdout after the relocate completes.
+        #[arg(long, default_value = "text", help_heading = "Automation")]
+        format: crate::cli::SwitchFormat,
+    },
+
+    /// \[experimental\] Run a command; kill its whole process tree when its worktree is removed
+    ///
+    /// Teardown is automatic and needs no `pre-remove` hook; the group gets `SIGTERM` then `SIGKILL`.
+    #[command(after_long_help = r#"## Why
+
+A `post-start` hook to start a long-lived process and a `pre-remove` hook to
+stop it is usually enough. But `pre-remove` only runs when worktrunk removes
+the worktree, so a `git worktree remove`, an `rm -rf`, or a crashed hook skips
+it. Across enough worktree churn some process is bound to outlive its worktree,
+and with no cleanup these leaks accumulate (on macOS they eventually saturate
+`fseventsd`). `tether` removes the need for a `pre-remove`: it ties the
+command's lifetime to the worktree and kills the whole process group once the
+worktree is gone.
+
+## Arguments
+
+Arguments after `--` are the program and its arguments, run directly, no shell.
+
+```console
+$ h0x-wt step tether -- npm run dev
+```
+
+For pipes, redirects, variables, or globs, wrap in `sh -c`:
+
+```console
+$ h0x-wt step tether -- sh -c 'PORT=$P npm run dev | tee dev.log'
+```
+
+To run the command from a subdirectory, pass the global `-C` flag:
+
+```console
+$ h0x-wt step tether -C frontend -- npm run dev
+```
+
+## Examples
+
+Run a dev server, torn down automatically when the worktree goes away:
+
+```toml
+# .config/h0x-wt.toml
+[post-start]
+server = "wt step tether -- npm run dev -- --port {{ branch | hash_port }}"
+```
+"#)]
+    Tether {
+        /// Command to run (after `--`, run directly, no shell)
+        #[arg(required = true, last = true, num_args = 1..)]
+        command: Vec<String>,
+    },
+
+    /// Catch-all for alias lookup
+    #[command(external_subcommand)]
+    External(Vec<String>),
+}

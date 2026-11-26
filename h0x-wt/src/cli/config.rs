@@ -1,0 +1,1790 @@
+use std::path::PathBuf;
+
+use clap::{Args, Subcommand};
+
+use super::SwitchFormat;
+use crate::commands::Shell;
+
+/// Shared global `--format` flag for the `h0x-wt config state` subcommands whose
+/// action subcommands inherit it (`cache`, `logs`, `hints`, `ci-status`,
+/// `marker`).
+#[derive(Args)]
+pub struct GlobalFormatFlag {
+    /// Output format (text, json) [default: text]
+    #[arg(
+        long,
+        default_value = "text",
+        global = true,
+        hide_possible_values = true,
+        hide_default_value = true,
+        help_heading = "Output"
+    )]
+    pub format: SwitchFormat,
+}
+
+// Ordering: primitive (init prints the code) → convenience (install writes
+// it) → inverse (uninstall removes it), then unrelated utilities. Hidden
+// commands last.
+#[derive(Subcommand)]
+pub enum ConfigShellCommand {
+    /// Generate shell integration code
+    #[command(
+        after_long_help = r#"Outputs shell code for `eval` or sourcing. Most users should run `h0x-wt config shell install` instead, which adds this automatically.
+
+## Manual setup
+
+For bash, fish, zsh, and PowerShell, add the matching line to the shell config. For Nushell, run the command to save the wrapper in its autoload directory.
+
+Bash (~/.bashrc):
+```console
+$ eval "$(wt config shell init bash)"
+```
+
+Fish (~/.config/fish/config.fish):
+```fish
+h0x-wt config shell init fish | source
+```
+
+Zsh (~/.zshrc):
+```zsh
+eval "$(wt config shell init zsh)"
+```
+
+Nushell 0.113+ [experimental] — save to vendor autoload directory:
+```console
+$ h0x-wt config shell init nu | save -f ($nu.vendor-autoload-dirs | last | path join wt.nu)
+```
+
+PowerShell ($PROFILE):
+```powershell
+Invoke-Expression (& wt config shell init powershell | Out-String)
+```"#
+    )]
+    Init {
+        /// Shell to generate code for
+        #[arg(value_enum)]
+        shell: Shell,
+
+        /// Command name for shell integration (defaults to binary name)
+        ///
+        /// Use this to create shell integration for an alternate command name.
+        /// For example, `--cmd=git-wt` creates a `git-wt` shell function
+        /// instead of `h0x-wt`, useful on Windows where `h0x-wt` conflicts with Windows Terminal.
+        #[arg(long)]
+        cmd: Option<String>,
+    },
+
+    /// Write shell integration to config files
+    #[command(
+        after_long_help = r#"Appends an initialization line to bash, zsh, and PowerShell config files. For fish and Nushell, it replaces the autoloaded wrapper file; fish also gets a separate completion file. See [worktrunk.dev/shell-integration](/shell-integration/#files-created) for their locations.
+
+## Examples
+
+Install for all detected shells:
+```console
+$ h0x-wt config shell install
+```
+
+Install for specific shell only:
+```console
+$ h0x-wt config shell install zsh
+```
+
+Shows proposed changes and waits for confirmation before modifying any files.
+Use --yes to skip confirmation."#
+    )]
+    Install {
+        /// Shell to install (default: all)
+        #[arg(value_enum)]
+        shell: Option<Shell>,
+
+        /// Show what would be changed
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Command name for shell integration (defaults to binary name)
+        ///
+        /// Use this to create shell integration for an alternate command name.
+        /// For example, `--cmd=git-wt` creates a `git-wt` shell function
+        /// instead of `h0x-wt`, useful on Windows where `h0x-wt` conflicts with Windows Terminal.
+        #[arg(long)]
+        cmd: Option<String>,
+    },
+
+    /// Remove shell integration from config files
+    #[command(
+        after_long_help = r#"Removes Worktrunk initialization lines from bash, zsh, and PowerShell config files, and Worktrunk wrapper and completion files for fish and Nushell.
+
+## Examples
+
+Uninstall from all shells:
+```console
+$ h0x-wt config shell uninstall
+```
+
+Uninstall from specific shell only:
+```console
+$ h0x-wt config shell uninstall zsh
+```
+
+Skip confirmation prompt:
+```console
+$ h0x-wt config shell uninstall --yes
+```
+
+## Version tolerance
+
+Uninstall removes every worktrunk-managed integration it finds, regardless of:
+- Binary name it was installed under (`h0x-wt`, `git-wt`, …)
+- Minor syntax variations between versions"#
+    )]
+    Uninstall {
+        /// Shell to uninstall (default: all)
+        #[arg(value_enum)]
+        shell: Option<Shell>,
+
+        /// Show what would be changed
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Show output theme samples
+    #[command(
+        after_long_help = r#"Displays samples of all output message types to preview how worktrunk output will appear in the terminal.
+
+## Message types
+
+- Progress, success, error, warning, hint, info
+- Gutter formatting for quoted content
+- Prompts for user input
+- Color palette showing each color rendered in itself"#
+    )]
+    ShowTheme,
+
+    /// Generate shell completions for package managers
+    ///
+    /// Outputs a completion registration that calls the binary at TAB time, so branch and
+    /// worktree names complete from a plain package install. For interactive setup, run
+    /// `h0x-wt config shell install` instead. It also enables directory changing on switch.
+    #[command(hide = true)]
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+}
+
+// Ordering: action + inverse adjacent (install, uninstall).
+#[derive(Subcommand)]
+pub enum ConfigPluginsOpencodeCommand {
+    /// Install the activity tracking plugin
+    #[command(
+        after_long_help = r#"Writes the worktrunk plugin to the OpenCode plugins directory.
+
+## Examples
+
+```console
+$ h0x-wt config plugins opencode install
+$ h0x-wt config plugins opencode install --yes
+```
+
+## Plugin location
+
+The plugin is written to `~/.config/opencode/plugins/h0x-wt.ts`,
+following OpenCode's global-config precedence:
+`$OPENCODE_CONFIG_DIR` > `$XDG_CONFIG_HOME/opencode` > `~/.config/opencode`.
+An empty `$OPENCODE_CONFIG_DIR` and an empty or relative `$XDG_CONFIG_HOME`
+are ignored."#
+    )]
+    Install,
+
+    /// Remove the activity tracking plugin
+    #[command(
+        after_long_help = r#"Removes the worktrunk plugin from the OpenCode plugins directory.
+
+## Examples
+
+```console
+$ h0x-wt config plugins opencode uninstall
+```"#
+    )]
+    Uninstall,
+}
+
+// Ordering: action + inverse adjacent (install, uninstall).
+#[derive(Subcommand)]
+pub enum ConfigPluginsPiCommand {
+    /// Install the activity tracking extension
+    #[command(
+        after_long_help = r#"Writes the Worktrunk extension to Pi's user extension directory.
+
+Where oh-my-pi is on `PATH` and Pi is not — the state a user of the pre-split
+`pi install` is in — the output names `h0x-wt config plugins omp install` before
+writing anything.
+
+## Examples
+
+```console
+$ h0x-wt config plugins pi install
+$ h0x-wt config plugins pi install --yes
+```
+
+## Extension location
+
+The default location is `~/.pi/agent/extensions/h0x-wt.ts`.
+`$PI_CODING_AGENT_DIR` replaces the agent directory (`~/.pi/agent`).
+
+This targets Pi (<https://github.com/earendil-works/pi>), which loads
+extensions from `extensions/`. oh-my-pi (`omp`) is a separate agent with a
+different hook API — use `h0x-wt config plugins omp install` for that."#
+    )]
+    Install,
+
+    /// Remove the activity tracking extension
+    #[command(
+        after_long_help = r#"Removes the Worktrunk extension from Pi's user extension directory.
+
+Where nothing is installed there while an oh-my-pi hook remains — the state an
+install from before `pi` and `omp` became separate commands leaves behind — the
+output names `h0x-wt config plugins omp uninstall` rather than reporting a removal.
+
+## Examples
+
+```console
+$ h0x-wt config plugins pi uninstall
+```"#
+    )]
+    Uninstall,
+}
+
+// Ordering: action + inverse adjacent (install, uninstall).
+#[derive(Subcommand)]
+pub enum ConfigPluginsOmpCommand {
+    /// Install the activity tracking hook
+    #[command(
+        after_long_help = r#"Writes the Worktrunk hook to oh-my-pi's profile-aware user hook directory.
+
+## Examples
+
+```console
+$ h0x-wt config plugins omp install
+$ h0x-wt config plugins omp install --yes
+```
+
+## Hook location
+
+The default location is `~/.omp/agent/hooks/pre/h0x-wt.ts`. The installer
+honors `$PI_CONFIG_DIR` and active `$OMP_PROFILE` / `$PI_PROFILE` profiles.
+`$PI_CODING_AGENT_DIR` overrides the agent directory for the default profile
+only — named profiles ignore it, matching oh-my-pi's own resolution."#
+    )]
+    Install,
+
+    /// Remove the activity tracking hook
+    #[command(
+        after_long_help = r#"Removes the Worktrunk hook from oh-my-pi's active user hook directory.
+
+## Examples
+
+```console
+$ h0x-wt config plugins omp uninstall
+```"#
+    )]
+    Uninstall,
+}
+
+// Ordering: action + inverse adjacent (install, uninstall).
+#[derive(Subcommand)]
+pub enum ConfigPluginsCodexCommand {
+    /// Install the Worktrunk plugin
+    #[command(
+        after_long_help = r#"Adds the Worktrunk plugin from the marketplace and installs it. Equivalent to:
+
+```console
+$ codex plugin marketplace add vjk7989/h0x-ADE-core
+$ codex plugin add worktrunk@worktrunk
+```
+
+Requires `codex` CLI."#
+    )]
+    Install,
+
+    /// Remove the Worktrunk plugin
+    #[command(
+        after_long_help = r#"Uninstalls the Worktrunk plugin from Codex and removes its marketplace. Equivalent to:
+
+```console
+$ codex plugin remove worktrunk@worktrunk
+$ codex plugin marketplace remove worktrunk
+```
+
+Requires `codex` CLI."#
+    )]
+    Uninstall,
+}
+
+// Ordering: read first (list), then action + inverse adjacent (add, clear).
+#[derive(Subcommand)]
+pub enum ApprovalsCommand {
+    /// List project commands and their approval status
+    #[command(
+        after_long_help = r#"Shows every command the project config declares — hooks, aliases, and commit-message guidance — grouped into APPROVED and UNAPPROVED sections. Approvals recorded for commands no longer in the project config (edited or removed since approval) are listed separately.
+
+Reading is all it does: no prompt, no write. `--format=json` emits the same four distinctions as a structured payload — see [Reading approval state](/config/#wt-config-approvals--reading-approval-state).
+
+## Examples
+
+```console
+$ h0x-wt config approvals list
+```
+
+Check whether an unattended run would stop for approval:
+```console
+$ h0x-wt config approvals list --format=json | jq -r .state
+```"#
+    )]
+    List {
+        /// Output format
+        #[arg(long, default_value = "text", help_heading = "Output")]
+        format: SwitchFormat,
+    },
+
+    /// Store approvals in approvals.toml
+    #[command(
+        after_long_help = r#"Prompts for approval of all project commands and saves them to approvals.toml.
+
+By default, shows only unapproved commands. Use `--all` to review all commands
+including previously approved ones.
+
+`--yes` writes the approvals without prompting, which is how a container or CI job pre-approves a project it has just cloned. It trusts every command the project config declares, including one whose template changed since an earlier approval. A caller that wants to look before granting them can list those first — see [Reading approval state](/config/#wt-config-approvals--reading-approval-state).
+
+## Examples
+
+```console
+$ h0x-wt config approvals add --yes
+```"#
+    )]
+    Add {
+        /// Show all commands
+        #[arg(long)]
+        all: bool,
+    },
+
+    /// Clear approved commands from approvals.toml
+    #[command(
+        after_long_help = r#"Removes saved approvals, requiring re-approval on next command run.
+
+By default, clears approvals for the current project. Use `--global` to clear
+all approvals across all projects, or `--stale` to clear only approvals for
+commands no longer in the project config (edited or removed since approval)."#
+    )]
+    Clear {
+        /// Clear global approvals
+        #[arg(short, long)]
+        global: bool,
+
+        /// Clear only stale approvals
+        #[arg(long, conflicts_with = "global")]
+        stale: bool,
+    },
+}
+
+// Ordering: alphabetical. Equal-weight sibling plugins with no natural
+// precedence.
+#[derive(Subcommand)]
+pub enum ConfigPluginsCommand {
+    /// Claude Code plugin
+    #[command(after_long_help = r#"## Examples
+
+Install the plugin:
+```console
+$ h0x-wt config plugins claude install
+```
+
+Remove the plugin:
+```console
+$ h0x-wt config plugins claude uninstall
+```
+
+Configure the statusline:
+```console
+$ h0x-wt config plugins claude install-statusline
+```"#)]
+    Claude {
+        #[command(subcommand)]
+        action: ConfigPluginsClaudeCommand,
+    },
+
+    /// Codex plugin
+    #[command(
+        after_long_help = r#"Bundles a configuration skill — documentation Codex can read to help set up LLM commits, project hooks, and worktree paths — plus activity-marker hooks that show 🤖/💬 in `h0x-wt list` while a Codex session runs and clear the marker when it ends.
+
+## Examples
+
+```console
+$ h0x-wt config plugins codex install
+$ h0x-wt config plugins codex uninstall
+```"#
+    )]
+    Codex {
+        #[command(subcommand)]
+        action: ConfigPluginsCodexCommand,
+    },
+
+    /// oh-my-pi activity hook
+    #[command(
+        after_long_help = r#"Activity tracking hook — shows status markers in `h0x-wt list`:
+- 🤖 — agent is working
+- 💬 — agent is waiting for input
+
+oh-my-pi's `session_shutdown` event clears the marker when the session exits.
+
+## Examples
+
+```console
+$ h0x-wt config plugins omp install
+$ h0x-wt config plugins omp uninstall
+```
+
+## Hook location
+
+Written to `~/.omp/agent/hooks/pre/h0x-wt.ts`. Honors `$PI_CONFIG_DIR`,
+the active `$OMP_PROFILE` / `$PI_PROFILE` profile, and `$PI_CODING_AGENT_DIR`
+for the default profile."#
+    )]
+    Omp {
+        #[command(subcommand)]
+        action: ConfigPluginsOmpCommand,
+    },
+
+    /// OpenCode plugin
+    #[command(
+        after_long_help = r#"Activity tracking plugin — shows status markers in `h0x-wt list`:
+- 🤖 — agent is working
+- 💬 — agent is waiting for input
+
+## Examples
+
+```console
+$ h0x-wt config plugins opencode install
+$ h0x-wt config plugins opencode uninstall
+```
+
+## Plugin location
+
+Written to `~/.config/opencode/plugins/h0x-wt.ts`. Follows OpenCode's
+config precedence: `$OPENCODE_CONFIG_DIR` > `$XDG_CONFIG_HOME/opencode` >
+`~/.config/opencode`. An empty `$OPENCODE_CONFIG_DIR` and an empty or relative
+`$XDG_CONFIG_HOME` are ignored."#
+    )]
+    Opencode {
+        #[command(subcommand)]
+        action: ConfigPluginsOpencodeCommand,
+    },
+
+    /// Pi activity extension
+    #[command(
+        after_long_help = r#"Activity tracking extension — shows status markers in `h0x-wt list`:
+- 🤖 — agent is working
+- 💬 — agent is waiting for input
+
+Pi's `session_shutdown` event clears the marker when the session exits.
+
+## Examples
+
+```console
+$ h0x-wt config plugins pi install
+$ h0x-wt config plugins pi uninstall
+```
+
+## Extension location
+
+Written to `~/.pi/agent/extensions/h0x-wt.ts`. `$PI_CODING_AGENT_DIR`
+replaces the agent directory."#
+    )]
+    Pi {
+        #[command(subcommand)]
+        action: ConfigPluginsPiCommand,
+    },
+}
+
+// Ordering: action + inverse adjacent (install, uninstall), then related
+// extras.
+#[derive(Subcommand)]
+pub enum ConfigPluginsClaudeCommand {
+    /// Install the Worktrunk plugin
+    #[command(
+        after_long_help = r#"Adds the Worktrunk plugin from the marketplace and installs it. Equivalent to:
+
+```console
+$ claude plugin marketplace add vjk7989/h0x-ADE-core
+$ claude plugin install worktrunk@worktrunk
+```
+
+Requires `claude` CLI. Skips gracefully if already installed."#
+    )]
+    Install,
+
+    /// Remove the Worktrunk plugin
+    #[command(
+        after_long_help = r#"Uninstalls the Worktrunk plugin from Claude Code and removes its marketplace. Equivalent to:
+
+```console
+$ claude plugin uninstall worktrunk@worktrunk
+$ claude plugin marketplace remove worktrunk
+```
+
+Requires `claude` CLI. Both removals run every time, tolerating only the "already gone" error Claude Code itself reports. Running it again is safe, and finishes an uninstall that removed the plugin and then failed on the marketplace."#
+    )]
+    Uninstall,
+
+    /// Configure the Claude Code statusline
+    #[command(
+        name = "install-statusline",
+        after_long_help = r#"Writes the statusline configuration to `~/.claude/settings.json` (or `$CLAUDE_CONFIG_DIR/settings.json` when set), setting:
+
+```json
+{"statusLine":{"type":"command","command":"wt list statusline --format=claude-code"}}
+```
+
+Preserves existing settings. Creates the config directory and `settings.json` if needed.
+
+Skips gracefully if the statusline is already configured."#
+    )]
+    InstallStatusline,
+
+    /// Internal: the plugin's hook command, reading Claude Code's hook payload from stdin
+    #[command(hide = true)]
+    Hook,
+
+    /// Internal: the PermissionRequest hook of plugin copies that predate `hook`
+    #[command(hide = true, name = "approve-enter-worktree")]
+    ApproveEnterWorktree,
+}
+
+// Ordering: introspection adjacent to invocation — show prints the template,
+// dry-run previews the expansion for a given invocation.
+#[derive(Subcommand)]
+pub enum ConfigAliasCommand {
+    /// Show an alias's template, or all aliases' templates
+    #[command(
+        after_long_help = r#"With a name, prints each pipeline step's raw template indented with a gutter, tagged by source (user / project). Duplicate names defined in both configs show as two entries in runtime order (user first, then project).
+
+With no name, prints that block for every configured alias in name order — equivalent to running `h0x-wt config alias show <name>` for each. `h0x-wt --help` shows a compact names-only list and points here.
+
+## Examples
+
+Show every alias's template:
+```console
+$ h0x-wt config alias show
+```
+
+Show the template for `deploy`:
+```console
+$ h0x-wt config alias show deploy
+```"#
+    )]
+    Show {
+        /// Alias name (omit to show all)
+        #[arg(add = crate::completion::alias_name_completer())]
+        name: Option<String>,
+    },
+
+    /// Preview an alias invocation with template expansion
+    #[command(
+        after_long_help = r#"Runs the same parser used at invocation time, applies template expansion (including `{{ args }}` and any `--KEY=VALUE` assignments), and prints the resulting command without executing it. Each `{{ vars.<key> }}` renders as itself while everything around it expands — those values resolve from git config at execution time, after earlier steps have had a chance to set them.
+
+Arguments after `--` are forwarded verbatim as if typed after `h0x-wt <name>`.
+
+## Examples
+
+Preview with no arguments:
+```console
+$ h0x-wt config alias dry-run deploy
+```
+
+Preview with positional args:
+```console
+$ h0x-wt config alias dry-run deploy -- staging us-east-1
+```
+
+Preview with a variable assignment:
+```console
+$ h0x-wt config alias dry-run deploy -- --env=staging
+```"#
+    )]
+    DryRun {
+        /// Alias name
+        #[arg(add = crate::completion::alias_name_completer())]
+        name: String,
+
+        /// Arguments forwarded to the alias as if typed after `h0x-wt <name>`
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
+// Ordering: user journey — shell (install integration), create (bootstrap
+// config files), show (inspect), update (migrate deprecations), approvals
+// (security policy for project commands), aliases (inspect/preview user &
+// project aliases), plugins (optional add-ons), state (advanced diagnostics).
+#[derive(Subcommand)]
+pub enum ConfigCommand {
+    /// Shell integration setup
+    #[command(
+        after_long_help = r#"A subprocess cannot change its parent shell's directory. Shell integration defines a function that runs the Worktrunk binary, then changes the shell's directory when the command requests it. It also enables tab completion.
+
+## Setup
+
+```console
+$ h0x-wt config shell install
+```
+
+Start a new shell after installation to load the wrapper. Invoke `h0x-wt` by name. Running a binary path or `git wt` bypasses the wrapper, so the shell's directory stays unchanged.
+
+- `h0x-wt config shell install --help` — installation options
+- `h0x-wt config shell init --help` — manual setup
+- `h0x-wt config shell uninstall` — remove the integration
+
+## Check the current shell
+
+```console
+$ h0x-wt config show
+```
+
+The SHELL INTEGRATION section reports whether the wrapper is active in the current session. Installation and activation are separate: a configured shell can still be running without the wrapper until its config is reloaded.
+
+In bash, zsh, or fish, `type wt` checks that `h0x-wt` resolves to a function. In PowerShell, `Get-Command wt -All` lists the Function and Application definitions.
+
+See [worktrunk.dev/shell-integration](/shell-integration/) for warning messages, installed files, and wrapper behavior.
+<!-- subdoc: init -->
+<!-- subdoc: install -->
+<!-- subdoc: uninstall -->"#
+    )]
+    Shell {
+        #[command(subcommand)]
+        action: ConfigShellCommand,
+    },
+
+    /// Create configuration file
+    #[command(
+        after_long_help = concat!(
+            "## User config\n\n",
+            "Creates `~/.config/h0x-wt/config.toml` with the following content:\n\n```\n",
+            include_str!("../../dev/config.example.toml"),
+            "```\n\n",
+            "## Project config\n\n",
+            "With `--project`, creates `.config/h0x-wt.toml` in the current repository:\n\n```\n",
+            include_str!("../../dev/wt.example.toml"),
+            "```"
+        )
+    )]
+    Create {
+        /// Create project config (`.config/h0x-wt.toml`) instead of user config
+        #[arg(long)]
+        project: bool,
+    },
+
+    /// Show configuration files & locations
+    #[command(
+        after_long_help = r#"Shows config sources and checks for invalid TOML or list columns, misplaced or
+deprecated keys, and commands awaiting approval. It renders every section
+before failing; warnings exit zero.
+
+## Full diagnostics
+
+Use `--full` to run diagnostic checks:
+
+```console
+$ h0x-wt config show --full
+```
+
+This tests:
+- **CI tool status** — Whether the CLI for the repository's forge (`gh`, `glab`, `tea`, or `az`) is installed and authenticated
+- **Commit generation** — Whether the LLM command can generate commit messages
+- **Version check** — Whether a newer version is available on GitHub"#
+    )]
+    Show {
+        /// Run diagnostic checks (CI tools, commit generation, version)
+        #[arg(long)]
+        full: bool,
+
+        /// Output format
+        #[arg(long, default_value = "text", help_heading = "Output")]
+        format: SwitchFormat,
+    },
+
+    /// Update deprecated config settings
+    #[command(
+        after_long_help = r#"Updates deprecated settings in user and project config files
+to their current equivalents, removes deprecated keys that have no equivalent,
+and reports each one. Shows a diff and asks for confirmation.
+
+## Examples
+
+Preview and apply updates:
+```console
+$ h0x-wt config update
+```
+
+Apply without confirmation:
+```console
+$ h0x-wt config update --yes
+```
+
+Write the migrated config to a file instead of updating in place:
+```console
+$ h0x-wt config update --output migrated.toml
+```
+
+Print the migrated config:
+```console
+$ h0x-wt config update --output=-
+```"#
+    )]
+    Update {
+        /// Output migrated config (`-` for stdout)
+        #[arg(long, value_name = "PATH")]
+        output: Option<PathBuf>,
+    },
+
+    /// Manage command approvals
+    #[command(
+        after_long_help = r#"Project hooks and project aliases prompt for approval on first run to prevent untrusted projects from running arbitrary commands. Approvals from both flows are stored together.
+
+## Examples
+
+List commands and their approval status for current project:
+```console
+$ h0x-wt config approvals list
+```
+
+Pre-approve all hook and alias commands for current project:
+```console
+$ h0x-wt config approvals add
+```
+
+Pre-approve without prompting, for a container or CI job:
+```console
+$ h0x-wt config approvals add --yes
+```
+
+Clear approvals for current project:
+```console
+$ h0x-wt config approvals clear
+```
+
+Clear only approvals for commands no longer in the project config:
+```console
+$ h0x-wt config approvals clear --stale
+```
+
+Clear global approvals:
+```console
+$ h0x-wt config approvals clear --global
+```
+
+Check whether an unattended run would stop for approval:
+```console
+$ h0x-wt config approvals list --format=json | jq -r .state
+```
+
+## How approvals work
+
+Approved commands are saved to `~/.config/h0x-wt/approvals.toml`. Re-approval is required when the command template changes or the project moves.
+
+`--yes` bypasses the prompt, and what it leaves behind depends on the command it is passed to. On a command that runs project commands it grants consent for that run alone and records nothing, so the next run asks again. On `h0x-wt config approvals add` the record is the whole point, so the approvals are written — which is how an unattended environment pre-approves a project it has just cloned.
+
+## Reading approval state
+
+`h0x-wt config approvals list` reads the state without prompting or writing it, so an orchestrator can find out whether a non-interactive run will stop for approval before scheduling one. `--format=json` emits:
+
+```json
+{
+  "state": "approval_required",
+  "commands": [
+    {"phase": "post-start", "name": "dev", "template": "npm run dev", "approved": false},
+    {"phase": "pre-merge", "template": "cargo test", "approved": true}
+  ],
+  "stale": ["some removed command"]
+}
+```
+
+`state` is `no_commands` (the project declares none), `approval_required` (at least one is unapproved), or `approved`. `name` is absent for an unnamed command and for the commit-template fragment.
+
+`stale`, which can accompany any `state`, lists approvals whose command has since been edited or removed from the project config."#
+    )]
+    Approvals {
+        #[command(subcommand)]
+        action: ApprovalsCommand,
+    },
+
+    /// Inspect and preview aliases
+    #[command(
+        after_long_help = r#"Aliases are command templates configured in user (`~/.config/h0x-wt/config.toml`) or project (`.config/h0x-wt.toml`) config and run as `h0x-wt <name>`. See the [Extending Worktrunk guide](/extending/#aliases) for the configuration format.
+
+## Examples
+
+Show every configured alias's template:
+```console
+$ h0x-wt config alias show
+```
+
+Show the template for `deploy`:
+```console
+$ h0x-wt config alias show deploy
+```
+
+Preview an invocation without running it:
+```console
+$ h0x-wt config alias dry-run deploy
+$ h0x-wt config alias dry-run deploy -- --env=staging
+```"#
+    )]
+    Alias {
+        #[command(subcommand)]
+        action: ConfigAliasCommand,
+    },
+
+    /// Plugin management
+    #[command(
+        after_long_help = r#"Install and manage Worktrunk plugins for AI coding tools.
+
+## Supported tools
+
+- **claude** — Claude Code plugin (activity tracking + statusline)
+- **codex** — Codex plugin (activity tracking + Worktrunk configuration skill)
+- **omp** — oh-my-pi hook (activity tracking)
+- **opencode** — OpenCode plugin (activity tracking)
+- **pi** — Pi extension (activity tracking)
+
+## Examples
+
+```console
+$ h0x-wt config plugins claude install
+$ h0x-wt config plugins codex install
+$ h0x-wt config plugins omp install
+$ h0x-wt config plugins opencode install
+$ h0x-wt config plugins pi install
+```"#
+    )]
+    Plugins {
+        #[command(subcommand)]
+        action: ConfigPluginsCommand,
+    },
+
+    /// Manage internal data and cache
+    #[command(
+        after_long_help = r#"State is stored in `.git/` (config entries and log files), separate from configuration files.
+
+## Keys
+
+- **cache**: [Regenerable caches — CI status, summaries, git commands, hints, and the `h0x-wt switch -` target](/config/#wt-config-state-cache)
+- **default-branch**: [The repository's default branch (`main`, `master`, etc.)](/config/#wt-config-state-default-branch)
+- **marker**: [Custom status marker for a branch (shown in `h0x-wt list`)](/config/#wt-config-state-marker)
+- **vars**: [Custom variables per branch](/config/#wt-config-state-vars)
+- **logs**: [Operation and debug logs](/config/#wt-config-state-logs)
+
+## Examples
+
+Get the default branch:
+```console
+$ h0x-wt config state default-branch
+```
+
+Set the default branch manually:
+```console
+$ h0x-wt config state default-branch set main
+```
+
+Set a marker for current branch:
+```console
+$ h0x-wt config state marker set 🚧
+```
+
+Store arbitrary data:
+```console
+$ h0x-wt config state vars set env=staging
+```
+
+Drop the regenerable caches:
+```console
+$ h0x-wt config state cache clear
+```
+
+Show all stored state:
+```console
+$ h0x-wt config state get
+```
+
+Clear all stored state:
+```console
+$ h0x-wt config state clear
+```
+<!-- subdoc: cache -->
+<!-- subdoc: default-branch -->
+<!-- subdoc: logs -->
+<!-- subdoc: marker -->
+<!-- subdoc: vars -->"#
+    )]
+    State {
+        #[command(subcommand)]
+        action: StateCommand,
+    },
+}
+
+// Ordering: aggregate operations first (get, clear, cache) — entry points for
+// exploring, wiping, or refreshing state. Then authoritative state managed by
+// the user (default-branch override, marker, vars) and the operation logs.
+//
+// `cache` is the home for every regenerable cache (ci-status, summaries, git
+// commands, hints, previous branch). The per-category subcommands those caches
+// used to have (ci-status, hints, previous-branch) are `hide`-deprecated: they
+// still work and still appear in the match below, but print a deprecation
+// notice and are absent from `--help`.
+#[derive(Subcommand)]
+pub enum StateCommand {
+    /// Get all stored state
+    #[command(after_long_help = r#"Shows all stored state including:
+
+- **Default branch**: Cached result of querying remote for default branch
+- **Previous branch**: Previous branch for `h0x-wt switch -`
+- **Branch markers**: User-defined branch notes
+- **Vars**: Custom variables per branch
+- **CI status**: Cached forge CI status per branch (30-60s TTL)
+- **Summaries**: Cached LLM-generated branch summaries (shown in `h0x-wt list --full` and `h0x-wt switch` preview)
+- **Git commands cache**: Cached merge-tree, ancestry, diff-stat, and `h0x-wt switch` preview results
+- **Hints**: One-time hints that have been shown
+- **Log files**: Operation and debug logs
+- **Trash**: Staged worktree directories awaiting background deletion
+
+Every category that `h0x-wt config state clear` sweeps is shown here.
+
+CI cache entries show status, age, and the commit SHA they were fetched for."#)]
+    Get {
+        /// Output format
+        #[arg(long, value_enum, default_value = "table")]
+        format: super::OutputFormat,
+    },
+
+    /// Clear all stored state
+    #[command(after_long_help = r#"Clears all stored state:
+
+- Default branch cache
+- Previous branch
+- All branch markers
+- All variables
+- All caches (CI status, summaries, git commands)
+- All hints
+- All log files
+- Stale trash from worktree removal (`.git/h0x-wt/trash/`)
+
+Prompts for confirmation before clearing, since this removes hand-authored
+markers and vars. Pass `--yes` to skip the prompt.
+
+To drop only the regenerable caches (CI status, summaries, git commands,
+hints, previous branch), run `h0x-wt config state cache clear` — it needs no
+confirmation and leaves markers, vars, and the default-branch override
+untouched."#)]
+    Clear,
+
+    /// Regenerable caches
+    #[command(
+        after_long_help = r#"View or drop worktrunk's regenerable caches in one place. Everything here is rebuilt on demand — clearing only forces recomputation, never data loss.
+
+## What's cached
+
+- **CI status** — forge CI per branch (30–60s TTL), shown in [`h0x-wt list`](/list/#ci-status)
+- **Summaries** — LLM-generated branch summaries (`h0x-wt list --full`, `h0x-wt switch` preview)
+- **Git commands** — cached merge-tree, ancestry, diff-stat, and `h0x-wt switch` preview results
+- **Hints** — one-time hints already shown in this repo
+- **Previous branch** — the `h0x-wt switch -` target, re-recorded on the next switch
+
+`cache clear` drops all of the above with no prompt. It re-shows one-time hints and forgets the `h0x-wt switch -` target until the next switch — both repopulate on their own.
+
+Without a subcommand, runs `get`.
+
+## Examples
+
+Show cache contents:
+```console
+$ h0x-wt config state cache
+```
+
+Drop all caches:
+```console
+$ h0x-wt config state cache clear
+```"#
+    )]
+    Cache {
+        #[command(subcommand)]
+        action: Option<CacheAction>,
+
+        #[command(flatten)]
+        format: GlobalFormatFlag,
+    },
+
+    /// Default branch detection and override
+    #[command(
+        name = "default-branch",
+        after_long_help = r#"Useful in scripts to avoid hardcoding `main` or `master`:
+
+```console
+$ git rebase $(wt config state default-branch)
+```
+
+In a hook or alias template, prefer the `{{ default_branch }}` [template variable](/hook/#template-variables); `$(wt config state default-branch)` is for plain shell scripts.
+
+Without a subcommand, runs `get`. `set` stores the override in the repository's local git config. The override adds no project file and applies to every linked worktree in the clone. `clear` then `get` re-detects. The branch must exist locally for `h0x-wt list` comparisons.
+
+## Detection
+
+Worktrunk detects the default branch automatically:
+
+1. **Worktrunk cache** — Checks `git config h0x-wt.default-branch`
+2. **Git cache** — Detects primary remote and checks its HEAD (e.g., `origin/HEAD`)
+3. **Remote query** — If not cached, queries `git ls-remote`, giving up after 10s
+4. **Local inference** — If no remote, or the query was abandoned, infers from local branches
+
+Once detected, the result is cached in `h0x-wt.default-branch` — except a value inferred after the remote query was abandoned, so an outage can't make a guess permanent. A later change to `origin/HEAD` isn't picked up automatically: `h0x-wt config state` flags the mismatch, `set` adopts the new branch, and `clear` re-detects.
+
+The local inference fallback uses these heuristics in order:
+- If only one local branch exists, uses it
+- For bare repos or empty repos, checks `symbolic-ref HEAD`
+- Checks `git config init.defaultBranch`
+- Looks for common names: `main`, `master`, `develop`, `trunk`
+
+If none of these match, detection fails; set it explicitly with `h0x-wt config state default-branch set BRANCH`."#
+    )]
+    DefaultBranch {
+        #[command(subcommand)]
+        action: Option<DefaultBranchAction>,
+    },
+
+    /// Previous branch (for `h0x-wt switch -`)
+    #[command(
+        name = "previous-branch",
+        hide = true,
+        after_long_help = r#"**Deprecated** — the previous branch is now part of [`h0x-wt config state cache`](/config/#wt-config-state-cache). This subcommand still works but prints a deprecation notice.
+
+Enables `h0x-wt switch -` to return to the previous worktree, similar to `cd -` or `git checkout -`.
+
+## How it works
+
+Updated automatically on every `h0x-wt switch`. Stored in git config as `h0x-wt.history`, with the worktree's path in `h0x-wt.history-path`.
+
+Without a subcommand, runs `get`. Use `set` to override or `clear` to reset."#
+    )]
+    PreviousBranch {
+        #[command(subcommand)]
+        action: Option<PreviousBranchAction>,
+    },
+
+    /// Operation and debug logs
+    #[command(
+        after_long_help = r#"View and manage log files — hook output, command audit trail, and debug diagnostics.
+
+## What's logged
+
+Three kinds of logs live in `.git/h0x-wt/logs/`:
+
+### Command log (`commands.jsonl`)
+
+All hook executions and LLM commands are recorded automatically — one JSON object per line. Rotates to `commands.jsonl.old` at 1MB (~2MB total). Fields:
+
+| Field | Description |
+|-------|-------------|
+| `ts` | ISO 8601 timestamp |
+| `h0x-wt` | The `h0x-wt` command that triggered this (e.g., `h0x-wt hook pre-merge --yes`) |
+| `label` | What ran (e.g., `pre-merge user:lint`, `commit.generation`) |
+| `cmd` | Shell command executed |
+| `exit` | Exit code (`null` for background commands) |
+| `dur_ms` | Duration in milliseconds (`null` for background commands) |
+
+The command log appends entries and is not branch-specific — it records all activity across all worktrees.
+
+### Hook output logs
+
+Hook output lives in per-branch subtrees under `.git/h0x-wt/logs/{branch}/`:
+
+| Operation | Log path |
+|-----------|----------|
+| Background hooks | `{branch}/{source}/{hook-type}/{name}.log` |
+| Background removal | `{branch}/internal/remove.log` |
+
+All `post-*` hooks (post-start, post-switch, post-commit, post-merge, post-remove) run in the background and produce log files. Source is `user` or `project`. Branch and hook names are sanitized for filesystem safety. Same operation on same branch overwrites the previous log. Removing a branch clears its subtree; orphans from deleted branches can be swept with `h0x-wt config state logs clear`.
+
+### Diagnostic files
+
+| File | Created when |
+|------|-------------|
+| `trace.log` | Running with `-vv` |
+| `trace.jsonl` | Running with `-vv` |
+| `subprocess.log` | Running with `-vv` |
+| `diagnostic.md` | Running with `-vv` |
+
+`trace.log` is the human-readable trace of commands and their timings. `trace.jsonl` holds the same events as JSON lines, which `h0x-wt config state logs profile` summarizes into a performance report. `subprocess.log` holds full subprocess output. `diagnostic.md` is a bug-report bundle; `h0x-wt` prints a `gh gist create` command for it. All four are overwritten on each `-vv` run.
+
+## Location
+
+All logs are stored in `.git/h0x-wt/logs/` (in the main worktree's git directory). All worktrees write to the same directory.
+
+## Structured output
+
+`h0x-wt config state logs --format=json` emits three arrays — `command_log`, `hook_output`, `diagnostic`. Each entry carries a `file` (relative), `path` (absolute), `size`, and `modified_at` (unix seconds). Hook-output entries additionally expose `branch`, `source` (`user` / `project` / `internal`), `hook_type` (the `post-*` kind, or `null` for internal ops), and `name`. `branch` is the branch name, or `null` when no local branch writes to that log directory (e.g. the branch was deleted). `name` is the hook name as it appears in the log path, which differs from the configured name only when that contains characters unsafe in a filename. Filter with `jq` to pick out a specific entry.
+
+## Examples
+
+List all log files:
+```console
+$ h0x-wt config state logs
+```
+
+Query the command log:
+```console
+$ tail -5 .git/h0x-wt/logs/commands.jsonl | jq .
+```
+
+Path to one hook log (e.g. the `post-start` `server` hook for the current branch):
+```console
+$ h0x-wt config state logs --format=json | jq -r --arg branch "$(git branch --show-current)" '.hook_output[] | select([.branch, .source, .hook_type, .name] == [$branch, "user", "post-start", "server"]) | .path'
+```
+
+Logs for a specific branch:
+```console
+$ h0x-wt config state logs --format=json | jq '.hook_output[] | select(.branch == "feature/auth")'
+```
+
+Clear all logs:
+```console
+$ h0x-wt config state logs clear
+```"#
+    )]
+    Logs {
+        #[command(subcommand)]
+        action: Option<LogsAction>,
+
+        #[command(flatten)]
+        format: GlobalFormatFlag,
+    },
+
+    /// One-time hints shown in this repo
+    #[command(
+        hide = true,
+        after_long_help = r#"**Deprecated** — hints are now part of [`h0x-wt config state cache`](/config/#wt-config-state-cache). This subcommand still works but prints a deprecation notice.
+
+Some hints show once per repo on first use, then are recorded in git config
+as `h0x-wt.hints.<name>`, a count of times the hint has been shown.
+
+## Current hints
+
+| Name | Trigger | Message |
+|------|---------|---------|
+| `worktree-path` | First `h0x-wt switch --create` | Customize worktree locations: wt config create |
+| `skip-bare-repo-prompt` | Declining the bare-repo worktree-path prompt | Records the opt-out (no message shown) |
+
+## Examples
+
+```console
+$ h0x-wt config state hints              # list shown hints
+$ h0x-wt config state hints clear        # re-show all hints
+$ h0x-wt config state hints clear NAME   # re-show specific hint
+```"#
+    )]
+    Hints {
+        #[command(subcommand)]
+        action: Option<HintsAction>,
+
+        #[command(flatten)]
+        format: GlobalFormatFlag,
+    },
+
+    /// CI status cache
+    #[command(
+        name = "ci-status",
+        hide = true,
+        after_long_help = r#"**Deprecated** — the CI status cache is now part of [`h0x-wt config state cache`](/config/#wt-config-state-cache). This subcommand still works but prints a deprecation notice.
+
+Status values, display symbols, and fetch behavior: [`h0x-wt list` CI status](/list/#ci-status).
+
+Without a subcommand, runs `get` for the current branch. Use `clear` to reset cache for a branch or `clear --all` to reset all."#
+    )]
+    CiStatus {
+        #[command(subcommand)]
+        action: Option<CiStatusAction>,
+
+        #[command(flatten)]
+        format: GlobalFormatFlag,
+    },
+
+    /// Branch markers
+    #[command(
+        after_long_help = r#"Custom status text or emoji shown in the `h0x-wt list` Status column.
+
+## Display
+
+Markers appear at the end of the Status column, after git symbols:
+
+<!-- wt list (markers) -->
+```console
+h0x-wt list
+```
+
+## Use cases
+
+- **Work status** — `🚧` WIP, `✅` ready for review, `🔥` urgent
+- **Agent tracking** — [Agent plugins](/claude-code/) set markers automatically
+- **Notes** — Any short text: `"blocked"`, `"needs tests"`
+
+## Storage
+
+Stored in git config as `h0x-wt.state.<branch>.marker`. Set directly with:
+
+```console
+$ git config h0x-wt.state.feature.marker '{"marker":"🚧","set_at":0}'
+```
+
+Without a subcommand, runs `get` for the current branch. For `--branch`, use `get --branch=NAME`."#
+    )]
+    Marker {
+        #[command(subcommand)]
+        action: Option<MarkerAction>,
+
+        #[command(flatten)]
+        format: GlobalFormatFlag,
+    },
+
+    /// Custom variables per branch
+    #[command(
+        name = "vars",
+        after_long_help = r#"Store custom variables per branch. Values are stored as-is — plain strings or JSON.
+
+## Examples
+
+Set and get values:
+```console
+$ h0x-wt config state vars set env=staging
+$ h0x-wt config state vars get env
+```
+
+Store JSON:
+```console
+$ h0x-wt config state vars set config='{"port": 3000, "debug": true}'
+```
+
+List all keys:
+```console
+$ h0x-wt config state vars list
+```
+
+Operate on a different branch:
+```console
+$ h0x-wt config state vars set env=production --branch=main
+```
+
+## Template access
+
+Variables are available in [hook templates](/hook/#template-variables) as `{{ vars.<key> }}`. Use the `default` filter for keys that may not be set:
+
+```toml
+# .config/h0x-wt.toml
+[post-start]
+dev = "ENV={{ vars.env | default('development') }} npm start -- --port {{ vars.port | default('3000') }}"
+```
+
+JSON object and array values support dot access:
+
+```console
+$ h0x-wt config state vars set config='{"port": 3000, "debug": true}'
+```
+```toml
+# .config/h0x-wt.toml
+[post-start]
+dev = "npm start -- --port {{ vars.config.port }}"
+```
+
+## Storage format
+
+Stored in git config as `h0x-wt.state.<branch>.vars.<key>`. Keys may contain only letters, digits, and hyphens."#
+    )]
+    Vars {
+        #[command(subcommand)]
+        action: VarsAction,
+    },
+}
+
+// Ordering: CRUD — get, set, clear.
+#[derive(Subcommand)]
+pub enum DefaultBranchAction {
+    /// Get the default branch
+    #[command(after_long_help = r#"## Examples
+
+Get the default branch:
+```console
+$ h0x-wt config state default-branch
+```
+
+Clear cache and re-detect:
+```console
+$ h0x-wt config state default-branch clear && wt config state default-branch get
+```"#)]
+    Get,
+
+    /// Set the default branch
+    #[command(after_long_help = r#"## Examples
+
+Set the default branch:
+```console
+$ h0x-wt config state default-branch set main
+```"#)]
+    Set {
+        /// Branch name to set as default
+        #[arg(add = crate::completion::branch_value_completer(), value_parser = crate::cli::non_empty_branch)]
+        branch: String,
+    },
+
+    /// Clear the default branch cache
+    Clear,
+}
+
+// Ordering: CRUD — get, set, clear.
+#[derive(Subcommand)]
+pub enum PreviousBranchAction {
+    /// Get the previous branch
+    #[command(after_long_help = r#"## Examples
+
+Get the previous branch (used by `h0x-wt switch -`):
+```console
+$ h0x-wt config state previous-branch
+```"#)]
+    Get,
+
+    /// Set the previous branch
+    #[command(after_long_help = r#"## Examples
+
+Set the previous branch:
+```console
+$ h0x-wt config state previous-branch set feature
+```"#)]
+    Set {
+        /// Branch name to set as previous
+        #[arg(add = crate::completion::branch_value_completer(), value_parser = crate::cli::non_empty_branch)]
+        branch: String,
+    },
+
+    /// Clear the previous branch
+    Clear,
+}
+
+// Ordering: CRUD — get, clear.
+#[derive(Subcommand)]
+pub enum CacheAction {
+    /// Show cache contents
+    Get,
+
+    /// Drop all caches
+    Clear,
+}
+
+// Ordering: CRUD — get, clear.
+#[derive(Subcommand)]
+pub enum CiStatusAction {
+    /// Get CI status for a branch
+    #[command(
+        after_long_help = r#"Returns: passed, running, failed, conflicts, no-ci, or error.
+
+## Examples
+
+Get CI status for current branch:
+```console
+$ h0x-wt config state ci-status
+```
+
+Get CI status for a specific branch:
+```console
+$ h0x-wt config state ci-status get --branch=feature
+```
+
+Clear cache and re-fetch:
+```console
+$ h0x-wt config state ci-status clear && wt config state ci-status get
+```"#
+    )]
+    Get {
+        /// Target branch (defaults to current)
+        #[arg(long, add = crate::completion::branch_value_completer(), value_parser = crate::cli::non_empty_branch)]
+        branch: Option<String>,
+    },
+
+    /// Clear CI status cache
+    #[command(after_long_help = r#"## Examples
+
+Clear CI status for current branch:
+```console
+$ h0x-wt config state ci-status clear
+```
+
+Clear CI status for a specific branch:
+```console
+$ h0x-wt config state ci-status clear --branch=feature
+```
+
+Clear all CI status cache:
+```console
+$ h0x-wt config state ci-status clear --all
+```"#)]
+    Clear {
+        /// Target branch (defaults to current)
+        #[arg(long, add = crate::completion::branch_value_completer(), value_parser = crate::cli::non_empty_branch, conflicts_with = "all")]
+        branch: Option<String>,
+
+        /// Clear all CI status cache
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+// Ordering: CRUD — get, set, clear.
+#[derive(Subcommand)]
+pub enum MarkerAction {
+    /// Get marker for a branch
+    #[command(after_long_help = r#"## Examples
+
+Get marker for current branch:
+```console
+$ h0x-wt config state marker
+```
+
+Get marker for a specific branch:
+```console
+$ h0x-wt config state marker get --branch=feature
+```"#)]
+    Get {
+        /// Target branch (defaults to current)
+        #[arg(long, add = crate::completion::branch_value_completer(), value_parser = crate::cli::non_empty_branch)]
+        branch: Option<String>,
+    },
+
+    /// Set marker for a branch
+    #[command(after_long_help = r#"## Examples
+
+Set marker for current branch:
+```console
+$ h0x-wt config state marker set 🚧
+```
+
+Set marker for a specific branch:
+```console
+$ h0x-wt config state marker set "✅ ready" --branch=feature
+```"#)]
+    Set {
+        /// Marker text (shown in `h0x-wt list` output)
+        value: String,
+
+        /// Target branch (defaults to current)
+        #[arg(long, add = crate::completion::branch_value_completer(), value_parser = crate::cli::non_empty_branch)]
+        branch: Option<String>,
+    },
+
+    /// Clear marker for a branch
+    #[command(after_long_help = r#"## Examples
+
+Clear marker for current branch:
+```console
+$ h0x-wt config state marker clear
+```
+
+Clear marker for a specific branch:
+```console
+$ h0x-wt config state marker clear --branch=feature
+```
+
+Clear all markers:
+```console
+$ h0x-wt config state marker clear --all
+```"#)]
+    Clear {
+        /// Target branch (defaults to current)
+        #[arg(long, add = crate::completion::branch_value_completer(), value_parser = crate::cli::non_empty_branch, conflicts_with = "all")]
+        branch: Option<String>,
+
+        /// Clear all markers
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+// Ordering: CRUD — get, clear.
+#[derive(Subcommand)]
+pub enum LogsAction {
+    /// List all log file paths
+    #[command(
+        after_long_help = r#"Lists every log file — command log, hook output, and diagnostics. Compose with `jq` to pick out a specific entry.
+
+## Examples
+
+List all log files:
+```console
+$ h0x-wt config state logs
+```
+
+Get the absolute path of the current branch's `server` post-start hook log:
+```console
+$ h0x-wt config state logs --format=json | jq -r --arg branch "$(git branch --show-current)" '.hook_output[] | select([.branch, .source, .hook_type, .name] == [$branch, "user", "post-start", "server"]) | .path'
+```
+
+Stream that log with `tail -f`:
+```console
+$ tail -f "$(wt config state logs --format=json | jq -r --arg branch "$(git branch --show-current)" '.hook_output[] | select([.branch, .source, .hook_type, .name] == [$branch, "user", "post-start", "server"]) | .path')"
+```
+
+Logs for a background worktree removal (internal op):
+```console
+$ h0x-wt config state logs --format=json | jq '.hook_output[] | select(.source == "internal" and .name == "remove")'
+```
+
+Logs for a specific branch:
+```console
+$ h0x-wt config state logs --format=json | jq '.hook_output[] | select(.branch == "feature/auth")'
+```"#
+    )]
+    Get,
+
+    /// Performance profile from a trace
+    #[command(
+        after_long_help = r#"Summarize where a single `h0x-wt` invocation spent its time, reading the records captured to `trace.jsonl` by a `-vv` run.
+
+Reads `.git/h0x-wt/logs/trace.jsonl` by default, or a trace given as an argument (e.g. a CI artifact, or `-` for stdin). The report answers three questions: where time goes (subprocess time by command type and by worktree, plus the slowest individual jobs), how parallel the run was (concurrency factor and peak concurrency), and where work was wasted (commands re-run with the same context). For a `h0x-wt list` capture it also shows derived latencies (time to skeleton, time to first result) and a timeline of collect milestones; the skeleton/first-result markers need a terminal (TTY) capture. `--format=json` emits the same data for scripting.
+
+## Examples
+
+Profile the last `-vv` run in this repo:
+```console
+$ h0x-wt -vv list
+$ h0x-wt config state logs profile
+```
+
+Profile a trace from elsewhere (e.g. a CI artifact), by path or on stdin:
+```console
+$ h0x-wt config state logs profile ci-run.jsonl
+$ h0x-wt config state logs profile - < ci-run.jsonl
+```
+
+JSON for scripting:
+```console
+$ h0x-wt config state logs profile --format=json | jq '.by_type[0]'
+```"#
+    )]
+    Profile {
+        /// Trace to read (defaults to `.git/h0x-wt/logs/trace.jsonl`; `-` for stdin)
+        file: Option<std::path::PathBuf>,
+    },
+
+    /// Clear all log files
+    Clear,
+}
+
+// Ordering: CRUD — get, clear.
+#[derive(Subcommand)]
+pub enum HintsAction {
+    /// List hints that have been shown
+    #[command(
+        after_long_help = r#"Lists which one-time hints have been shown in this repository.
+
+## Examples
+
+List shown hints:
+```console
+$ h0x-wt config state hints
+```"#
+    )]
+    Get,
+
+    /// Clear hints (re-show on next trigger)
+    #[command(
+        after_long_help = r#"Clears hint state so hints will show again on next trigger.
+
+## Examples
+
+Clear all hints:
+```console
+$ h0x-wt config state hints clear
+```
+
+Clear a specific hint:
+```console
+$ h0x-wt config state hints clear worktree-path
+```"#
+    )]
+    Clear {
+        /// Specific hint to clear (clears all if not specified)
+        name: Option<String>,
+    },
+}
+
+/// Write-ness of a state action, co-located with the action enums so a new
+/// variant cannot be added without classifying it.
+///
+/// `--format` is `global = true` on the state-cache parents so the bareword and
+/// `get` read forms accept it; clap therefore also accepts it on write actions,
+/// where it has no effect. The dispatcher guards against that
+/// (`guard_format_on_write`). Deriving the verb from this trait — rather than
+/// hand-placing the guard at each write arm — means the exhaustive match below
+/// fails to compile until a newly added write variant declares itself, so a
+/// write action can't silently bypass the guard.
+pub(crate) trait StateWrite {
+    /// `Some(verb)` for write actions (verb names the action in the conflict
+    /// error); `None` for reads.
+    fn write_verb(&self) -> Option<&'static str>;
+}
+
+impl StateWrite for CacheAction {
+    fn write_verb(&self) -> Option<&'static str> {
+        match self {
+            Self::Get => None,
+            Self::Clear => Some("clear"),
+        }
+    }
+}
+
+impl StateWrite for CiStatusAction {
+    fn write_verb(&self) -> Option<&'static str> {
+        match self {
+            Self::Get { .. } => None,
+            Self::Clear { .. } => Some("clear"),
+        }
+    }
+}
+
+impl StateWrite for MarkerAction {
+    fn write_verb(&self) -> Option<&'static str> {
+        match self {
+            Self::Get { .. } => None,
+            Self::Set { .. } => Some("set"),
+            Self::Clear { .. } => Some("clear"),
+        }
+    }
+}
+
+impl StateWrite for LogsAction {
+    fn write_verb(&self) -> Option<&'static str> {
+        match self {
+            Self::Get | Self::Profile { .. } => None,
+            Self::Clear => Some("clear"),
+        }
+    }
+}
+
+impl StateWrite for HintsAction {
+    fn write_verb(&self) -> Option<&'static str> {
+        match self {
+            Self::Get => None,
+            Self::Clear { .. } => Some("clear"),
+        }
+    }
+}
+
+// Ordering: reads before writes — get, list, set, clear.
+#[derive(Subcommand)]
+pub enum VarsAction {
+    /// Get a value
+    #[command(after_long_help = r#"## Examples
+
+Get a value for the current branch:
+```console
+$ h0x-wt config state vars get env
+```
+
+Get a value for a specific branch:
+```console
+$ h0x-wt config state vars get env --branch=feature
+```"#)]
+    Get {
+        /// Key name
+        key: String,
+
+        /// Target branch (defaults to current)
+        #[arg(long, add = crate::completion::branch_value_completer(), value_parser = crate::cli::non_empty_branch)]
+        branch: Option<String>,
+    },
+
+    /// List all keys
+    #[command(after_long_help = r#"## Examples
+
+List keys for current branch:
+```console
+$ h0x-wt config state vars list
+```
+
+List keys for a specific branch:
+```console
+$ h0x-wt config state vars list --branch=feature
+```"#)]
+    List {
+        /// Target branch (defaults to current)
+        #[arg(long, add = crate::completion::branch_value_completer(), value_parser = crate::cli::non_empty_branch)]
+        branch: Option<String>,
+
+        /// Output format
+        #[arg(long, default_value = "text", help_heading = "Output")]
+        format: SwitchFormat,
+    },
+
+    /// Set a value
+    #[command(after_long_help = r#"## Examples
+
+Set a plain string:
+```console
+$ h0x-wt config state vars set env=staging
+```
+
+Set JSON:
+```console
+$ h0x-wt config state vars set config='{"port": 3000}'
+```
+
+Set for a specific branch:
+```console
+$ h0x-wt config state vars set env=production --branch=main
+```"#)]
+    Set {
+        /// KEY=VALUE pair
+        #[arg(value_name = "KEY=VALUE", value_parser = super::parse_vars_assignment)]
+        assignment: (String, String),
+
+        /// Target branch (defaults to current)
+        #[arg(long, add = crate::completion::branch_value_completer(), value_parser = crate::cli::non_empty_branch)]
+        branch: Option<String>,
+    },
+
+    /// Clear a key or all keys
+    #[command(after_long_help = r#"## Examples
+
+Clear a specific key:
+```console
+$ h0x-wt config state vars clear env
+```
+
+Clear all keys for current branch:
+```console
+$ h0x-wt config state vars clear --all
+```
+
+Clear all keys for a specific branch:
+```console
+$ h0x-wt config state vars clear --all --branch=feature
+```"#)]
+    Clear {
+        /// Key to clear (required unless --all)
+        #[arg(conflicts_with = "all")]
+        key: Option<String>,
+
+        /// Clear all keys for the branch
+        #[arg(long)]
+        all: bool,
+
+        /// Target branch (defaults to current)
+        #[arg(long, add = crate::completion::branch_value_completer(), value_parser = crate::cli::non_empty_branch)]
+        branch: Option<String>,
+    },
+}

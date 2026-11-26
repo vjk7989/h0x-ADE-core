@@ -1,0 +1,461 @@
+//! Azure DevOps PR backend using the `az` CLI. Requires the `azure-devops`
+//! extension (`az extension add --name azure-devops`).
+
+use anyhow::{Context, bail};
+use serde::Deserialize;
+
+use super::{CliApiRequest, PlatformData, RemoteRefInfo, cli_api_error};
+use crate::git::canonical_url_path_segment;
+use crate::git::ci_platform::host_is_within;
+use crate::git::url::{GitRemoteUrl, authority_host};
+use crate::git::{ForgeKind, Repository};
+use crate::shell_exec::Cmd;
+
+/// Whether `az` is logged in.
+///
+/// `az account show` reads the local profile and exits non-zero when logged
+/// out, whether or not the azure-devops extension is installed. Returns
+/// `false` if `az` is not installed.
+pub fn is_logged_in() -> bool {
+    Cmd::new("az")
+        .args(["account", "show"])
+        .run()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// Construct an Azure DevOps remote URL for a repo.
+///
+/// Emits `https://{host}/{org}/{project}/_git/{repo}` for `dev.azure.com` and
+/// `https://{host}/{project}/_git/{repo}` for legacy `*.visualstudio.com` hosts
+/// (where the org is in the hostname). Azure DevOps SSH URLs require per-org
+/// public keys, so HTTPS — which works with both PAT and Azure CLI auth — is
+/// the safe default.
+pub fn fork_remote_url(host: &str, organization: &str, project: &str, repo: &str) -> String {
+    let organization = canonical_url_path_segment(organization);
+    let project = canonical_url_path_segment(project);
+    let repo = canonical_url_path_segment(repo);
+    if host_is_within(host, "visualstudio.com") {
+        format!("https://{}/{}/_git/{}", host, project, repo)
+    } else {
+        format!(
+            "https://{}/{}/{}/_git/{}",
+            host, organization, project, repo
+        )
+    }
+}
+
+/// Construct the PR web URL for the user's actual host (handles `*.visualstudio.com`).
+pub fn pr_web_url(host: &str, organization: &str, project: &str, repo: &str, pr: u32) -> String {
+    let organization = canonical_url_path_segment(organization);
+    let project = canonical_url_path_segment(project);
+    let repo = canonical_url_path_segment(repo);
+    if host_is_within(host, "visualstudio.com") {
+        format!(
+            "https://{}/{}/_git/{}/pullrequest/{}",
+            host, project, repo, pr
+        )
+    } else {
+        format!(
+            "https://dev.azure.com/{}/{}/_git/{}/pullrequest/{}",
+            organization, project, repo, pr
+        )
+    }
+}
+
+/// Construct the build-results web URL for the user's actual host.
+pub fn build_web_url(host: &str, organization: &str, project: &str, build_id: u32) -> String {
+    let organization = canonical_url_path_segment(organization);
+    let project = canonical_url_path_segment(project);
+    if host_is_within(host, "visualstudio.com") {
+        format!(
+            "https://{}/{}/_build/results?buildId={}",
+            host, project, build_id
+        )
+    } else {
+        format!(
+            "https://dev.azure.com/{}/{}/_build/results?buildId={}",
+            organization, project, build_id
+        )
+    }
+}
+
+/// Raw JSON response from `az repos pr show --id <N>`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AzPrResponse {
+    title: String,
+    created_by: AzIdentity,
+    status: String,
+    #[serde(default)]
+    is_draft: bool,
+    source_ref_name: String,
+    repository: AzRepository,
+    #[serde(default)]
+    fork_source: Option<AzForkRef>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AzIdentity {
+    unique_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AzRepository {
+    name: String,
+    project: AzProject,
+    #[serde(default)]
+    web_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AzProject {
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AzForkRef {
+    repository: AzForkRepository,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AzForkRepository {
+    #[serde(default)]
+    remote_url: Option<String>,
+    #[serde(default)]
+    ssh_url: Option<String>,
+}
+
+/// Detect the Azure DevOps `(host, organization)` to use for API calls.
+///
+/// Prefers the primary remote (typically `origin` or whatever the user pushed
+/// with) so fork workflows hit the right tenant. Falls back to the first
+/// Azure remote found if the primary isn't Azure DevOps.
+///
+/// The host is a web host, the same shape [`parse_web_url`] returns: an
+/// `ssh.dev.azure.com` remote reports `dev.azure.com`, since the URL builders
+/// that consume it put the host into an HTTPS URL.
+fn detect_azure_target(repo: &Repository) -> Option<(String, String)> {
+    let target = |parsed: &GitRemoteUrl| {
+        let org = parsed.azure_organization()?;
+        let host = if host_is_within(parsed.host(), "visualstudio.com") {
+            parsed.host()
+        } else {
+            "dev.azure.com"
+        };
+        Some((host.to_string(), org.to_string()))
+    };
+    if let Ok(remote) = repo.primary_remote()
+        && let Some(url) = repo.effective_remote_url(&remote)
+        && let Some(parsed) = GitRemoteUrl::parse(&url)
+        && let Some(found) = target(&parsed)
+    {
+        return Some(found);
+    }
+    repo.all_remote_urls()
+        .into_iter()
+        .find_map(|(_, url)| target(&GitRemoteUrl::parse(&url)?))
+}
+
+/// Build the `--org` URL for the `az` CLI from a host and organization.
+///
+/// `dev.azure.com` and `ssh.dev.azure.com` both map to the cloud `dev.azure.com`
+/// API host. Legacy `*.visualstudio.com` hosts keep their hostname (the API
+/// accepts both forms).
+pub fn az_org_url(host: &str, organization: &str) -> String {
+    if host_is_within(host, "visualstudio.com") {
+        format!("https://{}", host)
+    } else {
+        format!("https://dev.azure.com/{}", organization)
+    }
+}
+
+/// Parse `(host, organization)` out of an Azure DevOps web URL.
+///
+/// Returns `None` if the URL is missing or unrecognised; callers fall back to
+/// the org detected from local remotes. We refuse to invent values here — the
+/// previous version's `unwrap_or(project_name)` produced wrong but plausible
+/// identifiers that propagated into the constructed PR URL.
+///
+/// Two shapes are recognised:
+/// - `https://dev.azure.com/{org}/{project}/_git/{repo}` → `("dev.azure.com", org)`
+/// - `https://{org}.visualstudio.com/{project}/_git/{repo}` → `("{org}.visualstudio.com", org)`
+fn parse_web_url(web_url: Option<&str>) -> Option<(String, String)> {
+    let url = web_url?;
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let (authority, path) = rest.split_once('/')?;
+    let host = authority_host(authority)?;
+    if host_is_within(host, "dev.azure.com") {
+        let org = path.split('/').next().filter(|s| !s.is_empty())?;
+        Some((host.to_string(), org.to_string()))
+    } else if host_is_within(host, "visualstudio.com") {
+        let org = host.split('.').next().filter(|s| !s.is_empty())?;
+        Some((host.to_string(), org.to_string()))
+    } else {
+        None
+    }
+}
+
+/// One entry of `az extension list --output json`.
+#[derive(Debug, Deserialize)]
+struct AzExtension {
+    name: String,
+}
+
+/// Whether the `azure-devops` extension is installed.
+///
+/// `az extension list --output json` answers with a name/version array, so no
+/// prose is involved. An `az` that can't answer — spawn failure, non-zero
+/// exit, output that won't parse — leaves the question open, and an open
+/// question counts as installed: callers then say nothing about the extension
+/// rather than blaming one we never confirmed was missing.
+///
+/// Two callers, both on a path where the answer is actionable: `fetch_pr_info`
+/// when `az repos pr show` has already failed, and `wt config show --full`,
+/// which reports a missing extension as the persistent condition it is.
+pub fn azure_devops_extension_installed(repo_root: &std::path::Path) -> bool {
+    Cmd::new("az")
+        .args(["extension", "list", "--output", "json"])
+        .current_dir(repo_root)
+        .env("AZURE_CORE_NO_COLOR", "true")
+        .run()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| serde_json::from_slice::<Vec<AzExtension>>(&output.stdout).ok())
+        .is_none_or(|extensions| extensions.iter().any(|e| e.name == "azure-devops"))
+}
+
+pub(super) fn fetch_pr_info(pr_number: u32, repo: &Repository) -> anyhow::Result<RemoteRefInfo> {
+    let repo_root = repo.repo_path()?;
+    let pr_id = pr_number.to_string();
+
+    let mut args = vec![
+        "repos",
+        "pr",
+        "show",
+        "--id",
+        pr_id.as_str(),
+        "--output",
+        "json",
+    ];
+
+    // Auto-detect organization from the primary Azure DevOps remote so
+    // contributors don't have to pass `--org` explicitly.
+    let target = detect_azure_target(repo);
+    let org_url = target.as_ref().map(|(host, org)| az_org_url(host, org));
+    if let Some(org_url) = &org_url {
+        args.extend(["--org", org_url]);
+    }
+
+    let output = super::run_cli_api(CliApiRequest {
+        tool: "az",
+        args: &args,
+        repo_root,
+        prompt_env: ("AZURE_CORE_NO_COLOR", "true"),
+        install_hint: "Azure CLI (az) not installed; install from https://aka.ms/installazurecli",
+        run_context: "Failed to run az repos pr show",
+    })?;
+
+    if !output.status.success() {
+        // The whole `az repos` command group ships in the azure-devops
+        // extension, so "is the extension installed?" is a precondition of this
+        // call rather than one guess among many — and `az extension list`
+        // answers it in JSON. Asking it here, on the failure path only, keeps
+        // the install command out of the happy path's cost.
+        if !azure_devops_extension_installed(repo_root) {
+            bail!("azure-devops extension not installed; run az extension add --name azure-devops");
+        }
+        // Everything else `az` reports is prose on stderr — no exit code, no
+        // JSON error channel. Rather than guess at the cause from English
+        // substrings, surface what `az` said: its own text names the remedy
+        // ("Please run 'az login' …") more reliably than a paraphrase keyed on
+        // a word that can occur anywhere in an org, project, or repo name.
+        return Err(cli_api_error(
+            ForgeKind::AzureDevOps.ref_type(),
+            format!("az repos pr show failed for PR #{}", pr_number),
+            &output,
+        ));
+    }
+
+    let response: AzPrResponse = serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "Failed to parse Azure DevOps API response for PR #{}. \
+             This may indicate an az CLI version issue.",
+            pr_number
+        )
+    })?;
+
+    // Strip refs/heads/ prefix from branch names
+    let source_branch = response
+        .source_ref_name
+        .strip_prefix("refs/heads/")
+        .unwrap_or(&response.source_ref_name)
+        .to_string();
+
+    // Validate at the forge backend boundary — same as the GitHub/GitLab/Gitea
+    // backends — so an empty or `refs/heads/`-only sourceRefName produces a
+    // clear diagnostic rather than confusing downstream git/path errors.
+    if source_branch.is_empty() {
+        bail!(
+            "Azure DevOps PR #{} has empty branch name; the PR may be in an invalid state",
+            pr_number
+        );
+    }
+
+    let is_cross_repo = response.fork_source.is_some();
+
+    let fork_push_url = response.fork_source.as_ref().and_then(|fork| {
+        fork.repository
+            .ssh_url
+            .clone()
+            .or_else(|| fork.repository.remote_url.clone())
+    });
+
+    let project = response.repository.project.name.clone();
+    let repo_name = response.repository.name.clone();
+
+    // Prefer the API response's web_url; fall back to whatever we detected from
+    // local remotes. Never invent the org from the project name — Azure orgs
+    // and projects share a namespace, so a collision produces a URL that 404s
+    // in a hard-to-debug way.
+    let (host, organization) = parse_web_url(response.repository.web_url.as_deref())
+        .or_else(|| target.clone())
+        .with_context(|| {
+            format!(
+                "Could not determine Azure DevOps org/host for PR #{}: \
+                 response had no web_url and no local Azure remote is configured.",
+                pr_number
+            )
+        })?;
+
+    let pr_url = pr_web_url(&host, &organization, &project, &repo_name, pr_number);
+
+    Ok(RemoteRefInfo {
+        number: pr_number,
+        title: response.title,
+        author: response.created_by.unique_name,
+        state: response.status,
+        draft: response.is_draft,
+        source_branch,
+        is_cross_repo,
+        url: pr_url,
+        fork_push_url,
+        platform_data: PlatformData::AzureDevOps {
+            host,
+            organization,
+            project,
+            repo_name,
+        },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_web_url_dev_azure() {
+        let parsed = parse_web_url(Some("https://dev.azure.com/myorg/myproject/_git/myrepo"));
+        assert_eq!(
+            parsed,
+            Some(("dev.azure.com".to_string(), "myorg".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_web_url_visualstudio() {
+        // Legacy *.visualstudio.com URLs encode the org in the hostname.
+        let parsed = parse_web_url(Some("https://myorg.visualstudio.com/myproject/_git/myrepo"));
+        assert_eq!(
+            parsed,
+            Some(("myorg.visualstudio.com".to_string(), "myorg".to_string()))
+        );
+        assert_eq!(
+            parse_web_url(Some(
+                "https://user:token@myorg.visualstudio.com/myproject/_git/myrepo"
+            )),
+            Some(("myorg.visualstudio.com".to_string(), "myorg".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_parse_web_url_missing_or_unknown() {
+        assert_eq!(parse_web_url(None), None);
+        assert_eq!(parse_web_url(Some("https://github.com/owner/repo")), None);
+        assert_eq!(parse_web_url(Some("not-a-url")), None);
+    }
+
+    #[test]
+    fn test_fork_remote_url_format() {
+        // dev.azure.com gets the canonical {host}/{org}/{project}/_git/{repo} layout.
+        assert_eq!(
+            fork_remote_url("dev.azure.com", "myorg", "myproject", "myrepo"),
+            "https://dev.azure.com/myorg/myproject/_git/myrepo"
+        );
+        // *.visualstudio.com URLs omit the org (it's already in the hostname).
+        assert_eq!(
+            fork_remote_url("myorg.visualstudio.com", "myorg", "myproject", "myrepo"),
+            "https://myorg.visualstudio.com/myproject/_git/myrepo"
+        );
+    }
+
+    #[test]
+    fn test_pr_web_url_format() {
+        assert_eq!(
+            pr_web_url("dev.azure.com", "myorg", "myproject", "myrepo", 42),
+            "https://dev.azure.com/myorg/myproject/_git/myrepo/pullrequest/42"
+        );
+        assert_eq!(
+            pr_web_url("myorg.visualstudio.com", "myorg", "myproject", "myrepo", 42),
+            "https://myorg.visualstudio.com/myproject/_git/myrepo/pullrequest/42"
+        );
+    }
+
+    #[test]
+    fn legacy_url_builders_recognize_ports_and_trailing_root_dots() {
+        for host in ["myorg.visualstudio.com:443", "myorg.visualstudio.com."] {
+            assert_eq!(
+                fork_remote_url(host, "myorg", "myproject", "myrepo"),
+                format!("https://{host}/myproject/_git/myrepo"),
+                "{host}"
+            );
+            assert_eq!(
+                pr_web_url(host, "myorg", "myproject", "myrepo", 42),
+                format!("https://{host}/myproject/_git/myrepo/pullrequest/42"),
+                "{host}"
+            );
+            assert_eq!(
+                build_web_url(host, "myorg", "myproject", 7),
+                format!("https://{host}/myproject/_build/results?buildId=7"),
+                "{host}"
+            );
+            assert_eq!(
+                az_org_url(host, "myorg"),
+                format!("https://{host}"),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_az_org_url_format() {
+        assert_eq!(
+            az_org_url("dev.azure.com", "myorg"),
+            "https://dev.azure.com/myorg"
+        );
+        assert_eq!(
+            az_org_url("myorg.visualstudio.com", "myorg"),
+            "https://myorg.visualstudio.com"
+        );
+        // ssh.dev.azure.com is the API's cloud host — still routes through dev.azure.com.
+        assert_eq!(
+            az_org_url("ssh.dev.azure.com", "myorg"),
+            "https://dev.azure.com/myorg"
+        );
+    }
+}

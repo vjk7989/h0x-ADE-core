@@ -1,0 +1,1443 @@
+//! Git operations and repository management
+
+use std::path::{Path, PathBuf};
+
+fn git_path_from_bytes(bytes: &[u8]) -> std::io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(bytes.to_vec())))
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows accepts Git's forward slashes; preserve its output spelling.
+        std::str::from_utf8(bytes)
+            .map(PathBuf::from)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+}
+
+/// Decode one path from Git output, preserving bytes before its final LF.
+fn git_path_from_output(bytes: &[u8]) -> std::io::Result<PathBuf> {
+    let path = bytes.strip_suffix(b"\n").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Unterminated Git path output",
+        )
+    })?;
+    git_path_from_bytes(path)
+}
+
+/// Gitfiles and backlinks terminate paths with CR/LF, unlike command output.
+fn git_path_from_file(bytes: &[u8]) -> std::io::Result<PathBuf> {
+    let mut path = bytes;
+    while matches!(path.last(), Some(b'\n' | b'\r')) {
+        path = &path[..path.len() - 1];
+    }
+    if path.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Empty Git path",
+        ));
+    }
+    git_path_from_bytes(path)
+}
+
+// Submodules
+mod ci_platform;
+mod diff;
+mod error;
+pub(crate) use error::error_chain_message;
+pub mod fsmonitor;
+mod parse;
+#[cfg(unix)]
+pub mod reap;
+pub mod recover;
+mod ref_deletion;
+pub mod remote_ref;
+pub mod remove;
+mod repository;
+mod url;
+mod version;
+
+#[cfg(test)]
+mod test;
+
+// Global semaphore for limiting concurrent heavy git operations
+// to reduce mmap thrash on shared commit-graph and pack files.
+//
+// Permit count of 4 was chosen based on:
+// - Typical CPU core counts (4-8 cores common on developer machines)
+// - Empirical testing showing 25.6% improvement on 4-worktree repos
+// - Balance between parallelism and mmap contention
+// - With 4 permits: operations remain fast, overall throughput improves
+//
+// Heavy operations protected:
+// - git rev-list --count (accesses commit-graph via mmap)
+// - git diff-tree --shortstat (accesses pack files and indexes via mmap)
+use crate::path::canonicalize_with_parents;
+use crate::sync::Semaphore;
+use std::sync::LazyLock;
+static HEAVY_OPS_SEMAPHORE: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(4));
+
+/// The null OID returned by git when no commits exist (e.g., `git rev-parse HEAD` on an unborn branch).
+pub const NULL_OID: &str = "0000000000000000000000000000000000000000";
+
+/// Whether `dir` is itself a git directory — a bare repository, or the `.git`
+/// directory of a non-bare one.
+///
+/// Git's own `is_git_directory()` shape: a `HEAD`, an `objects/`, and a
+/// `refs/`. Read from disk rather than by asking git, because both callers ask
+/// about an arbitrary directory and git's own discovery answers *upward* — it
+/// would report on some enclosing repository instead of saying "not one here".
+///
+/// Deliberately shallow: git additionally validates what `HEAD` contains, and
+/// a false positive costs each caller little — one withholds a claim, the
+/// other still has to find the deleted path in the candidate's own worktree
+/// list before it recovers. [`Repository::at`] is not that check: discovering
+/// upward, it succeeds for a false positive that sits inside a real
+/// repository.
+pub(crate) fn is_bare_repo_dir(dir: &Path) -> bool {
+    dir.join("HEAD").is_file() && dir.join("objects").is_dir() && dir.join("refs").is_dir()
+}
+
+// Re-exports from submodules
+pub use ci_platform::ForgeKind;
+pub(crate) use diff::DiffStats;
+pub use diff::{LineDiff, PlumbingDiff, parse_numstat_line};
+pub use error::{
+    // Typed leaf error for buffered command-runner failures (downcast target)
+    CommandError,
+    // Trait for typed errors that produce a rich, styled diagnostic block
+    // distinct from their short single-line `Display`
+    Diagnostic,
+    // Extension methods on `anyhow::Error` (render_diagnostic,
+    // display_message, exit_code, interrupt_signal). Bring into scope
+    // to call them via method syntax.
+    ErrorExt,
+    // Structured command failure info
+    FailedCommand,
+    // Typed error enum
+    GitError,
+    // Special-handling error enum
+    HookErrorWithHint,
+    // Platform-specific reference type (PR vs MR)
+    RefType,
+    // CLI context for enriching switch suggestions in error hints
+    SwitchSuggestionCtx,
+    WorktrunkError,
+    // Wrap a HookCommandFailed-bearing error with a --no-hooks hint
+    add_hook_skip_hint,
+    // Shared phrasing for an unmerged index ("1 path with unresolved conflicts")
+    format_unresolved_conflicts,
+    process_exit_description,
+    // Render a single error via Diagnostic if it implements one
+    try_render_diagnostic,
+};
+pub use parse::{parse_porcelain_z, parse_untracked_files};
+pub use recover::{current_or_recover, cwd_removed_hint};
+pub use remove::{
+    BranchDeletionMode, BranchDeletionOutcome, BranchDeletionResult, RemovalOutput, RemoveOptions,
+    delete_branch_if_safe, drain_trash, execute_branch_deletion, remove_worktree_with_cleanup,
+    stage_worktree_removal, staged_trash_entries, stop_fsmonitor_daemon, trash_drain_running,
+};
+pub use repository::sha_cache;
+pub use repository::{
+    Branch, BranchDiffSpec, CommitMessageDetail, InProgressOperation, IntegrationTargets,
+    PreparedDiff, RefSnapshot, Repository, ResolvedWorktree, SafetyBackup, Selector,
+    StaleWorktreeWork, TempIndex, WorkingTree, base_path, duplicated_branches,
+    is_valid_branch_name, normalize_selector, resolve_input_path, select_comparison_base,
+    set_base_path,
+};
+pub use url::parse_owner_repo;
+pub use url::{GitRemoteUrl, GitRepoInfo, GitRepoProvider};
+pub(crate) use url::{canonical_url_path_segment, legacy_project_identifier, url_path_segments_eq};
+pub use version::{git_version, require_minimum_git};
+
+/// Why branch content is considered integrated into the target branch.
+///
+/// Used by both `wt list` (for status symbols) and `wt remove` (for messages).
+/// Each variant corresponds to a specific integration check. In `wt list`,
+/// three symbols represent these checks:
+/// - `_` for [`SameCommit`](Self::SameCommit) with clean working tree (empty)
+/// - `–` for [`SameCommit`](Self::SameCommit) with dirty working tree
+/// - `⊂` for all others (content integrated via different history)
+///
+/// The checks are ordered by cost (cheapest first):
+/// 1. [`SameCommit`](Self::SameCommit) - commit SHA comparison (~1ms)
+/// 2. [`Ancestor`](Self::Ancestor) - ancestor check (~1ms)
+/// 3. [`NoAddedChanges`](Self::NoAddedChanges) - three-dot diff (~50-100ms)
+/// 4. [`TreesMatch`](Self::TreesMatch) - tree SHA comparison (~100-300ms)
+/// 5. [`MergeAddsNothing`](Self::MergeAddsNothing) - merge simulation (~500ms-2s)
+/// 6. [`PatchIdMatch`](Self::PatchIdMatch) - patch-id matching when merge-tree conflicts (~1-3s)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, strum::IntoStaticStr)]
+#[serde(rename_all = "kebab-case")]
+#[strum(serialize_all = "kebab-case")]
+pub enum IntegrationReason {
+    /// Branch HEAD is literally the same commit as target.
+    ///
+    /// Used by `wt remove` to determine if branch is safely deletable.
+    /// In `wt list`, same-commit state is shown via `MainState::Empty` (`_`) or
+    /// `MainState::SameCommit` (`–`) depending on working tree cleanliness.
+    SameCommit,
+
+    /// Branch HEAD is an ancestor of target (target has moved past this branch).
+    ///
+    /// Symbol in `wt list`: `⊂`
+    Ancestor,
+
+    /// Three-dot diff (`main...branch`) shows no files.
+    /// The branch has no file changes beyond the merge-base.
+    ///
+    /// Symbol in `wt list`: `⊂`
+    NoAddedChanges,
+
+    /// Branch tree SHA equals target tree SHA.
+    /// Commit history differs but file contents are identical.
+    ///
+    /// Symbol in `wt list`: `⊂`
+    TreesMatch,
+
+    /// The branch has changes, but merging would produce the same tree as target.
+    ///
+    /// Detected via `git merge-tree` simulation. Handles squash-merged branches
+    /// where target has advanced with changes to different files.
+    ///
+    /// Symbol in `wt list`: `⊂`
+    MergeAddsNothing,
+
+    /// The branch's entire squashed diff matches a single commit on target.
+    ///
+    /// Fallback for when `merge-tree` conflicts (both sides modified the same
+    /// files). Computes `git diff-tree -p merge-base branch` as one combined
+    /// diff and checks if any individual commit on target has the same
+    /// patch-id. This specifically detects GitHub/GitLab squash merges — the
+    /// squash commit contains the whole branch in one commit, so the patch-ids
+    /// match. Does NOT detect cherry-picks of individual commits.
+    ///
+    /// Symbol in `wt list`: `⊂`
+    PatchIdMatch,
+}
+
+impl IntegrationReason {
+    /// Human-readable description for use in messages (e.g., `wt remove` output).
+    ///
+    /// Returns a phrase that expects the target branch name to follow
+    /// (e.g., "same commit as" + "main" → "same commit as main").
+    pub fn description(&self) -> &'static str {
+        match self {
+            Self::SameCommit => "same commit as",
+            Self::Ancestor => "ancestor of",
+            Self::NoAddedChanges => "no added changes on",
+            Self::TreesMatch => "tree matches",
+            Self::MergeAddsNothing => "all changes in",
+            Self::PatchIdMatch => "all changes in",
+        }
+    }
+
+    /// Status symbol used in `wt list` for this integration reason.
+    ///
+    /// - `SameCommit` → `_` (matches `MainState::Empty`)
+    /// - Others → `⊂` (matches `MainState::Integrated`)
+    pub fn symbol(&self) -> &'static str {
+        match self {
+            Self::SameCommit => "_",
+            _ => "⊂",
+        }
+    }
+}
+
+/// Integration signals for checking if a branch is integrated into target.
+///
+/// `None` means "unknown/failed to check". The check functions treat `None`
+/// conservatively (as if not integrated).
+///
+/// Used by:
+/// - `wt list`: Built from parallel task results
+/// - `wt remove`/`wt merge`: Built via [`compute_integration_lazy`]
+#[derive(Debug, Default)]
+pub struct IntegrationSignals {
+    pub is_same_commit: Option<bool>,
+    pub is_ancestor: Option<bool>,
+    pub has_added_changes: Option<bool>,
+    pub trees_match: Option<bool>,
+    pub would_merge_add: Option<bool>,
+    pub is_patch_id_match: Option<bool>,
+}
+
+/// Canonical integration check using pre-computed signals.
+///
+/// Checks signals in priority order (cheapest first). Returns as soon as any
+/// integration reason is found.
+///
+/// `None` values are treated conservatively: unknown signals don't match.
+/// This is the single source of truth for integration priority logic.
+pub fn check_integration(signals: &IntegrationSignals) -> Option<IntegrationReason> {
+    // Priority 1 (cheapest): Same commit as target
+    if signals.is_same_commit == Some(true) {
+        return Some(IntegrationReason::SameCommit);
+    }
+
+    // Priority 2 (cheap): Branch is ancestor of target (target has moved past)
+    if signals.is_ancestor == Some(true) {
+        return Some(IntegrationReason::Ancestor);
+    }
+
+    // Priority 3: No file changes beyond merge-base (empty three-dot diff)
+    if signals.has_added_changes == Some(false) {
+        return Some(IntegrationReason::NoAddedChanges);
+    }
+
+    // Priority 4: Tree SHA matches target (handles squash merge/rebase)
+    if signals.trees_match == Some(true) {
+        return Some(IntegrationReason::TreesMatch);
+    }
+
+    // Priority 5 (expensive ~500ms-2s): Merge would not add anything
+    if signals.would_merge_add == Some(false) {
+        return Some(IntegrationReason::MergeAddsNothing);
+    }
+
+    // Priority 6 (most expensive): Patch-id match detects squash merge when merge-tree conflicts
+    if signals.is_patch_id_match == Some(true) {
+        return Some(IntegrationReason::PatchIdMatch);
+    }
+
+    None
+}
+
+/// Compute integration signals lazily with short-circuit evaluation.
+///
+/// Runs git commands in priority order, stopping as soon as integration is
+/// confirmed. This avoids expensive checks (like `would_merge_add` which
+/// takes ~500ms-2s) when cheaper checks succeed.
+///
+/// Used by `wt remove` and `wt merge` for single-branch checks.
+/// For batch operations, use parallel tasks to build [`IntegrationSignals`] directly.
+///
+/// Resolves both `branch` and `target` to commit SHAs via `snapshot` so the
+/// integration probes read the ref state the caller captured — this
+/// is the safety contract that lets `wt merge`'s post-update-ref check
+/// observe the new local target SHA instead of the pre-merge value.
+/// Refs not in the snapshot (typically transient HEAD commits during a
+/// rebase, or raw SHAs) fall back to uncached `git rev-parse`.
+#[allow(clippy::field_reassign_with_default)] // Intentional: short-circuit populates fields incrementally
+pub fn compute_integration_lazy(
+    repo: &Repository,
+    snapshot: &RefSnapshot,
+    branch: &str,
+    target: &str,
+) -> anyhow::Result<IntegrationSignals> {
+    let mut signals = IntegrationSignals::default();
+
+    let branch_sha = resolve_via_snapshot(repo, snapshot, branch)?;
+    let target_sha = resolve_via_snapshot(repo, snapshot, target)?;
+
+    // Priority 1: Same commit
+    signals.is_same_commit = Some(branch_sha == target_sha);
+    if signals.is_same_commit == Some(true) {
+        return Ok(signals);
+    }
+
+    // Priority 2: Ancestor
+    signals.is_ancestor = Some(repo.is_ancestor_by_sha(&branch_sha, &target_sha)?);
+    if signals.is_ancestor == Some(true) {
+        return Ok(signals);
+    }
+
+    // Priority 3: No added changes
+    signals.has_added_changes = Some(repo.has_added_changes_by_sha(&branch_sha, &target_sha)?);
+    if signals.has_added_changes == Some(false) {
+        return Ok(signals);
+    }
+
+    // Priority 4: Trees match
+    signals.trees_match = Some(repo.trees_match_by_sha(&branch_sha, &target_sha)?);
+    if signals.trees_match == Some(true) {
+        return Ok(signals);
+    }
+
+    // Priority 5+6: Merge-tree simulation + patch-id fallback
+    let probe = repo.merge_integration_probe_by_sha(&branch_sha, &target_sha)?;
+    signals.would_merge_add = Some(probe.would_merge_add);
+    if !probe.would_merge_add {
+        return Ok(signals);
+    }
+    signals.is_patch_id_match = Some(probe.is_patch_id_match);
+
+    Ok(signals)
+}
+
+/// Resolve a ref name through the snapshot, falling back to an uncached
+/// `git rev-parse` for refs the snapshot doesn't carry (HEAD, raw SHAs,
+/// tags, transient rebase commits). Used by [`compute_integration_lazy`]
+/// at the boundary into SHA-keyed integration probes.
+fn resolve_via_snapshot(
+    repo: &Repository,
+    snapshot: &RefSnapshot,
+    name: &str,
+) -> anyhow::Result<String> {
+    if let Some(sha) = snapshot.resolve(name) {
+        return Ok(sha.to_string());
+    }
+    Ok(repo
+        .run_command(&["rev-parse", "--verify", "--end-of-options", name])?
+        .trim()
+        .to_string())
+}
+
+/// Category of branch for completion display
+#[derive(Debug, Clone, PartialEq)]
+pub enum BranchCategory {
+    /// Branch has an active worktree
+    Worktree,
+    /// Local branch without worktree
+    Local,
+    /// Remote-only branch (includes remote names — multiple if same branch on multiple remotes)
+    Remote(Vec<String>),
+}
+
+/// Branch information for shell completions
+#[derive(Debug, Clone)]
+pub struct CompletionBranch {
+    /// Branch name (local name for remotes, e.g., "fix" not "origin/fix")
+    pub name: String,
+    /// Unix timestamp of last commit
+    pub timestamp: i64,
+    /// Category for sorting and display
+    pub category: BranchCategory,
+}
+
+/// A single local branch entry from the branch inventory.
+///
+/// Populated by one `git for-each-ref refs/heads/` scan per Repository lifetime
+/// (see [`Repository::local_branches`]). Sorted by most recent commit first.
+#[derive(Debug, Clone)]
+pub struct LocalBranch {
+    /// Short branch name, e.g., "feature" (not "refs/heads/feature").
+    pub name: String,
+    /// Commit SHA this branch points at.
+    pub commit_sha: String,
+    /// Unix timestamp of the commit.
+    pub committer_ts: i64,
+    /// Upstream tracking ref (e.g., "origin/main"), if configured and present.
+    /// `None` when no upstream is set, or when the configured upstream is gone
+    /// (git reports `[gone]` via `%(upstream:track)`).
+    pub upstream_short: Option<String>,
+    /// Where this branch pushes, from `%(push:remotename)`: a remote name, or a
+    /// URL when `branch.<name>.pushRemote` is one (`gh pr checkout` sets that
+    /// for a fork's PR). `None` when no push remote is configured.
+    pub push_remote: Option<String>,
+}
+
+/// A single remote-tracking branch entry from the branch inventory.
+///
+/// Populated by one `git for-each-ref refs/remotes/` scan per Repository
+/// lifetime (see [`Repository::remote_branches`]). `<remote>/HEAD` symrefs are
+/// excluded. Sorted by most recent commit first.
+#[derive(Debug, Clone)]
+pub struct RemoteBranch {
+    /// Remote-qualified name, e.g., "origin/feature".
+    pub short_name: String,
+    /// Commit SHA this remote ref points at.
+    pub commit_sha: String,
+    /// Unix timestamp of the commit.
+    pub committer_ts: i64,
+    /// Remote name, e.g., "origin".
+    pub remote_name: String,
+    /// Branch name without the remote prefix, e.g., "feature".
+    pub local_name: String,
+}
+
+// Re-export parsing helpers for internal use
+pub(crate) use parse::DefaultBranchName;
+
+use crate::shell_exec::Cmd;
+
+/// Check if a local branch is tracking a specific remote ref.
+///
+/// Returns `Some(true)` if the branch is configured to track the given ref.
+/// Returns `Some(false)` if the branch exists but tracks something else (or nothing).
+/// Returns `None` if the branch doesn't exist.
+///
+/// Used by PR/MR checkout to detect when a branch name collision exists.
+///
+/// # Arguments
+/// * `repo_root` - Path to run git commands from
+/// * `branch` - Local branch name to check
+/// * `expected_ref` - Full ref path (e.g., `refs/pull/101/head` or `refs/merge-requests/42/head`)
+/// * `expected_remote` - Optional remote name that must also match `branch.<name>.remote`
+pub fn branch_tracks_ref(
+    repo_root: &std::path::Path,
+    branch: &str,
+    expected_ref: &str,
+    expected_remote: Option<&str>,
+) -> Option<bool> {
+    let config_key = format!("branch.{}.merge", branch);
+    let output = Cmd::new("git")
+        .args(["config", "--get", &config_key])
+        .current_dir(repo_root)
+        .run()
+        .ok()?;
+
+    if !output.status.success() {
+        // Config key doesn't exist - branch might not track anything
+        // Check if branch exists at all
+        let branch_exists = Cmd::new("git")
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{}", branch),
+            ])
+            .current_dir(repo_root)
+            .run()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+
+        return if branch_exists { Some(false) } else { None };
+    }
+
+    let merge_ref = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if merge_ref != expected_ref {
+        return Some(false);
+    }
+
+    let Some(expected_remote) = expected_remote else {
+        return Some(true);
+    };
+
+    let remote_key = format!("branch.{}.remote", branch);
+    let remote_output = Cmd::new("git")
+        .args(["config", "--get", &remote_key])
+        .current_dir(repo_root)
+        .run()
+        .ok()?;
+
+    if !remote_output.status.success() {
+        return Some(false);
+    }
+
+    let remote = String::from_utf8_lossy(&remote_output.stdout)
+        .trim()
+        .to_string();
+    Some(remote == expected_remote)
+}
+
+// Note: HookType and WorktreeInfo are defined in this module and are already public.
+// They're accessible as git::HookType and git::WorktreeInfo without needing re-export.
+
+/// Hook types for git operations
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    strum::Display,
+    strum::EnumString,
+    strum::EnumIter,
+)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[serde(rename_all = "kebab-case")]
+#[strum(serialize_all = "kebab-case")]
+pub enum HookType {
+    PreSwitch,
+    PostSwitch,
+    // Canonical display is `pre-start`/`post-start`; `pre-create`/`post-create`
+    // are accepted as silent aliases via `FromStr`. The Rust variant name uses
+    // the future canonical (`-create`) so the eventual flip is a Display-only
+    // change.
+    #[strum(to_string = "pre-start", serialize = "pre-create")]
+    #[serde(rename = "pre-start", alias = "pre-create")]
+    #[cfg_attr(feature = "cli", value(name = "pre-start", alias = "pre-create"))]
+    PreCreate,
+    #[strum(to_string = "post-start", serialize = "post-create")]
+    #[serde(rename = "post-start", alias = "post-create")]
+    #[cfg_attr(feature = "cli", value(name = "post-start", alias = "post-create"))]
+    PostCreate,
+    PreCommit,
+    PostCommit,
+    PreMerge,
+    PostMerge,
+    PreRemove,
+    PostRemove,
+}
+
+impl HookType {
+    /// True for `pre-*` hooks. `pre-*` hooks block the operation and propagate
+    /// failures fail-fast; `post-*` hooks run after success and default to
+    /// background-with-warn.
+    ///
+    /// Uses an exhaustive match (not `matches!`) so a new variant trips a
+    /// compile-time nudge instead of silently classifying as post-*.
+    pub fn is_pre(self) -> bool {
+        match self {
+            HookType::PreSwitch
+            | HookType::PreCreate
+            | HookType::PreCommit
+            | HookType::PreMerge
+            | HookType::PreRemove => true,
+            HookType::PostSwitch
+            | HookType::PostCreate
+            | HookType::PostCommit
+            | HookType::PostMerge
+            | HookType::PostRemove => false,
+        }
+    }
+}
+
+/// Reference to a branch for parallel task execution.
+///
+/// Works for both worktree items (has path) and branch-only items (no worktree).
+/// The `Option<PathBuf>` makes the worktree distinction explicit instead of using
+/// empty paths as a sentinel value.
+///
+/// # Construction
+///
+/// - From a worktree: `worktree_info.worktree_ref()` and then
+///   [`WorktreeRef::into_branch_ref()`]
+/// - For a local branch: `BranchRef::local_branch("feature", "abc123")`
+/// - For a remote branch: `BranchRef::remote_branch("origin/feature", "abc123")`
+///
+/// # Working Tree Access
+///
+/// For worktree-specific operations, use [`working_tree()`](Self::working_tree)
+/// which returns `Some(WorkingTree)` only when this ref has a worktree path.
+#[derive(Debug, Clone)]
+pub struct BranchRef {
+    /// Repository-scoped identity of this inventory item. Constructed with the
+    /// snapshot so downstream users never reinterpret paths or ref names.
+    id: GitItemId,
+    /// Full git ref (e.g., `refs/heads/feature`, `refs/remotes/origin/feature`).
+    /// `None` for detached HEAD.
+    ///
+    /// Storing the full ref — rather than a short name plus a remote/local
+    /// flag — makes the ref unambiguous: git lets users create a local branch
+    /// literally named `origin/foo`, and `git rev-parse origin/foo` then picks
+    /// `refs/heads/origin/foo` over `refs/remotes/origin/foo`. With the full
+    /// ref there is nothing to disambiguate.
+    full_ref: Option<String>,
+    /// Commit SHA this branch/worktree points to.
+    pub commit_sha: String,
+    /// Path to worktree, if this branch has one.
+    /// None for branch-only items (remote branches, local branches without worktrees).
+    worktree_path: Option<PathBuf>,
+}
+
+/// Canonical snapshot of a registered worktree.
+///
+/// This is the typed construction boundary for worktree-backed items. Inner
+/// layers can accept it instead of an arbitrary [`BranchRef`], which makes a
+/// missing worktree path unrepresentable while preserving the same canonical
+/// [`WorktreeId`] used for equality.
+#[derive(Debug, Clone)]
+pub struct WorktreeRef(BranchRef);
+
+/// Canonical identity of one registered worktree.
+///
+/// Git's registered path remains available separately for display and command
+/// execution. Equality uses the canonical path so aliases such as `/var` and
+/// `/private/var` name the same worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorktreeId(PathBuf);
+
+impl WorktreeId {
+    pub fn new(path: impl AsRef<Path>) -> Self {
+        Self(canonicalize_with_parents(path.as_ref()))
+    }
+}
+
+/// Repository-scoped identity for a worktree or branch-only item.
+///
+/// This is deliberately separate from every adjacent string representation:
+///
+/// - a worktree is identified by its canonical path, because detached
+///   worktrees have no ref and Git can force-check out one branch more than
+///   once;
+/// - a branch-only item is identified by its full ref, so a local branch named
+///   `origin/foo` cannot collide with `refs/remotes/origin/foo`.
+///
+/// The key identifies the item, not its current content. Caches whose values
+/// depend on a commit or tree must include that content signature separately.
+/// Likewise, user-facing selectors and display labels are representations of
+/// an item, not substitutes for this key.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GitItemId(GitItemIdKind);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum GitItemIdKind {
+    Worktree(WorktreeId),
+    Ref(String),
+}
+
+impl GitItemId {
+    /// Identify a worktree by the canonical form used for path comparisons.
+    fn worktree(path: impl AsRef<Path>) -> Self {
+        WorktreeId::new(path).into()
+    }
+
+    /// Identify a branch-only item by an already-qualified ref.
+    fn full_ref(full_ref: impl Into<String>) -> Self {
+        Self(GitItemIdKind::Ref(full_ref.into()))
+    }
+
+    fn local_branch(branch: &str) -> Self {
+        Self::full_ref(local_ref(branch))
+    }
+
+    fn remote_branch(branch: &str) -> Self {
+        Self::full_ref(remote_ref(branch))
+    }
+}
+
+fn local_ref(branch: &str) -> String {
+    format!("refs/heads/{branch}")
+}
+
+fn remote_ref(branch: &str) -> String {
+    format!("refs/remotes/{branch}")
+}
+
+impl From<WorktreeId> for GitItemId {
+    fn from(id: WorktreeId) -> Self {
+        Self(GitItemIdKind::Worktree(id))
+    }
+}
+
+impl std::fmt::Display for GitItemId {
+    /// Tagged diagnostic form. Equality and hashing use the structured key;
+    /// this string exists only for logs and test-only cache inventories.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            GitItemIdKind::Worktree(id) => {
+                write!(f, "worktree:{}", id.0.to_string_lossy())
+            }
+            GitItemIdKind::Ref(full_ref) => write!(f, "ref:{full_ref}"),
+        }
+    }
+}
+
+impl BranchRef {
+    /// Create a BranchRef for a local branch without a worktree.
+    pub fn local_branch(branch: &str, commit_sha: &str) -> Self {
+        let full_ref = local_ref(branch);
+        Self {
+            id: GitItemId::local_branch(branch),
+            full_ref: Some(full_ref),
+            commit_sha: commit_sha.to_string(),
+            worktree_path: None,
+        }
+    }
+
+    /// Create a BranchRef for a remote-tracking branch.
+    ///
+    /// `branch` is the short remote-qualified name (e.g., `"origin/feature"`),
+    /// as produced by `%(refname:lstrip=2)` in `list_remote_branches`. It is
+    /// stored as `refs/remotes/<branch>`.
+    pub fn remote_branch(branch: &str, commit_sha: &str) -> Self {
+        let full_ref = remote_ref(branch);
+        Self {
+            id: GitItemId::remote_branch(branch),
+            full_ref: Some(full_ref),
+            commit_sha: commit_sha.to_string(),
+            worktree_path: None,
+        }
+    }
+
+    /// Repository-scoped identity of this worktree or branch-only item.
+    pub fn id(&self) -> &GitItemId {
+        &self.id
+    }
+
+    /// Get a working tree handle for this branch's worktree.
+    ///
+    /// Returns `Some(WorkingTree)` if this branch has a worktree path,
+    /// `None` for branch-only items.
+    pub fn working_tree<'a>(&self, repo: &'a Repository) -> Option<WorkingTree<'a>> {
+        self.worktree_path
+            .as_ref()
+            .map(|p| repo.worktree_at(p.clone()))
+    }
+
+    /// Git's registered path for a worktree-backed item.
+    pub fn worktree_path(&self) -> Option<&Path> {
+        self.worktree_path.as_deref()
+    }
+
+    /// Full git ref (e.g., `refs/heads/feature`, `refs/remotes/origin/feature`),
+    /// suitable for passing to integration helpers that go through `git rev-parse`.
+    ///
+    /// Returns `None` for detached HEAD.
+    pub fn full_ref(&self) -> Option<&str> {
+        self.full_ref.as_deref()
+    }
+
+    /// Short display name (e.g., `feature`, `origin/feature`) with the
+    /// `refs/heads/` or `refs/remotes/` prefix stripped. Use for user-facing
+    /// output and APIs that expect short names (`git config branch.<name>.*`,
+    /// `gh pr view <branch>`).
+    ///
+    /// Returns `None` for detached HEAD.
+    ///
+    /// # Panics
+    ///
+    /// Every constructor on this type produces a `full_ref` starting with
+    /// `refs/heads/` or `refs/remotes/`; this panics if that invariant is
+    /// ever violated (e.g., by a future struct-literal caller). The panic
+    /// is the intended behavior — silently returning an unqualified ref
+    /// would re-open the shadowing class of bug this type exists to rule out.
+    pub fn short_name(&self) -> Option<&str> {
+        let r = self.full_ref.as_deref()?;
+        Some(
+            r.strip_prefix("refs/heads/")
+                .or_else(|| r.strip_prefix("refs/remotes/"))
+                .expect("BranchRef.full_ref must start with refs/heads/ or refs/remotes/"),
+        )
+    }
+
+    /// True if this is a remote-tracking ref (under `refs/remotes/`).
+    pub fn is_remote(&self) -> bool {
+        self.full_ref
+            .as_deref()
+            .is_some_and(|r| r.starts_with("refs/remotes/"))
+    }
+}
+
+impl WorktreeRef {
+    /// Capture a worktree's identity and Git snapshot once while preserving
+    /// the registered path spelling for commands and display.
+    pub fn new(path: impl Into<PathBuf>, branch: Option<&str>, commit_sha: &str) -> Self {
+        let path = path.into();
+        Self(BranchRef {
+            id: WorktreeId::new(&path).into(),
+            full_ref: branch.map(local_ref),
+            commit_sha: commit_sha.to_string(),
+            worktree_path: Some(path),
+        })
+    }
+
+    /// Canonical worktree identity captured by [`Self::new`].
+    pub fn id(&self) -> &WorktreeId {
+        match &self.0.id.0 {
+            GitItemIdKind::Worktree(id) => id,
+            GitItemIdKind::Ref(_) => unreachable!("WorktreeRef always contains a worktree ID"),
+        }
+    }
+
+    /// Pass the already-canonicalized subject to an inner layer.
+    pub fn into_branch_ref(self) -> BranchRef {
+        self.0
+    }
+}
+
+/// Parsed worktree data from `git worktree list --porcelain`.
+///
+/// This is a data record containing metadata about a worktree.
+/// For running commands in a worktree, use [`WorkingTree`] via
+/// [`Repository::worktree_at()`] or [`BranchRef::working_tree()`].
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct WorktreeInfo {
+    pub path: PathBuf,
+    pub head: String,
+    pub branch: Option<String>,
+    pub bare: bool,
+    pub detached: bool,
+    pub locked: Option<String>,
+    pub prunable: Option<String>,
+}
+
+/// Extract the directory name from a path for display purposes.
+///
+/// Returns the last component of the path as a string, or "(unknown)" if
+/// the path has no filename or contains invalid UTF-8.
+pub fn path_dir_name(path: &std::path::Path) -> &str {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("(unknown)")
+}
+
+impl WorktreeInfo {
+    /// Canonical identity of this inventory entry. The registered path remains
+    /// unchanged on [`Self::path`] for display and Git operations.
+    pub fn id(&self) -> WorktreeId {
+        WorktreeId::new(&self.path)
+    }
+
+    /// Build the canonical worktree subject for this inventory entry.
+    pub fn worktree_ref(&self) -> WorktreeRef {
+        // `branch` is the short form produced by `parse_porcelain_list_z` (one
+        // `refs/heads/` prefix stripped). Re-qualifying it in the worktree
+        // constructor preserves even a pathological branch literally named
+        // `refs/heads/foo` as `refs/heads/refs/heads/foo`.
+        WorktreeRef::new(self.path.clone(), self.branch.as_deref(), &self.head)
+    }
+
+    /// Returns true if git reports this worktree prunable: the `.git` its
+    /// registration names is gone, with the directory or without it.
+    ///
+    /// Prunable worktrees cannot be operated on — git no longer resolves the
+    /// directory, if one remains, as this worktree. Most iteration over
+    /// worktrees should skip prunable ones.
+    pub fn is_prunable(&self) -> bool {
+        self.prunable.is_some()
+    }
+
+    /// Returns true if this worktree points to a real commit (not the null OID).
+    ///
+    /// Unborn branches (no commits yet) have the null OID as their HEAD.
+    pub fn has_commits(&self) -> bool {
+        self.head != NULL_OID
+    }
+
+    /// Returns the worktree directory name.
+    ///
+    /// This is the filesystem directory name (e.g., "repo.feature" from "/path/to/repo.feature").
+    /// For user-facing display with context (branch consistency, detached state),
+    /// use `worktree_display_name()` from the commands module instead.
+    pub fn dir_name(&self) -> &str {
+        path_dir_name(&self.path)
+    }
+}
+
+// Helper functions for worktree parsing
+//
+// These live in mod.rs rather than parse.rs because they bridge multiple concerns:
+// - finalize_worktrees() uses Repository (from repository.rs) to access git internals
+// - it operates on WorktreeInfo (defined here in mod.rs)
+//
+// Placing them here avoids circular dependencies and keeps them close to WorktreeInfo.
+
+/// The branch a rebase in this git dir is rewriting, from `head-name`.
+fn rebase_branch(git_dir: &Path) -> Option<String> {
+    // Check both rebase-merge and rebase-apply
+    for rebase_dir in ["rebase-merge", "rebase-apply"] {
+        let head_name_path = git_dir.join(rebase_dir).join("head-name");
+        if let Ok(content) = std::fs::read_to_string(head_name_path) {
+            let branch_ref = content.trim();
+            // Strip refs/heads/ prefix if present
+            let branch = branch_ref
+                .strip_prefix("refs/heads/")
+                .unwrap_or(branch_ref)
+                .to_string();
+            return Some(branch);
+        }
+    }
+
+    None
+}
+
+/// Finalize worktrees after parsing: a detached worktree mid-rebase takes the
+/// name of the branch it is rebasing.
+///
+/// `git worktree list` reports a rebasing worktree only as `detached`, so each
+/// detached worktree needs its own `git rev-parse --git-dir` to find its rebase
+/// state. [`WorkingTree::git_dirs`] runs those forks concurrently as child
+/// processes rather than on a thread pool: this runs inside the
+/// `list_worktrees` cache initializer, and a pool thread waiting there would
+/// run other pool jobs, one of which could wait on the same cache.
+///
+/// A stale (prunable) entry's rebase state is read from its registration
+/// instead. With its `.git` gone, a `rev-parse` from its path finds nothing
+/// there and walks up to whatever repository encloses the directory — for a
+/// worktree nested in the main one, the main worktree's git dir — and would
+/// name the entry after a rebase that is not its own.
+pub(crate) fn finalize_worktrees(repo: &Repository, worktrees: &mut [WorktreeInfo]) {
+    let (stale, mut detached): (Vec<&mut WorktreeInfo>, Vec<&mut WorktreeInfo>) = worktrees
+        .iter_mut()
+        .filter(|wt| wt.detached && wt.branch.is_none())
+        .partition(|wt| wt.is_prunable());
+    for wt in stale {
+        if let Ok((registration, _)) = repo.registration_at(&wt.path) {
+            wt.branch = rebase_branch(&registration);
+        }
+    }
+    if detached.is_empty() {
+        return;
+    }
+    let trees: Vec<WorkingTree<'_>> = detached
+        .iter()
+        .map(|wt| repo.worktree_at(&wt.path))
+        .collect();
+    for (wt, git_dir) in detached.iter_mut().zip(WorkingTree::git_dirs(&trees)) {
+        if let Ok(git_dir) = git_dir {
+            wt.branch = rebase_branch(&git_dir);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_check_integration() {
+        // Each integration reason + not integrated
+        // Tuple: (is_same_commit, is_ancestor, has_added_changes, trees_match, would_merge_add, is_patch_id_match)
+        let cases = [
+            (
+                (
+                    Some(true),
+                    Some(false),
+                    Some(true),
+                    Some(false),
+                    Some(true),
+                    None,
+                ),
+                Some(IntegrationReason::SameCommit),
+            ),
+            (
+                (
+                    Some(false),
+                    Some(true),
+                    Some(true),
+                    Some(false),
+                    Some(true),
+                    None,
+                ),
+                Some(IntegrationReason::Ancestor),
+            ),
+            (
+                (
+                    Some(false),
+                    Some(false),
+                    Some(false),
+                    Some(false),
+                    Some(true),
+                    None,
+                ),
+                Some(IntegrationReason::NoAddedChanges),
+            ),
+            (
+                (
+                    Some(false),
+                    Some(false),
+                    Some(true),
+                    Some(true),
+                    Some(true),
+                    None,
+                ),
+                Some(IntegrationReason::TreesMatch),
+            ),
+            (
+                (
+                    Some(false),
+                    Some(false),
+                    Some(true),
+                    Some(false),
+                    Some(false),
+                    None,
+                ),
+                Some(IntegrationReason::MergeAddsNothing),
+            ),
+            (
+                // Patch-id match (merge-tree conflicts but patch-id finds squash commit)
+                (
+                    Some(false),
+                    Some(false),
+                    Some(true),
+                    Some(false),
+                    Some(true),
+                    Some(true),
+                ),
+                Some(IntegrationReason::PatchIdMatch),
+            ),
+            (
+                // Not integrated (nothing matches)
+                (
+                    Some(false),
+                    Some(false),
+                    Some(true),
+                    Some(false),
+                    Some(true),
+                    Some(false),
+                ),
+                None,
+            ),
+            (
+                (
+                    Some(true),
+                    Some(true),
+                    Some(false),
+                    Some(true),
+                    Some(false),
+                    None,
+                ),
+                Some(IntegrationReason::SameCommit),
+            ), // Priority test: is_same_commit wins
+            // None values are treated conservatively (as if not integrated)
+            ((None, None, None, None, None, None), None),
+            (
+                (None, Some(true), Some(false), Some(true), Some(false), None),
+                Some(IntegrationReason::Ancestor),
+            ),
+        ];
+        for ((same, ancestor, added, trees, merge, patch_id), expected) in cases {
+            let signals = IntegrationSignals {
+                is_same_commit: same,
+                is_ancestor: ancestor,
+                has_added_changes: added,
+                trees_match: trees,
+                would_merge_add: merge,
+                is_patch_id_match: patch_id,
+            };
+            assert_eq!(
+                check_integration(&signals),
+                expected,
+                "case: {same:?},{ancestor:?},{added:?},{trees:?},{merge:?},{patch_id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_integration_reason_description() {
+        assert_eq!(
+            IntegrationReason::SameCommit.description(),
+            "same commit as"
+        );
+        assert_eq!(IntegrationReason::Ancestor.description(), "ancestor of");
+        assert_eq!(
+            IntegrationReason::NoAddedChanges.description(),
+            "no added changes on"
+        );
+        assert_eq!(IntegrationReason::TreesMatch.description(), "tree matches");
+        assert_eq!(
+            IntegrationReason::MergeAddsNothing.description(),
+            "all changes in"
+        );
+        assert_eq!(
+            IntegrationReason::PatchIdMatch.description(),
+            "all changes in"
+        );
+    }
+
+    #[test]
+    fn test_path_dir_name() {
+        assert_eq!(
+            path_dir_name(&PathBuf::from("/home/user/repo.feature")),
+            "repo.feature"
+        );
+        assert_eq!(path_dir_name(&PathBuf::from("/")), "(unknown)");
+        assert!(!path_dir_name(&PathBuf::from("/home/user/repo/")).is_empty());
+
+        // WorktreeInfo::dir_name
+        let wt = WorktreeInfo {
+            path: PathBuf::from("/repos/myrepo.feature"),
+            head: "abc123".into(),
+            branch: Some("feature".into()),
+            bare: false,
+            detached: false,
+            locked: None,
+            prunable: None,
+        };
+        assert_eq!(wt.dir_name(), "myrepo.feature");
+    }
+
+    #[test]
+    fn test_hook_type_display() {
+        use strum::IntoEnumIterator;
+
+        // Verify all hook types serialize to kebab-case
+        for hook in HookType::iter() {
+            let display = format!("{hook}");
+            assert!(
+                display.chars().all(|c| c.is_lowercase() || c == '-'),
+                "Hook {hook:?} should be kebab-case, got: {display}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_branch_ref_from_worktree_info() {
+        let wt = WorktreeInfo {
+            path: PathBuf::from("/repo.feature"),
+            head: "abc123".into(),
+            branch: Some("feature".into()),
+            bare: false,
+            detached: false,
+            locked: None,
+            prunable: None,
+        };
+
+        let branch_ref = wt.worktree_ref().into_branch_ref();
+
+        assert_eq!(branch_ref.full_ref(), Some("refs/heads/feature"));
+        assert_eq!(branch_ref.short_name(), Some("feature"));
+        assert_eq!(branch_ref.commit_sha, "abc123");
+        assert_eq!(
+            branch_ref.worktree_path,
+            Some(PathBuf::from("/repo.feature"))
+        );
+        assert!(branch_ref.worktree_path().is_some());
+        assert!(!branch_ref.is_remote()); // Worktrees are always local
+    }
+
+    #[test]
+    fn test_branch_ref_local_branch() {
+        let branch_ref = BranchRef::local_branch("feature", "abc123");
+
+        assert_eq!(branch_ref.full_ref(), Some("refs/heads/feature"));
+        assert_eq!(branch_ref.short_name(), Some("feature"));
+        assert_eq!(branch_ref.commit_sha, "abc123");
+        assert_eq!(branch_ref.worktree_path, None);
+        assert!(branch_ref.worktree_path().is_none());
+        assert!(!branch_ref.is_remote());
+    }
+
+    #[test]
+    fn test_branch_ref_remote_branch() {
+        let branch_ref = BranchRef::remote_branch("origin/feature", "abc123");
+
+        assert_eq!(branch_ref.full_ref(), Some("refs/remotes/origin/feature"));
+        assert_eq!(branch_ref.short_name(), Some("origin/feature"));
+        assert_eq!(branch_ref.commit_sha, "abc123");
+        assert_eq!(branch_ref.worktree_path, None);
+        assert!(branch_ref.worktree_path().is_none());
+        assert!(branch_ref.is_remote());
+    }
+
+    #[test]
+    fn test_branch_ref_full_ref_disambiguates_remote_from_local() {
+        // Git allows local branches literally named `origin/foo`. Full refs
+        // make the two distinguishable even though they share a short name.
+        //
+        // This pins the type-level contract; the end-to-end guardrail against
+        // `git rev-parse` picking the wrong ref lives at
+        // `test_list_remote_row_not_shadowed_by_same_named_local_branch` in
+        // `tests/integration_tests/list.rs`.
+        let remote = BranchRef::remote_branch("origin/foo", "abc");
+        let local = BranchRef::local_branch("origin/foo", "def");
+
+        assert_eq!(remote.full_ref(), Some("refs/remotes/origin/foo"));
+        assert_eq!(local.full_ref(), Some("refs/heads/origin/foo"));
+        assert_eq!(remote.short_name(), Some("origin/foo"));
+        assert_eq!(local.short_name(), Some("origin/foo"));
+        assert!(remote.is_remote());
+        assert!(!local.is_remote());
+    }
+
+    #[test]
+    fn branch_ref_preserves_git_item_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let first_path = root.path().join("first");
+        let second_path = root.path().join("second");
+        std::fs::create_dir_all(&first_path).unwrap();
+        std::fs::create_dir_all(&second_path).unwrap();
+
+        // Worktree state belongs to the checkout, not to its branch or commit.
+        // Two detached worktrees at one commit and two force-checkouts of one
+        // branch therefore remain distinct keys.
+        assert_ne!(
+            WorktreeRef::new(&first_path, None, "abc").id(),
+            WorktreeRef::new(&second_path, None, "abc").id()
+        );
+
+        // Equivalent path spellings converge on the same checkout identity.
+        let same_path = WorktreeRef::new(first_path.join("."), None, "abc");
+        assert_eq!(
+            WorktreeRef::new(&first_path, None, "abc").id(),
+            same_path.id()
+        );
+
+        // A short name is presentation; the full ref is identity.
+        assert_ne!(
+            BranchRef::local_branch("origin/foo", "abc").id(),
+            BranchRef::remote_branch("origin/foo", "abc").id()
+        );
+    }
+
+    #[test]
+    fn test_branch_ref_detached_has_no_ref() {
+        // Detached HEAD has no branch name — callers fall back to commit_sha.
+        let detached = WorktreeRef::new("/tmp/detached", None, "abc").into_branch_ref();
+        assert_eq!(detached.full_ref(), None);
+        assert_eq!(detached.short_name(), None);
+        assert!(!detached.is_remote());
+    }
+
+    #[test]
+    fn test_branch_tracks_ref_matching() {
+        let test = crate::testing::TestRepo::with_initial_commit();
+        let repo = test.path();
+
+        // Create a branch and set its merge config to a PR ref
+        crate::shell_exec::Cmd::new("git")
+            .args(["branch", "pr-branch"])
+            .current_dir(repo)
+            .run()
+            .unwrap();
+        crate::shell_exec::Cmd::new("git")
+            .args(["config", "branch.pr-branch.merge", "refs/pull/101/head"])
+            .current_dir(repo)
+            .run()
+            .unwrap();
+        crate::shell_exec::Cmd::new("git")
+            .args(["config", "branch.pr-branch.remote", "origin"])
+            .current_dir(repo)
+            .run()
+            .unwrap();
+
+        assert_eq!(
+            branch_tracks_ref(repo, "pr-branch", "refs/pull/101/head", None),
+            Some(true),
+        );
+        assert_eq!(
+            branch_tracks_ref(repo, "pr-branch", "refs/pull/101/head", Some("origin")),
+            Some(true),
+        );
+    }
+
+    #[test]
+    fn test_branch_tracks_ref_different_ref() {
+        let test = crate::testing::TestRepo::with_initial_commit();
+        let repo = test.path();
+
+        crate::shell_exec::Cmd::new("git")
+            .args(["branch", "pr-branch"])
+            .current_dir(repo)
+            .run()
+            .unwrap();
+        crate::shell_exec::Cmd::new("git")
+            .args(["config", "branch.pr-branch.merge", "refs/pull/101/head"])
+            .current_dir(repo)
+            .run()
+            .unwrap();
+
+        // Ask about a different ref — should return Some(false)
+        assert_eq!(
+            branch_tracks_ref(repo, "pr-branch", "refs/pull/999/head", None),
+            Some(false),
+        );
+    }
+
+    #[test]
+    fn test_branch_tracks_ref_wrong_remote() {
+        let test = crate::testing::TestRepo::with_initial_commit();
+        let repo = test.path();
+
+        crate::shell_exec::Cmd::new("git")
+            .args(["branch", "pr-branch"])
+            .current_dir(repo)
+            .run()
+            .unwrap();
+        crate::shell_exec::Cmd::new("git")
+            .args(["config", "branch.pr-branch.merge", "refs/pull/101/head"])
+            .current_dir(repo)
+            .run()
+            .unwrap();
+        crate::shell_exec::Cmd::new("git")
+            .args(["config", "branch.pr-branch.remote", "fork"])
+            .current_dir(repo)
+            .run()
+            .unwrap();
+
+        assert_eq!(
+            branch_tracks_ref(repo, "pr-branch", "refs/pull/101/head", Some("origin")),
+            Some(false),
+        );
+    }
+
+    #[test]
+    fn test_branch_tracks_ref_no_tracking_config() {
+        let test = crate::testing::TestRepo::with_initial_commit();
+        let repo = test.path();
+
+        // Create a branch with no tracking config
+        crate::shell_exec::Cmd::new("git")
+            .args(["branch", "local-only"])
+            .current_dir(repo)
+            .run()
+            .unwrap();
+
+        // Branch exists but has no merge config — Some(false)
+        assert_eq!(
+            branch_tracks_ref(repo, "local-only", "refs/pull/1/head", None),
+            Some(false),
+        );
+    }
+
+    #[test]
+    fn test_branch_tracks_ref_nonexistent_branch() {
+        let test = crate::testing::TestRepo::with_initial_commit();
+        let repo = test.path();
+
+        // Branch doesn't exist at all — None
+        assert_eq!(
+            branch_tracks_ref(repo, "no-such-branch", "refs/pull/1/head", None),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_branch_tracks_ref_invalid_repo_path() {
+        // Invalid repo path causes Cmd::run() to fail → .ok()? returns None
+        let bad_path = std::path::Path::new("/nonexistent/repo/path");
+        assert_eq!(
+            branch_tracks_ref(bad_path, "main", "refs/pull/1/head", None),
+            None,
+        );
+    }
+
+    #[test]
+    fn test_branch_tracks_ref_mr_ref() {
+        let test = crate::testing::TestRepo::with_initial_commit();
+        let repo = test.path();
+
+        // Test with GitLab-style MR ref
+        crate::shell_exec::Cmd::new("git")
+            .args(["branch", "mr-branch"])
+            .current_dir(repo)
+            .run()
+            .unwrap();
+        crate::shell_exec::Cmd::new("git")
+            .args([
+                "config",
+                "branch.mr-branch.merge",
+                "refs/merge-requests/42/head",
+            ])
+            .current_dir(repo)
+            .run()
+            .unwrap();
+        crate::shell_exec::Cmd::new("git")
+            .args(["config", "branch.mr-branch.remote", "origin"])
+            .current_dir(repo)
+            .run()
+            .unwrap();
+
+        assert_eq!(
+            branch_tracks_ref(
+                repo,
+                "mr-branch",
+                "refs/merge-requests/42/head",
+                Some("origin"),
+            ),
+            Some(true),
+        );
+        assert_eq!(
+            branch_tracks_ref(repo, "mr-branch", "refs/pull/42/head", Some("origin")),
+            Some(false),
+        );
+    }
+
+    #[test]
+    fn test_branch_ref_detached_head() {
+        let wt = WorktreeInfo {
+            path: PathBuf::from("/repo.detached"),
+            head: "def456".into(),
+            branch: None, // Detached HEAD
+            bare: false,
+            detached: true,
+            locked: None,
+            prunable: None,
+        };
+
+        let branch_ref = wt.worktree_ref().into_branch_ref();
+
+        assert_eq!(branch_ref.full_ref(), None);
+        assert_eq!(branch_ref.short_name(), None);
+        assert_eq!(branch_ref.commit_sha, "def456");
+        assert!(branch_ref.worktree_path().is_some());
+    }
+}

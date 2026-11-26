@@ -1,0 +1,963 @@
+//! User-level configuration
+//!
+//! Personal preferences and per-project approved commands, not checked into git.
+//!
+//! # Precedence
+//!
+//! Sources rank by how close they are to the invocation: system config, user
+//! config, `H0X_WT_*` env vars, `--config-set`. Within a layer, a
+//! `[projects."…"]` entry outranks the global key of the same name; across
+//! layers, a higher layer's global key beats a lower layer's entry.
+//!
+//! [`UserConfig::load_with_warnings`] flattens the layers into one document
+//! and the accessors resolve specificity on the result — which alone would let
+//! any entry beat any global key, whichever layer set it. So each layer merges
+//! through [`merge_layer`], which first drops what the layer sets globally
+//! from the entries beneath it.
+
+mod accessors;
+mod merge;
+pub(crate) mod mutation;
+mod path;
+mod persistence;
+pub(crate) mod project_match;
+mod resolved;
+mod schema;
+mod sections;
+#[cfg(test)]
+mod tests;
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex, OnceLock};
+
+use super::{ConfigError, ConfigFileKind};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+/// Inline config overrides from the CLI `--config-set <toml>` flag, in
+/// invocation order.
+///
+/// Set once from `main` after arg parsing (mirroring [`set_config_path`]) and
+/// applied by [`UserConfig::load_with_warnings`] as the highest-priority layer,
+/// above config files and `H0X_WT_*` env vars. Each entry is an independent
+/// TOML fragment (e.g. `list.full = true`); later entries replace earlier ones
+/// for the same key.
+static CONFIG_OVERRIDES: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Explicit config paths already reported missing in this process.
+static WARNED_MISSING_CONFIG_PATHS: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// Record the CLI `--config-set` overrides (called once from the
+/// `--config-set` flag in `main`).
+pub fn set_config_overrides(overrides: Vec<String>) {
+    CONFIG_OVERRIDES.set(overrides).ok();
+}
+
+/// The CLI `--config-set` overrides, empty when the flag was not used.
+fn cli_config_overrides() -> &'static [String] {
+    CONFIG_OVERRIDES.get().map_or(&[], Vec::as_slice)
+}
+
+// Re-export public types
+pub use merge::Merge;
+pub use path::{
+    config_path, config_path_for_display, default_config_path, require_config_path,
+    set_config_path, system_config_path,
+};
+pub use resolved::ResolvedConfig;
+pub use schema::valid_user_config_keys;
+pub use sections::{
+    CommitConfig, CommitGenerationConfig, CopyIgnoredConfig, ListColumnConfig, ListConfig,
+    MergeConfig, RemoveConfig, StageMode, StepConfig, SwitchConfig, SwitchPickerConfig,
+    UserProjectOverrides,
+};
+
+/// Describes a problem encountered during config loading. Each variant
+/// identifies which layer failed so callers can emit targeted diagnostics
+/// (file errors with line/col vs env-var attribution).
+///
+/// Strict loading treats the first issue as fatal; best-effort
+/// [`UserConfig::load_with_warnings()`] returns all issues alongside the
+/// usable config.
+#[derive(Debug)]
+pub enum LoadError {
+    /// A file parser failed, retaining its source and raw diagnosis.
+    File(super::ConfigParseError),
+    /// Config files parsed cleanly; applying env-var overrides failed.
+    /// `vars` lists the exact `H0X_WT_*` env vars that were parsed
+    /// as `(name, value)` pairs.
+    Env {
+        err: String,
+        vars: Vec<(String, String)>,
+    },
+    /// Lower layers loaded cleanly; applying CLI `--config-set` overrides
+    /// failed — either a fragment was not valid TOML or the merged result no
+    /// longer deserializes. `overrides` lists the raw values for attribution.
+    CliOverride { err: String, overrides: Vec<String> },
+    /// Validation errors (e.g. empty worktree-path).
+    Validation(String),
+}
+
+impl std::fmt::Display for LoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadError::File(error) => error.fmt(f),
+            LoadError::Env { err, .. } => write!(f, "{err}"),
+            LoadError::CliOverride { err, .. } => write!(f, "{err}"),
+            LoadError::Validation(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for LoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::File(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+// ---- Env-var overlay ----
+
+/// A single parsed H0X_WT_* env var with both typed and string representations.
+#[derive(Clone)]
+struct EnvVar {
+    /// Original env var name (e.g., `H0X_WT__LIST__TIMEOUT_MS`)
+    name: String,
+    /// TOML path segments (e.g., `["list", "timeout-ms"]`)
+    segments: Vec<String>,
+    /// Typed TOML value (bool/int/float/string coercion via [`try_parse_value`])
+    typed_value: toml::Value,
+    /// Raw string value, kept for fallback when the typed form doesn't match
+    /// the target field's type (e.g., `H0X_WT_WORKTREE_PATH=42` needs
+    /// `String`, not `Integer`).
+    raw_value: String,
+}
+
+/// Environment overrides that form one independently validatable setting.
+///
+/// Most settings are one leaf. Entries under an atomic section (currently a
+/// custom list column) stay together so a required field and its companion
+/// fields are validated as the setting the user actually configured.
+#[derive(Default)]
+struct EnvOverrideUnit {
+    vars: Vec<EnvVar>,
+    overlay: toml::Table,
+}
+
+/// Read `H0X_WT_*` env vars and parse each into an [`EnvVar`].
+///
+/// Env-var convention (matches the config crate's prior behavior):
+/// - `H0X_WT_WORKTREE_PATH=foo` → `worktree-path = "foo"`
+/// - `H0X_WT__LIST__TIMEOUT_MS=30` → `[list]\ntimeout-ms = 30`
+/// - `H0X_WT_COMMIT__GENERATION__COMMAND=cmd` → `[commit.generation]\ncommand = "cmd"`
+///
+/// Infrastructure vars (`_CONFIG_PATH`, `_SYSTEM_CONFIG_PATH`,
+/// `_APPROVALS_PATH`) and test vars (`_TEST_*`) are excluded.
+fn parse_worktrunk_env_vars() -> Vec<EnvVar> {
+    const INFRA_VARS: &[&str] = &[
+        "H0X_WT_CONFIG_PATH",
+        "H0X_WT_SYSTEM_CONFIG_PATH",
+        "H0X_WT_APPROVALS_PATH",
+    ];
+
+    let mut env_vars: Vec<_> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("H0X_WT_"))
+        .filter(|(k, _)| !INFRA_VARS.contains(&k.as_str()))
+        .filter(|(k, _)| !k.starts_with("H0X_WT_TEST_"))
+        .collect();
+    env_vars.sort_by(|a, b| a.0.cmp(&b.0));
+
+    env_vars
+        .into_iter()
+        .filter_map(|(key, value)| {
+            // Strip H0X_WT_ prefix, split by __ for nesting, convert to kebab-case
+            let stripped = &key["H0X_WT_".len()..];
+            let segments: Vec<String> = stripped
+                .split("__")
+                .map(|s| {
+                    s.to_lowercase()
+                        .replace('_', "-")
+                        .trim_start_matches('-')
+                        .to_string()
+                })
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            if segments.is_empty() {
+                return None;
+            }
+
+            Some(EnvVar {
+                name: key,
+                segments,
+                typed_value: try_parse_value(&value),
+                raw_value: value,
+            })
+        })
+        .collect()
+}
+
+/// Canonicalize a built env-var overlay through the same deprecation migration
+/// as config files and `--config-set`, so a deprecated env var such as
+/// `H0X_WT__MERGE__NO_FF` (which resolves to the deprecated key
+/// `merge.no-ff`) takes effect as `merge.ff` instead of falling through as an
+/// unknown field. Migrating before the deep-merge keeps env winning over a
+/// lower layer's canonical key — the same fragment-before-merge ordering
+/// [`UserConfig::apply_cli_overrides`] uses.
+///
+/// The rewrite is silent, matching the other ephemeral layer: an env overlay
+/// has no file for `wt config update` to materialize.
+///
+/// Round-trips through [`super::deprecation::migrate_content`]'s string form.
+/// The overlay's leaves are the scalars [`try_parse_value`] produces (bool,
+/// int, float, string) plus nested tables, so it always serializes, and
+/// `migrate_content` always returns valid TOML — mirroring the same
+/// post-migration reparse `expect` in [`load_config_file`].
+///
+/// Canonicalization happens before choosing typed or string representations,
+/// so deprecated names are checked against the same field types as canonical
+/// names.
+fn migrate_env_overlay(overlay: toml::Table) -> toml::Table {
+    let serialized = toml::to_string(&overlay).expect("env overlay serializes to TOML");
+    super::deprecation::migrate_content(&serialized)
+        .parse::<toml::Table>()
+        .expect("migrate_content returns valid TOML")
+}
+
+/// Return the path of a single-variable overlay after deprecation migration.
+/// Migration moves, renames, or removes a scalar; it never expands it into
+/// several settings. Removing an obsolete setting can leave an empty overlay.
+fn env_overlay_path(mut table: &toml::Table) -> Option<Vec<String>> {
+    let mut path = Vec::new();
+    loop {
+        let (key, value) = table.iter().next()?;
+        path.push(key.clone());
+        match value {
+            toml::Value::Table(nested) if !nested.is_empty() => table = nested,
+            _ => return Some(path),
+        }
+    }
+}
+
+/// Group the fields that make up one setting, keeping atomic section entries
+/// together. This reuses the same atomic-section contract as project precedence.
+fn env_override_key(path: &[String]) -> Vec<String> {
+    for section_len in 0..path.len() {
+        let section: Vec<_> = path[..section_len].iter().map(String::as_str).collect();
+        let project_section =
+            section.len() == 4 && section[0] == "projects" && is_atomic_section(&section[2..]);
+        if is_atomic_section(&section) || project_section {
+            return path[..section_len + 1].to_vec();
+        }
+    }
+    path.to_vec()
+}
+
+/// Build and migrate an overlay from a chosen representation for every var.
+fn env_overlay_from_values(vars: &[EnvVar], values: &[toml::Value]) -> toml::Table {
+    let mut overlay = toml::Table::new();
+    for (var, value) in vars.iter().zip(values) {
+        set_nested_value(&mut overlay, &var.segments, value.clone());
+    }
+    migrate_env_overlay(overlay)
+}
+
+/// Choose typed or string values for one setting as a group. Probing the
+/// whole setting keeps required compound fields together: a custom column's
+/// width can be typed as an integer when its required template arrives in the
+/// same environment layer.
+fn resolve_env_override_unit(file_table: &toml::Table, vars: &[EnvVar]) -> toml::Table {
+    let mut values: Vec<_> = vars.iter().map(|var| var.typed_value.clone()).collect();
+
+    loop {
+        let mut changed = false;
+        for (index, var) in vars.iter().enumerate() {
+            let overlay = env_overlay_from_values(vars, &values);
+            let mut candidate = file_table.clone();
+            merge_layer(&mut candidate, overlay);
+            if toml::Value::Table(candidate)
+                .try_into::<UserConfig>()
+                .is_ok()
+            {
+                continue;
+            }
+
+            let typed_value = std::mem::replace(
+                &mut values[index],
+                toml::Value::String(var.raw_value.clone()),
+            );
+            let overlay = env_overlay_from_values(vars, &values);
+            let mut candidate = file_table.clone();
+            merge_layer(&mut candidate, overlay);
+            if toml::Value::Table(candidate)
+                .try_into::<UserConfig>()
+                .is_ok()
+            {
+                changed = true;
+            } else {
+                values[index] = typed_value;
+            }
+        }
+
+        if !changed {
+            return env_overlay_from_values(vars, &values);
+        }
+    }
+}
+
+/// Resolve, migrate, and group each environment variable against the same
+/// lower-layer config. Sorting makes aliases that migrate to one setting
+/// deterministic, independent of the caller's input order.
+fn env_override_units(file_table: &toml::Table, vars: &[EnvVar]) -> Vec<EnvOverrideUnit> {
+    let mut ordered_vars: Vec<_> = vars.iter().collect();
+    ordered_vars.sort_by(|left, right| left.name.cmp(&right.name));
+
+    let mut grouped_vars = std::collections::BTreeMap::<Vec<String>, Vec<EnvVar>>::new();
+    for var in ordered_vars {
+        let overlay = env_overlay_from_values(
+            std::slice::from_ref(var),
+            std::slice::from_ref(&var.typed_value),
+        );
+        let Some(path) = env_overlay_path(&overlay) else {
+            continue;
+        };
+        let key = env_override_key(&path);
+        grouped_vars.entry(key).or_default().push(var.clone());
+    }
+
+    grouped_vars
+        .into_values()
+        .map(|vars| EnvOverrideUnit {
+            overlay: resolve_env_override_unit(file_table, &vars),
+            vars,
+        })
+        .collect()
+}
+
+/// Try to coerce a string into a typed TOML value (bool → i64 → f64 → string).
+fn try_parse_value(s: &str) -> toml::Value {
+    if s.eq_ignore_ascii_case("true") {
+        return toml::Value::Boolean(true);
+    }
+    if s.eq_ignore_ascii_case("false") {
+        return toml::Value::Boolean(false);
+    }
+    if let Ok(n) = s.parse::<i64>() {
+        return toml::Value::Integer(n);
+    }
+    if let Ok(n) = s.parse::<f64>() {
+        return toml::Value::Float(n);
+    }
+    toml::Value::String(s.to_string())
+}
+
+/// Set a value at a nested path in a TOML table, creating intermediate tables.
+fn set_nested_value(table: &mut toml::Table, path: &[String], value: toml::Value) {
+    if path.len() == 1 {
+        table.insert(path[0].clone(), value);
+        return;
+    }
+    let entry = table
+        .entry(&path[0])
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if let toml::Value::Table(inner) = entry {
+        set_nested_value(inner, &path[1..], value);
+    }
+}
+
+/// Recursively merge `overlay` into `base`. Overlay values win for scalars;
+/// nested tables merge recursively.
+fn deep_merge_table(base: &mut toml::Table, overlay: toml::Table) {
+    for (key, value) in overlay {
+        match (base.get_mut(&key), &value) {
+            (Some(toml::Value::Table(base_t)), toml::Value::Table(overlay_t)) => {
+                deep_merge_table(base_t, overlay_t.clone());
+            }
+            _ => {
+                base.insert(key, value);
+            }
+        }
+    }
+}
+
+/// Merge one layer over `merged_table`, ranking its global keys above the
+/// `[projects."…"]` entries the lower layers left there.
+///
+/// Every leaf `layer` sets globally is dropped from the accumulated entries
+/// first, so the global key it also set is what answers for them; the layer
+/// then merges on top, its own entries included. Dropping before the merge is
+/// what keeps specificity local to a layer — a key the layer restates under
+/// `projects."<name>"` lands after the drop and wins, with nothing here having
+/// to recognize the case.
+///
+/// Composing keys are held back, their project-scoped values appending to the
+/// global ones rather than replacing them ([`is_compose_only`]). Both already
+/// apply, so there is no ranking to settle, and dropping the project's copy
+/// would silently stop it running.
+///
+/// Only removals precede the merge, but a removal can still leave a document
+/// that no longer deserializes: [`is_atomic_section`] names the sections that
+/// have to go as a unit, and the removals degrade as a unit behind them — they
+/// land on a candidate, and a candidate that stops
+/// deserializing or validating is dropped for the plain merge rather than
+/// handed to [`UserConfig::finalize`], which would answer a stranded required
+/// field by wiping the config to defaults. The layer itself applies either way.
+fn merge_layer(merged_table: &mut toml::Table, layer: toml::Table) {
+    // Nothing to rank: no entries beneath, or nothing above them. The common
+    // case is a config with no `[projects]` table at all, and it pays only the
+    // lookup.
+    if !merged_table.contains_key("projects") || layer.keys().all(|key| key == "projects") {
+        deep_merge_table(merged_table, layer);
+        return;
+    }
+
+    let mut global = layer.clone();
+    global.remove("projects");
+
+    let mut candidate = merged_table.clone();
+    if let Some(projects) = candidate
+        .get_mut("projects")
+        .and_then(toml::Value::as_table_mut)
+    {
+        for entry in projects
+            .iter_mut()
+            .filter_map(|(_, entry)| entry.as_table_mut())
+        {
+            drop_overridden_keys(entry, &global, &mut Vec::new());
+        }
+    }
+    deep_merge_table(&mut candidate, layer.clone());
+
+    match deserialize_and_validate(&candidate) {
+        Ok(()) => *merged_table = candidate,
+        // Reachable when a partial removal the enumerations above miss would
+        // invalidate the candidate, or when the layer itself is invalid (for
+        // example, an empty global `worktree-path` from the environment or
+        // `--config-set`). Keep the layer without the removals so its caller
+        // can validate and attribute the complete candidate.
+        Err(err) => {
+            log::debug!("keeping project precedence: {err}");
+            deep_merge_table(merged_table, layer);
+        }
+    }
+}
+
+/// Deserialize `table` into [`UserConfig`] and validate it, reporting the
+/// first failure. The probe every layer runs before it commits.
+fn deserialize_and_validate(table: &toml::Table) -> Result<(), String> {
+    match toml::Value::Table(table.clone()).try_into::<UserConfig>() {
+        Ok(config) => config.validate().map_err(|e| e.to_string()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn deserialize_validation_issues(
+    table: &toml::Table,
+) -> Result<Vec<persistence::UserConfigValidationIssue>, String> {
+    let config = toml::Value::Table(table.clone())
+        .try_into::<UserConfig>()
+        .map_err(|err| err.to_string())?;
+    Ok(config.validation_issues())
+}
+
+/// Remove from `entry` every leaf `overlay` sets. `section` tracks the path
+/// walked so far for the predicates beside it.
+fn drop_overridden_keys<'a>(
+    entry: &mut toml::Table,
+    overlay: &'a toml::Table,
+    section: &mut Vec<&'a str>,
+) {
+    for (key, value) in overlay {
+        if is_compose_only(section, key) {
+            continue;
+        }
+
+        match (entry.get_mut(key.as_str()), value) {
+            // Both sides are sections: recurse, so an override of one leaf
+            // leaves the project's sibling leaves alone. An atomic section's
+            // children are not sections in that sense — they go whole, through
+            // the arms below.
+            (Some(toml::Value::Table(entry_table)), toml::Value::Table(overlay_table))
+                if !is_atomic_section(section) =>
+            {
+                section.push(key);
+                drop_overridden_keys(entry_table, overlay_table, section);
+                section.pop();
+                if entry_table.is_empty() {
+                    entry.remove(key.as_str());
+                }
+            }
+            (Some(_), _) => {
+                entry.remove(key.as_str());
+            }
+            (None, _) => {}
+        }
+    }
+}
+
+/// A table whose entries the merge replaces whole, so removing one of an
+/// entry's leaves neither removes the precedence nor leaves the entry usable.
+///
+/// `[list.custom-columns]` is the case: `ListConfig::merge_with` extends
+/// `custom_columns` per *column*, so a project's `Ticket` replaces the global
+/// `Ticket` outright — dropping only the overridden leaf would leave the
+/// project's column winning anyway, the ranking this pass exists to remove.
+/// And `ListColumnConfig::template` is required, so a partial removal can
+/// strand a column that no longer deserializes.
+///
+/// `section` is the path of the containing table, so this asks "are this
+/// table's children atomic".
+fn is_atomic_section(section: &[&str]) -> bool {
+    section == ["list", "custom-columns"]
+}
+
+/// Whether the project-scoped `key` under `section` composes with the global
+/// one instead of replacing it, so no layer displaces it.
+///
+/// Hook names come from the schema, cached the way
+/// `config::is_user_project_override_key` caches its own lookup, so a new hook
+/// can't be forgotten. The others are the composing keys elsewhere in the tree
+/// — `[aliases]` (`UserConfig::aliases`) and `step.copy-ignored.exclude`
+/// (`CopyIgnoredConfig::merged_with` unions the two pattern lists).
+fn is_compose_only(section: &[&str], key: &str) -> bool {
+    static HOOKS: OnceLock<Vec<String>> = OnceLock::new();
+    match section {
+        [] => {
+            key == "aliases"
+                || HOOKS
+                    .get_or_init(crate::config::schema_top_level_keys::<crate::config::HooksConfig>)
+                    .iter()
+                    .any(|hook| hook == key)
+        }
+        ["step", "copy-ignored"] => key == "exclude",
+        _ => false,
+    }
+}
+
+/// Load and validate a single config file. Returns the parsed table for
+/// merging and validates via `toml::from_str::<UserConfig>` for rich errors.
+fn load_config_file(
+    path: &Path,
+    migrated: &str,
+    kind: ConfigFileKind,
+) -> Result<toml::Table, LoadError> {
+    // Validate by deserializing — gives rich line/col errors.
+    if let Err(err) = toml::from_str::<UserConfig>(migrated) {
+        return Err(LoadError::File(super::ConfigParseError::new(
+            kind, path, err,
+        )));
+    }
+    // Parse as table for merging. Infallible after from_str::<UserConfig>
+    // succeeds — valid UserConfig TOML is always valid TOML.
+    Ok(migrated
+        .parse::<toml::Table>()
+        .expect("valid TOML after UserConfig parse"))
+}
+
+/// User-level configuration for worktree path formatting and LLM integration.
+///
+/// This config is stored at `~/.config/h0x-wt/config.toml` (or platform equivalent)
+/// and is NOT checked into git. Each developer maintains their own user config.
+///
+/// The `worktree-path` template is relative to the repository root.
+/// Supported variables:
+/// - `{{ repo }}` - Repository directory name (e.g., `myproject`)
+/// - `{{ branch }}` - Raw branch name (e.g., `feature/auth`)
+/// - `{{ branch | sanitize }}` - Branch name with `/` and `\` replaced by `-`
+///
+/// # Examples
+///
+/// ```toml
+/// # Default - parent directory siblings
+/// worktree-path = "../{{ repo }}.{{ branch | sanitize }}"
+///
+/// # Inside repo (clean, no redundant directory)
+/// worktree-path = ".worktrees/{{ branch | sanitize }}"
+///
+/// # Repository-namespaced (useful for shared directories with multiple repos)
+/// worktree-path = "../worktrees/{{ repo }}/{{ branch | sanitize }}"
+///
+/// # Commit generation configuration
+/// [commit.generation]
+/// command = "llm -m claude-haiku-4.5"  # Shell command for generating commit messages
+///
+/// # Per-project configuration
+/// [projects."github.com/user/repo"]
+/// worktree-path = ".worktrees/{{ branch | sanitize }}"
+/// ```
+///
+/// Config file location:
+/// - Linux: `$XDG_CONFIG_HOME/h0x-wt/config.toml` or `~/.config/h0x-wt/config.toml`
+/// - macOS: `$XDG_CONFIG_HOME/h0x-wt/config.toml` or `~/.config/h0x-wt/config.toml`
+/// - Windows: `%APPDATA%\h0x-wt\config.toml`
+///
+/// Environment variables can override config file settings using `H0X_WT_` prefix with
+/// `__` separator for nested fields (e.g., `H0X_WT_COMMIT__GENERATION__COMMAND`).
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct UserConfig {
+    /// Per-project configuration (approved commands, etc.)
+    /// Uses BTreeMap for deterministic serialization order and better diff readability
+    #[serde(default)]
+    pub projects: std::collections::BTreeMap<String, UserProjectOverrides>,
+
+    /// Hooks configuration (top-level keys like pre-merge, post-switch, etc.)
+    #[serde(flatten, default)]
+    pub hooks: crate::config::HooksConfig,
+
+    /// Worktree path template
+    #[serde(
+        rename = "worktree-path",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub worktree_path: Option<String>,
+
+    /// Configuration for the `wt list` command
+    #[serde(default, skip_serializing_if = "super::is_default")]
+    pub list: sections::ListConfig,
+
+    /// Configuration for the `wt step commit` command (also used by merge)
+    #[serde(default, skip_serializing_if = "super::is_default")]
+    pub commit: sections::CommitConfig,
+
+    /// Configuration for the `wt merge` command
+    #[serde(default, skip_serializing_if = "super::is_default")]
+    pub merge: sections::MergeConfig,
+
+    /// Configuration for the `wt remove` command
+    #[serde(default, skip_serializing_if = "super::is_default")]
+    pub remove: sections::RemoveConfig,
+
+    /// Configuration for the `wt switch` command
+    #[serde(default, skip_serializing_if = "super::is_default")]
+    pub switch: sections::SwitchConfig,
+
+    /// Configuration for `wt step` subcommands
+    #[serde(default, skip_serializing_if = "super::is_default")]
+    pub step: sections::StepConfig,
+
+    /// Command aliases for `wt <name>`
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub aliases: std::collections::BTreeMap<String, crate::config::commands::CommandConfig>,
+
+    /// Skip the first-run shell integration prompt
+    #[serde(
+        default,
+        rename = "skip-shell-integration-prompt",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub skip_shell_integration_prompt: bool,
+
+    /// Skip the first-run commit generation prompt
+    #[serde(
+        default,
+        rename = "skip-commit-generation-prompt",
+        skip_serializing_if = "std::ops::Not::not"
+    )]
+    pub skip_commit_generation_prompt: bool,
+}
+
+impl UserConfig {
+    /// Load configuration from system config, user config, and environment variables.
+    ///
+    /// Configuration is loaded in the following order (later sources override earlier ones):
+    /// 1. Default values
+    /// 2. System config (organization-wide defaults)
+    /// 3. User config file (personal preferences)
+    /// 4. Environment variables (H0X_WT_*)
+    pub fn load() -> Result<Self, ConfigError> {
+        Self::load_with_cause().map_err(ConfigError::Load)
+    }
+
+    /// Like [`load()`](Self::load), but returns a [`LoadError`] that
+    /// distinguishes file-level parse failures (with line/col) from
+    /// env-var override failures.
+    pub(crate) fn load_with_cause() -> Result<Self, LoadError> {
+        let (config, warnings) = Self::load_with_warnings();
+        if let Some(err) = warnings.into_iter().next() {
+            return Err(err);
+        }
+        Ok(config)
+    }
+
+    /// Load the best config achievable, collecting issues as warnings.
+    ///
+    /// Each config layer (system file, user file, env-var overlay) degrades
+    /// independently — a failure in one preserves data from earlier layers
+    /// instead of falling back to defaults. This means:
+    /// - Bad system config → skipped, user config + env vars still apply
+    /// - Bad user config → skipped, system config + env vars still apply
+    /// - Bad env vars → ignored, file-based config preserved
+    /// - Validation failure → warning emitted, defaults used (invalid config
+    ///   causes bad behavior if applied, e.g. empty worktree-path template)
+    pub fn load_with_warnings() -> (Self, Vec<LoadError>) {
+        let mut warnings = Vec::new();
+        let mut merged_table = toml::Table::new();
+
+        // 1. System config (lowest priority)
+        if let Some(system_path) = path::system_config_path()
+            && let Ok(content) = std::fs::read_to_string(&system_path)
+        {
+            match super::deprecation::check_and_migrate(
+                &system_path,
+                &content,
+                true,
+                ConfigFileKind::System,
+                None,
+                true,
+            ) {
+                Ok(result) => {
+                    super::deprecation::warn_unknown_fields::<UserConfig>(
+                        &content,
+                        &system_path,
+                        ConfigFileKind::System,
+                    );
+
+                    match load_config_file(
+                        &system_path,
+                        &result.migrated_content,
+                        ConfigFileKind::System,
+                    ) {
+                        Ok(table) => merge_layer(&mut merged_table, table),
+                        Err(e) => warnings.push(e),
+                    }
+                }
+                Err(err) => {
+                    warnings.push(LoadError::Validation(err.to_string()));
+                }
+            }
+        }
+
+        // 2. User config (overrides system)
+        let config_path = config_path();
+        if let Some(config_path) = config_path.as_ref()
+            && config_path.exists()
+        {
+            if let Ok(content) = std::fs::read_to_string(config_path) {
+                match super::deprecation::check_and_migrate(
+                    config_path,
+                    &content,
+                    true,
+                    ConfigFileKind::User,
+                    None,
+                    true,
+                ) {
+                    Ok(result) => {
+                        super::deprecation::warn_unknown_fields::<UserConfig>(
+                            &content,
+                            config_path,
+                            ConfigFileKind::User,
+                        );
+
+                        match load_config_file(
+                            config_path,
+                            &result.migrated_content,
+                            ConfigFileKind::User,
+                        ) {
+                            Ok(table) => merge_layer(&mut merged_table, table),
+                            Err(e) => warnings.push(e),
+                        }
+                    }
+                    Err(err) => {
+                        warnings.push(LoadError::Validation(err.to_string()));
+                    }
+                }
+            }
+        } else if let Some(config_path) = config_path.as_ref()
+            && path::is_config_path_explicit()
+            && WARNED_MISSING_CONFIG_PATHS
+                .lock()
+                .unwrap()
+                .insert(config_path.clone())
+        {
+            crate::styling::eprintln!(
+                "{}",
+                crate::styling::warning_message(color_print::cformat!(
+                    "Config file not found: <bold>{}</>",
+                    crate::path::format_path_for_display(config_path)
+                ))
+            );
+        }
+
+        // 3. Env-var overrides (override config files)
+        let env_vars = parse_worktrunk_env_vars();
+        if let Err(err) = Self::apply_env_vars(&env_vars, &mut merged_table, &mut warnings) {
+            warnings.push(LoadError::Validation(err));
+            return (Self::default(), warnings);
+        }
+
+        // 4. CLI `--config-set` overrides (override env vars and config files)
+        Self::apply_cli_overrides(cli_config_overrides(), &mut merged_table, &mut warnings);
+
+        Self::finalize(merged_table, warnings)
+    }
+
+    /// Apply the environment override layer above the file layers.
+    fn apply_env_vars(
+        env_vars: &[EnvVar],
+        merged_table: &mut toml::Table,
+        warnings: &mut Vec<LoadError>,
+    ) -> Result<(), String> {
+        if env_vars.is_empty() {
+            return Ok(());
+        }
+
+        let file_table = merged_table.clone();
+
+        // File layers deserialize before merging. A malformed merged table
+        // is a loader error, rather than an error attributed to an env var.
+        let lower_validation_issues = deserialize_validation_issues(&file_table)?;
+
+        // Validate each setting against the same lower layer. Sequentially
+        // accepting values here would make compound settings such as custom
+        // columns depend on which field happened to be visited first.
+        let mut accepted_overlay = toml::Table::new();
+        for unit in env_override_units(&file_table, env_vars) {
+            let mut candidate = file_table.clone();
+            merge_layer(&mut candidate, unit.overlay.clone());
+            match deserialize_validation_issues(&candidate) {
+                Ok(issues) => {
+                    // An unrelated unit may leave an existing file error for
+                    // another override to repair. A unit setting that invalid
+                    // value itself must be rejected, even if its issue matches
+                    // the lower layer: retaining it could undo a valid repair.
+                    if let Some(issue) = issues.iter().find(|issue| {
+                        !lower_validation_issues.contains(issue) || issue.is_set_in(&unit.overlay)
+                    }) {
+                        warnings.push(LoadError::Env {
+                            err: issue.to_string(),
+                            vars: unit
+                                .vars
+                                .into_iter()
+                                .map(|var| (var.name, var.raw_value))
+                                .collect(),
+                        });
+                    } else {
+                        deep_merge_table(&mut accepted_overlay, unit.overlay);
+                    }
+                }
+                Err(err) => warnings.push(LoadError::Env {
+                    err,
+                    vars: unit
+                        .vars
+                        .into_iter()
+                        .map(|var| (var.name, var.raw_value))
+                        .collect(),
+                }),
+            }
+        }
+
+        if accepted_overlay.is_empty() {
+            return Ok(());
+        }
+
+        let mut candidate = file_table.clone();
+        merge_layer(&mut candidate, accepted_overlay);
+        *merged_table = candidate;
+        Ok(())
+    }
+
+    /// Apply CLI `--config-set <toml>` overrides as the highest-priority layer.
+    ///
+    /// Each override is an independent TOML fragment merged in order, so a
+    /// later override replaces an earlier one for the same key. Scalars and
+    /// arrays replace the lower-layer value, while nested tables deep-merge
+    /// (via [`deep_merge_table`]) so sibling keys survive —
+    /// `--config-set list.full=true` leaves `list.branches` untouched.
+    ///
+    /// Each fragment first runs through the same deprecation migration as a
+    /// config file ([`super::deprecation::migrate_content`] — structural and
+    /// silent rewrites, no `UpdateOnly`), so a deprecated key such as
+    /// `merge.no-ff` is canonicalized to `merge.ff` *before* the fragment is
+    /// parsed and merged, instead of falling through as an unknown field.
+    /// Migrating the fragment
+    /// (not the merged document) keeps layer precedence intact: the
+    /// canonicalized override wins over a lower layer's canonical key, rather
+    /// than colliding with it. The rewrite is silent — there is no file to
+    /// materialize, so the file-scoped "run `wt config update`" warning would
+    /// have nothing to act on.
+    ///
+    /// The whole layer degrades as a unit: if any fragment fails to parse, or
+    /// the merged result fails to deserialize or validate, every override is
+    /// dropped and a [`LoadError::CliOverride`] is recorded, so a bad override
+    /// never silently corrupts (or wipes) the lower layers.
+    fn apply_cli_overrides(
+        overrides: &[String],
+        merged_table: &mut toml::Table,
+        warnings: &mut Vec<LoadError>,
+    ) {
+        if overrides.is_empty() {
+            return;
+        }
+
+        let mut overlay = toml::Table::new();
+        for raw in overrides {
+            // `migrate_content` returns the fragment unchanged when it is not
+            // valid TOML, so the parse below still catches a malformed fragment
+            // and drops the whole layer with an attributed warning.
+            let migrated = super::deprecation::migrate_content(raw);
+            match migrated.parse::<toml::Table>() {
+                Ok(fragment) => deep_merge_table(&mut overlay, fragment),
+                Err(err) => {
+                    warnings.push(LoadError::CliOverride {
+                        err: err.to_string(),
+                        overrides: overrides.to_vec(),
+                    });
+                    return;
+                }
+            }
+        }
+
+        let mut candidate = merged_table.clone();
+        merge_layer(&mut candidate, overlay);
+
+        // Probe deserialize *and* validate, so a semantically-invalid override
+        // (e.g. an empty worktree-path) drops just this layer rather than
+        // falling through to finalize(), which would wipe the lower layers to
+        // defaults.
+        if let Err(err) = deserialize_and_validate(&candidate) {
+            warnings.push(LoadError::CliOverride {
+                err,
+                overrides: overrides.to_vec(),
+            });
+            return;
+        }
+
+        *merged_table = candidate;
+    }
+
+    /// Deserialize a merged table into `UserConfig`, validate, and collect
+    /// any issues as warnings. Shared by the no-env and env-fallback paths.
+    fn finalize(table: toml::Table, mut warnings: Vec<LoadError>) -> (Self, Vec<LoadError>) {
+        match toml::Value::Table(table).try_into::<Self>() {
+            Ok(config) => match config.validate() {
+                Ok(()) => (config, warnings),
+                Err(e) => {
+                    // Validation means the config is semantically wrong (e.g.,
+                    // worktree-path=""). Using it causes bad behavior, so fall
+                    // back to defaults rather than applying the broken config.
+                    warnings.push(LoadError::Validation(e.to_string()));
+                    (Self::default(), warnings)
+                }
+            },
+            Err(err) => {
+                warnings.push(LoadError::Validation(err.to_string()));
+                (Self::default(), warnings)
+            }
+        }
+    }
+
+    /// Load configuration from a TOML string for testing.
+    #[cfg(test)]
+    pub(crate) fn load_from_str(content: &str) -> Result<Self, ConfigError> {
+        let migrated = crate::config::deprecation::migrate_content(content);
+        let config: Self =
+            toml::from_str(&migrated).map_err(|e| ConfigError::Message(e.to_string()))?;
+        config.validate()?;
+        Ok(config)
+    }
+}

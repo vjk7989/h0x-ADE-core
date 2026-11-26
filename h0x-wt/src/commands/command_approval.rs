@@ -1,0 +1,373 @@
+//! Command approval and execution utilities
+//!
+//! Shared helpers for approving commands declared in project configuration.
+//!
+//! # "Approve at the Gate" Pattern
+//!
+//! Commands that run hooks should approve all project commands **upfront** before any execution:
+//!
+//! ```text
+//! User runs command
+//!     ↓
+//! approve_hooks() ← Single approval prompt
+//!     ↓
+//! Execute hooks (approval already done)
+//! ```
+//!
+//! This ensures approval happens exactly once at the command entry point,
+//! eliminating the need to thread `auto_trust` through execution layers.
+
+use std::io::{self, IsTerminal, Write};
+use std::path::Path;
+
+use anyhow::Context;
+use color_print::cformat;
+use h0x_wt::config::{Approvals, ProjectId, require_approvals_path};
+use h0x_wt::git::{GitError, HookType};
+use h0x_wt::styling::{
+    INFO_SYMBOL, WARNING_SYMBOL, eprint, eprintln, format_heading, hint_message, prompt_message,
+    stderr, warning_message,
+};
+
+use super::hook_filter::ParsedFilter;
+use super::project_config::{ApprovableCommand, Phase, collect_commands_for_hooks};
+use h0x_wt::config::HookSource;
+
+/// Batch approval helper used when multiple commands are queued for execution.
+/// Returns `Ok(true)` when execution may continue, `Ok(false)` when the user
+/// declined, and `Err` if config reload/save fails.
+///
+/// Shows command templates to the user (what gets saved to config), not expanded values.
+/// This ensures users see exactly what they're approving.
+///
+/// `yes` grants consent for this invocation alone: nothing is recorded, so the
+/// next run asks again. Recording without a prompt is `wt config approvals
+/// add --yes`'s job ([`crate::commands::add_approvals`]), which doesn't pass
+/// through this gate. Because `yes` neither reads nor records approvals,
+/// `approvals.toml` is loaded only on the interactive path, so a malformed
+/// file never aborts a `--yes` run.
+pub fn approve_command_batch(
+    commands: &[ApprovableCommand],
+    project_id: &ProjectId,
+    yes: bool,
+) -> anyhow::Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+
+    let mut approvals = Approvals::load().context("Failed to load approvals")?;
+    let needs_approval: Vec<&ApprovableCommand> = commands
+        .iter()
+        .filter(|cmd| !approvals.is_command_approved(project_id, &cmd.command.template))
+        .collect();
+
+    if needs_approval.is_empty() {
+        return Ok(true);
+    }
+
+    if !prompt_for_batch_approval(&needs_approval, project_id)? {
+        return Ok(false);
+    }
+
+    // A failed save costs one more prompt next run, not the command the user
+    // actually ran, so it warns rather than errors. `approve_commands` reloads
+    // under the lock, so approvals saved since the load above are kept.
+    let commands: Vec<String> = needs_approval
+        .iter()
+        .map(|cmd| cmd.command.template.clone())
+        .collect();
+    let save_result = require_approvals_path()
+        .and_then(|path| approvals.approve_commands(project_id.to_string(), commands, &path));
+    if let Err(e) = save_result {
+        eprintln!(
+            "{}",
+            warning_message(format!("Failed to save command approval: {e}"))
+        );
+        eprintln!(
+            "{}",
+            hint_message("Approval will be requested again next time")
+        );
+    }
+
+    Ok(true)
+}
+
+/// The project's directory name, which is what a user recognizes; the full
+/// identifier is a path or a remote URL.
+fn display_project_name(project_id: &str) -> &str {
+    Path::new(project_id)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(project_id)
+}
+
+/// The batch as the user sees it: a header, then each command's label and its
+/// template. Shared by the prompt and by `--yes` on `wt config approvals add`.
+fn print_command_batch(header: impl std::fmt::Display, commands: &[&ApprovableCommand]) {
+    eprintln!("{header}");
+    for cmd in commands {
+        // Uses INFO_SYMBOL (○) since this is a preview, not active execution
+        eprintln!("{} {}", INFO_SYMBOL, cmd.label());
+        eprintln!("{}", cmd.format_template());
+    }
+}
+
+/// The batch `wt config approvals add --yes` is about to trust. Nothing is
+/// being asked, but the batch still prints: it is the record of what an
+/// unattended run just approved. Lives beside [`prompt_for_batch_review`]
+/// so the two headers stay parallel.
+pub fn announce_batch_approval(commands: &[&ApprovableCommand], project_id: &str) {
+    let project_name = display_project_name(project_id);
+    let count = commands.len();
+    let plural = if count == 1 { "" } else { "s" };
+    print_command_batch(
+        format_heading(
+            &cformat!(
+                "Approving <bold>{count}</> command{plural} for <bold>{project_name}</> (--yes):"
+            ),
+            None,
+        ),
+        commands,
+    );
+}
+
+fn prompt_for_batch_approval(
+    commands: &[&ApprovableCommand],
+    project_id: &str,
+) -> anyhow::Result<bool> {
+    let project_name = display_project_name(project_id);
+    let count = commands.len();
+    let plural = if count == 1 { "" } else { "s" };
+
+    let header = cformat!(
+        "{WARNING_SYMBOL} <yellow><bold>{project_name}</> needs approval to execute <bold>{count}</> command{plural}:</>"
+    );
+    prompt_for_batch_approval_with_header(commands, header)
+}
+
+/// Prompt used by `wt config approvals add`, where reviewing approvals is the
+/// command's expected workflow rather than an interruption to another action.
+pub fn prompt_for_batch_review(
+    commands: &[&ApprovableCommand],
+    project_id: &str,
+) -> anyhow::Result<bool> {
+    let project_name = display_project_name(project_id);
+    let count = commands.len();
+    let plural = if count == 1 { "" } else { "s" };
+
+    let header = format_heading(
+        &cformat!("Review <bold>{count}</> command{plural} for <bold>{project_name}</>:"),
+        None,
+    );
+    prompt_for_batch_approval_with_header(commands, header)
+}
+
+fn prompt_for_batch_approval_with_header(
+    commands: &[&ApprovableCommand],
+    header: impl std::fmt::Display,
+) -> anyhow::Result<bool> {
+    print_command_batch(header, commands);
+
+    // Check if stdin is a TTY before attempting to prompt
+    // This happens AFTER showing the commands so they appear in CI/CD logs
+    // even when the prompt cannot be displayed (fail-fast principle)
+    if !io::stdin().is_terminal() {
+        return Err(GitError::NotInteractive.into());
+    }
+
+    // Blank line before prompt for visual separation
+    h0x_wt::styling::eprintln!();
+    stderr().flush()?;
+
+    eprint!(
+        "{} ",
+        prompt_message(cformat!("Allow and remember? <bold>[y/N]</>"))
+    );
+    stderr().flush()?;
+
+    let mut response = String::new();
+    io::stdin().read_line(&mut response)?;
+
+    Ok(response.trim().eq_ignore_ascii_case("y"))
+}
+
+/// Approve a project-config alias before execution.
+///
+/// Returns `Ok(true)` if approved (or already approved), `Ok(false)` if declined.
+pub fn approve_alias_commands(
+    commands: &h0x_wt::config::CommandConfig,
+    alias_name: &str,
+    project_id: &ProjectId,
+    yes: bool,
+) -> anyhow::Result<bool> {
+    let cmds: Vec<_> = commands
+        .commands()
+        .map(|cmd| ApprovableCommand {
+            phase: Phase::Alias,
+            command: h0x_wt::config::Command::new(
+                Some(cmd.name.clone().unwrap_or_else(|| alias_name.to_string())),
+                cmd.template.clone(),
+            ),
+        })
+        .collect();
+
+    approve_command_batch(&cmds, project_id, yes)
+}
+
+/// Collect project commands for hooks and request batch approval.
+///
+/// This is the "gate" function that should be called at command entry points
+/// (like `wt remove`, `wt switch --create`, `wt merge`) before any hooks execute.
+/// Shows command templates (not expanded values) so users see exactly what
+/// patterns they're approving.
+///
+/// # Parameters
+/// - `ctx`: Command context (provides project identifier and config)
+/// - `hook_types`: Which hook types to collect commands for
+///
+/// # Example
+///
+/// ```ignore
+/// let ctx = CommandContext::new(&repo, &config, &branch, &worktree_path, yes);
+/// let approved = approve_hooks(&ctx, &[HookType::PreCreate, HookType::PostCreate])?;
+/// ```
+pub fn approve_hooks(
+    ctx: &super::command_executor::CommandContext<'_>,
+    hook_types: &[HookType],
+) -> anyhow::Result<bool> {
+    approve_hooks_filtered(ctx, hook_types, &[])
+}
+
+/// Like `approve_hooks` but with name filters for targeted hook approval.
+///
+/// When `name_filters` is non-empty, only commands matching those names are shown
+/// in the approval prompt. This is used by `wt hook <type> <name...>` to
+/// approve only the targeted hooks rather than all hooks of that type.
+///
+/// Supports filter syntax per name:
+/// - `"foo"` — approves commands named "foo" from project config
+/// - `"project:foo"` — approves commands named "foo" from project config
+/// - `"project:"` — approves all commands from project config
+/// - `"user:"` or `"user:foo"` — skips approval (user hooks don't need approval)
+pub fn approve_hooks_filtered(
+    ctx: &super::command_executor::CommandContext<'_>,
+    hook_types: &[HookType],
+    name_filters: &[String],
+) -> anyhow::Result<bool> {
+    // Parse filters to understand source and name separately
+    // Uses the same ParsedFilter as hooks.rs for consistent behavior
+    let parsed_filters: Vec<ParsedFilter<'_>> = name_filters
+        .iter()
+        .map(|f| ParsedFilter::parse(f))
+        .collect();
+
+    // If all filters explicitly target user hooks only, skip project approval entirely
+    if !parsed_filters.is_empty()
+        && parsed_filters
+            .iter()
+            .all(|f| f.source == Some(HookSource::User))
+    {
+        return Ok(true);
+    }
+
+    let project_config = match ctx.repo.load_project_config()? {
+        Some(cfg) => cfg,
+        None => return Ok(true), // No project config = no commands to approve
+    };
+
+    let mut commands = collect_commands_for_hooks(&project_config, hook_types);
+
+    // Apply source-aware filters before approval to only prompt for targeted
+    // project commands. User-scoped filters never match project commands.
+    if !parsed_filters.is_empty() {
+        commands.retain(|cmd| {
+            parsed_filters
+                .iter()
+                .any(|f| f.matches_command(HookSource::Project, cmd.command.name.as_deref()))
+        });
+    }
+
+    if commands.is_empty() {
+        return Ok(true);
+    }
+
+    let project_id = ctx.repo.project_identifier()?;
+    approve_command_batch(&commands, &project_id, ctx.yes)
+}
+
+/// Approve `hook_types` and centralize the "decline → continue without hooks" message.
+///
+/// Returns `true` when approval succeeded (hooks should run) and `false` when the
+/// user declined (caller should fall through without hook execution). Emits
+/// `on_decline` as an info message on the decline path.
+pub fn approve_or_skip(
+    ctx: &super::command_executor::CommandContext<'_>,
+    hook_types: &[HookType],
+    on_decline: &str,
+) -> anyhow::Result<bool> {
+    let approved = approve_hooks(ctx, hook_types)?;
+    if !approved {
+        h0x_wt::styling::eprintln!("{}", h0x_wt::styling::info_message(on_decline));
+    }
+    Ok(approved)
+}
+
+/// Resolve the project commit template for a preview path (`--show-prompt` /
+/// `--dry-run`).
+///
+/// `--show-prompt` doesn't invoke the LLM, so it always returns the configured
+/// fragment verbatim. `--dry-run` does invoke the LLM, so when an LLM is
+/// configured it goes through the same approval gate as a real commit.
+pub fn resolve_template_for_preview(
+    ctx: &super::command_executor::CommandContext<'_>,
+    commit_config: &h0x_wt::config::CommitGenerationConfig,
+    dry_run: bool,
+) -> anyhow::Result<Option<String>> {
+    if dry_run && commit_config.is_configured() {
+        approve_commit_template_append(ctx)
+    } else {
+        Ok(ctx
+            .repo
+            .load_project_config()?
+            .as_ref()
+            .and_then(|cfg| cfg.commit_template_append().map(str::to_string)))
+    }
+}
+
+/// Approve the project-level commit append fragment before sending it to the LLM.
+///
+/// Returns `Ok(Some(fragment))` when approved (or already approved), `Ok(None)`
+/// when no fragment is configured or the user declined. Declining is non-fatal:
+/// the LLM still runs, just without the project append, mirroring the
+/// "commands declined, continuing without hooks" pattern. The user-level
+/// `template-append` is not gated here — it's the developer's own config.
+///
+/// Callers should invoke this on every LLM-bearing path (`wt commit`, `wt step
+/// commit`, `wt step squash`, `wt merge`, `wt step commit --dry-run`, etc.).
+/// `--show-prompt` paths skip the gate — they don't execute the LLM, so showing
+/// the fragment is a preview, not a send.
+pub fn approve_commit_template_append(
+    ctx: &super::command_executor::CommandContext<'_>,
+) -> anyhow::Result<Option<String>> {
+    let Some(project_config) = ctx.repo.load_project_config()? else {
+        return Ok(None);
+    };
+    let Some(fragment) = project_config.commit_template_append() else {
+        return Ok(None);
+    };
+
+    let project_id = ctx.repo.project_identifier()?;
+    let owned = fragment.to_string();
+    let batch = vec![ApprovableCommand::commit_template_append(owned.clone())];
+    let approved = approve_command_batch(&batch, &project_id, ctx.yes)?;
+    if !approved {
+        h0x_wt::styling::eprintln!(
+            "{}",
+            h0x_wt::styling::info_message(
+                "Project commit guidance declined; generating without it",
+            )
+        );
+        return Ok(None);
+    }
+    Ok(Some(owned))
+}

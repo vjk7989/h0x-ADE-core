@@ -1,0 +1,161 @@
+# worktrunk shell integration for nushell 0.113+
+
+# Tab completions: calls binary with COMPLETE=nu to get candidates.
+# Note: nushell's completion engine bypasses custom completers when the current
+# token starts with `-`, so flag completions (e.g. `wt switch --<TAB>`) don't
+# appear. Subcommand and value completions work. (nushell/nushell#14504)
+#
+# Nushell 0.116 binds completer inputs by parameter name and hands `place` a
+# record whose `command` field is the old spans list; a parameter still named
+# `spans` works but warns as deprecated every time this file is sourced.
+# Earlier versions pass the spans list positionally, whatever the name.
+export def "nu-complete {{ cmd }}" [place] {
+    let spans = if ($place | describe | str starts-with "record") { $place.command } else { $place }
+    let worktrunk_bin = if ($env.H0X_WT_BIN? | is-not-empty) {
+        $env.H0X_WT_BIN
+    } else {
+        let external = (which -a {{ cmd }} | where type == "external")
+        if ($external | is-empty) { return [] }
+        ($external | get 0.path)
+    }
+
+    let result = (do {
+        with-env { COMPLETE: nu } { ^$worktrunk_bin -- ...$spans }
+    } | complete)
+    if $result.exit_code != 0 { return [] }
+
+    $result.stdout | lines | each {|line|
+        let parts = ($line | split row "\t")
+        if ($parts | length) >= 2 {
+            { value: ($parts | get 0), description: ($parts | get 1) }
+        } else {
+            { value: ($parts | get 0) }
+        }
+    }
+}
+
+# Override {{ cmd }} so it can change the parent shell's directory.
+# H0X_WT_BIN can override the binary path (for testing dev builds).
+#
+# Nushell pipeline workaround (nushell/nushell#12643):
+#
+# In POSIX shells, pipes are file-descriptor plumbing — stdout flows through
+# the pipe while the shell continues executing post-command logic (directive
+# processing, exit codes). In nushell, a function's "output" is its return
+# value (the last expression), not bytes written to fd1. When an external
+# command isn't the last expression, its stdout goes to the terminal as a
+# side effect but doesn't flow through `|`.
+#
+# This means we can't both stream stdout through a pipe AND do post-processing
+# (directives, cleanup) in the same function. We handle this by splitting into
+# two paths based on the subcommand:
+#
+# - `list`: Direct passthrough. The binary is the last expression, so stdout
+#   streams to the terminal (progressive rendering) and flows through pipes
+#   (`{{ cmd }} list --format json | from json`). No directive processing — `list`
+#   never emits directives. No directive env vars are set.
+#
+# - Everything else: Stdout is normally redirected to a temp file via `o>`,
+#   then returned as the function's last expression after directive processing.
+#   `--execute` is the exception: wt's child needs the terminal, so stdout
+#   streams directly and is not available to an outer nushell pipeline.
+#
+# Completer wired via `@complete` attribute on an untyped `[...args]` rest.
+# The parameter-level `string@"completer"` form keeps tokens literal, which
+# blocks nushell's normal argument handling for `--flag="value"` (quote
+# stripping) and `~` (path expansion). Untyped rest gets that handling once
+# nushell/nushell#18131 ships in stable nu; until then `--flag="value"` still
+# arrives quoted. See nushell/nushell#18128 for upstream tracking.
+@complete "nu-complete {{ cmd }}"
+export def --env --wrapped {{ cmd }} [...args] {
+    let worktrunk_bin = if ($env.H0X_WT_BIN? | is-not-empty) {
+        $env.H0X_WT_BIN
+    } else {
+        # Find the external binary, not the custom function
+        # `which -a` is needed because `which` alone only returns the custom command
+        let external = (which -a {{ cmd }} | where type == "external")
+        if ($external | is-empty) {
+            error make {
+                msg: "{{ cmd }} binary not found in PATH. Install with 'cargo install --path .' or set $env.H0X_WT_BIN"
+            }
+        }
+        ($external | get 0.path)
+    }
+
+    # Unquoted wrapped arguments can be glob values. Classify their text
+    # while preserving the original arguments for external execution.
+    let arg_text = ($args | each {|arg| $arg | into string })
+
+    # `list` is the only command that benefits from streaming stdout (progressive
+    # table rendering). It never emits directives, so we skip directive processing
+    # and let the binary be the last expression — stdout flows through pipes.
+    # Note: global flags before `list` (e.g. `wt -C /path list`) miss this check
+    # and fall through to the buffered path. Output is still correct, just not
+    # progressively rendered.
+    if (not ($arg_text | is-empty)) and ($arg_text | first) == "list" {
+        # Direct passthrough: binary is the last expression of this branch,
+        # which is the last expression of the function. Stdout streams to the
+        # terminal and flows through nushell pipelines.
+        ^$worktrunk_bin ...$args
+    } else {
+        let cd_file = (mktemp --tmpdir)
+        let stdout_file = (mktemp --tmpdir)
+        # The return value comes from outside `try … finally`: under an output
+        # redirect (`o> file`), Nushell fails converting a `try … finally`
+        # that evaluates to nothing ("can't convert nothing to string").
+        let result = (try {
+            let wt_args = ($arg_text | take until {|arg| $arg == "--" })
+            # Before `-x`, `c`, `v`, and `y` are boolean flags clap may cluster with it.
+            let has_execute = ($wt_args | any {|arg| $arg == "--execute" or ($arg | str starts-with "--execute=") or ($arg =~ '^-[cvy]*x') })
+
+            # Capture stdout for pipeline passthrough unless wt will launch an
+            # interactive child, which must inherit the terminal.
+            # Capture failure status without discarding buffered stdout.
+            # The outer `finally` applies directives and cleans up on Ctrl-C too.
+            let exit_code = (try {
+                with-env { H0X_WT_DIRECTIVE_CD_FILE: $cd_file } {
+                    if $has_execute {
+                        ^$worktrunk_bin ...$args
+                    } else {
+                        ^$worktrunk_bin ...$args o> $stdout_file
+                    }
+                }
+                0
+            } catch {
+                # Nushell reports signal deaths as negative signal numbers. Its
+                # `exit` builtin needs the corresponding shell status instead.
+                let code = $env.LAST_EXIT_CODE
+                if $code < 0 { 128 - $code } else { $code }
+            })
+
+            let output = if $has_execute { "" } else { open $stdout_file --raw }
+            # A failure's stdout prints now, so a failing directive can't drop it.
+            if $exit_code != 0 and ($output | is-not-empty) { print -n $output }
+            { exit_code: $exit_code, output: $output }
+        } finally {
+            try {
+                # cd file holds a raw path — no shell parsing needed
+                if ($cd_file | path exists) and (open $cd_file --raw | str trim | is-not-empty) {
+                    let target_dir = open $cd_file --raw | str trim
+                    cd $target_dir
+                }
+            } finally {
+                # Bypass user rm aliases on Unix; Windows uses Nushell's builtin.
+                # Cleanup cannot replace the command's status.
+                if $nu.os-info.family == "windows" {
+                    try { rm -f $cd_file $stdout_file }
+                } else {
+                    try { ^rm -f $cd_file $stdout_file }
+                }
+            }
+        })
+
+        # Return captured stdout or reproduce the external failure without
+        # a source trace. Nu itself also works on Windows, where sh is absent.
+        if $result.exit_code != 0 {
+            ^$nu.current-exe --no-config-file --no-std-lib -c $"exit ($result.exit_code)"
+        } else if ($result.output | is-not-empty) {
+            $result.output
+        }
+    }
+}

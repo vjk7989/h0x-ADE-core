@@ -1,0 +1,252 @@
+//! For-each command implementation
+//!
+//! Runs a command sequentially in each worktree by direct exec — no implicit
+//! shell. Each post-`--` argv element is template-expanded and passed through
+//! to the program. Users wanting shell features (pipes, redirects, `$VAR`)
+//! pass `sh -c '<snippet>'` explicitly.
+//!
+//! # Design Notes
+//!
+//! The `step` subcommand grouping is not fully satisfying. It holds the merge
+//! workflow's single-worktree steps (`commit`, `squash`, `rebase`, `push`)
+//! alongside unrelated utilities, including `for-each`, the one that runs a
+//! command across all worktrees.
+//!
+//! These don't naturally belong together. Options considered:
+//!
+//! 1. **Top-level `wt for-each`** — more discoverable, but adds top-level commands
+//! 2. **Rename `step` to `ops`** — clearer grouping, but breaking change
+//! 3. **New `wt run` subcommand** — but unclear what stays in `step`
+//! 4. **Keep current structure** — document the awkwardness (this option)
+//!
+//! Historical note: `hook` subcommands (pre-commit, post-merge, etc.) were originally
+//! under `step` but were moved to their own `wt hook` subcommand for clarity.
+//!
+//! For now, we keep `for-each` under `step` as a pragmatic choice.
+
+use std::io::Write as _;
+use std::process::Stdio;
+
+use anyhow::Context;
+use h0x_wt::config::{UserConfig, VarScope};
+use h0x_wt::git::{ErrorExt, Repository, WorktreeInfo, WorktrunkError};
+use h0x_wt::shell_exec::{Cmd, ShellEscapeMode};
+use h0x_wt::styling::{
+    eprint, eprintln, error_message, format_with_gutter, progress_message, stderr, success_message,
+    warning_message,
+};
+
+use crate::commands::command_executor::{CommandContext, build_hook_context};
+use crate::commands::worktree_display_name;
+use crate::output::print_json;
+
+/// Run a command in each worktree sequentially.
+///
+/// Executes the given argv directly in every worktree, streaming output in
+/// real-time. Continues on errors and reports a summary at the end.
+///
+/// All template variables from hooks are available; values are substituted
+/// into argv elements without shell escaping. Context JSON is provided on stdin.
+pub fn step_for_each(args: Vec<String>, format: crate::cli::SwitchFormat) -> anyhow::Result<()> {
+    let json_mode = format == crate::cli::SwitchFormat::Json;
+    let repo = Repository::current()?;
+    // Filter out prunable worktrees (directory or its `.git` gone) - can't run commands there
+    let worktrees: Vec<&WorktreeInfo> = repo
+        .list_worktrees()?
+        .iter()
+        .filter(|wt| !wt.is_prunable())
+        .collect();
+    let config = UserConfig::load().context("Failed to load config")?;
+
+    let mut failed: Vec<String> = Vec::new();
+    let mut json_results: Vec<serde_json::Value> = Vec::new();
+    // The signal a child died from (Ctrl-C / SIGTERM), if any. We abort the
+    // loop and propagate `Interrupted` rather than visiting the remaining
+    // worktrees — the user asked for the work to stop.
+    let mut interrupted: Option<i32> = None;
+    let total = worktrees.len();
+
+    for &wt in &worktrees {
+        let display_name = worktree_display_name(wt, &repo, &config);
+        eprintln!(
+            "{}",
+            progress_message(format!("Running in {display_name}..."))
+        );
+
+        // Build full hook context for this worktree
+        // Pass wt.branch directly (not the display string) so a detached
+        // worktree maps to None and leaves `{{ branch }}` unset
+        let ctx = CommandContext::new(&repo, &config, wt.branch.as_deref(), &wt.path, false);
+        let context_map = build_hook_context(&ctx, &[], VarScope::All)?;
+
+        // Expand each argv element through the template engine without
+        // shell-escaping — values are interpolated directly into the argv
+        // element a program receives, not through `sh -c`.
+        let expanded: Vec<String> = args
+            .iter()
+            .map(|arg| {
+                context_map.expand(arg, ShellEscapeMode::Literal, &repo, "for-each argument")
+            })
+            .collect::<Result<_, _>>()?;
+
+        let context_json = context_map.to_json();
+
+        match run_argv(&wt.path, expanded, &context_json) {
+            Ok(()) => {
+                if json_mode {
+                    json_results.push(serde_json::json!({
+                        "branch": wt.branch,
+                        "path": wt.path,
+                        "exit_code": 0,
+                        "success": true,
+                    }));
+                }
+            }
+            Err(err) => {
+                let signal_exit = err.interrupt_signal();
+                // Two error strings: a styled block for stderr (preserves
+                // hints from typed diagnostics) and a plain string for
+                // JSON (consumers shouldn't see ANSI codes or symbols).
+                let (exit_info, exit_code, stderr_detail, json_detail) =
+                    if let Some(WorktrunkError::ChildProcessExited { code, .. }) =
+                        err.downcast_ref::<WorktrunkError>()
+                    {
+                        (
+                            format!(" ({err})"),
+                            serde_json::json!(code),
+                            None,
+                            err.to_string(),
+                        )
+                    } else {
+                        let detail = err.display_message();
+                        let styled = err.render_diagnostic().unwrap_or_else(|| detail.clone());
+                        (
+                            " (spawn failed)".to_string(),
+                            serde_json::json!(null),
+                            Some(styled),
+                            detail,
+                        )
+                    };
+                eprintln!(
+                    "{}",
+                    error_message(format!("Failed in {display_name}{exit_info}"))
+                );
+                if let Some(detail) = &stderr_detail {
+                    eprintln!("{}", format_with_gutter(detail, None));
+                }
+                failed.push(display_name.to_string());
+                if json_mode {
+                    json_results.push(serde_json::json!({
+                        "branch": wt.branch,
+                        "path": wt.path,
+                        "exit_code": exit_code,
+                        "success": false,
+                        "error": json_detail,
+                    }));
+                }
+                if let Some(signal) = signal_exit {
+                    interrupted = Some(signal);
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some(signal) = interrupted {
+        if json_mode {
+            print_json(&json_results)?;
+        } else {
+            eprintln!();
+            eprintln!(
+                "{}",
+                warning_message("Interrupted — skipped remaining worktrees")
+            );
+        }
+        return Err(WorktrunkError::Interrupted { signal, hint: None }.into());
+    }
+
+    if json_mode {
+        print_json(&json_results)?;
+        if failed.is_empty() {
+            return Ok(());
+        } else {
+            return Err(WorktrunkError::AlreadyDisplayed { exit_code: 1 }.into());
+        }
+    }
+
+    // Summary
+    eprintln!();
+    if failed.is_empty() {
+        eprintln!(
+            "{}",
+            success_message(format!(
+                "Completed in {total} worktree{}",
+                if total == 1 { "" } else { "s" }
+            ))
+        );
+        Ok(())
+    } else {
+        eprintln!(
+            "{}",
+            warning_message(format!(
+                "{} of {total} worktree{} failed",
+                failed.len(),
+                if total == 1 { "" } else { "s" }
+            ))
+        );
+        let failed_list = failed.join("\n");
+        eprintln!("{}", format_with_gutter(&failed_list, None));
+        // Return silent error so main exits with code 1 without duplicate message
+        Err(WorktrunkError::AlreadyDisplayed { exit_code: 1 }.into())
+    }
+}
+
+/// Run argv directly (no shell) with streaming output, signal forwarding,
+/// stdout→stderr redirect, and JSON context on stdin.
+///
+/// Mirrors the bookkeeping in `output::execute_shell_command` (flush, ANSI
+/// reset, signal forwarding) but builds the command via `Cmd::new` so the
+/// program is exec'd directly without `sh -c` interposition. Directive env
+/// vars are scrubbed by `Cmd` for every spawn, so child commands run in
+/// other worktrees can't perturb the parent shell's CD/exec state.
+/// Git-discovery vars are scrubbed too: for-each relocates the user's
+/// command into each worktree, so its `git` calls must discover that
+/// worktree from the cwd, not resolve an inherited `GIT_DIR` pinned to
+/// wherever `wt` was invoked (see `scrub_git_discovery_env_vars`).
+///
+/// Child stdout is merged onto stderr so it interleaves cleanly with
+/// for-each's decorated per-worktree headers and footers; the structured
+/// `--format=json` output is the only stdout write, emitted once after all
+/// children complete.
+fn run_argv(
+    working_dir: &std::path::Path,
+    argv: Vec<String>,
+    stdin_json: &str,
+) -> anyhow::Result<()> {
+    // Reset ANSI codes on stderr so our color doesn't bleed into the child's
+    // output, the same three lines `execute_shell_command` runs before its own
+    // spawn. Both `eprint!` and `stderr` are anstream's: the flushes have to
+    // name the stream the reset was written to, and on a redirected stderr
+    // anstream drops the reset rather than writing a literal `ESC[0m` into the
+    // file.
+    stderr().flush()?;
+    eprint!("{}", anstyle::Reset);
+    stderr().flush().ok();
+
+    let mut iter = argv.into_iter();
+    let program = iter
+        .next()
+        .expect("clap enforces at least one argv element");
+
+    Cmd::new(program)
+        .args(iter)
+        .current_dir(working_dir)
+        .scrub_git_discovery_env()
+        .stdout(Stdio::from(std::io::stderr()))
+        .forward_signals()
+        .stdin_bytes(stdin_json.as_bytes().to_vec())
+        .stream()?;
+
+    stderr().flush()?;
+    Ok(())
+}

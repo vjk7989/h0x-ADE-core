@@ -855,6 +855,10 @@ pub fn route(core: &Core, method: &str, params: &Value) -> Result<Option<(To, Va
             | "session.list"
             | "session.resume_argv"
             | "session.trash"
+            | "worktree.list"
+            | "worktree.create"
+            | "worktree.remove"
+            | "worktree.merge"
     ) {
         let Some(on) = params["on"].as_str().map(String::from) else { return Ok(None) };
         params.as_object_mut().map(|p| p.remove("on"));

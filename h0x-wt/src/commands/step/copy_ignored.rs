@@ -1,0 +1,335 @@
+//! `wt step copy-ignored` — copy gitignored files matching `.worktreeinclude`.
+
+use std::fs;
+use std::path::PathBuf;
+
+use anyhow::Context;
+use color_print::cformat;
+use h0x_wt::copy::{copy_dir_recursive, copy_leaf};
+use h0x_wt::git::{Repository, path_dir_name};
+use h0x_wt::path::format_path_for_display;
+use h0x_wt::progress::{Progress, format_bytes, format_reflink_paren};
+use h0x_wt::styling::{
+    eprintln, format_with_gutter, hint_message, info_message, println, success_message, verbosity,
+};
+
+use crate::output::print_json;
+
+use super::shared::{list_and_filter_ignored_entries, resolve_copy_ignored_config};
+
+/// Add the four counts a result payload reports, all zero, to an exit that
+/// copied nothing.
+///
+/// An `outcome: "planned"` payload takes none of them. It reports what *would*
+/// be copied, so a file count and a reflink split have nothing to describe, and
+/// leaving them out keeps `planned` one shape whether or not anything matched:
+/// the two `!dry_run`-gated early returns reach it with an empty entry list,
+/// the main path with a full one.
+///
+/// `same_worktree` is not a plan. It is a no-op exit in either mode, carrying
+/// no `dry_run` key, so it takes the zeroed counts unconditionally.
+fn insert_empty_counts(payload: &mut serde_json::Value) {
+    let obj = payload
+        .as_object_mut()
+        .expect("the json! macro above produced an object");
+    for key in ["files", "bytes", "reflinked", "written"] {
+        obj.insert(key.to_string(), serde_json::json!(0));
+    }
+}
+
+/// Handle `wt step copy-ignored` command
+///
+/// Copies gitignored files from a source worktree to a destination worktree.
+/// If a `.worktreeinclude` file exists, only files matching both `.worktreeinclude`
+/// and gitignore patterns are copied. Without `.worktreeinclude`, all gitignored
+/// files are copied. Uses COW (reflink) when available for efficient copying of
+/// large directories like `target/`.
+pub fn step_copy_ignored(
+    from: Option<&str>,
+    to: Option<&str>,
+    dry_run: bool,
+    force: bool,
+    require_include: bool,
+    format: crate::cli::SwitchFormat,
+) -> anyhow::Result<()> {
+    // Self-lower only when we're running inside a background hook pipeline
+    // (parent `wt` sets `H0X_WT_FOREGROUND=-1` on the detached runner).
+    // Foreground callers — interactive `wt step copy-ignored` and synchronous
+    // `pre-*` hook pipelines — are the UI the user is waiting on and must not
+    // be I/O-throttled by `taskpolicy -b` on macOS.
+    if h0x_wt::priority::in_background_hook() {
+        h0x_wt::priority::lower_current_process();
+    }
+    let json_mode = format == crate::cli::SwitchFormat::Json;
+    let repo = Repository::current()?;
+    let copy_ignored_config = resolve_copy_ignored_config(&repo)?;
+
+    // Resolve source and destination worktree paths
+    let (source_path, source_context) = match from {
+        Some(selector) => {
+            let (path, branch) = repo.require_worktree(selector)?;
+            let context = branch.unwrap_or_else(|| path_dir_name(&path).to_string());
+            (path, context)
+        }
+        None => {
+            // Default source is the primary worktree (main worktree for normal repos,
+            // default branch worktree for bare repos).
+            let path = repo.primary_worktree()?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "No primary worktree found (bare repo with no default branch worktree)"
+                )
+            })?;
+            let context = path_dir_name(&path).to_string();
+            (path, context)
+        }
+    };
+
+    let dest_path = repo.require_worktree(to.unwrap_or("@"))?.0;
+
+    if source_path == dest_path {
+        if json_mode {
+            let mut payload = serde_json::json!({
+                "outcome": "same_worktree",
+                "from": source_path,
+                "to": dest_path,
+                "entries": Vec::<serde_json::Value>::new(),
+            });
+            insert_empty_counts(&mut payload);
+            print_json(&payload)?;
+        } else {
+            eprintln!(
+                "{}",
+                info_message("Source and destination are the same worktree")
+            );
+        }
+        return Ok(());
+    }
+
+    let worktree_paths: Vec<PathBuf> = repo
+        .list_worktrees()?
+        .iter()
+        .map(|wt| wt.path.clone())
+        .collect();
+
+    // `--require-include` gate: when passed, copy nothing unless a
+    // `.worktreeinclude` file exists in the source worktree. Checked before
+    // discovery so the `git ls-files --ignored` traversal is skipped entirely
+    // when nothing copies.
+    if require_include && !source_path.join(".worktreeinclude").exists() {
+        if json_mode {
+            let mut payload = serde_json::json!({
+                "outcome": if dry_run { "planned" } else { "copied" },
+                "dry_run": dry_run,
+                "from": source_path,
+                "to": dest_path,
+                "reason": "require-include-no-worktreeinclude",
+                "entries": Vec::<serde_json::Value>::new(),
+            });
+            if !dry_run {
+                insert_empty_counts(&mut payload);
+            }
+            print_json(&payload)?;
+        } else {
+            eprintln!(
+                "{}",
+                info_message(cformat!(
+                    "Nothing copied — <bold>--require-include</> was passed but no <bold>.worktreeinclude</> exists"
+                ))
+            );
+            eprintln!(
+                "{}",
+                hint_message(cformat!(
+                    "Add a <underline>.worktreeinclude</> to select files, or drop <underline>--require-include</> to copy everything"
+                ))
+            );
+        }
+        return Ok(());
+    }
+
+    let entries_to_copy = list_and_filter_ignored_entries(
+        &source_path,
+        &source_context,
+        &worktree_paths,
+        &copy_ignored_config.exclude,
+    )?;
+
+    if entries_to_copy.is_empty() {
+        if json_mode {
+            let mut payload = serde_json::json!({
+                "outcome": if dry_run { "planned" } else { "copied" },
+                "dry_run": dry_run,
+                "from": source_path,
+                "to": dest_path,
+                "entries": Vec::<serde_json::Value>::new(),
+            });
+            if !dry_run {
+                insert_empty_counts(&mut payload);
+            }
+            print_json(&payload)?;
+        } else {
+            eprintln!("{}", info_message("No matching files to copy"));
+        }
+        return Ok(());
+    }
+
+    let verbose = verbosity();
+
+    if dry_run {
+        if json_mode {
+            let entries: Vec<_> = entries_to_copy
+                .iter()
+                .map(|(src_entry, is_dir)| {
+                    let relative = src_entry
+                        .strip_prefix(&source_path)
+                        .unwrap_or(src_entry.as_path());
+                    serde_json::json!({
+                        "path": relative.to_string_lossy(),
+                        "kind": if *is_dir { "dir" } else { "file" },
+                    })
+                })
+                .collect();
+            let payload = serde_json::json!({
+                "outcome": "planned",
+                "dry_run": true,
+                "from": source_path,
+                "to": dest_path,
+                "entries": entries,
+            });
+            print_json(&payload)?;
+            return Ok(());
+        }
+        let items: Vec<String> = entries_to_copy
+            .iter()
+            .map(|(src_entry, is_dir)| {
+                let relative = src_entry
+                    .strip_prefix(&source_path)
+                    .unwrap_or(src_entry.as_path());
+                let entry_type = if *is_dir { "dir" } else { "file" };
+                format!("{} ({})", format_path_for_display(relative), entry_type)
+            })
+            .collect();
+        let entry_word = if items.len() == 1 { "entry" } else { "entries" };
+        // The human preview mirrors the `--format=json` plan (the entries that
+        // would be copied), so it goes to stdout — see /writing-user-outputs.
+        println!(
+            "{}",
+            info_message(format!(
+                "Would copy {} {}:\n{}",
+                items.len(),
+                entry_word,
+                format_with_gutter(&items.join("\n"), None)
+            ))
+        );
+        return Ok(());
+    }
+
+    // Show entries in verbose mode (text only — JSON mode emits the full list at the end).
+    if verbose >= 1 && !json_mode {
+        let items: Vec<String> = entries_to_copy
+            .iter()
+            .map(|(src_entry, is_dir)| {
+                let relative = src_entry
+                    .strip_prefix(&source_path)
+                    .unwrap_or(src_entry.as_path());
+                let entry_type = if *is_dir { "dir" } else { "file" };
+                format!("{} ({})", format_path_for_display(relative), entry_type)
+            })
+            .collect();
+        let entry_word = if items.len() == 1 { "entry" } else { "entries" };
+        eprintln!(
+            "{}",
+            info_message(format!(
+                "Copying {} {}:\n{}",
+                items.len(),
+                entry_word,
+                format_with_gutter(&items.join("\n"), None)
+            ))
+        );
+    }
+
+    // `start` auto-detects the TTY; verbose/dry-run already print enough.
+    let progress = if verbose >= 1 || json_mode {
+        Progress::disabled()
+    } else {
+        Progress::start("Copying")
+    };
+
+    for (src_entry, is_dir) in &entries_to_copy {
+        let relative = src_entry
+            .strip_prefix(&source_path)
+            .unwrap_or(src_entry.as_path());
+        let dest_entry = dest_path.join(relative);
+
+        if *is_dir {
+            // A pure copy deletes no source, so the skip count has nothing to guard.
+            let _skipped =
+                copy_dir_recursive(src_entry, &dest_entry, Some(&dest_path), force, &progress)
+                    .with_context(|| {
+                        format!("copying directory {}", format_path_for_display(relative))
+                    })?;
+        } else {
+            if let Some(parent) = dest_entry.parent() {
+                fs::create_dir_all(parent).with_context(|| {
+                    format!(
+                        "creating directory for {}",
+                        format_path_for_display(relative)
+                    )
+                })?;
+            }
+            if let Some((bytes, data)) = copy_leaf(src_entry, &dest_entry, Some(&dest_path), force)?
+            {
+                progress.record(bytes, data);
+            }
+        }
+    }
+    let (copied_count, copied_bytes) = progress.totals();
+    let (reflinked, written) = progress.copy_split();
+    progress.finish();
+
+    if json_mode {
+        // `entries` mirrors dry-run: the top-level units selected for copy
+        // (files and dirs). `files` counts the actual leaves written
+        // (recursive + skipping pre-existing files), `bytes` sums their size,
+        // and `reflinked`/`written` split those leaves by whether the
+        // filesystem shared the source's extents. `insert_empty_counts` carries
+        // all four through the exits that copy nothing, so a consumer never
+        // branches on a key's presence.
+        let entries: Vec<_> = entries_to_copy
+            .iter()
+            .map(|(src_entry, is_dir)| {
+                let relative = src_entry
+                    .strip_prefix(&source_path)
+                    .unwrap_or(src_entry.as_path());
+                serde_json::json!({
+                    "path": relative.to_string_lossy(),
+                    "kind": if *is_dir { "dir" } else { "file" },
+                })
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "outcome": "copied",
+            "dry_run": false,
+            "from": source_path,
+            "to": dest_path,
+            "entries": entries,
+            "files": copied_count,
+            "bytes": copied_bytes,
+            "reflinked": reflinked,
+            "written": written,
+        });
+        print_json(&payload)?;
+    } else {
+        // Show summary
+        let file_word = if copied_count == 1 { "file" } else { "files" };
+        eprintln!(
+            "{}",
+            success_message(format!(
+                "Copied {copied_count} {file_word} · {}",
+                format_bytes(copied_bytes)
+            ))
+            .append(&format_reflink_paren(reflinked, written))
+        );
+    }
+
+    Ok(())
+}

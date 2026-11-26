@@ -1,0 +1,11 @@
+◎ Rebasing onto main...
+✗ Rebase onto main incomplete
+  Rebasing (1/1)
+  error: could not apply a9b75a0... c2
+  hint: Resolve all conflicts manually, mark them as resolved with
+  hint: "git add/rm <conflicted_files>", then run "git rebase --continue".
+  hint: You can instead skip this commit: run "git rebase --skip".
+  hint: To abort and get back to the state before "git rebase", run "git rebase --abort".
+  Could not apply a9b75a0... c2
+  Auto-merging f
+  CONFLICT (content): Merge conflict in f

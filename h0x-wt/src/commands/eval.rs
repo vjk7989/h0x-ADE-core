@@ -1,0 +1,72 @@
+//! Eval command implementation
+//!
+//! Evaluates a template expression in the current worktree context and prints
+//! the result to stdout.
+
+use anyhow::Context;
+use color_print::cformat;
+use h0x_wt::config::{UserConfig, VarScope, format_base_variables};
+use h0x_wt::git::Repository;
+use h0x_wt::shell_exec::ShellEscapeMode;
+use h0x_wt::styling::{eprintln, format_with_gutter, info_message, println, verbosity};
+
+use crate::cli::SwitchFormat;
+use crate::commands::command_executor::{CommandContext, build_hook_context};
+use crate::output::print_json;
+
+/// Template name reported in errors, the `-v` expansion view, and JSON output.
+const EVAL_NAME: &str = "eval";
+
+/// Evaluate a template expression in the current worktree context.
+///
+/// In text mode, prints the expanded result to stdout with a trailing newline.
+/// In JSON mode (`--format=json`), prints `{name, template, result}` instead.
+/// All hook template variables and filters are available.
+///
+/// `eval` mutates nothing, so it has no `--dry-run`. Variable discovery lives
+/// in the verbose lane instead: `-v` lists the available template variables on
+/// stderr, above the labeled `source` / `result` expansion view that
+/// `expand_template` renders at `-v`. The `-v` lane writes to stderr, so it
+/// composes with either output format.
+pub fn step_eval(template: &str, format: SwitchFormat) -> anyhow::Result<()> {
+    let repo = Repository::current()?;
+    let config = UserConfig::load().context("Failed to load config")?;
+
+    let wt = repo.current_worktree();
+    let branch = wt.branch()?;
+    let worktree_path = wt.root()?;
+
+    let ctx = CommandContext::new(&repo, &config, branch.as_deref(), &worktree_path, false);
+    let context_map = build_hook_context(&ctx, &[], VarScope::All)?;
+
+    if verbosity() >= 1 {
+        eprintln!(
+            "{}",
+            info_message(cformat!("<bold>{EVAL_NAME}</> template variables:"))
+        );
+        eprintln!(
+            "{}",
+            format_with_gutter(&format_base_variables(&context_map), None)
+        );
+    }
+
+    let result = context_map.expand(template, ShellEscapeMode::Literal, &repo, EVAL_NAME)?;
+    // `expand_template` emitted the `source` / `result` view to stderr under
+    // `-v`; a trailing blank separates it from the result printed below.
+    if verbosity() >= 1 {
+        eprintln!();
+    }
+
+    match format {
+        SwitchFormat::Text => println!("{result}"),
+        SwitchFormat::Json => {
+            let payload = serde_json::json!({
+                "name": EVAL_NAME,
+                "template": template,
+                "result": result,
+            });
+            print_json(&payload)?;
+        }
+    }
+    Ok(())
+}

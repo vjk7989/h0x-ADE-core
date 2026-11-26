@@ -1,0 +1,90 @@
+use std::path::PathBuf;
+use h0x_wt::config::UserConfig;
+use h0x_wt::git::Repository;
+
+use super::command_executor::CommandContext;
+
+/// Shared execution context for command handlers that act on one worktree.
+///
+/// Centralizes the common "repo + branch + config + worktree" setup so individual
+/// handlers can focus on their core logic while sharing consistent error messaging.
+///
+/// Used by commands that act on a single worktree — the one named by `--branch`,
+/// or `@` without it (`merge`, `step commit`, `step squash`, `hook`). Commands that
+/// inspect multiple worktrees or run without a config/branch requirement (`list`, the
+/// picker, some `worktree` helpers) still call `Repository::current()` directly so
+/// they can operate in broader contexts without forcing config loads or branch
+/// resolution.
+pub struct CommandEnv {
+    pub repo: Repository,
+    /// The selected worktree's branch (None in detached HEAD state).
+    pub branch: Option<String>,
+    pub config: UserConfig,
+    /// The selected worktree's root.
+    pub worktree_path: PathBuf,
+}
+
+impl CommandEnv {
+    /// Load the command environment for the worktree `selector` names.
+    ///
+    /// Commands without a `--branch` pass `"@"`, so "the current worktree" has
+    /// one definition, [`Repository::resolve_worktree`]'s: the worktree the
+    /// command runs in, or outside every worktree, the one checked out on the
+    /// branch HEAD names.
+    ///
+    /// `repo` is rooted at the selected worktree (see
+    /// [`Repository::rooted_at`]), so a command run with `--branch <b>`
+    /// (e.g. `wt step commit --branch <b>`) and its hooks (`pre-commit` /
+    /// `post-commit`) operate on, and resolve `.config/h0x-wt.toml` from, `<b>`'s
+    /// worktree rather than the cwd. See the `commands::hooks` module docs for
+    /// the hook config-resolution rule.
+    ///
+    /// `branch` carries the resolved branch, not the selector, so a worktree
+    /// named by path expands `{{ branch }}` to the branch checked out there.
+    pub fn for_selector(config: UserConfig, selector: &str) -> anyhow::Result<Self> {
+        let repo = Repository::current()?;
+        let (worktree_path, branch) = repo.require_worktree(selector)?;
+
+        Ok(Self {
+            repo: repo.rooted_at(&worktree_path)?,
+            branch,
+            config,
+            worktree_path,
+        })
+    }
+
+    /// Build a `CommandContext` tied to this environment.
+    pub fn context(&self, yes: bool) -> CommandContext<'_> {
+        CommandContext::new(
+            &self.repo,
+            &self.config,
+            self.branch.as_deref(),
+            &self.worktree_path,
+            yes,
+        )
+    }
+
+    /// Get branch name, returning error if in detached HEAD state.
+    pub fn require_branch(&self, action: &str) -> anyhow::Result<&str> {
+        self.branch.as_deref().ok_or_else(|| {
+            h0x_wt::git::GitError::DetachedHead {
+                action: Some(action.into()),
+                worktree: None,
+            }
+            .into()
+        })
+    }
+
+    /// Get the project identifier for per-project config lookup.
+    ///
+    /// Uses the remote URL if available, otherwise the canonical repository path.
+    /// Returns None only if the path is not valid UTF-8.
+    pub fn project_id(&self) -> Option<h0x_wt::config::ProjectId> {
+        self.repo.project_identifier().ok()
+    }
+
+    /// Get all resolved config with defaults applied.
+    pub fn resolved(&self) -> h0x_wt::config::ResolvedConfig {
+        self.config.resolved(self.project_id().as_ref())
+    }
+}

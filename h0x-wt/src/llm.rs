@@ -1,0 +1,2217 @@
+use anyhow::Context;
+use shell_escape::unix::escape;
+use std::borrow::Cow;
+use std::fmt;
+use std::path::Path;
+use std::sync::Arc;
+use h0x_wt::config::CommitGenerationConfig;
+use h0x_wt::git::{CommandError, CommitMessageDetail, ErrorExt, TempIndex, WorkingTree};
+use h0x_wt::shell_exec::{Cmd, ShellConfig};
+
+use minijinja::Environment;
+use minijinja::value::{Enumerator, Object, Value};
+
+/// minijinja view of one squashed commit, exposed to squash templates as an
+/// element of `commit_details`.
+///
+/// It renders as its bare subject (`{{ detail }}` yields the subject line) so a
+/// template that iterates the list and prints the loop variable directly
+/// behaves exactly like the retired `commits` list of subject strings. That
+/// equivalence is what lets the deprecation layer rewrite a `commits` template
+/// to `commit_details` as a plain identifier rename — on every load, and in the
+/// file itself via `wt config update` — with no shape-changing hand edits (see
+/// #2984 and `RETIRED_VARS`). The `.subject` and `.body` properties remain
+/// available for
+/// templates that want the structured form, and because minijinja coerces an
+/// object to a string via its `render`, string filters (`{{ c | upper }}`)
+/// operate on the subject too.
+#[derive(Debug)]
+struct CommitDetailValue {
+    subject: String,
+    body: String,
+}
+
+impl Object for CommitDetailValue {
+    // `repr` is left at the trait default (`ObjectRepr::Map`).
+
+    fn get_value(self: &Arc<Self>, key: &Value) -> Option<Value> {
+        match key.as_str()? {
+            "subject" => Some(Value::from(self.subject.clone())),
+            "body" => Some(Value::from(self.body.clone())),
+            _ => None,
+        }
+    }
+
+    // Report the two keys so the object is non-empty: with the default
+    // `Map`-repr enumerator (`Empty`) the object would be falsy in `{% if c %}`,
+    // breaking the equivalence with the old non-empty subject string.
+    fn enumerate(self: &Arc<Self>) -> Enumerator {
+        Enumerator::Str(&["subject", "body"])
+    }
+
+    fn render(self: &Arc<Self>, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.subject)
+    }
+}
+
+/// Characters that require shell wrapping when used in a command.
+/// If a command contains any of these, it needs `sh -c '...'` to execute correctly.
+const SHELL_METACHARACTERS: &[char] = &[
+    '&', '|', ';', '<', '>', '$', '`', '\'', '"', '(', ')', '{', '}', '*', '?', '[', ']', '~', '!',
+    '\\',
+];
+
+/// Render the shell invocation worktrunk would use to run `command`.
+///
+/// Mirrors the wrapping done by [`execute_llm_command`]: every LLM command is passed as
+/// a single argument to the platform shell, so the displayed form is always
+/// `<shell> <shell-args> <quoted-command>` (e.g. `sh -c 'claude -p'`).
+///
+/// Uses the shell's basename rather than the full path so the displayed command stays
+/// short and doesn't leak the user's install path (`C:\Program Files\Git\bin\bash.exe`
+/// becomes `bash.exe`).
+pub(crate) fn render_llm_invocation(command: &str) -> anyhow::Result<String> {
+    let shell = ShellConfig::get()?;
+    let mut rendered = shell
+        .executable
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| shell.executable.to_string_lossy().into_owned());
+    for arg in &shell.args {
+        rendered.push(' ');
+        rendered.push_str(arg);
+    }
+    rendered.push(' ');
+    rendered.push_str(&escape(Cow::Borrowed(command)));
+    Ok(rendered)
+}
+
+/// Start a "still waiting" watchdog for a *foreground* LLM shell-out.
+///
+/// [`execute_llm_command`] captures stdout, so a slow or hung command is
+/// otherwise silent. The watchdog shows a dim status line that escalates to
+/// reveal the exact invocation (via [`render_llm_invocation`]) in a gutter. The
+/// caller holds the returned guard until the command returns; on drop it clears
+/// the status before the result is printed.
+///
+/// Only for single, foreground calls — never the concurrent summary path
+/// ([`generate_summary_core`](crate::summary::generate_summary_core), up to 8
+/// under a semaphore), where
+/// per-call spinners would interleave.
+fn watch_llm_command(command: &str) -> h0x_wt::progress::Watchdog {
+    let invocation = render_llm_invocation(command).ok();
+    h0x_wt::progress::Watchdog::start("the commit generation command", invocation.as_deref())
+}
+
+/// Format a reproduction command, only wrapping with `sh -c` if needed.
+///
+/// Simple commands like `llm -m haiku` are shown as-is.
+/// Complex commands with shell syntax are wrapped: `sh -c 'complex && command'`
+fn format_reproduction_command(base_cmd: &str, llm_command: &str) -> String {
+    let needs_shell = llm_command.contains(SHELL_METACHARACTERS)
+        || llm_command
+            .split_whitespace()
+            .next()
+            .is_some_and(|first| first.contains('='));
+
+    if needs_shell {
+        format!(
+            "{} | sh -c {}",
+            base_cmd,
+            escape(Cow::Borrowed(llm_command))
+        )
+    } else {
+        format!("{} | {}", base_cmd, llm_command)
+    }
+}
+
+/// Byte budget for the diff embedded in a prompt. ~25k tokens for typical
+/// code; syntax-dense content (hashes, minified assets) tokenizes as low as
+/// ~2 bytes/token, so the worst case is ~50k tokens — bounded well under
+/// small-model context windows, where the old 400k threshold was not.
+const DIFF_BUDGET: usize = 100_000;
+
+/// Maximum lines per file section once the diff exceeds the budget
+const MAX_LINES_PER_FILE: usize = 50;
+
+/// Maximum bytes per line once the diff exceeds the budget. A line-count cap
+/// alone passes single-line minified/generated files through whole; this
+/// bounds each section to `MAX_LINES_PER_FILE * MAX_LINE_LEN` bytes so no
+/// one file eats the whole budget.
+const MAX_LINE_LEN: usize = 500;
+
+/// Maximum diffstat lines, applied at any diff size. The stat is one line
+/// per file, so a many-thousand-file diff would otherwise dwarf the
+/// truncated diff itself.
+const STAT_MAX_LINES: usize = 200;
+
+/// Maximum squashed commits rendered into a squash prompt; a synthetic
+/// "(N earlier commits omitted)" entry stands in for the older tail. This
+/// bounds the one prompt input the diff budget doesn't cover — subjects from
+/// a branch with thousands of commits would otherwise grow the prompt
+/// without limit.
+const MAX_SQUASH_COMMITS: usize = 200;
+
+/// Lock file patterns that are filtered out when diff is too large
+const LOCK_FILE_PATTERNS: &[&str] = &[".lock", "-lock.json", "-lock.yaml", ".lock.hcl"];
+
+/// Prepared diff output with optional filtering applied
+pub(crate) struct PreparedDiff {
+    /// The diff content (possibly filtered/truncated)
+    pub(crate) diff: String,
+    /// The diffstat output
+    pub(crate) stat: String,
+}
+
+/// Check if a filename matches lock file patterns
+fn is_lock_file(filename: &str) -> bool {
+    LOCK_FILE_PATTERNS
+        .iter()
+        .any(|pattern| filename.ends_with(pattern))
+}
+
+/// Extract the destination path from a `diff --git` header line.
+///
+/// Every diff fed to [`prepare_diff`] comes from plumbing (`diff-index`,
+/// `diff-tree`), which ignores the prefix settings and always writes `a/` and
+/// `b/`, so the destination begins at the last ` b/` — or, when git quotes the pair,
+/// at the last ` "b/`. Quoting is not optional: `core.quotePath` escapes a
+/// non-ASCII name, and a name holding `"` or `\` is quoted whatever that
+/// setting says, so a parser that only knows the bare form fails on both.
+///
+/// The escaped form is what comes back for a quoted name — it feeds
+/// [`is_lock_file`]'s suffix match, not the filesystem — and a path that
+/// itself contains ` b/` stays ambiguous, exactly as it is in git's own
+/// plain-text output.
+fn parse_diff_header_path(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("diff --git ")?;
+    if let Some(index) = rest.rfind(" \"b/") {
+        let path = &rest[index + 4..];
+        return Some(path.strip_suffix('"').unwrap_or(path));
+    }
+    rest.rfind(" b/").map(|index| &rest[index + 3..])
+}
+
+/// Parse a diff into individual file sections
+///
+/// Returns Vec of (filename, diff_content) pairs
+fn parse_diff_sections(diff: &str) -> Vec<(&str, &str)> {
+    let mut sections = Vec::new();
+    let mut current_file: Option<&str> = None;
+    let mut section_start_byte = 0;
+    let mut current_byte = 0;
+
+    // Iterate with `split_inclusive` so each chunk includes its line terminator
+    // (`\n` or `\r\n`). Advancing by the chunk length keeps `current_byte` aligned
+    // with real byte offsets — `str::lines()` strips terminators, so reconstructing
+    // the offset as `line.len() + 1` under-counts by one byte per CRLF line and
+    // can end up slicing inside a multi-byte UTF-8 character.
+    for full_line in diff.split_inclusive('\n') {
+        let line = full_line
+            .strip_suffix("\r\n")
+            .or_else(|| full_line.strip_suffix('\n'))
+            .unwrap_or(full_line);
+        if line.starts_with("diff --git ") {
+            // Save previous section
+            if let Some(file) = current_file
+                && current_byte > section_start_byte
+            {
+                sections.push((file, &diff[section_start_byte..current_byte]));
+            }
+
+            // A header opens a section whether or not its path parses: the
+            // name only feeds lock-file filtering, while treating the section
+            // as absent drops the file's diff from the prompt entirely.
+            current_file = Some(parse_diff_header_path(line).unwrap_or(""));
+            section_start_byte = current_byte;
+        }
+        current_byte += full_line.len();
+    }
+
+    // Save final section
+    if let Some(file) = current_file
+        && section_start_byte < diff.len()
+    {
+        sections.push((file, &diff[section_start_byte..]));
+    }
+
+    sections
+}
+
+/// Cap a line at [`MAX_LINE_LEN`] bytes, cutting at a char boundary
+fn truncate_line(line: &str) -> Cow<'_, str> {
+    if line.len() <= MAX_LINE_LEN {
+        return Cow::Borrowed(line);
+    }
+    let mut end = MAX_LINE_LEN;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    Cow::Owned(format!("{}... (line truncated)", &line[..end]))
+}
+
+/// Truncate a diff section to max lines (keeping at least the header lines,
+/// through the first `@@` hunk marker) and cap each surviving line at
+/// [`MAX_LINE_LEN`] bytes. Output is LF-normalized.
+fn truncate_diff_section(section: &str, max_lines: usize) -> String {
+    let line_count = section.lines().count();
+    let total_lines = if line_count <= max_lines {
+        line_count
+    } else {
+        let header_lines = section
+            .lines()
+            .position(|l| l.starts_with("@@"))
+            .map_or(1, |i| i + 1);
+        max_lines.max(header_lines)
+    };
+
+    let mut result = String::new();
+    for line in section.lines().take(total_lines) {
+        result.push_str(&truncate_line(line));
+        result.push('\n');
+    }
+    let omitted = line_count - total_lines;
+    if omitted > 0 {
+        result.push_str(&format!("\n... ({} lines omitted)\n", omitted));
+    }
+
+    result
+}
+
+/// Cap the diffstat at [`STAT_MAX_LINES`] lines plus an omission marker. No
+/// line is special-cased: the summary path concatenates two `--stat` blocks
+/// (branch + working tree), so "the last line is the total" doesn't hold in
+/// general.
+fn truncate_stat(stat: String) -> String {
+    let line_count = stat.lines().count();
+    if line_count <= STAT_MAX_LINES {
+        return stat;
+    }
+
+    let mut out = String::new();
+    for line in stat.lines().take(STAT_MAX_LINES) {
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&format!(
+        "... ({} more files)\n",
+        line_count - STAT_MAX_LINES
+    ));
+    out
+}
+
+/// Prepare diff for LLM consumption, applying filtering if needed.
+///
+/// The stat is always capped at [`STAT_MAX_LINES`]. A diff at or under
+/// [`DIFF_BUDGET`] passes through unchanged. Over budget, lock-file sections
+/// are dropped; if that isn't enough, each section is truncated (line count
+/// and line length) and sections accumulate in diff order until the budget
+/// is spent — the accumulation is the output bound, the per-section caps
+/// only keep one file from eating the whole budget.
+pub(crate) fn prepare_diff(diff: String, stat: String) -> PreparedDiff {
+    let stat = truncate_stat(stat);
+
+    if diff.len() <= DIFF_BUDGET {
+        return PreparedDiff { diff, stat };
+    }
+
+    tracing::debug!(
+        count = diff.len(),
+        budget = DIFF_BUDGET,
+        "Diff size ({} bytes) exceeds budget ({}), filtering",
+        diff.len(),
+        DIFF_BUDGET
+    );
+
+    // Step 1: Filter out lock files
+    let sections = parse_diff_sections(&diff);
+    let filtered_sections: Vec<_> = sections
+        .iter()
+        .filter(|(filename, _)| !is_lock_file(filename))
+        .collect();
+
+    let lock_files_removed = sections.len() - filtered_sections.len();
+    if lock_files_removed > 0 {
+        tracing::debug!(
+            count = lock_files_removed,
+            "Filtered out {} lock file(s)",
+            lock_files_removed
+        );
+    }
+
+    let filtered_len: usize = filtered_sections
+        .iter()
+        .map(|(_, content)| content.len())
+        .sum();
+
+    // If filtering lock files brought us under budget, we're done
+    if filtered_len <= DIFF_BUDGET {
+        return PreparedDiff {
+            diff: filtered_sections
+                .iter()
+                .map(|(_, content)| *content)
+                .collect(),
+            stat,
+        };
+    }
+
+    // Step 2: Truncate each section, accumulating until the budget is spent
+    tracing::debug!(
+        count = filtered_len,
+        "Still too large ({} bytes), truncating to {} lines/file within a {} byte budget",
+        filtered_len,
+        MAX_LINES_PER_FILE,
+        DIFF_BUDGET
+    );
+
+    let mut truncated = String::new();
+    let mut included = 0;
+    for (_, content) in &filtered_sections {
+        let section = truncate_diff_section(content, MAX_LINES_PER_FILE);
+        if truncated.len() + section.len() > DIFF_BUDGET {
+            break;
+        }
+        truncated.push_str(&section);
+        included += 1;
+    }
+
+    let files_omitted = filtered_sections.len() - included;
+    if files_omitted > 0 {
+        truncated.push_str(&format!(
+            "\n... ({} files omitted, see diffstat)\n",
+            files_omitted
+        ));
+    }
+
+    PreparedDiff {
+        diff: truncated,
+        stat,
+    }
+}
+
+/// Context data for building LLM prompts
+///
+/// All fields are available to both commit and squash templates.
+/// Squash-specific fields (`commit_details`, `target_branch`) are empty/None for regular commits.
+struct PromptContext<'a> {
+    /// The diff to describe (staged changes for commit, combined diff for squash)
+    git_diff: &'a str,
+    /// Diff statistics summary (`--stat` output)
+    git_diff_stat: &'a str,
+    /// Current branch name
+    branch: &'a str,
+    /// Recent commit subjects for style reference
+    recent_commits: Option<&'a Vec<String>>,
+    /// Repository name
+    repo_name: &'a str,
+    /// Subject/body details for commits being squashed (squash only)
+    commit_details: &'a [CommitMessageDetail],
+    /// Target branch for merge (squash only)
+    target_branch: Option<&'a str>,
+    /// Approved project-level append fragment. `None` when no project
+    /// `template-append` is set or the user declined approval. The
+    /// user-level append fragment is read from the [`CommitGenerationConfig`]
+    /// directly (it needs no approval). Both fragments are themselves
+    /// minijinja templates — `build_prompt` renders each one and exposes
+    /// them as the `user_guidance` and `project_guidance` variables, which
+    /// the default templates wrap in `<user-guidance>` / `<project-guidance>`
+    /// blocks.
+    project_append: Option<&'a str>,
+}
+
+/// Default template for commit message prompts
+///
+/// Synced to dev/config.example.toml by `cargo test readme_sync`
+const DEFAULT_TEMPLATE: &str = r#"<task>Write a commit message for the staged changes below.</task>
+
+<format>
+- Subject line under 50 chars
+- For material changes, add a blank line then a body paragraph explaining the change
+- Output only the commit message, no quotes or code blocks
+</format>
+
+<style>
+- Imperative mood: "Add feature" not "Added feature"
+- Match recent commit style (conventional commits if used)
+- Describe the change, not the intent or benefit
+</style>
+{% if user_guidance %}
+<user-guidance>
+{{ user_guidance }}
+</user-guidance>
+{% endif %}{% if project_guidance %}
+<project-guidance>
+{{ project_guidance }}
+</project-guidance>
+{% endif %}
+<diffstat>
+{{ git_diff_stat }}
+</diffstat>
+
+<diff>
+{{ git_diff }}
+</diff>
+
+<context>
+Branch: {{ branch }}
+{% if recent_commits %}<recent_commits>
+{% for commit in recent_commits %}- {{ commit }}
+{% endfor %}</recent_commits>{% endif %}
+</context>
+"#;
+
+/// Default template for squash commit message prompts
+///
+/// Synced to dev/config.example.toml by `cargo test readme_sync`
+const DEFAULT_SQUASH_TEMPLATE: &str = r#"<task>Write a commit message for the change in <diff>, which is everything the squash will record. <commits> lists what it folds in.</task>
+
+<format>
+- Subject line under 50 chars
+- For material changes, add a blank line then a body paragraph explaining the change
+- Output only the commit message, no quotes or code blocks
+</format>
+
+<style>
+- Imperative mood: "Add feature" not "Added feature"
+- Match the style of commits being squashed (conventional commits if used)
+- Describe the change, not the intent or benefit
+</style>
+{% if user_guidance %}
+<user-guidance>
+{{ user_guidance }}
+</user-guidance>
+{% endif %}{% if project_guidance %}
+<project-guidance>
+{{ project_guidance }}
+</project-guidance>
+{% endif %}
+<commits branch="{{ branch }}" target="{{ target_branch }}">
+{% for detail in commit_details %}- {{ detail.subject }}
+{% endfor %}</commits>
+
+<diffstat>
+{{ git_diff_stat }}
+</diffstat>
+
+<diff>
+{{ git_diff }}
+</diff>
+"#;
+
+/// Execute an LLM command with the given prompt via stdin.
+///
+/// The command is a shell string executed via the platform shell (sh on Unix,
+/// Git Bash on Windows), allowing environment variables to be set inline
+/// (e.g., `MAX_THINKING_TOKENS=0 claude -p ...`).
+///
+/// This is the canonical way to execute LLM commands in this codebase.
+/// All LLM execution should go through this function to maintain consistency.
+pub(crate) fn execute_llm_command(command: &str, prompt: &str) -> anyhow::Result<String> {
+    // TODO(diff-pipe): Consider splitting the prompt template around
+    // `{{ git_diff }}` and piping the diff directly into the LLM via
+    // `Cmd::pipe_into` (preamble + epilogue through env vars). Avoids buffering
+    // MB-scale diffs in our process memory and removes them from our logs
+    // entirely. See conversation around PR #2136 for sketch.
+
+    let shell = ShellConfig::get()?;
+    let args: Vec<&str> = shell
+        .args
+        .iter()
+        .map(String::as_str)
+        .chain([command])
+        .collect();
+    let output = Cmd::new(shell.executable.to_string_lossy())
+        .args(args.iter().copied())
+        .external("commit.generation")
+        .stdin_bytes(prompt)
+        .run()
+        .context("Failed to spawn LLM command")?;
+
+    if !output.status.success() {
+        // Shell basename only — the full install path is noise (and on
+        // Windows leaks the Git Bash location); same rule as
+        // `render_llm_invocation`.
+        let shell_name = shell
+            .executable
+            .file_name()
+            .unwrap_or(shell.executable.as_os_str())
+            .to_string_lossy();
+        return Err(CommandError::from_failed_output(shell_name, &args, &output).into());
+    }
+
+    let message = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+
+    if message.is_empty() {
+        return Err(h0x_wt::git::GitError::Other {
+            message: "LLM returned empty message".into(),
+        }
+        .into());
+    }
+
+    Ok(message)
+}
+
+/// Template type for selecting the appropriate template source
+enum TemplateType {
+    Commit,
+    Squash,
+}
+
+/// Build prompt from template using minijinja
+///
+/// Template variables available to both commit and squash templates:
+/// - `git_diff`: The diff to describe
+/// - `branch`: Current branch name
+/// - `recent_commits`: Recent commit subjects for style reference
+/// - `repo`: Repository directory name
+///
+/// Squash-specific variables (empty for regular commits):
+/// - `commit_details`: Commits being squashed. Each element renders as its
+///   subject when printed bare and exposes `.subject` / `.body` properties.
+///   Capped at [`MAX_SQUASH_COMMITS`]; the older tail is represented by one
+///   synthetic "(N earlier commits omitted)" entry.
+/// - `target_branch`: Target branch for merge
+///
+/// The retired `commits` variable is not supplied: the deprecation layer
+/// rewrites it to `commit_details` before serde parses the config, so an
+/// unmigrated template still renders its commit list (see `RETIRED_VARS`).
+fn build_prompt(
+    config: &CommitGenerationConfig,
+    template_type: TemplateType,
+    context: &PromptContext<'_>,
+) -> anyhow::Result<String> {
+    // Get template source based on type
+    let (template, type_name) = match template_type {
+        TemplateType::Commit => (
+            config.template.as_deref().unwrap_or(DEFAULT_TEMPLATE),
+            "Template",
+        ),
+        TemplateType::Squash => (
+            config
+                .squash_template
+                .as_deref()
+                .unwrap_or(DEFAULT_SQUASH_TEMPLATE),
+            "Squash template",
+        ),
+    };
+
+    // Validate non-empty
+    if template.trim().is_empty() {
+        return Err(h0x_wt::git::GitError::Other {
+            message: format!("{} is empty", type_name),
+        }
+        .into());
+    }
+
+    // Render template with minijinja - all variables available to all templates
+    let env = Environment::new();
+    let tmpl = env.template_from_str(template)?;
+
+    // Reverse commits so they're in chronological order (oldest first).
+    //
+    // `commit_details` is the only commit list supplied. The retired `commits`
+    // variable (a list of bare subject strings) is handled entirely by the
+    // config deprecation layer (`RETIRED_VARS`), which rewrites it to
+    // `commit_details` on every load and warns, so an unmigrated template
+    // arrives here already renamed — nothing is detected or warned here. The
+    // rename is safe because each `commit_details` element renders as its
+    // subject (see `CommitDetailValue`), so `{% for c in commit_details %}{{ c
+    // }}` reads identically to the old `{% for c in commits %}{{ c }}`.
+    //
+    // The list is capped at `MAX_SQUASH_COMMITS` — the one prompt input the
+    // diff budget doesn't bound. Details arrive newest-first, so the newest
+    // are kept and a synthetic entry stands in for the older tail; it renders
+    // first in the chronological order below.
+    let omitted_commits = context
+        .commit_details
+        .len()
+        .saturating_sub(MAX_SQUASH_COMMITS);
+    let synthetic_tail = (omitted_commits > 0).then(|| CommitMessageDetail {
+        subject: format!("... ({} earlier commits omitted)", omitted_commits),
+        body: String::new(),
+    });
+    let kept_details = &context.commit_details[..context.commit_details.len() - omitted_commits];
+    let details_chronological: Vec<&CommitMessageDetail> = synthetic_tail
+        .iter()
+        .chain(kept_details.iter().rev())
+        .collect();
+    let commit_details_chronological: Vec<Value> = details_chronological
+        .iter()
+        .map(|detail| {
+            Value::from_object(CommitDetailValue {
+                subject: detail.subject.clone(),
+                body: detail.body.clone(),
+            })
+        })
+        .collect();
+    let empty_commits: Vec<String> = vec![];
+
+    // The append fragments are themselves minijinja templates. Render each
+    // one in its own pass with the same variable context so it doesn't share
+    // scope with the parent template (and can't recursively reference
+    // itself), then expose them separately as `user_guidance` /
+    // `project_guidance` so the default templates can label each by
+    // provenance. The user fragment needs no approval (it's the developer's
+    // own config); the project fragment is gated upstream and arrives here
+    // as `context.project_append` (or `None` if declined). Empty string when
+    // a source is absent — the templates gate the block on truthiness.
+    let render_fragment = |fragment: &str| -> anyhow::Result<String> {
+        let frag_tmpl = env.template_from_str(fragment)?;
+        Ok(frag_tmpl.render(minijinja::context! {
+            git_diff => context.git_diff,
+            git_diff_stat => context.git_diff_stat,
+            branch => context.branch,
+            recent_commits => context.recent_commits.unwrap_or(&empty_commits),
+            repo => context.repo_name,
+            commit_details => &commit_details_chronological,
+            target_branch => context.target_branch.unwrap_or(""),
+        })?)
+    };
+    let user_guidance = match config
+        .template_append
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(fragment) => render_fragment(fragment)?,
+        None => String::new(),
+    };
+    let project_guidance = match context.project_append {
+        Some(fragment) => render_fragment(fragment)?,
+        None => String::new(),
+    };
+
+    let rendered = tmpl.render(minijinja::context! {
+        git_diff => context.git_diff,
+        git_diff_stat => context.git_diff_stat,
+        branch => context.branch,
+        recent_commits => context.recent_commits.unwrap_or(&empty_commits),
+        repo => context.repo_name,
+        commit_details => commit_details_chronological,
+        target_branch => context.target_branch.unwrap_or(""),
+        user_guidance => user_guidance,
+        project_guidance => project_guidance,
+    })?;
+
+    Ok(rendered)
+}
+
+/// `wt` is the worktree being committed — the diff, branch, and history all
+/// come from there. It is not always the invoking worktree: `wt step commit
+/// --branch <b>` and `wt step relocate --commit` commit somewhere else, and
+/// reading the diff from the cwd instead handed the LLM an empty diff.
+///
+/// `staging_index` is the temporary index `--dry-run` staged into, read in
+/// place of the real one so the preview doesn't touch it.
+///
+/// `project_append` is the approved project-level append fragment (or
+/// `None` to skip). It is rendered with the main template's context and
+/// appended to the prompt inside a `<project-guidance>` block; the
+/// user-level append fragment from the [`CommitGenerationConfig`] renders
+/// separately into `<user-guidance>`.
+pub(crate) fn generate_commit_message(
+    commit_generation_config: &CommitGenerationConfig,
+    wt: &WorkingTree<'_>,
+    staging_index: Option<&TempIndex>,
+    project_append: Option<&str>,
+) -> anyhow::Result<String> {
+    // Check if commit generation is configured (non-empty command)
+    if commit_generation_config.is_configured() {
+        let command = commit_generation_config.command.as_ref().unwrap();
+        // Prompt-build failures (git plumbing) propagate as-is; only a
+        // failure of the LLM command itself gets the `LlmCommandFailed`
+        // wrapper — mirroring `SquashInputs::generate_message`.
+        let prompt =
+            build_commit_prompt(commit_generation_config, wt, staging_index, project_append)?;
+        // A slow or hung command is otherwise silent (stdout is captured); the
+        // watchdog surfaces a "still waiting" status. Held until this function
+        // returns, clearing the block before the caller prints the message.
+        let _watchdog = watch_llm_command(command);
+        // Commit generation is explicitly configured - fail if it doesn't work
+        return execute_llm_command(command, &prompt).map_err(|e| {
+            h0x_wt::git::GitError::LlmCommandFailed {
+                command: command.clone(),
+                error: e.display_message(),
+                reproduction_command: Some(format_reproduction_command(
+                    "wt step commit --show-prompt",
+                    command,
+                )),
+            }
+            .into()
+        });
+    }
+
+    // Fallback: generate a descriptive commit message based on changed files
+    let file_list =
+        staged_diff(wt, staging_index, wt.index_base()?).capture(["--name-only", "-z"])?;
+    let staged_files = file_list
+        .split('\0')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|path| {
+            Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path)
+        })
+        .collect::<Vec<_>>();
+
+    let message = match staged_files.len() {
+        0 => "WIP: Changes".to_string(),
+        1 => format!("Changes to {}", staged_files[0]),
+        2 => format!("Changes to {} & {}", staged_files[0], staged_files[1]),
+        3 => format!(
+            "Changes to {}, {} & {}",
+            staged_files[0], staged_files[1], staged_files[2]
+        ),
+        n => format!("Changes to {} files", n),
+    };
+
+    Ok(message)
+}
+
+/// The changes a commit from `wt` would record against `base`, read from
+/// `staging_index` when given and from the real index otherwise.
+///
+/// `base` is the commit the resulting one sits on: `HEAD` for a plain commit,
+/// the merge base for a squash that rewrites everything since it. The caller
+/// supplies it because only the caller knows which, and reading `HEAD` is the
+/// only fallible part of naming either.
+fn staged_diff<'a>(
+    wt: &WorkingTree<'a>,
+    staging_index: Option<&'a TempIndex>,
+    base: impl Into<String>,
+) -> h0x_wt::git::PreparedDiff<'a> {
+    match staging_index {
+        Some(index) => index.prepare_staged_diff(base),
+        None => wt.prepare_staged_diff(base),
+    }
+}
+
+/// Build the commit prompt from staged changes.
+///
+/// Gathers the staged diff, branch name, repo name, and recent commits, then renders
+/// the prompt template. Used by normal commit generation, `--show-prompt`, and
+/// `--dry-run`.
+///
+/// Every input is read from `wt`, the worktree being committed — which is not
+/// always the invoking one (see [`generate_commit_message`]).
+///
+/// `staging_index` is the temporary index `--dry-run` staged per the user's
+/// `--stage` flag, read in place of the real index.
+pub(crate) fn build_commit_prompt(
+    config: &CommitGenerationConfig,
+    wt: &WorkingTree<'_>,
+    staging_index: Option<&TempIndex>,
+    project_append: Option<&str>,
+) -> anyhow::Result<String> {
+    let staged = staged_diff(wt, staging_index, wt.index_base()?);
+    let diff_output = staged.capture(["--patch"])?;
+    let diff_stat = staged.capture(["--stat"])?;
+
+    // Prepare diff (may filter if too large)
+    let prepared = prepare_diff(diff_output, diff_stat);
+
+    // Get the committed branch and its worktree root
+    let current_branch = wt.branch()?.unwrap_or_else(|| "HEAD".to_string());
+    let repo_root = wt.root()?;
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("repo");
+
+    let recent_commits = wt.recent_commit_subjects(None, 5);
+
+    let context = PromptContext {
+        git_diff: &prepared.diff,
+        git_diff_stat: &prepared.stat,
+        branch: &current_branch,
+        recent_commits: recent_commits.as_ref(),
+        repo_name,
+        commit_details: &[],
+        target_branch: None,
+        project_append,
+    };
+    build_prompt(config, TemplateType::Commit, &context)
+}
+
+/// Everything the squash's message is derived from.
+///
+/// One struct rather than eight positional arguments: `generate` forwards the
+/// whole set to `build`, and the three call sites pass the same values in the
+/// same order, which is exactly where a transposed pair goes unnoticed.
+pub(crate) struct SquashInputs<'a> {
+    pub worktree: &'a WorkingTree<'a>,
+    pub target_branch: &'a str,
+    pub merge_base: &'a str,
+    pub commit_details: &'a [CommitMessageDetail],
+    pub current_branch: &'a str,
+    pub repo_name: &'a str,
+    pub config: &'a CommitGenerationConfig,
+    pub project_append: Option<&'a str>,
+    /// The temporary index `--dry-run` staged per the user's `--stage` mode,
+    /// read in place of the real one so the preview spans what a real run would
+    /// commit. A real run passes `None` — it has already staged the real index
+    /// — and so does `--show-prompt`, the cheap "what's already staged" path.
+    pub staging_index: Option<&'a TempIndex>,
+}
+
+impl SquashInputs<'_> {
+    /// The squash commit's message: generated by the configured LLM command, or
+    /// a deterministic list of the folded-in subjects when none is configured.
+    pub(crate) fn generate_message(&self) -> anyhow::Result<String> {
+        if self.config.is_configured() {
+            let command = self.config.command.as_ref().unwrap();
+            let prompt = self.prompt()?;
+
+            // See `generate_commit_message` — keep a slow squash-message
+            // generation from being silent.
+            let _watchdog = watch_llm_command(command);
+            return execute_llm_command(command, &prompt).map_err(|e| {
+                h0x_wt::git::GitError::LlmCommandFailed {
+                    command: command.clone(),
+                    error: e.display_message(),
+                    reproduction_command: Some(format_reproduction_command(
+                        "wt step squash --show-prompt",
+                        command,
+                    )),
+                }
+                .into()
+            });
+        }
+
+        let mut commit_message = format!("Squash commits from {}\n\n", self.current_branch);
+        commit_message.push_str("Combined commits:\n");
+        for detail in self.commit_details.iter().rev() {
+            // Reverse so they're in chronological order
+            commit_message.push_str(&format!("- {}\n", detail.subject));
+        }
+        Ok(commit_message)
+    }
+
+    /// Render the squash prompt from what the squash commit will record.
+    ///
+    /// Gathers the combined diff, commit message details, branch names, and
+    /// recent commits, then renders the prompt template. Used by normal squash
+    /// generation, `--show-prompt`, and `--dry-run`.
+    ///
+    /// The diff spans everything the one resulting commit records — the commits
+    /// since `merge_base` plus any working-tree changes folded in with them.
+    pub(crate) fn prompt(&self) -> anyhow::Result<String> {
+        let wt = self.worktree;
+
+        // Diff `merge_base` against the index, because the index is what the
+        // squash commits: `handle_squash` stages the working tree before
+        // generating this message and writes the squash commit's tree from the
+        // index afterwards, so the index already holds everything the one
+        // resulting commit will record. `merge_base..HEAD` would name only the pre-existing commits
+        // and omit the working-tree changes folded into the same commit — and
+        // for `wt merge` on a dirty worktree those changes are the whole reason
+        // it ran, so the message came out describing the branch's older commits
+        // instead of the work just finished. With nothing staged the index
+        // matches `HEAD` and the two spans are the same diff, so this needs no
+        // second path. It also matches the stats `handle_squash` prints for the
+        // same commit.
+        let squashed = staged_diff(wt, self.staging_index, self.merge_base);
+        let diff_output = squashed.capture(["--patch"])?;
+        let diff_stat = squashed.capture(["--stat"])?;
+
+        // Prepare diff (may filter if too large)
+        let prepared = prepare_diff(diff_output, diff_stat);
+
+        let recent_commits = wt.recent_commit_subjects(Some(self.merge_base), 5);
+        let context = PromptContext {
+            git_diff: &prepared.diff,
+            git_diff_stat: &prepared.stat,
+            branch: self.current_branch,
+            recent_commits: recent_commits.as_ref(),
+            repo_name: self.repo_name,
+            commit_details: self.commit_details,
+            target_branch: Some(self.target_branch),
+            project_append: self.project_append,
+        };
+        build_prompt(self.config, TemplateType::Squash, &context)
+    }
+}
+
+/// Synthetic diff for testing commit generation
+const SYNTHETIC_DIFF: &str = r#"diff --git a/src/main.rs b/src/main.rs
+index abc1234..def5678 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -10,6 +10,10 @@ fn main() {
+     println!("Hello, world!");
++
++    // Add new feature
++    let config = load_config();
++    process_data(&config);
+ }
+"#;
+
+/// Synthetic diffstat for testing commit generation
+const SYNTHETIC_DIFF_STAT: &str = " src/main.rs | 4 ++++
+ 1 file changed, 4 insertions(+)";
+
+/// Test commit generation with a synthetic diff.
+///
+/// Returns Ok(message) if the LLM command succeeds, or an error describing
+/// what went wrong (command not found, API error, empty response, etc.)
+pub(crate) fn test_commit_generation(
+    commit_generation_config: &CommitGenerationConfig,
+) -> anyhow::Result<String> {
+    if !commit_generation_config.is_configured() {
+        anyhow::bail!(
+            "Commit generation is not configured. Add [commit.generation] to the config."
+        );
+    }
+
+    let command = commit_generation_config.command.as_ref().unwrap();
+
+    // Build prompt with synthetic data
+    let recent_commits = vec![
+        "feat: Add user authentication".to_string(),
+        "fix: Handle edge case in parser".to_string(),
+        "docs: Update README".to_string(),
+    ];
+    let context = PromptContext {
+        git_diff: SYNTHETIC_DIFF,
+        git_diff_stat: SYNTHETIC_DIFF_STAT,
+        branch: "feature/example",
+        recent_commits: Some(&recent_commits),
+        repo_name: "test-repo",
+        commit_details: &[],
+        target_branch: None,
+        // The connectivity test sends a synthetic prompt — keep it independent
+        // of any project guidance so it doesn't surface team-policy text in
+        // `wt config show`.
+        project_append: None,
+    };
+    let prompt = build_prompt(commit_generation_config, TemplateType::Commit, &context)?;
+
+    // The connectivity test shells out the same way real generation does, so a
+    // slow command would be just as silent — surface the same waiting status.
+    let _watchdog = watch_llm_command(command);
+    execute_llm_command(command, &prompt).map_err(|e| {
+        h0x_wt::git::GitError::LlmCommandFailed {
+            command: command.clone(),
+            error: e.display_message(),
+            reproduction_command: None, // Already a test command
+        }
+        .into()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use insta::assert_snapshot;
+
+    /// `render_llm_invocation` should wrap the command through the platform shell with
+    /// the shell's basename (no full install path) and shell-escape the command argument
+    /// so paths/quotes survive the round-trip.
+    #[test]
+    fn test_render_llm_invocation_basics() {
+        let rendered = render_llm_invocation("llm -m haiku").unwrap();
+        // Linux: "sh -c 'llm -m haiku'" — Windows: "bash.exe -c 'llm -m haiku'"
+        assert!(
+            rendered.ends_with(" -c 'llm -m haiku'"),
+            "expected '<shell> -c <quoted-command>', got: {rendered}"
+        );
+        // Basename only — no install-path leakage.
+        assert!(
+            !rendered.contains('/') && !rendered.contains('\\'),
+            "shell rendered with directory components: {rendered}"
+        );
+    }
+
+    /// Git failures while constructing a configured prompt surface directly;
+    /// they must not be mislabeled as a failure of the configured LLM command.
+    #[test]
+    fn test_generate_commit_message_propagates_prompt_error() {
+        let test_repo = h0x_wt::testing::TestRepo::with_initial_commit();
+        let missing_path = test_repo.path().join("missing-worktree");
+        let wt = test_repo.repo.worktree_at(missing_path);
+        let config = CommitGenerationConfig {
+            command: Some("exit 99".to_string()),
+            ..Default::default()
+        };
+
+        let err = generate_commit_message(&config, &wt, None, None).unwrap_err();
+
+        assert!(
+            !matches!(
+                err.downcast_ref::<h0x_wt::git::GitError>(),
+                Some(h0x_wt::git::GitError::LlmCommandFailed { .. })
+            ),
+            "prompt-construction error was mislabeled as an LLM command failure: {err:#}"
+        );
+    }
+
+    /// A failing LLM command must surface as a typed [`CommandError`] carrying
+    /// the exit code and captured output — `LlmCommandFailed` and the summary
+    /// pane read the detail via `display_message`.
+    #[test]
+    fn test_execute_llm_command_failure_is_command_error() {
+        let err = execute_llm_command("printf 'oops' >&2; exit 3", "prompt").unwrap_err();
+        let cmd_err = CommandError::find_in(&err).expect("error should carry a CommandError");
+        assert_eq!(cmd_err.exit_code, Some(3));
+        assert_eq!(err.display_message(), "oops");
+        // Basename only — no install-path leakage (see render_llm_invocation).
+        assert!(
+            !cmd_err.program.contains('/') && !cmd_err.program.contains('\\'),
+            "shell program has directory components: {}",
+            cmd_err.program
+        );
+    }
+
+    /// Single-quotes in the user's command must be escaped so the displayed string is a
+    /// faithful, copy-pasteable shell invocation.
+    #[test]
+    fn test_render_llm_invocation_escapes_quotes() {
+        let rendered = render_llm_invocation("echo 'hi'").unwrap();
+        assert!(
+            rendered.contains(r#"'echo '\''hi'\'''"#),
+            "single quotes not escaped: {rendered}"
+        );
+    }
+
+    /// Render a one-off template with a single `CommitDetailValue` bound to `c`.
+    fn render_with_detail(template: &str, subject: &str, body: &str) -> String {
+        let env = Environment::new();
+        let detail = Value::from_object(CommitDetailValue {
+            subject: subject.to_string(),
+            body: body.to_string(),
+        });
+        env.template_from_str(template)
+            .unwrap()
+            .render(minijinja::context! { c => detail })
+            .unwrap()
+    }
+
+    /// A `commit_details` element renders as its bare subject and exposes
+    /// `.subject` / `.body`. This is the equivalence that lets the
+    /// `commits` → `commit_details` rename be a mechanical identifier rewrite,
+    /// which is what the config deprecation layer applies on every load now
+    /// that nothing supplies `commits` (see #2984 and `CommitDetailValue`).
+    #[test]
+    fn test_commit_detail_value_render_and_properties() {
+        assert_eq!(render_with_detail("{{ c }}", "Add a", "body a"), "Add a");
+        assert_eq!(
+            render_with_detail("{{ c.subject }}|{{ c.body }}", "Add a", "body a"),
+            "Add a|body a"
+        );
+    }
+
+    /// An unknown attribute resolves to undefined (renders empty), exercising the
+    /// catch-all in `get_value`. A bare `{% if c %}` is truthy because
+    /// `enumerate` reports two keys — without that override a `Map`-repr object
+    /// defaults to an empty enumerator and would read as falsy, diverging from
+    /// the old non-empty subject string.
+    #[test]
+    fn test_commit_detail_value_unknown_key_and_truthiness() {
+        assert_eq!(
+            render_with_detail("[{{ c.nope }}]", "Add a", "body a"),
+            "[]"
+        );
+        assert_eq!(
+            render_with_detail("{% if c %}yes{% else %}no{% endif %}", "Add a", "body a"),
+            "yes"
+        );
+    }
+
+    /// Helper to create a commit context (no squash-specific fields)
+    fn commit_context<'a>(
+        git_diff: &'a str,
+        branch: &'a str,
+        recent_commits: Option<&'a Vec<String>>,
+        repo_name: &'a str,
+    ) -> PromptContext<'a> {
+        PromptContext {
+            git_diff,
+            git_diff_stat: "",
+            branch,
+            recent_commits,
+            repo_name,
+            commit_details: &[],
+            target_branch: None,
+            project_append: None,
+        }
+    }
+
+    /// Helper to create a squash context (all fields)
+    fn squash_context<'a>(
+        git_diff: &'a str,
+        branch: &'a str,
+        recent_commits: Option<&'a Vec<String>>,
+        repo_name: &'a str,
+        commit_details: &'a [CommitMessageDetail],
+        target_branch: &'a str,
+    ) -> PromptContext<'a> {
+        PromptContext {
+            git_diff,
+            git_diff_stat: "",
+            branch,
+            recent_commits,
+            repo_name,
+            commit_details,
+            target_branch: Some(target_branch),
+            project_append: None,
+        }
+    }
+
+    #[test]
+    fn test_build_commit_prompt_with_default_template() {
+        let config = CommitGenerationConfig::default();
+
+        // No recent commits
+        let context = commit_context("diff content", "main", None, "myrepo");
+        let prompt = build_prompt(&config, TemplateType::Commit, &context).unwrap();
+        assert_snapshot!(prompt, @r#"
+        <task>Write a commit message for the staged changes below.</task>
+
+        <format>
+        - Subject line under 50 chars
+        - For material changes, add a blank line then a body paragraph explaining the change
+        - Output only the commit message, no quotes or code blocks
+        </format>
+
+        <style>
+        - Imperative mood: "Add feature" not "Added feature"
+        - Match recent commit style (conventional commits if used)
+        - Describe the change, not the intent or benefit
+        </style>
+
+        <diffstat>
+
+        </diffstat>
+
+        <diff>
+        diff content
+        </diff>
+
+        <context>
+        Branch: main
+
+        </context>
+        "#);
+
+        // With recent commits
+        let commits = vec!["feat: add feature".to_string(), "fix: bug".to_string()];
+        let context = commit_context("diff", "main", Some(&commits), "repo");
+        let prompt = build_prompt(&config, TemplateType::Commit, &context).unwrap();
+        assert_snapshot!(prompt, @r#"
+        <task>Write a commit message for the staged changes below.</task>
+
+        <format>
+        - Subject line under 50 chars
+        - For material changes, add a blank line then a body paragraph explaining the change
+        - Output only the commit message, no quotes or code blocks
+        </format>
+
+        <style>
+        - Imperative mood: "Add feature" not "Added feature"
+        - Match recent commit style (conventional commits if used)
+        - Describe the change, not the intent or benefit
+        </style>
+
+        <diffstat>
+
+        </diffstat>
+
+        <diff>
+        diff
+        </diff>
+
+        <context>
+        Branch: main
+        <recent_commits>
+        - feat: add feature
+        - fix: bug
+        </recent_commits>
+        </context>
+        "#);
+
+        // Empty recent commits list — should not render commit data section
+        let commits = vec![];
+        let context = commit_context("diff", "main", Some(&commits), "repo");
+        let prompt = build_prompt(&config, TemplateType::Commit, &context).unwrap();
+        assert_snapshot!(prompt, @r#"
+        <task>Write a commit message for the staged changes below.</task>
+
+        <format>
+        - Subject line under 50 chars
+        - For material changes, add a blank line then a body paragraph explaining the change
+        - Output only the commit message, no quotes or code blocks
+        </format>
+
+        <style>
+        - Imperative mood: "Add feature" not "Added feature"
+        - Match recent commit style (conventional commits if used)
+        - Describe the change, not the intent or benefit
+        </style>
+
+        <diffstat>
+
+        </diffstat>
+
+        <diff>
+        diff
+        </diff>
+
+        <context>
+        Branch: main
+
+        </context>
+        "#);
+    }
+
+    #[test]
+    fn test_build_commit_prompt_with_custom_template() {
+        let config = CommitGenerationConfig {
+            command: None,
+            template: Some("Branch: {{ branch }}\nDiff: {{ git_diff }}".to_string()),
+            squash_template: None,
+            template_append: None,
+        };
+        let context = commit_context("my diff", "feature", None, "repo");
+        let result = build_prompt(&config, TemplateType::Commit, &context);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "Branch: feature\nDiff: my diff");
+    }
+
+    #[test]
+    fn test_build_commit_prompt_malformed_jinja() {
+        let config = CommitGenerationConfig {
+            command: None,
+            template: Some("{{ unclosed".to_string()),
+            squash_template: None,
+            template_append: None,
+        };
+        let context = commit_context("diff", "main", None, "repo");
+        let result = build_prompt(&config, TemplateType::Commit, &context);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_commit_prompt_empty_template() {
+        let config = CommitGenerationConfig {
+            command: None,
+            template: Some("   ".to_string()),
+            squash_template: None,
+            template_append: None,
+        };
+        let context = commit_context("diff", "main", None, "repo");
+        let result = build_prompt(&config, TemplateType::Commit, &context);
+        assert_snapshot!(result.unwrap_err().to_string(), @"Template is empty");
+    }
+
+    #[test]
+    fn test_build_commit_prompt_with_all_variables() {
+        let config = CommitGenerationConfig {
+            command: None,
+            template: Some(
+                "Repo: {{ repo }}\nBranch: {{ branch }}\nDiff: {{ git_diff }}\n{% for c in recent_commits %}{{ c }}\n{% endfor %}"
+                    .to_string(),
+            ),
+            squash_template: None,
+            template_append: None,
+        };
+        let commits = vec!["commit1".to_string(), "commit2".to_string()];
+        let context = commit_context("my diff", "feature", Some(&commits), "myrepo");
+        let result = build_prompt(&config, TemplateType::Commit, &context);
+        assert!(result.is_ok());
+        let prompt = result.unwrap();
+        assert_eq!(
+            prompt,
+            "Repo: myrepo\nBranch: feature\nDiff: my diff\ncommit1\ncommit2\n"
+        );
+    }
+
+    #[test]
+    fn test_default_commit_template_renders_project_fragment() {
+        let config = CommitGenerationConfig::default();
+        let mut context = commit_context("diff content", "main", None, "myrepo");
+        context.project_append = Some("- Use conventional commits\n- Reference the issue");
+        let prompt = build_prompt(&config, TemplateType::Commit, &context).unwrap();
+        // The block lives between `<style>` and `<diffstat>`, only when guidance is set.
+        assert_snapshot!(prompt, @r#"
+        <task>Write a commit message for the staged changes below.</task>
+
+        <format>
+        - Subject line under 50 chars
+        - For material changes, add a blank line then a body paragraph explaining the change
+        - Output only the commit message, no quotes or code blocks
+        </format>
+
+        <style>
+        - Imperative mood: "Add feature" not "Added feature"
+        - Match recent commit style (conventional commits if used)
+        - Describe the change, not the intent or benefit
+        </style>
+
+        <project-guidance>
+        - Use conventional commits
+        - Reference the issue
+        </project-guidance>
+
+        <diffstat>
+
+        </diffstat>
+
+        <diff>
+        diff content
+        </diff>
+
+        <context>
+        Branch: main
+
+        </context>
+        "#);
+    }
+
+    /// The user-level `template-append` (from `CommitGenerationConfig`,
+    /// no approval) renders into a `<user-guidance>` block.
+    #[test]
+    fn test_user_template_append_renders() {
+        let config = CommitGenerationConfig {
+            template_append: Some("- Personal: explain the why".to_string()),
+            ..Default::default()
+        };
+        let context = commit_context("diff content", "main", None, "myrepo");
+        let prompt = build_prompt(&config, TemplateType::Commit, &context).unwrap();
+        assert!(
+            prompt.contains("<user-guidance>\n- Personal: explain the why\n</user-guidance>"),
+            "user append should render in <user-guidance>, got:\n{prompt}"
+        );
+    }
+
+    /// User and project appends render into separate provenance-labeled
+    /// blocks, `<user-guidance>` before `<project-guidance>`.
+    #[test]
+    fn test_user_and_project_append_combined() {
+        let config = CommitGenerationConfig {
+            template_append: Some("USER LINE".to_string()),
+            ..Default::default()
+        };
+        let mut context = commit_context("d", "main", None, "repo");
+        context.project_append = Some("PROJECT LINE");
+        let prompt = build_prompt(&config, TemplateType::Commit, &context).unwrap();
+        let user_at = prompt.find("<user-guidance>\nUSER LINE\n</user-guidance>");
+        let project_at = prompt.find("<project-guidance>\nPROJECT LINE\n</project-guidance>");
+        assert!(
+            matches!((user_at, project_at), (Some(u), Some(p)) if u < p),
+            "<user-guidance> should precede <project-guidance>, got:\n{prompt}"
+        );
+    }
+
+    /// A blank user append is treated as unset — no empty block rendered.
+    #[test]
+    fn test_user_template_append_blank_is_unset() {
+        let config = CommitGenerationConfig {
+            template_append: Some("   \n\t ".to_string()),
+            ..Default::default()
+        };
+        let context = commit_context("d", "main", None, "repo");
+        let prompt = build_prompt(&config, TemplateType::Commit, &context).unwrap();
+        assert!(
+            !prompt.contains("<user-guidance>"),
+            "blank user append must not render a block, got:\n{prompt}"
+        );
+    }
+
+    /// The user append is itself a minijinja template, rendered against the
+    /// same context as the main template.
+    #[test]
+    fn test_user_template_append_expands_variables() {
+        let config = CommitGenerationConfig {
+            template_append: Some("Repo {{ repo }} on {{ branch }}".to_string()),
+            ..Default::default()
+        };
+        let context = commit_context("d", "feat/x", None, "myrepo");
+        let prompt = build_prompt(&config, TemplateType::Commit, &context).unwrap();
+        assert!(
+            prompt.contains("Repo myrepo on feat/x"),
+            "user append should expand variables, got:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("{{ repo }}"),
+            "user append was not rendered:\n{prompt}"
+        );
+    }
+
+    /// The project fragment is itself a minijinja template — variables in it
+    /// expand against the same context as the main template. Without this
+    /// test, the pre-render pass in `build_prompt` could regress to a raw
+    /// string injection and nothing else would catch it.
+    #[test]
+    fn test_project_fragment_expands_template_variables() {
+        let config = CommitGenerationConfig::default();
+        let mut context = commit_context("diff", "feature/auth", None, "myrepo");
+        context.project_append = Some("Branch: {{ branch }} ({{ repo }})");
+        let prompt = build_prompt(&config, TemplateType::Commit, &context).unwrap();
+        assert!(
+            prompt.contains("Branch: feature/auth (myrepo)"),
+            "expected minijinja-expanded fragment in prompt, got:\n{prompt}"
+        );
+        // Make sure the unexpanded form didn't sneak through.
+        assert!(
+            !prompt.contains("{{ branch }}"),
+            "fragment was not rendered:\n{prompt}"
+        );
+    }
+
+    /// A malformed fragment must surface its render error rather than slipping
+    /// into the LLM prompt as literal text.
+    #[test]
+    fn test_project_fragment_render_error_propagates() {
+        let config = CommitGenerationConfig::default();
+        let mut context = commit_context("diff", "main", None, "repo");
+        context.project_append = Some("Unclosed {{ branch");
+        let err = build_prompt(&config, TemplateType::Commit, &context).unwrap_err();
+        assert!(
+            err.to_string().contains("syntax error")
+                || err.to_string().to_lowercase().contains("unexpected"),
+            "expected minijinja syntax error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_default_squash_template_renders_project_fragment() {
+        let config = CommitGenerationConfig::default();
+        let commit_details = vec![
+            CommitMessageDetail {
+                subject: "feat: A".to_string(),
+                body: String::new(),
+            },
+            CommitMessageDetail {
+                subject: "fix: B".to_string(),
+                body: String::new(),
+            },
+        ];
+        let mut context = squash_context(
+            "diff content",
+            "feature",
+            None,
+            "repo",
+            &commit_details,
+            "main",
+        );
+        context.project_append = Some("- Reference the related issue");
+        let prompt = build_prompt(&config, TemplateType::Squash, &context).unwrap();
+        assert_snapshot!(prompt, @r#"
+        <task>Write a commit message for the change in <diff>, which is everything the squash will record. <commits> lists what it folds in.</task>
+
+        <format>
+        - Subject line under 50 chars
+        - For material changes, add a blank line then a body paragraph explaining the change
+        - Output only the commit message, no quotes or code blocks
+        </format>
+
+        <style>
+        - Imperative mood: "Add feature" not "Added feature"
+        - Match the style of commits being squashed (conventional commits if used)
+        - Describe the change, not the intent or benefit
+        </style>
+
+        <project-guidance>
+        - Reference the related issue
+        </project-guidance>
+
+        <commits branch="feature" target="main">
+        - fix: B
+        - feat: A
+        </commits>
+
+        <diffstat>
+
+        </diffstat>
+
+        <diff>
+        diff content
+        </diff>
+        "#);
+    }
+
+    #[test]
+    fn test_build_squash_prompt_with_default_template() {
+        let config = CommitGenerationConfig::default();
+        let commit_details = vec![
+            CommitMessageDetail {
+                subject: "feat: A".to_string(),
+                body: String::new(),
+            },
+            CommitMessageDetail {
+                subject: "fix: B".to_string(),
+                body: String::new(),
+            },
+        ];
+        let context = squash_context(
+            "diff content",
+            "feature",
+            None,
+            "repo",
+            &commit_details,
+            "main",
+        );
+        let prompt = build_prompt(&config, TemplateType::Squash, &context).unwrap();
+        assert_snapshot!(prompt, @r#"
+        <task>Write a commit message for the change in <diff>, which is everything the squash will record. <commits> lists what it folds in.</task>
+
+        <format>
+        - Subject line under 50 chars
+        - For material changes, add a blank line then a body paragraph explaining the change
+        - Output only the commit message, no quotes or code blocks
+        </format>
+
+        <style>
+        - Imperative mood: "Add feature" not "Added feature"
+        - Match the style of commits being squashed (conventional commits if used)
+        - Describe the change, not the intent or benefit
+        </style>
+
+        <commits branch="feature" target="main">
+        - fix: B
+        - feat: A
+        </commits>
+
+        <diffstat>
+
+        </diffstat>
+
+        <diff>
+        diff content
+        </diff>
+        "#);
+    }
+
+    #[test]
+    fn test_build_squash_prompt_with_custom_template() {
+        let config = CommitGenerationConfig {
+            command: None,
+            template: None,
+            squash_template: Some(
+                "Target: {{ target_branch }}\n{% for c in commit_details %}{{ c }}\n{% endfor %}"
+                    .to_string(),
+            ),
+            template_append: None,
+        };
+        let commit_details = vec![
+            CommitMessageDetail {
+                subject: "A".to_string(),
+                body: "body A".to_string(),
+            },
+            CommitMessageDetail {
+                subject: "B".to_string(),
+                body: "body B".to_string(),
+            },
+        ];
+        let context = squash_context("diff", "feature", None, "repo", &commit_details, "main");
+        let result = build_prompt(&config, TemplateType::Squash, &context);
+        assert!(result.is_ok());
+        // Commits are reversed, so chronological order is B, A
+        assert_eq!(result.unwrap(), "Target: main\nB\nA\n");
+    }
+
+    #[test]
+    fn test_build_squash_prompt_with_commit_details() {
+        let config = CommitGenerationConfig {
+            command: None,
+            template: None,
+            squash_template: Some(
+                r#"{% for detail in commit_details %}{{ loop.index }}. {{ detail.subject }}
+{{ detail.body }}
+{% endfor %}"#
+                    .to_string(),
+            ),
+            template_append: None,
+        };
+        let commit_details = vec![
+            CommitMessageDetail {
+                subject: "newer subject".to_string(),
+                body: "newer body".to_string(),
+            },
+            CommitMessageDetail {
+                subject: "older subject".to_string(),
+                body: "older body line 1\nolder body line 2".to_string(),
+            },
+        ];
+        let context = squash_context("diff", "feature", None, "repo", &commit_details, "main");
+
+        let prompt = build_prompt(&config, TemplateType::Squash, &context).unwrap();
+
+        assert_eq!(
+            prompt,
+            "1. older subject\nolder body line 1\nolder body line 2\n2. newer subject\nnewer body\n"
+        );
+    }
+
+    #[test]
+    fn test_build_squash_prompt_empty_commits() {
+        let config = CommitGenerationConfig::default();
+        let commit_details = vec![];
+        let context = squash_context("diff", "feature", None, "repo", &commit_details, "main");
+        let result = build_prompt(&config, TemplateType::Squash, &context);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_build_squash_prompt_malformed_jinja() {
+        let config = CommitGenerationConfig {
+            command: None,
+            template: None,
+            squash_template: Some("{% for x in commit_details %}{{ x }".to_string()),
+            template_append: None,
+        };
+        let commit_details = vec![];
+        let context = squash_context("diff", "feature", None, "repo", &commit_details, "main");
+        let result = build_prompt(&config, TemplateType::Squash, &context);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_squash_prompt_empty_template() {
+        let config = CommitGenerationConfig {
+            command: None,
+            template: None,
+            squash_template: Some("  \n  ".to_string()),
+            template_append: None,
+        };
+        let commit_details = vec![];
+        let context = squash_context("diff", "feature", None, "repo", &commit_details, "main");
+        let result = build_prompt(&config, TemplateType::Squash, &context);
+        assert_snapshot!(result.unwrap_err().to_string(), @"Squash template is empty");
+    }
+
+    #[test]
+    fn test_build_squash_prompt_with_all_variables() {
+        // Test that squash templates now have access to ALL variables including git_diff and recent_commits
+        let config = CommitGenerationConfig {
+            command: None,
+            template: None,
+            squash_template: Some(
+                "Repo: {{ repo }}\nBranch: {{ branch }}\nTarget: {{ target_branch }}\nDiff: {{ git_diff }}\n{% for c in commit_details %}{{ c }}\n{% endfor %}{% for r in recent_commits %}style: {{ r }}\n{% endfor %}"
+                    .to_string(),
+            ),
+            template_append: None,
+        };
+        let commit_details = vec![
+            CommitMessageDetail {
+                subject: "A".to_string(),
+                body: String::new(),
+            },
+            CommitMessageDetail {
+                subject: "B".to_string(),
+                body: String::new(),
+            },
+        ];
+        let recent = vec!["prev1".to_string(), "prev2".to_string()];
+        let context = squash_context(
+            "the diff",
+            "feature",
+            Some(&recent),
+            "myrepo",
+            &commit_details,
+            "main",
+        );
+        let result = build_prompt(&config, TemplateType::Squash, &context);
+        assert!(result.is_ok());
+        let prompt = result.unwrap();
+        assert_eq!(
+            prompt,
+            "Repo: myrepo\nBranch: feature\nTarget: main\nDiff: the diff\nB\nA\nstyle: prev1\nstyle: prev2\n"
+        );
+    }
+
+    #[test]
+    fn test_build_commit_prompt_with_sophisticated_jinja() {
+        // Test advanced jinja features: filters, length, conditionals, whitespace control
+        let config = CommitGenerationConfig {
+            command: None,
+            template: Some(
+                r#"=== {{ repo | upper }} ===
+Branch: {{ branch }}
+{%- if recent_commits %}
+Commits: {{ recent_commits | length }}
+{%- for c in recent_commits %}
+  - {{ loop.index }}. {{ c }}
+{%- endfor %}
+{%- else %}
+No recent commits
+{%- endif %}
+
+Diff follows:
+{{ git_diff }}"#
+                    .to_string(),
+            ),
+            squash_template: None,
+            template_append: None,
+        };
+
+        // With commits — exercises if-branch, filters, loop.index, whitespace control
+        let commits = vec![
+            "feat: add auth".to_string(),
+            "fix: bug".to_string(),
+            "docs: update".to_string(),
+        ];
+        let context = commit_context("my diff content", "feature-x", Some(&commits), "myapp");
+        let prompt = build_prompt(&config, TemplateType::Commit, &context).unwrap();
+        assert_snapshot!(prompt, @"
+        === MYAPP ===
+        Branch: feature-x
+        Commits: 3
+          - 1. feat: add auth
+          - 2. fix: bug
+          - 3. docs: update
+
+        Diff follows:
+        my diff content
+        ");
+
+        // Without commits — exercises else-branch
+        let context = commit_context("diff", "main", None, "test");
+        let prompt = build_prompt(&config, TemplateType::Commit, &context).unwrap();
+        assert_snapshot!(prompt, @"
+        === TEST ===
+        Branch: main
+        No recent commits
+
+        Diff follows:
+        diff
+        ");
+    }
+
+    #[test]
+    fn test_build_squash_prompt_with_sophisticated_jinja() {
+        // Test sophisticated jinja in squash templates
+        let config = CommitGenerationConfig {
+            command: None,
+            template: None,
+            squash_template: Some(
+                r#"Squashing {{ commit_details | length }} commit(s) from {{ branch }} to {{ target_branch }}
+{% if commit_details | length > 1 -%}
+Multiple commits detected:
+{%- for c in commit_details %}
+  {{ loop.index }}/{{ loop.length }}: {{ c }}
+{%- endfor %}
+{%- else -%}
+Single commit: {{ commit_details[0] }}
+{%- endif %}"#
+                    .to_string(),
+            ),
+            template_append: None,
+        };
+
+        // Multiple commits — reversed for chronological order (C, B, A)
+        let commit_details = vec![
+            CommitMessageDetail {
+                subject: "commit A".to_string(),
+                body: String::new(),
+            },
+            CommitMessageDetail {
+                subject: "commit B".to_string(),
+                body: String::new(),
+            },
+            CommitMessageDetail {
+                subject: "commit C".to_string(),
+                body: String::new(),
+            },
+        ];
+        let context = squash_context("diff", "feature", None, "repo", &commit_details, "main");
+        let prompt = build_prompt(&config, TemplateType::Squash, &context).unwrap();
+        assert_snapshot!(prompt, @"
+        Squashing 3 commit(s) from feature to main
+        Multiple commits detected:
+          1/3: commit C
+          2/3: commit B
+          3/3: commit A
+        ");
+
+        // Single commit — exercises else-branch
+        let single_commit = vec![CommitMessageDetail {
+            subject: "solo commit".to_string(),
+            body: String::new(),
+        }];
+        let context = squash_context("diff", "feature", None, "repo", &single_commit, "main");
+        let prompt = build_prompt(&config, TemplateType::Squash, &context).unwrap();
+        assert_snapshot!(prompt, @"
+        Squashing 1 commit(s) from feature to main
+        Single commit: solo commit
+        ");
+    }
+
+    #[test]
+    fn test_commit_template_can_access_squash_variables() {
+        // Verify that commit templates can access squash-specific variables without errors
+        // (they're empty/None for regular commits, but shouldn't cause template errors)
+        let config = CommitGenerationConfig {
+            command: None,
+            template: Some(
+                "Branch: {{ branch }}\nTarget: {{ target_branch }}\nCommit details: {{ commit_details | length }}"
+                    .to_string(),
+            ),
+            squash_template: None,
+            template_append: None,
+        };
+        let context = commit_context("diff", "feature", None, "repo");
+        let result = build_prompt(&config, TemplateType::Commit, &context);
+        assert!(result.is_ok());
+        let prompt = result.unwrap();
+        // Squash-specific variables are empty for regular commits
+        assert_eq!(prompt, "Branch: feature\nTarget: \nCommit details: 0");
+    }
+
+    // Tests for diff filtering
+
+    #[test]
+    fn test_is_lock_file() {
+        // Matches
+        assert!(is_lock_file("Cargo.lock"));
+        assert!(is_lock_file("package-lock.json"));
+        assert!(is_lock_file("pnpm-lock.yaml"));
+        assert!(is_lock_file("yarn-lock.yaml"));
+        assert!(is_lock_file(".terraform.lock.hcl"));
+        assert!(is_lock_file("terraform.lock.hcl"));
+        assert!(is_lock_file("path/to/Cargo.lock"));
+
+        // Non-matches
+        assert!(!is_lock_file("src/main.rs"));
+        assert!(!is_lock_file("README.md"));
+        assert!(!is_lock_file("config.toml"));
+        assert!(!is_lock_file("lockfile.txt"));
+        assert!(!is_lock_file("my.lock.rs")); // Not a standard lock pattern
+    }
+
+    #[test]
+    fn test_parse_diff_sections() {
+        // Empty input
+        assert!(parse_diff_sections("").is_empty());
+
+        // Single file
+        let diff = "diff --git a/foo.rs b/foo.rs\nsome content\n";
+        let sections = parse_diff_sections(diff);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].0, "foo.rs");
+
+        // Multiple files
+        let diff = r#"diff --git a/src/foo.rs b/src/foo.rs
+index abc..def 100644
+--- a/src/foo.rs
++++ b/src/foo.rs
+@@ -1,3 +1,4 @@
+ fn foo() {}
++fn bar() {}
+diff --git a/Cargo.lock b/Cargo.lock
+index 111..222 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1,100 +1,150 @@
+ lots of lock content
+"#;
+        let sections = parse_diff_sections(diff);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].0, "src/foo.rs");
+        assert_snapshot!(sections[0].1, @"
+        diff --git a/src/foo.rs b/src/foo.rs
+        index abc..def 100644
+        --- a/src/foo.rs
+        +++ b/src/foo.rs
+        @@ -1,3 +1,4 @@
+         fn foo() {}
+        +fn bar() {}
+        ");
+        assert_eq!(sections[1].0, "Cargo.lock");
+        assert_snapshot!(sections[1].1, @"
+        diff --git a/Cargo.lock b/Cargo.lock
+        index 111..222 100644
+        --- a/Cargo.lock
+        +++ b/Cargo.lock
+        @@ -1,100 +1,150 @@
+         lots of lock content
+        ");
+    }
+
+    #[test]
+    fn test_parse_diff_sections_quoted_paths() {
+        // `core.quotePath` (git's default) quotes and octal-escapes a
+        // non-ASCII name, and a name holding `"` is quoted whatever that
+        // setting says. Neither header contains a bare ` b/`, so a parser
+        // that only knows the unquoted form found no path and dropped the
+        // file's diff from the prompt.
+        let diff = r#"diff --git "a/\303\251.txt" "b/\303\251.txt"
++accented
+diff --git "a/we\"ird.lock" "b/we\"ird.lock"
++quoted
+diff --git a/plain.rs b/plain.rs
++plain
+"#;
+
+        let sections = parse_diff_sections(diff);
+        assert_eq!(sections.len(), 3);
+        assert_eq!(sections[0].0, "\\303\\251.txt");
+        assert_eq!(sections[1].0, "we\\\"ird.lock");
+        assert_eq!(sections[2].0, "plain.rs");
+
+        // No bytes dropped: every section's content survives to the prompt.
+        let combined: String = sections.iter().map(|(_, s)| *s).collect();
+        assert_eq!(combined, diff);
+    }
+
+    #[test]
+    fn test_parse_diff_sections_unparsable_header_keeps_content() {
+        // A header we can't read a path out of still opens a section — the
+        // name only drives lock-file filtering, so losing it must not lose
+        // the diff.
+        let diff = "diff --git weird\n+kept\ndiff --git a/plain.rs b/plain.rs\n+plain\n";
+
+        let sections = parse_diff_sections(diff);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].0, "");
+        assert_eq!(sections[1].0, "plain.rs");
+        let combined: String = sections.iter().map(|(_, s)| *s).collect();
+        assert_eq!(combined, diff);
+    }
+
+    #[test]
+    fn test_prepare_diff_keeps_quoted_path_sections() {
+        // Over budget, the truncating path is what the section list feeds.
+        // A quoted-path section used to vanish from it entirely.
+        let big = "x".repeat(DIFF_BUDGET);
+        let diff = format!(
+            r#"diff --git "a/\303\251.rs" "b/\303\251.rs"
++accented
+diff --git a/plain.rs b/plain.rs
++{big}
+"#
+        );
+
+        let prepared = prepare_diff(diff, "stat".to_string());
+        assert!(
+            prepared.diff.contains("\\303\\251.rs"),
+            "quoted-path section must survive truncation:\n{}",
+            prepared.diff
+        );
+    }
+
+    #[test]
+    fn test_parse_diff_sections_crlf_with_multibyte_utf8() {
+        // Regression: CRLF line endings combined with multi-byte UTF-8
+        // content used to drift the byte offset (one byte lost per line),
+        // eventually slicing inside a char boundary and panicking. See #2355.
+        let mut diff = String::from("diff --git a/a b/a\r\n");
+        for _ in 0..10 {
+            diff.push_str("+测测测\r\n");
+        }
+        diff.push_str("diff --git a/b b/b\r\n");
+        diff.push_str("+more\r\n");
+
+        let sections = parse_diff_sections(&diff);
+        assert_eq!(sections.len(), 2);
+        assert_eq!(sections[0].0, "a");
+        assert_eq!(sections[1].0, "b");
+        // Each section must start at the "diff --git" header and together
+        // cover the whole input with no bytes dropped or duplicated.
+        assert!(sections[0].1.starts_with("diff --git a/a b/a"));
+        assert!(sections[1].1.starts_with("diff --git a/b b/b"));
+        let combined: String = sections.iter().map(|(_, s)| *s).collect();
+        assert_eq!(combined, diff);
+    }
+
+    #[test]
+    fn test_truncate_diff_section() {
+        let section = r#"diff --git a/file.rs b/file.rs
+index abc..def 100644
+--- a/file.rs
++++ b/file.rs
+@@ -1,10 +1,15 @@
+ line 1
+ line 2
+ line 3
+ line 4
+ line 5
+ line 6
+ line 7
+ line 8
+ line 9
+ line 10
+"#;
+
+        // Truncate to 8 lines (should keep header + first few content lines)
+        let truncated = truncate_diff_section(section, 8);
+        assert_snapshot!(truncated, @"
+        diff --git a/file.rs b/file.rs
+        index abc..def 100644
+        --- a/file.rs
+        +++ b/file.rs
+        @@ -1,10 +1,15 @@
+         line 1
+         line 2
+         line 3
+
+        ... (7 lines omitted)
+        ");
+    }
+
+    #[test]
+    fn test_prepare_diff_small_diff_passes_through() {
+        let diff = "small diff".to_string();
+        let stat = "1 file changed".to_string();
+
+        let prepared = prepare_diff(diff.clone(), stat.clone());
+        assert_eq!(prepared.diff, diff);
+        assert_eq!(prepared.stat, stat);
+    }
+
+    #[test]
+    fn test_prepare_diff_filters_lock_files() {
+        // Over budget only because of the lock file: filtering it restores
+        // the regular content untouched (multi-line, so line caps would show)
+        let regular_content = "line of code\n".repeat(3_000);
+        let lock_content = "y".repeat(150_000);
+
+        let diff = format!(
+            "diff --git a/src/main.rs b/src/main.rs\n{}diff --git a/Cargo.lock b/Cargo.lock\n{}\n",
+            regular_content, lock_content
+        );
+        let stat = "2 files changed".to_string();
+
+        let prepared = prepare_diff(diff, stat);
+
+        assert!(!prepared.diff.contains("Cargo.lock"));
+        assert!(prepared.diff.contains("src/main.rs"));
+        // The surviving section is under budget, so it passes through whole
+        assert!(prepared.diff.contains(&regular_content));
+    }
+
+    #[test]
+    fn test_prepare_diff_accumulates_sections_up_to_budget() {
+        // Many multi-line files that exceed the budget even after per-file
+        // truncation: sections accumulate in diff order until the budget is
+        // spent, and the rest are reported against the diffstat
+        let mut diff = String::new();
+        for i in 0..100 {
+            diff.push_str(&format!(
+                "diff --git a/file{}.rs b/file{}.rs\n{}",
+                i,
+                i,
+                "line of code that is well under the length cap\n".repeat(200)
+            ));
+        }
+        assert!(diff.len() > DIFF_BUDGET);
+
+        let stat = "100 files changed".to_string();
+        let prepared = prepare_diff(diff, stat);
+
+        assert!(prepared.diff.contains("file0.rs"));
+        assert!(prepared.diff.contains("lines omitted"));
+        assert!(prepared.diff.contains("files omitted, see diffstat"));
+        // The omission marker is the only content past the budget
+        assert!(prepared.diff.len() < DIFF_BUDGET + 100);
+    }
+
+    #[test]
+    fn test_prepare_diff_caps_single_line_files() {
+        // A minified single-line file slips through a line-count cap; the
+        // line-length cap must bound it. Multi-byte content exercises the
+        // char-boundary cut.
+        let minified = format!("+{}", "测".repeat(80_000)); // ~240k bytes, one line
+        let diff = format!(
+            "diff --git a/src/lib.rs b/src/lib.rs\n+fn real_change() {{}}\ndiff --git a/dist/bundle.min.js b/dist/bundle.min.js\n{}\n",
+            minified
+        );
+        let stat = "2 files changed".to_string();
+
+        let prepared = prepare_diff(diff, stat);
+
+        assert!(prepared.diff.contains("real_change"));
+        assert!(prepared.diff.contains("line truncated"));
+        assert!(prepared.diff.len() < DIFF_BUDGET + 100);
+    }
+
+    #[test]
+    fn test_truncate_stat_caps_lines() {
+        // Small stat passes through unchanged
+        let small = " src/main.rs | 4 ++++\n 1 file changed, 4 insertions(+)\n".to_string();
+        assert_eq!(truncate_stat(small.clone()), small);
+
+        // Oversized stat keeps the head plus an omission marker
+        let mut stat = String::new();
+        for i in 0..500 {
+            stat.push_str(&format!(" src/file{}.rs | 2 +-\n", i));
+        }
+        stat.push_str(" 500 files changed, 500 insertions(+), 500 deletions(-)\n");
+
+        let truncated = truncate_stat(stat);
+        let lines: Vec<&str> = truncated.lines().collect();
+        assert_eq!(lines.len(), STAT_MAX_LINES + 1);
+        assert_eq!(lines[0], " src/file0.rs | 2 +-");
+        assert_eq!(lines[STAT_MAX_LINES - 1], " src/file199.rs | 2 +-");
+        assert_eq!(lines[STAT_MAX_LINES], "... (301 more files)");
+    }
+
+    #[test]
+    fn test_build_squash_prompt_caps_commit_count() {
+        // Details arrive newest-first; over MAX_SQUASH_COMMITS the newest are
+        // kept and a synthetic entry for the older tail renders first in the
+        // chronological list.
+        let config = CommitGenerationConfig {
+            squash_template: Some(
+                "{% for c in commit_details %}- {{ c }}\n{% endfor %}".to_string(),
+            ),
+            ..Default::default()
+        };
+        let commit_details: Vec<CommitMessageDetail> = (0..MAX_SQUASH_COMMITS + 50)
+            .map(|i| CommitMessageDetail {
+                subject: format!("commit {}", i),
+                body: String::new(),
+            })
+            .collect();
+        let context = squash_context("diff", "feature", None, "repo", &commit_details, "main");
+
+        let prompt = build_prompt(&config, TemplateType::Squash, &context).unwrap();
+
+        assert!(prompt.starts_with("- ... (50 earlier commits omitted)\n"));
+        // Newest (index 0) renders last; the oldest kept (index 199) follows
+        // the marker; the 50 oldest are gone.
+        assert!(prompt.ends_with("- commit 0\n"));
+        assert!(prompt.contains("- commit 199\n"));
+        assert!(!prompt.contains("- commit 200\n"));
+        assert_eq!(prompt.lines().count(), MAX_SQUASH_COMMITS + 1);
+    }
+
+    #[test]
+    fn test_truncate_diff_section_short() {
+        // Section shorter than max lines should pass through unchanged
+        let section = "line1\nline2\nline3\n";
+        let truncated = truncate_diff_section(section, 10);
+        assert_eq!(truncated, section);
+    }
+
+    #[test]
+    fn test_truncate_diff_section_no_header() {
+        // Section without @@ marker
+        let section = "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\n";
+        let truncated = truncate_diff_section(section, 3);
+        assert_snapshot!(truncated, @"
+        line1
+        line2
+        line3
+
+        ... (5 lines omitted)
+        ");
+    }
+
+    #[test]
+    fn test_format_reproduction_command() {
+        // Simple command — no wrapping needed
+        let result = format_reproduction_command("git diff", "llm -m haiku");
+        assert_snapshot!(result, @"git diff | llm -m haiku");
+
+        // Env var assignment — needs shell wrapping
+        let result = format_reproduction_command("git diff", "MAX_THINKING_TOKENS=0 claude -p");
+        assert_snapshot!(result, @"git diff | sh -c 'MAX_THINKING_TOKENS=0 claude -p'");
+
+        // Shell metacharacters — needs wrapping
+        let result = format_reproduction_command("git diff", "cmd1 && cmd2");
+        assert_snapshot!(result, @"git diff | sh -c 'cmd1 && cmd2'");
+    }
+}

@@ -1,0 +1,1730 @@
+use crate::display::{format_relative_time_short, shorten_path};
+use anstyle::{Effects, Style};
+use unicode_width::UnicodeWidthStr;
+use h0x_wt::styling::{DETACHED, StyledLine, truncate_visible};
+
+use super::columns::{ColumnKind, DiffVariant};
+use super::layout::{
+    ColumnFormat, ColumnLayout, DiffColumnConfig, LayoutConfig, LinkStyle, format_url_cell,
+};
+use super::model::{ItemKind, ListItem};
+
+/// Placeholder glyph for unresolved Status positions — both "still loading" and
+/// "drain deadline fired, won't arrive."
+///
+/// TODO: collapse-to-one-glyph is temporary. Loading and timed-out are
+/// semantically distinct states; the original design used `⋯` vs `·` but `⋯`
+/// is too visually loud for a tight column where most cells are in one state
+/// or the other during a render. Revisit and pick a subtle second glyph
+/// (e.g. `·` for one, `–` or braille dot for the other) once we can evaluate
+/// them side-by-side in real tables. Also update `src/cli/mod.rs`
+/// status-column help table when resplit.
+pub const PLACEHOLDER: &str = "·";
+
+/// Blank placeholder used by `wt list` during the first ~200ms of progressive
+/// rendering. The skeleton renders with blanks so fast commands (everything
+/// resolved under 200ms) never flash the `·` loading indicator. After the
+/// 200ms threshold, `LayoutConfig::placeholder` is promoted to [`PLACEHOLDER`]
+/// and every still-pending cell is re-rendered with the dot.
+pub const PLACEHOLDER_BLANK: &str = " ";
+
+/// Step a style up one emphasis level for compact (C/K) diff notation, which
+/// flags an approximated count. A dimmed base drops the dim to land at normal;
+/// any other base gains bold. This keeps the jump uniform across subcolumns —
+/// the dimmed "behind" count (`↓6C`) steps dim → normal rather than leaping two
+/// levels to dim+bold, while the normal "ahead" count (`↑6C`) still steps
+/// normal → bold.
+fn bump_emphasis(style: Style) -> Style {
+    let effects = style.get_effects();
+    if effects.contains(Effects::DIMMED) {
+        style.effects(effects.remove(Effects::DIMMED))
+    } else {
+        style.bold()
+    }
+}
+
+impl DiffColumnConfig {
+    /// Check if a value exceeds the allocated digit width
+    fn exceeds_width(value: usize, digits: usize) -> bool {
+        if digits == 0 {
+            return value > 0;
+        }
+        let max_value = 10_usize.pow(digits as u32) - 1;
+        value > max_value
+    }
+
+    /// Format a value using compact notation (K for thousands, optionally C for hundreds)
+    ///
+    /// Returns (formatted_string, uses_compact_notation)
+    ///
+    /// For line diffs (Signs): Shows full numbers in 100-999 range, uses K for thousands
+    /// For commit counts (Arrows): Uses C for hundreds, K for thousands
+    ///
+    /// Note: Uses integer division for approximation (intentional truncation):
+    /// - 648 / 100 = 6 → "6C" (represents ~600)
+    /// - 1999 / 1000 = 1 → "1K" (represents ~1000)
+    ///
+    /// Values >= 10,000 display as "∞" to indicate "very large" without false precision.
+    ///
+    /// Examples (Signs):  100 -> ("100", false), 648 -> ("648", false), 1000 -> ("1K", true)
+    /// Examples (Arrows): 100 -> ("1C", true),   648 -> ("6C", true),   1000 -> ("1K", true)
+    fn format_overflow(value: usize, variant: DiffVariant) -> (String, bool) {
+        if value >= 10_000 {
+            // Use ∞ for extreme values to avoid false precision (9K could be 9K or 900K)
+            ("∞".to_string(), true)
+        } else if value >= 1_000 {
+            (format!("{}K", value / 1_000), true)
+        } else if value >= 100 {
+            match variant {
+                // Line diffs: show full number (user prefers precision over compactness)
+                DiffVariant::Signs => (value.to_string(), false),
+                // Commit counts: use C abbreviation
+                DiffVariant::Arrows | DiffVariant::UpstreamArrows => {
+                    (format!("{}C", value / 100), true)
+                }
+            }
+        } else {
+            (value.to_string(), false)
+        }
+    }
+
+    /// Render a subcolumn value with symbol and padding to fixed width
+    /// Numbers are right-aligned on the ones column (e.g., " +2", "+53")
+    /// For compact notation (C/K suffix), bumps the base style one emphasis
+    /// level (e.g. dim "↓6C" → normal, normal "↑6C" → bold) — see
+    /// [`bump_emphasis`].
+    fn render_subcolumn(
+        segment: &mut StyledLine,
+        symbol: &str,
+        value: usize,
+        width: usize,
+        style: Style,
+        overflow: bool,
+        variant: DiffVariant,
+    ) {
+        let (value_str, is_compact) = if overflow {
+            Self::format_overflow(value, variant)
+        } else {
+            (value.to_string(), false)
+        };
+        let content_len = 1 + value_str.width(); // symbol + display width
+        let padding_needed = width.saturating_sub(content_len);
+
+        // Add left padding for right-alignment
+        if padding_needed > 0 {
+            segment.push_raw(" ".repeat(padding_needed));
+        }
+
+        // Add styled content - bump emphasis one level for compact notation
+        // (C/K suffix) to flag the approximated count
+        if is_compact {
+            segment.push_styled(format!("{}{}", symbol, value_str), bump_emphasis(style));
+        } else {
+            segment.push_styled(format!("{}{}", symbol, value_str), style);
+        }
+    }
+
+    /// Render diff values as a StyledLine with fixed-width alignment.
+    ///
+    /// Numbers are right-aligned within their allocated digit width.
+    /// Use this for tabular display where columns must align vertically.
+    pub fn render_segment(&self, positive: usize, negative: usize) -> StyledLine {
+        let symbols = self.display.variant.symbols();
+        let mut segment = StyledLine::new();
+
+        // Check for overflow
+        let positive_overflow = Self::exceeds_width(positive, self.positive_digits);
+        let negative_overflow = Self::exceeds_width(negative, self.negative_digits);
+
+        if positive == 0 && negative == 0 {
+            segment.push_raw(" ".repeat(self.total_width));
+            return segment;
+        }
+
+        let positive_width = 1 + self.positive_digits;
+        let negative_width = 1 + self.negative_digits;
+
+        // Fixed content width ensures vertical alignment of subcolumns
+        let content_width = positive_width + 1 + negative_width;
+        let total_padding = self.total_width.saturating_sub(content_width);
+
+        // Add leading padding for right-alignment
+        if total_padding > 0 {
+            segment.push_raw(" ".repeat(total_padding));
+        }
+
+        // Render positive (added) subcolumn
+        if positive > 0 {
+            Self::render_subcolumn(
+                &mut segment,
+                symbols.positive,
+                positive,
+                positive_width,
+                self.display.positive_style,
+                positive_overflow,
+                self.display.variant,
+            );
+        } else {
+            // Empty positive subcolumn - add spaces to maintain alignment
+            segment.push_raw(" ".repeat(positive_width));
+        }
+
+        // Always add separator to maintain fixed layout (early return handles empty case)
+        segment.push_raw(" ");
+
+        // Render negative (deleted) subcolumn
+        if negative > 0 {
+            Self::render_subcolumn(
+                &mut segment,
+                symbols.negative,
+                negative,
+                negative_width,
+                self.display.negative_style,
+                negative_overflow,
+                self.display.variant,
+            );
+        } else {
+            // Empty negative subcolumn - add spaces to maintain alignment
+            segment.push_raw(" ".repeat(negative_width));
+        }
+
+        segment
+    }
+}
+
+impl LayoutConfig {
+    fn render_line<F>(&self, mut render_cell: F) -> StyledLine
+    where
+        F: FnMut(&ColumnLayout) -> StyledLine,
+    {
+        let mut line = StyledLine::new();
+        if self.columns.is_empty() {
+            return line;
+        }
+
+        let last_index = self.columns.len() - 1;
+
+        for (index, column) in self.columns.iter().enumerate() {
+            line.pad_to(column.start);
+            let cell = render_cell(column);
+            let cell_width = cell.width();
+
+            // Debug: Log if cell exceeds its allocated width
+            if cell_width > column.width {
+                tracing::debug!(
+                    column = ?column.kind,
+                    allocated = column.width,
+                    actual = cell_width,
+                    excess = cell_width - column.width,
+                    "Cell overflow: column={:?} allocated={} actual={} excess={}",
+                    column.kind,
+                    column.width,
+                    cell_width,
+                    cell_width - column.width
+                );
+            }
+
+            line.extend(cell);
+
+            // Pad to end of column (unless it's the last column)
+            if index != last_index {
+                line.pad_to(column.start + column.width);
+            }
+        }
+
+        // Padding after the last cell places nothing. A row whose rightmost
+        // columns are empty carried up to 14 trailing spaces the header line
+        // never had, which a reader inherits the moment they select the row.
+        line.trim_end();
+
+        let final_width = line.width();
+        tracing::debug!(width = final_width, "Rendered line width: {}", final_width);
+
+        line
+    }
+
+    pub fn format_header_line(&self) -> String {
+        self.render_header_line().render()
+    }
+
+    /// Render header line as StyledLine (for extracting both plain and styled text)
+    pub fn render_header_line(&self) -> StyledLine {
+        let style = Style::new().bold();
+        self.render_line(|column| {
+            let mut cell = StyledLine::new();
+            if !column.header.is_empty() {
+                cell.push_styled(column.header.to_string(), style);
+            }
+            column.aligned_cell(cell)
+        })
+    }
+
+    pub fn format_list_item_line(&self, item: &ListItem, placeholder: &str) -> String {
+        self.render_list_item_line(item, placeholder).render()
+    }
+
+    /// Render list item line as StyledLine (for extracting both plain and styled text).
+    ///
+    /// `placeholder` is the glyph to use for cells whose data hasn't arrived
+    /// yet. The `wt list` progressive path threads in [`PLACEHOLDER_BLANK`]
+    /// for the first ~200ms (so fast commands never flash) and promotes it
+    /// to [`PLACEHOLDER`] on the reveal tick. Non-progressive callers pass
+    /// [`PLACEHOLDER`] directly.
+    pub fn render_list_item_line(&self, item: &ListItem, placeholder: &str) -> StyledLine {
+        self.render_line(|column| column.render_cell(item, self, item.placeholder(placeholder)))
+    }
+
+    /// Render a skeleton row showing known data (branch, path) with placeholders for other columns.
+    ///
+    /// Used for both worktrees and branch-only items; branch-only rows render an empty path
+    /// and a blank gutter placeholder. See [`Self::render_list_item_line`] for `placeholder` semantics.
+    pub fn render_skeleton_row(&self, item: &ListItem, placeholder: &str) -> StyledLine {
+        let branch = item.display_name();
+        let shortened_path = item
+            .worktree_path()
+            .map(|p| shorten_path(p, &self.main_worktree_path))
+            .unwrap_or_default();
+
+        let dim = Style::new().dimmed();
+        let spinner = item.placeholder(placeholder);
+
+        self.render_line(|col| {
+            let mut cell = StyledLine::new();
+
+            match col.kind {
+                ColumnKind::Gutter => {
+                    // Worktree gutter symbols (@/^/+, including is_previous)
+                    // resolve when WorktreeData is populated post-skeleton, so
+                    // show the dimmed placeholder — it keeps the 200ms
+                    // blank-reveal flow in lockstep with the data columns.
+                    // Branch scope is known at construction, so its sigil
+                    // (`/`/`|`) renders immediately, dimmed to match the final
+                    // render (and its Status-column twin) — no flash or flicker.
+                    match item.kind() {
+                        ItemKind::Worktree(_) => cell.push_styled(format!("{spinner} "), dim),
+                        ItemKind::Branch(scope) => {
+                            cell.push_styled(format!("{} ", scope.gutter_glyph()), dim)
+                        }
+                    }
+                }
+                ColumnKind::Branch => {
+                    // Show actual branch name (no dim - start normal, gray out later if removable).
+                    // A detached row shows its abbreviated HEAD in the settled
+                    // row's `DETACHED` style, so the cell doesn't restyle as
+                    // the row fills in. Empty text goes unstyled for the reason
+                    // [`Self::render_text_cell`] gives.
+                    if item.branch().is_none() && !branch.is_empty() {
+                        cell.push_styled(branch.to_string(), DETACHED);
+                    } else {
+                        cell.push_raw(branch.to_string());
+                    }
+                    // Elide past the column's cap, matching the settled row —
+                    // `render_text_cell` truncates there, and a skeleton that
+                    // didn't would overflow into the next column.
+                    let mut cell = cell.truncate_to_width(col.width);
+                    cell.pad_to(col.width);
+                    return cell;
+                }
+                ColumnKind::Path => {
+                    // Show actual path (no dim - start normal, gray out later if removable)
+                    cell.push_raw(&shortened_path);
+                    cell.pad_to(col.width);
+                }
+                ColumnKind::Commit => {
+                    // git's own `%h`, folded in before the skeleton — so the cell
+                    // shows the hash from the first frame. Empty for unborn
+                    // branches (null OID, nothing to abbreviate).
+                    if !item.short_sha.is_empty() {
+                        cell.push_styled(&item.short_sha, dim);
+                    }
+                }
+                ColumnKind::Custom(i) => {
+                    // Custom values are expanded before the skeleton renders —
+                    // show them like Branch/Path rather than a placeholder.
+                    let text = item
+                        .custom_values
+                        .get(i as usize)
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    return col.render_text_cell(text, None);
+                }
+                ColumnKind::CiStatus if item.pr_status.is_some() => {
+                    // Set before the skeleton only by the picker's cache prime —
+                    // render it now for an instant first paint; the live CiStatus
+                    // task repaints the cell as it lands. `wt list` never sets
+                    // pr_status this early and keeps the placeholder arm below.
+                    return match &item.pr_status {
+                        Some(Some(pr_status)) => {
+                            let mut ci = StyledLine::new();
+                            ci.push_raw(pr_status.format_cell(col.width, self.link_style));
+                            ci
+                        }
+                        _ => StyledLine::new(),
+                    };
+                }
+                // Age (Time) and Message carry no task — their data arrives in
+                // `item.commit` from the pre-skeleton commit batch, not from a
+                // task result. Render them through the canonical cell renderer
+                // so the post-skeleton commit paint (and the 200ms reveal) fill
+                // them the moment that batch is folded in, instead of leaving
+                // them on the placeholder until the row's first task result
+                // happens to redraw it. Before the batch lands (the very first
+                // skeleton paint) `item.commit` is `None`, and `render_cell`
+                // returns the same placeholder the `_` arm below would.
+                ColumnKind::Time | ColumnKind::Message => {
+                    return col.render_cell(item, self, spinner);
+                }
+                _ => {
+                    // Show spinner for data columns (placeholder_cell handles alignment)
+                    return col.placeholder_cell(spinner);
+                }
+            }
+
+            cell
+        })
+    }
+}
+
+/// Which edge a column's content sits against.
+#[derive(Clone, Copy, Debug)]
+enum CellAlignment {
+    /// Text, read from the left: Branch, Path, Message, …
+    Left,
+    /// A single value whose digits and unit only line up from the right —
+    /// Age (`now`, `4m`, `11mo`).
+    Right,
+    /// A diff field: two right-aligned halves either side of a separator
+    /// (`+999 -999`), so neither edge is the field's centre of gravity.
+    Split,
+}
+
+impl ColumnLayout {
+    fn alignment(&self) -> CellAlignment {
+        if matches!(self.format, ColumnFormat::Diff(_)) {
+            CellAlignment::Split
+        } else if self.kind == ColumnKind::Time {
+            CellAlignment::Right
+        } else {
+            CellAlignment::Left
+        }
+    }
+
+    /// Place whole-cell content according to the column's value shape.
+    ///
+    /// A diff column is two right-aligned halves, so its own value renderer
+    /// places each half. Content that names or describes the whole field — its
+    /// header, loading state, or in-sync marker — sits over their separator.
+    /// Age is a single right-aligned value; everything else reads from the left.
+    fn aligned_cell(&self, content: StyledLine) -> StyledLine {
+        let leading = match self.alignment() {
+            CellAlignment::Left => return content,
+            CellAlignment::Right => self.width.saturating_sub(content.width()),
+            // A split column's value renderer owns the two halves. A loading
+            // or skipped marker describes the whole field, so it sits between
+            // them just like the header and the in-sync marker do.
+            CellAlignment::Split => self.width.saturating_sub(content.width()) / 2,
+        };
+        if leading == 0 {
+            return content;
+        }
+        let mut cell = StyledLine::new();
+        cell.push_raw(" ".repeat(leading));
+        cell.extend(content);
+        cell
+    }
+
+    /// Render a placeholder indicator (loading or skipped state).
+    fn placeholder_cell(&self, symbol: &str) -> StyledLine {
+        let mut cell = StyledLine::new();
+        cell.push_styled(symbol, Style::new().dimmed());
+        self.aligned_cell(cell)
+    }
+
+    /// Render a text cell with optional style, truncated to column width.
+    ///
+    /// Styles only text that exists: an empty string wrapped
+    /// in a style is a bare escape pair around nothing, which a terminal renders
+    /// as an invisible artifact and a snapshot records verbatim. Every cell whose
+    /// text can be empty — the Commit column for an unborn branch, a detached
+    /// row's Branch column when the commit-details batch failed — relies on this
+    /// rather than repeating the check.
+    fn render_text_cell(&self, text: &str, style: Option<Style>) -> StyledLine {
+        let mut cell = StyledLine::new();
+        match style.filter(|_| !text.is_empty()) {
+            Some(s) => cell.push_styled(text.to_string(), s),
+            None => cell.push_raw(text.to_string()),
+        }
+        cell.truncate_to_width(self.width)
+    }
+
+    fn render_diff_cell(&self, positive: usize, negative: usize) -> StyledLine {
+        let ColumnFormat::Diff(config) = self.format else {
+            return StyledLine::new();
+        };
+
+        debug_assert_eq!(config.total_width, self.width);
+
+        config.render_segment(positive, negative)
+    }
+
+    /// Render this column's cell for `item`.
+    ///
+    /// Reads the render-wide facts — the Status mask, the path rows shorten
+    /// against, the text budgets, the [`LinkStyle`] — off the `layout` this
+    /// column belongs to, so every cell in a row answers them the same way.
+    fn render_cell(&self, item: &ListItem, layout: &LayoutConfig, placeholder: &str) -> StyledLine {
+        let status_mask = &layout.status_position_mask;
+        let main_worktree_path = &layout.main_worktree_path;
+        let max_message_len = layout.max_message_len;
+        let max_summary_len = layout.max_summary_len;
+        let link: LinkStyle = layout.link_style;
+
+        // Compute derived values inline (avoids separate context struct)
+        let worktree_data = item.worktree_data();
+        let text_style = item.should_dim().then(|| Style::new().dimmed());
+
+        match self.kind {
+            ColumnKind::Gutter => {
+                // The gutter is a 2-cell presence/location axis. Worktree rows
+                // (`@`/`^`/`+`) are materialized on disk and render bright;
+                // branch rows are refs with no working copy, split by scope
+                // (`/` local, `|` remote) and rendered dim to match those same
+                // glyphs in the Status column (WORKTREE_STATE `/`, upstream `|`
+                // are both dim) — bright worktree vs dim ref reinforces the
+                // presence gradient, glyph still primary. All single-width
+                // ASCII — the gutter must dodge skim's `width_cjk` clipping.
+                //
+                // PR rows (open PRs with no local branch, `wt switch --prs`)
+                // also carry a gutter sigil — a dim `#` — but they're a picker
+                // row built without a `ListItem`, so they render their gutter in
+                // `commands::picker::prs` (`PR_GUTTER_SIGIL`) rather than through
+                // this `ItemKind` match.
+                let mut cell = StyledLine::new();
+                // `glyph` + trailing space = the two-cell sigil; the bare glyph
+                // also feeds the picker's fuzzy-search text (`gutter_glyph`).
+                let sigil = format!("{} ", item.kind().gutter_glyph());
+                match item.kind() {
+                    // Worktree rows are materialized on disk — render bright.
+                    ItemKind::Worktree(_) => cell.push_raw(sigil),
+                    // Branch rows are refs with no working copy — render dim.
+                    ItemKind::Branch(_) => cell.push_styled(sigil, Style::new().dimmed()),
+                }
+                cell
+            }
+            ColumnKind::Branch => {
+                // A detached worktree has no name for this cell, so it carries
+                // the abbreviated HEAD — the Commit column's value, repeated
+                // here because the column's question is "which ref is this?"
+                // and a SHA is the answer. `DETACHED` outranks `text_style`:
+                // the removable dim still reaches this row's Path and Message
+                // cells, while yellow keeps the SHA from reading as a branch
+                // that happens to be named like one.
+                let style = if item.branch().is_none() {
+                    Some(DETACHED)
+                } else {
+                    text_style
+                };
+                self.render_text_cell(item.display_name(), style)
+            }
+            ColumnKind::Status => {
+                // `render_with_mask` emits the placeholder glyph per
+                // position for unresolved gates, so a row whose Status
+                // cell is partially loaded renders e.g. `+!  · ↕ | ·`
+                // rather than a cell-level placeholder. The `placeholder`
+                // arg comes from `render_list_item_line` (`·` today — see
+                // `PLACEHOLDER`).
+                let mut cell = StyledLine::new();
+                cell.push_raw(
+                    item.status_symbols
+                        .render_with_mask(status_mask, placeholder),
+                );
+                let mut cell = cell.truncate_to_width(self.width);
+                cell.pad_to(self.width);
+                cell
+            }
+            ColumnKind::WorkingDiff => {
+                let Some(data) = worktree_data else {
+                    return StyledLine::new(); // Branch item — no working tree
+                };
+                let Some(diff) = data.working_tree_diff.as_ref() else {
+                    return self.placeholder_cell(placeholder); // Not loaded yet
+                };
+                self.render_diff_cell(diff.added, diff.deleted)
+            }
+            ColumnKind::AheadBehind => {
+                if item.is_main() {
+                    return StyledLine::new();
+                }
+                match item.counts {
+                    Some(counts) if counts.ahead == 0 && counts.behind == 0 => StyledLine::new(),
+                    Some(counts) => self.render_diff_cell(counts.ahead, counts.behind),
+                    None => self.placeholder_cell(placeholder), // Not loaded yet
+                }
+            }
+            ColumnKind::BranchDiff => {
+                if item.is_main() {
+                    return StyledLine::new();
+                }
+                match item.branch_diff() {
+                    Some(bd) => self.render_diff_cell(bd.diff.added, bd.diff.deleted),
+                    None => self.placeholder_cell(placeholder),
+                }
+            }
+            ColumnKind::Path => {
+                let Some(path) = item.worktree_path() else {
+                    return StyledLine::new();
+                };
+                let path_str = shorten_path(path, main_worktree_path);
+                self.render_text_cell(&path_str, text_style)
+            }
+            ColumnKind::Upstream => {
+                let Some(ref upstream) = item.upstream else {
+                    return self.placeholder_cell(placeholder); // Not loaded yet
+                };
+                let Some(active) = upstream.active() else {
+                    return StyledLine::new(); // Loaded, no active upstream
+                };
+                // Show centered | when in sync instead of ⇡0  ⇣0
+                // Note: This duplicates the InSync check from Divergence::Special, but
+                // checking counts directly is simpler than threading the enum through.
+                if active.ahead == 0 && active.behind == 0 {
+                    let mut cell = StyledLine::new();
+                    cell.push_styled("|", Style::new().dimmed());
+                    return self.aligned_cell(cell);
+                }
+                self.render_diff_cell(active.ahead, active.behind)
+            }
+            ColumnKind::Time => {
+                let Some(ref commit) = item.commit else {
+                    return self.placeholder_cell(placeholder);
+                };
+                let mut cell = StyledLine::new();
+                cell.push_styled(
+                    format_relative_time_short(commit.timestamp),
+                    Style::new().dimmed(),
+                );
+                // `now` and `4m` are different lengths with the unit at the
+                // end, so they only line up from the right.
+                self.aligned_cell(cell)
+            }
+            ColumnKind::Url => {
+                // URL column: shows dev server URL from project config template
+                // as ":port" or in full (see `format_url_cell`), dim if not
+                // available/active, normal if active
+                let Some(url) = &item.url else {
+                    return StyledLine::new();
+                };
+                let mut cell = StyledLine::new();
+                let formatted = format_url_cell(url, link);
+                if item.url_active == Some(true) {
+                    cell.push_raw(formatted);
+                } else {
+                    // Not active or unknown: dim styling
+                    cell.push_styled(formatted, Style::new().dimmed());
+                }
+                cell.truncate_to_width(self.width)
+            }
+            ColumnKind::CiStatus => {
+                match &item.pr_status {
+                    None => self.placeholder_cell(placeholder),
+                    Some(None) => StyledLine::new(), // No CI for this branch
+                    Some(Some(pr_status)) => {
+                        let mut cell = StyledLine::new();
+                        cell.push_raw(pr_status.format_cell(self.width, link));
+                        cell
+                    }
+                }
+            }
+            ColumnKind::Commit => {
+                self.render_text_cell(&item.short_sha, Some(Style::new().dimmed()))
+            }
+            ColumnKind::Summary => match &item.summary {
+                None => self.placeholder_cell(placeholder),
+                Some(None) => StyledLine::new(),
+                Some(Some(summary)) => {
+                    let mut cell = StyledLine::new();
+                    let msg = truncate_visible(summary, max_summary_len);
+                    cell.push_styled(msg, Style::new());
+                    cell
+                }
+            },
+            ColumnKind::Message => {
+                let Some(ref commit) = item.commit else {
+                    return self.placeholder_cell(placeholder);
+                };
+                let mut cell = StyledLine::new();
+                let msg = truncate_visible(&commit.commit_message, max_message_len);
+                cell.push_styled(msg, Style::new().dimmed());
+                cell
+            }
+            // Values are expanded before layout — no loading state, so an
+            // absent or empty value is an empty cell, never a placeholder.
+            ColumnKind::Custom(i) => {
+                let text = item
+                    .custom_values
+                    .get(i as usize)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                self.render_text_cell(text, text_style)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::model::PositionMask;
+    use super::*;
+    use crate::commands::list::layout::DiffDisplayConfig;
+    use ansi_str::AnsiStr;
+    use insta::assert_snapshot;
+    use std::path::PathBuf;
+    use h0x_wt::styling::{ADDITION, DELETION};
+
+    fn format_diff_like_column(
+        positive: usize,
+        negative: usize,
+        config: DiffColumnConfig,
+    ) -> StyledLine {
+        config.render_segment(positive, negative)
+    }
+
+    /// A one-column layout carrying the render-wide facts `render_cell` reads.
+    fn cell_layout(column: ColumnLayout) -> LayoutConfig {
+        LayoutConfig {
+            columns: vec![column],
+            main_worktree_path: PathBuf::from("/tmp"),
+            max_message_len: 50,
+            max_summary_len: 40,
+            hidden_columns: Vec::new(),
+            status_position_mask: PositionMask::FULL,
+            link_style: LinkStyle::Expanded,
+        }
+    }
+
+    /// Alignment follows the shape of the value: text starts at the left,
+    /// scalar values end at the right, and labels or states for a split value
+    /// sit over its centre.
+    #[test]
+    fn test_alignment_policy_by_column_shape() {
+        let columns = [
+            ColumnLayout {
+                kind: ColumnKind::Branch,
+                header: std::borrow::Cow::Borrowed("Branch"),
+                start: 0,
+                width: 8,
+                format: ColumnFormat::Text,
+            },
+            ColumnLayout {
+                kind: ColumnKind::Time,
+                header: std::borrow::Cow::Borrowed("Age"),
+                start: 0,
+                width: 4,
+                format: ColumnFormat::Text,
+            },
+            ColumnLayout {
+                kind: ColumnKind::WorkingDiff,
+                header: std::borrow::Cow::Borrowed("HEAD±"),
+                start: 0,
+                width: 9,
+                format: ColumnFormat::Diff(DiffColumnConfig {
+                    positive_digits: 3,
+                    negative_digits: 3,
+                    total_width: 9,
+                    display: DiffDisplayConfig {
+                        variant: super::super::columns::DiffVariant::Signs,
+                        positive_style: ADDITION,
+                        negative_style: DELETION,
+                    },
+                }),
+            },
+        ];
+
+        let headers = columns
+            .iter()
+            .cloned()
+            .map(cell_layout)
+            .map(|layout| {
+                layout
+                    .render_header_line()
+                    .render()
+                    .ansi_strip()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        let placeholders = columns
+            .iter()
+            .map(|column| {
+                column
+                    .placeholder_cell(PLACEHOLDER)
+                    .render()
+                    .ansi_strip()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+
+        assert_snapshot!(format!("{headers}\n{placeholders}"), @"
+        Branch| Age|  HEAD±
+        ·|   ·|    ·
+        ");
+    }
+
+    #[test]
+    fn test_format_aligned_produces_fixed_width_output() {
+        use super::super::columns::DiffVariant;
+
+        let config = DiffDisplayConfig {
+            variant: DiffVariant::Signs,
+            positive_style: ADDITION,
+            negative_style: DELETION,
+        };
+
+        // Test various values
+        let result1 = config.format_aligned(310, 112);
+        let result2 = config.format_aligned(54, 63);
+        let result3 = config.format_aligned(9, 3);
+
+        // All should have the same width (3 + 1 + 3 + 1 + 3 = 9 chars for "+NNN -NNN")
+        let clean1 = result1.ansi_strip().into_owned();
+        let clean2 = result2.ansi_strip().into_owned();
+        let clean3 = result3.ansi_strip().into_owned();
+
+        assert_eq!(
+            clean1.len(),
+            clean2.len(),
+            "All aligned outputs should have same width"
+        );
+        assert_eq!(
+            clean2.len(),
+            clean3.len(),
+            "All aligned outputs should have same width"
+        );
+
+        // Verify right-alignment: smaller numbers have leading spaces
+        assert!(
+            clean2.starts_with(' '),
+            "54 should have leading space: '{}'",
+            clean2
+        );
+        assert!(
+            clean3.starts_with(' '),
+            "9 should have leading spaces: '{}'",
+            clean3
+        );
+    }
+
+    #[test]
+    fn test_format_aligned_handles_single_side() {
+        use super::super::columns::DiffVariant;
+
+        let config = DiffDisplayConfig {
+            variant: DiffVariant::Signs,
+            positive_style: ADDITION,
+            negative_style: DELETION,
+        };
+
+        // Insertions only
+        let ins_only = config.format_aligned(447, 0);
+        let clean_ins = ins_only.ansi_strip().into_owned();
+        assert!(
+            clean_ins.contains("+447"),
+            "Should contain +447: '{}'",
+            clean_ins
+        );
+
+        // Deletions only
+        let del_only = config.format_aligned(0, 5);
+        let clean_del = del_only.ansi_strip().into_owned();
+        assert!(
+            clean_del.contains("-5"),
+            "Should contain -5: '{}'",
+            clean_del
+        );
+
+        // Both should have same total width
+        assert_eq!(
+            clean_ins.len(),
+            clean_del.len(),
+            "Single-side outputs should match width"
+        );
+    }
+
+    #[test]
+    fn test_format_diff_column_pads_to_total_width() {
+        use super::super::columns::DiffVariant;
+
+        // Case 1: Single-digit diffs with total=6 (to fit "WT +/-" header)
+        let total = 6;
+        let result = format_diff_like_column(
+            1,
+            1,
+            DiffColumnConfig {
+                positive_digits: 1,
+                negative_digits: 1,
+                total_width: total,
+                display: DiffDisplayConfig {
+                    variant: DiffVariant::Signs,
+                    positive_style: ADDITION,
+                    negative_style: DELETION,
+                },
+            },
+        );
+        assert_eq!(
+            result.width(),
+            total,
+            "Diff '+1 -1' should be padded to 6 chars"
+        );
+
+        // Case 2: Two-digit diffs with total=8
+        let total = 8;
+        let result = format_diff_like_column(
+            10,
+            50,
+            DiffColumnConfig {
+                positive_digits: 2,
+                negative_digits: 2,
+                total_width: total,
+                display: DiffDisplayConfig {
+                    variant: DiffVariant::Signs,
+                    positive_style: ADDITION,
+                    negative_style: DELETION,
+                },
+            },
+        );
+        assert_eq!(
+            result.width(),
+            total,
+            "Diff '+10 -50' should be padded to 8 chars"
+        );
+
+        // Case 3: Asymmetric digit counts with total=9
+        let total = 9;
+        let result = format_diff_like_column(
+            100,
+            50,
+            DiffColumnConfig {
+                positive_digits: 3,
+                negative_digits: 2,
+                total_width: total,
+                display: DiffDisplayConfig {
+                    variant: DiffVariant::Signs,
+                    positive_style: ADDITION,
+                    negative_style: DELETION,
+                },
+            },
+        );
+        assert_eq!(
+            result.width(),
+            total,
+            "Diff '+100 -50' should be padded to 9 chars"
+        );
+
+        // Case 4: Zero diff should also pad to total width
+        let total = 6;
+        let result = format_diff_like_column(
+            0,
+            0,
+            DiffColumnConfig {
+                positive_digits: 1,
+                negative_digits: 1,
+                total_width: total,
+                display: DiffDisplayConfig {
+                    variant: DiffVariant::Signs,
+                    positive_style: ADDITION,
+                    negative_style: DELETION,
+                },
+            },
+        );
+        assert_eq!(result.width(), total, "Empty diff should be 6 spaces");
+    }
+
+    #[test]
+    fn test_format_diff_column_right_alignment() {
+        // Test that diff values are right-aligned within the total width
+        use super::super::columns::DiffVariant;
+
+        let total = 6;
+
+        let result = format_diff_like_column(
+            1,
+            1,
+            DiffColumnConfig {
+                positive_digits: 1,
+                negative_digits: 1,
+                total_width: total,
+                display: DiffDisplayConfig {
+                    variant: DiffVariant::Signs,
+                    positive_style: ADDITION,
+                    negative_style: DELETION,
+                },
+            },
+        );
+        let rendered = result.render();
+
+        // Strip ANSI codes to check alignment
+        let clean = rendered.ansi_strip().into_owned();
+
+        // Should be " +1 -1" (with leading space for right-alignment)
+        assert_eq!(clean, " +1 -1", "Diff should be right-aligned");
+    }
+
+    #[test]
+    fn test_message_padding_with_unicode() {
+        use unicode_width::UnicodeWidthStr;
+
+        // Test that messages with wide unicode characters (emojis, CJK) are padded correctly
+
+        // Case 1: Message with emoji (☕ takes 2 visual columns but 1 character)
+        let msg_with_emoji = "Fix bug with café ☕...";
+        assert_eq!(
+            msg_with_emoji.chars().count(),
+            22,
+            "Emoji message should be 22 characters"
+        );
+        assert_eq!(
+            msg_with_emoji.width(),
+            23,
+            "Emoji message should have visual width 23"
+        );
+
+        let mut line = StyledLine::new();
+        let msg_start = line.width(); // 0
+        line.push_styled(msg_with_emoji.to_string(), Style::new().dimmed());
+        line.pad_to(msg_start + 24); // Pad to width 24
+
+        // After padding, line should have visual width 24
+        assert_eq!(
+            line.width(),
+            24,
+            "Line with emoji should be padded to visual width 24"
+        );
+
+        // The rendered output should have correct spacing
+        let rendered = line.render();
+        let clean = rendered.ansi_strip().into_owned();
+        assert_eq!(
+            clean.width(),
+            24,
+            "Rendered line should have visual width 24"
+        );
+
+        // Case 2: Message with only ASCII should also pad to 24
+        let msg_ascii = "Add support for...";
+        assert_eq!(
+            msg_ascii.width(),
+            18,
+            "ASCII message should have visual width 18"
+        );
+
+        let mut line2 = StyledLine::new();
+        let msg_start2 = line2.width();
+        line2.push_styled(msg_ascii.to_string(), Style::new().dimmed());
+        line2.pad_to(msg_start2 + 24);
+
+        assert_eq!(
+            line2.width(),
+            24,
+            "Line with ASCII should be padded to visual width 24"
+        );
+
+        // Both should have the same visual width
+        assert_eq!(
+            line.width(),
+            line2.width(),
+            "Unicode and ASCII messages should pad to same visual width"
+        );
+    }
+
+    #[test]
+    fn test_branch_name_padding_with_unicode() {
+        use unicode_width::UnicodeWidthStr;
+
+        // Test that branch names with unicode are padded correctly
+
+        // Case 1: Branch with Japanese characters (each takes 2 visual columns)
+        let branch_ja = "feature-日本語-test";
+        // "feature-" (8) + "日本語" (6 visual, 3 chars) + "-test" (5) = 19 visual width
+        assert_eq!(branch_ja.width(), 19);
+
+        let mut line1 = StyledLine::new();
+        line1.push_styled(branch_ja.to_string(), Style::new().bold());
+        line1.pad_to(20); // Pad to width 20
+
+        assert_eq!(line1.width(), 20);
+
+        // Case 2: Regular ASCII branch
+        let branch_ascii = "feature-test";
+        assert_eq!(branch_ascii.width(), 12);
+
+        let mut line2 = StyledLine::new();
+        line2.push_styled(branch_ascii.to_string(), Style::new().bold());
+        line2.pad_to(20);
+
+        assert_eq!(line2.width(), 20);
+
+        // Both should have the same visual width after padding
+        assert_eq!(
+            line1.width(),
+            line2.width(),
+            "Unicode and ASCII branches should pad to same visual width"
+        );
+    }
+
+    #[test]
+    fn test_arrow_variant_alignment_invariant() {
+        use super::super::columns::DiffVariant;
+        use h0x_wt::styling::{ADDITION, DELETION};
+
+        let total = 7;
+
+        let dim_deletion = DELETION.dimmed();
+        let cases = [(0, 0), (1, 0), (0, 1), (1, 1), (99, 99), (5, 44)];
+
+        for (ahead, behind) in cases {
+            let result = format_diff_like_column(
+                ahead,
+                behind,
+                DiffColumnConfig {
+                    positive_digits: 2,
+                    negative_digits: 2,
+                    total_width: total,
+                    display: DiffDisplayConfig {
+                        variant: DiffVariant::Arrows,
+                        positive_style: ADDITION,
+                        negative_style: dim_deletion,
+                    },
+                },
+            );
+            assert_eq!(result.width(), total);
+        }
+    }
+
+    #[test]
+    fn test_arrow_variant_respects_header_width() {
+        use super::super::columns::DiffVariant;
+        use h0x_wt::styling::{ADDITION, DELETION};
+
+        let total = 7;
+
+        let dim_deletion = DELETION.dimmed();
+
+        let empty = format_diff_like_column(
+            0,
+            0,
+            DiffColumnConfig {
+                positive_digits: 0,
+                negative_digits: 2,
+                total_width: total,
+                display: DiffDisplayConfig {
+                    variant: DiffVariant::Arrows,
+                    positive_style: ADDITION,
+                    negative_style: dim_deletion,
+                },
+            },
+        );
+        assert_eq!(empty.width(), total);
+
+        let behind_only = format_diff_like_column(
+            0,
+            50,
+            DiffColumnConfig {
+                positive_digits: 0,
+                negative_digits: 2,
+                total_width: total,
+                display: DiffDisplayConfig {
+                    variant: DiffVariant::Arrows,
+                    positive_style: ADDITION,
+                    negative_style: dim_deletion,
+                },
+            },
+        );
+        assert_eq!(behind_only.width(), total);
+    }
+
+    #[test]
+    fn test_status_column_padding_with_emoji() {
+        use unicode_width::UnicodeWidthStr;
+
+        // Test that status column with emoji is padded correctly using visual width
+        // This reproduces the issue where "↑🤖" was misaligned
+
+        // Case 1: Status with emoji (↑ is 1 column, 🤖 is 2 columns = 3 total)
+        let status_with_emoji = "↑🤖";
+        assert_eq!(
+            status_with_emoji.width(),
+            3,
+            "Status '↑🤖' should have visual width 3"
+        );
+
+        let mut line1 = StyledLine::new();
+        let status_start = line1.width(); // 0
+        line1.push_raw(status_with_emoji.to_string());
+        line1.pad_to(status_start + 6); // Pad to width 6 (typical Status column width)
+
+        assert_eq!(line1.width(), 6);
+
+        // Case 2: Status with only ASCII symbols (↑ is 1 column = 1 total)
+        let status_ascii = "↑";
+        assert_eq!(
+            status_ascii.width(),
+            1,
+            "Status '↑' should have visual width 1"
+        );
+
+        let mut line2 = StyledLine::new();
+        let status_start2 = line2.width();
+        line2.push_raw(status_ascii.to_string());
+        line2.pad_to(status_start2 + 6);
+
+        assert_eq!(line2.width(), 6);
+
+        // Both should have the same visual width after padding
+        assert_eq!(
+            line1.width(),
+            line2.width(),
+            "Unicode and ASCII status should pad to same visual width"
+        );
+
+        // Case 3: Complex status with multiple emoji (git symbols + user marker)
+        let complex_status = "↑⇡🤖📝";
+        // ↑ (1) + ⇡ (1) + 🤖 (2) + 📝 (2) = 6 visual columns
+        assert_eq!(
+            complex_status.width(),
+            6,
+            "Complex status should have visual width 6"
+        );
+
+        let mut line3 = StyledLine::new();
+        let status_start3 = line3.width();
+        line3.push_raw(complex_status.to_string());
+        line3.pad_to(status_start3 + 10); // Pad to width 10
+
+        assert_eq!(line3.width(), 10);
+    }
+
+    #[test]
+    fn test_diff_column_numeric_right_alignment() {
+        use super::super::columns::DiffVariant;
+
+        // Test that numbers are right-aligned on the ones column
+        // When we have 2-digit allocation but use 1-digit values, they should have leading space
+        let total = 8; // 3 (added) + 1 (separator) + 3 (deleted) + 1 (leading padding)
+
+        // Test case 1: (53, 7) - large added, small deleted
+        let result1 = format_diff_like_column(
+            53,
+            7,
+            DiffColumnConfig {
+                positive_digits: 2, // Allocates 3 chars: "+NN"
+                negative_digits: 2,
+                total_width: total,
+                display: DiffDisplayConfig {
+                    variant: DiffVariant::Signs,
+                    positive_style: ADDITION,
+                    negative_style: DELETION,
+                },
+            },
+        );
+        let rendered1 = result1.render();
+        let clean1 = rendered1.ansi_strip().into_owned();
+        assert_eq!(clean1, " +53  -7");
+
+        // Test case 2: (33, 23) - both medium
+        let result2 = format_diff_like_column(
+            33,
+            23,
+            DiffColumnConfig {
+                positive_digits: 2,
+                negative_digits: 2,
+                total_width: total,
+                display: DiffDisplayConfig {
+                    variant: DiffVariant::Signs,
+                    positive_style: ADDITION,
+                    negative_style: DELETION,
+                },
+            },
+        );
+        let rendered2 = result2.render();
+        let clean2 = rendered2.ansi_strip().into_owned();
+        assert_eq!(clean2, " +33 -23");
+
+        // Test case 3: (2, 2) - both small (needs padding)
+        let result3 = format_diff_like_column(
+            2,
+            2,
+            DiffColumnConfig {
+                positive_digits: 2,
+                negative_digits: 2,
+                total_width: total,
+                display: DiffDisplayConfig {
+                    variant: DiffVariant::Signs,
+                    positive_style: ADDITION,
+                    negative_style: DELETION,
+                },
+            },
+        );
+        let rendered3 = result3.render();
+        let clean3 = rendered3.ansi_strip().into_owned();
+        assert_eq!(clean3, "  +2  -2");
+
+        // Verify vertical alignment: the ones digits should be in the same column
+        // The ones digit should be at position 3 for all cases (with 2-digit allocation)
+        // ' +53  -7' -> position 3 is '3'
+        // ' +33 -23' -> position 3 is '3' (second '3', the ones digit)
+        // '  +2  -2' -> position 3 is '2'
+        let ones_pos = 3;
+        assert_eq!(
+            clean1.chars().nth(ones_pos).unwrap(),
+            '3',
+            "Ones digit of 53 should be at position {ones_pos}"
+        );
+        assert_eq!(
+            clean2.chars().nth(ones_pos).unwrap(),
+            '3',
+            "Ones digit of 33 should be at position {ones_pos}"
+        );
+        assert_eq!(
+            clean3.chars().nth(ones_pos).unwrap(),
+            '2',
+            "Ones digit of 2 should be at position {ones_pos}"
+        );
+    }
+
+    #[test]
+    fn test_diff_column_overflow_handling() {
+        use super::super::columns::DiffVariant;
+
+        // Test overflow with Signs variant (+ and -)
+        // Allocated: 3 digits for added, 3 digits for deleted (total width 9)
+        // Max value: 999
+        let total = 9;
+
+        // Case 1: Value just within limit (should render normally)
+        let result = format_diff_like_column(
+            999,
+            999,
+            DiffColumnConfig {
+                positive_digits: 3,
+                negative_digits: 3,
+                total_width: total,
+                display: DiffDisplayConfig {
+                    variant: DiffVariant::Signs,
+                    positive_style: ADDITION,
+                    negative_style: DELETION,
+                },
+            },
+        );
+        assert_eq!(result.width(), total);
+        insta::assert_snapshot!(result.render(), @"[32m+999[0m [31m-999[0m");
+
+        // Case 2: Positive overflow (1000 exceeds 3 digits)
+        // Should show: "+1K -500" (positive with K suffix, negative normal)
+        let overflow_result = format_diff_like_column(
+            1000,
+            500,
+            DiffColumnConfig {
+                positive_digits: 3,
+                negative_digits: 3,
+                total_width: total,
+                display: DiffDisplayConfig {
+                    variant: DiffVariant::Signs,
+                    positive_style: ADDITION,
+                    negative_style: DELETION,
+                },
+            },
+        );
+        assert_eq!(overflow_result.width(), total);
+        insta::assert_snapshot!(overflow_result.render(), @" [1m[32m+1K[0m [31m-500[0m");
+
+        // Case 3: Negative overflow
+        // Should show: "+500 -1K" (positive normal, negative with K suffix)
+        let overflow_result2 = format_diff_like_column(
+            500,
+            1000,
+            DiffColumnConfig {
+                positive_digits: 3,
+                negative_digits: 3,
+                total_width: total,
+                display: DiffDisplayConfig {
+                    variant: DiffVariant::Signs,
+                    positive_style: ADDITION,
+                    negative_style: DELETION,
+                },
+            },
+        );
+        assert_eq!(overflow_result2.width(), total);
+        insta::assert_snapshot!(overflow_result2.render(), @"[32m+500[0m  [1m[31m-1K[0m");
+
+        // Case 4: Extreme overflow (>= 10K values show ∞ to avoid false precision)
+        let extreme_overflow = format_diff_like_column(
+            100_000,
+            200_000,
+            DiffColumnConfig {
+                positive_digits: 3,
+                negative_digits: 3,
+                total_width: total,
+                display: DiffDisplayConfig {
+                    variant: DiffVariant::Signs,
+                    positive_style: ADDITION,
+                    negative_style: DELETION,
+                },
+            },
+        );
+        assert_eq!(
+            extreme_overflow.width(),
+            total,
+            "100K overflow should fit in allocated width"
+        );
+        insta::assert_snapshot!(extreme_overflow.render(), @"  [1m[32m+∞[0m   [1m[31m-∞[0m");
+
+        // Test overflow with Arrows variant (↑ and ↓)
+        let arrow_total = 7;
+
+        // Case 5: Arrow positive overflow (100 exceeds 2 digits, max is 99)
+        // Should show with K suffix (not repeated symbols)
+        let arrow_overflow = format_diff_like_column(
+            1000, // Use larger value to show K suffix
+            50,
+            DiffColumnConfig {
+                positive_digits: 2,
+                negative_digits: 2,
+                total_width: arrow_total,
+                display: DiffDisplayConfig {
+                    variant: DiffVariant::Arrows,
+                    positive_style: ADDITION,
+                    negative_style: DELETION,
+                },
+            },
+        );
+        assert_eq!(arrow_overflow.width(), arrow_total);
+        insta::assert_snapshot!(arrow_overflow.render(), @"[1m[32m↑1K[0m [31m↓50[0m");
+
+        // Case 6: Arrow negative overflow
+        // Should show with K suffix
+        let arrow_overflow2 = format_diff_like_column(
+            50,
+            1000, // Use larger value to show K suffix
+            DiffColumnConfig {
+                positive_digits: 2,
+                negative_digits: 2,
+                total_width: arrow_total,
+                display: DiffDisplayConfig {
+                    variant: DiffVariant::Arrows,
+                    positive_style: ADDITION,
+                    negative_style: DELETION,
+                },
+            },
+        );
+        assert_eq!(arrow_overflow2.width(), arrow_total);
+        insta::assert_snapshot!(arrow_overflow2.render(), @"[32m↑50[0m [1m[31m↓1K[0m");
+
+        // Case 7: dimmed base steps up one level to normal, not two to dim+bold.
+        // The `main↕` / upstream behind subcolumn is `DELETION.dimmed()`, so a
+        // compact `↓1C` drops the dim (→ plain red) instead of leaping to bold.
+        let arrow_behind_dim = format_diff_like_column(
+            0,
+            100, // 100 behind → compact "1C"
+            DiffColumnConfig {
+                positive_digits: 2,
+                negative_digits: 2,
+                total_width: arrow_total,
+                display: DiffDisplayConfig {
+                    variant: DiffVariant::Arrows,
+                    positive_style: ADDITION,
+                    negative_style: DELETION.dimmed(),
+                },
+            },
+        );
+        assert_eq!(arrow_behind_dim.width(), arrow_total);
+        insta::assert_snapshot!(arrow_behind_dim.render(), @"    [31m↓1C[0m");
+    }
+
+    /// A row's link markup is a property of the render, not of the cell that
+    /// happens to emit it: the CI reference and the dev-server port either both
+    /// carry an underlined OSC 8 link or neither does. The picker renders
+    /// `Unlinked` (`layout::LinkStyle::Unlinked` has the reason), and an
+    /// underline there would mark text with nothing behind it.
+    #[test]
+    fn test_link_markup_is_uniform_across_a_row() {
+        use super::super::ci_status::{CiSource, CiStatus, PrRef, PrStatus};
+        use super::super::layout::{ColumnLayout, LayoutConfig};
+        use super::super::model::ListItem;
+
+        let columns = || {
+            [(ColumnKind::CiStatus, "CI", 5), (ColumnKind::Url, "URL", 6)]
+                .into_iter()
+                .enumerate()
+                .map(|(i, (kind, header, width))| ColumnLayout {
+                    kind,
+                    header: std::borrow::Cow::Borrowed(header),
+                    start: i * 8,
+                    width,
+                    format: ColumnFormat::Text,
+                })
+                .collect()
+        };
+        let layout = |link_style| LayoutConfig {
+            columns: columns(),
+            main_worktree_path: PathBuf::from("/tmp"),
+            max_message_len: 0,
+            max_summary_len: 10,
+            hidden_columns: Vec::new(),
+            status_position_mask: PositionMask::FULL,
+            link_style,
+        };
+
+        let mut item = ListItem::new_branch("abc123".into(), "feat".into());
+        item.url = Some("http://127.0.0.1:17913".into());
+        item.url_active = Some(true);
+        item.pr_status = Some(Some(PrStatus {
+            ci_status: CiStatus::Passed,
+            source: CiSource::PullRequest,
+            is_stale: false,
+            is_priming: false,
+            url: Some("https://github.com/owner/repo/pull/123".into()),
+            number: Some(PrRef::pr(123)),
+            review_state: None,
+            title: None,
+            body: None,
+            author: None,
+            comment_count: None,
+            updated_at: None,
+        }));
+
+        let linked = layout(LinkStyle::Linked)
+            .render_list_item_line(&item, PLACEHOLDER)
+            .render();
+        for (url, text) in [
+            ("https://github.com/owner/repo/pull/123", "#123"),
+            ("http://127.0.0.1:17913", ":17913"),
+        ] {
+            assert!(
+                linked.contains(&h0x_wt::styling::hyperlink(url, text)),
+                "{text} should be an underlined link in {linked:?}"
+            );
+        }
+
+        let unlinked = layout(LinkStyle::Unlinked)
+            .render_list_item_line(&item, PLACEHOLDER)
+            .render();
+        assert!(
+            unlinked.contains("#123") && unlinked.contains(":17913"),
+            "both references keep their short text in {unlinked:?}"
+        );
+        assert!(
+            !unlinked.contains("\u{1b}]8;"),
+            "an unlinked row carries no OSC 8 escape: {unlinked:?}"
+        );
+        assert!(
+            !unlinked.contains("\u{1b}[4m"),
+            "and no underline, which would mark text with nothing behind it: {unlinked:?}"
+        );
+    }
+
+    #[test]
+    fn test_loading_uses_middle_dot() {
+        use super::super::layout::{ColumnLayout, LayoutConfig};
+        use super::super::model::ListItem;
+
+        let layout = LayoutConfig {
+            columns: vec![ColumnLayout {
+                kind: ColumnKind::Summary,
+                header: std::borrow::Cow::Borrowed("Summary"),
+                start: 0,
+                width: 10,
+                format: ColumnFormat::Text,
+            }],
+            main_worktree_path: PathBuf::from("/tmp"),
+            max_message_len: 0,
+            max_summary_len: 10,
+            hidden_columns: Vec::new(),
+            status_position_mask: PositionMask::FULL,
+            link_style: LinkStyle::Expanded,
+        };
+
+        let item = ListItem::new_branch("abc123".into(), "feat".into());
+
+        let line = layout.render_list_item_line(&item, PLACEHOLDER).render();
+        assert!(line.contains('·'), "expected `·` in: {line}");
+        assert!(!line.contains('⋯'), "unexpected `⋯` in: {line}");
+    }
+
+    #[test]
+    fn test_summary_column_rendering() {
+        use super::super::layout::ColumnLayout;
+        use super::super::model::ListItem;
+
+        let summary_col = ColumnLayout {
+            kind: ColumnKind::Summary,
+            header: std::borrow::Cow::Borrowed("Summary"),
+            start: 0,
+            width: 40,
+            format: ColumnFormat::Text,
+        };
+
+        // Case 1: summary = None (not loaded yet → placeholder)
+        let mut item = ListItem::new_branch("abc123".into(), "feat".into());
+        item.summary = None;
+        let cell = summary_col.render_cell(&item, &cell_layout(summary_col.clone()), PLACEHOLDER);
+        insta::assert_snapshot!(cell.render(), @"[2m·[0m");
+
+        // Case 2: summary = Some(None) (loaded, no summary → blank)
+        item.summary = Some(None);
+        let cell = summary_col.render_cell(&item, &cell_layout(summary_col.clone()), PLACEHOLDER);
+        assert!(cell.render().is_empty());
+
+        // Case 3: summary = Some(Some(text)) (has summary)
+        item.summary = Some(Some("Add user authentication".into()));
+        let cell = summary_col.render_cell(&item, &cell_layout(summary_col.clone()), PLACEHOLDER);
+        insta::assert_snapshot!(cell.render(), @"Add user authentication");
+    }
+
+    /// The skeleton renders the task-free Age/Message columns from
+    /// `item.commit` the moment the pre-skeleton commit batch is folded in,
+    /// rather than leaving them on the placeholder until the row's first task
+    /// result. Before the batch lands (`commit = None`, the very first paint)
+    /// both columns show the loading placeholder, exactly as the catch-all arm
+    /// did — so the first frame is unchanged.
+    #[test]
+    fn test_skeleton_renders_commit_columns_when_loaded() {
+        use super::super::layout::{ColumnLayout, LayoutConfig};
+        use super::super::model::{CommitDetails, ListItem, PositionMask};
+        use std::path::PathBuf;
+
+        let layout = LayoutConfig {
+            columns: vec![
+                ColumnLayout {
+                    kind: ColumnKind::Time,
+                    header: std::borrow::Cow::Borrowed("Age"),
+                    start: 0,
+                    width: 6,
+                    format: ColumnFormat::Text,
+                },
+                ColumnLayout {
+                    kind: ColumnKind::Message,
+                    header: std::borrow::Cow::Borrowed("Message"),
+                    start: 7,
+                    width: 20,
+                    format: ColumnFormat::Text,
+                },
+            ],
+            main_worktree_path: PathBuf::from("/tmp"),
+            max_message_len: 20,
+            max_summary_len: 10,
+            hidden_columns: Vec::new(),
+            status_position_mask: PositionMask::FULL,
+            link_style: LinkStyle::Expanded,
+        };
+
+        // commit = None (first skeleton paint, before the batch) → placeholders.
+        let mut item = ListItem::new_branch("abc123".into(), "feat".into());
+        item.commit = None;
+        let line = layout.render_skeleton_row(&item, PLACEHOLDER).render();
+        assert!(
+            line.contains('·'),
+            "Age/Message are placeholders before the commit batch: {line}"
+        );
+        assert!(
+            !line.contains("Fix the parser"),
+            "no commit subject before the batch: {line}"
+        );
+
+        // commit = Some (post-skeleton commit paint) → the subject and a
+        // relative age render without waiting for any task result.
+        item.commit = Some(CommitDetails {
+            timestamp: 1_700_000_000,
+            commit_message: "Fix the parser".into(),
+        });
+        let line = layout.render_skeleton_row(&item, PLACEHOLDER).render();
+        assert!(
+            line.contains("Fix the parser"),
+            "commit subject paints in the skeleton once the batch is in: {line}"
+        );
+        assert!(
+            !line.contains('·'),
+            "no loading placeholder once commit data is in: {line}"
+        );
+    }
+
+    #[test]
+    fn test_working_diff_placeholder_when_not_loaded() {
+        use super::super::layout::ColumnLayout;
+        use super::super::model::ListItem;
+        use h0x_wt::styling::{ADDITION, DELETION};
+
+        let col = ColumnLayout {
+            kind: ColumnKind::WorkingDiff,
+            header: std::borrow::Cow::Borrowed("Working"),
+            start: 0,
+            width: 9,
+            format: ColumnFormat::Diff(DiffColumnConfig {
+                positive_digits: 3,
+                negative_digits: 3,
+                total_width: 9,
+                display: DiffDisplayConfig {
+                    variant: super::super::columns::DiffVariant::Signs,
+                    positive_style: ADDITION,
+                    negative_style: DELETION,
+                },
+            }),
+        };
+
+        // Branch item (no worktree data) → blank, not placeholder
+        let branch_item = ListItem::new_branch("abc123".into(), "feat".into());
+        let cell = col.render_cell(&branch_item, &cell_layout(col.clone()), PLACEHOLDER);
+        assert!(cell.render().is_empty(), "branch item should be blank");
+
+        // Worktree item with working_tree_diff: None → placeholder
+        let wt_item = ListItem::new_worktree(
+            h0x_wt::git::WorktreeRef::new(".", Some("feat"), "abc123"),
+            Default::default(),
+        );
+        let cell = col.render_cell(&wt_item, &cell_layout(col.clone()), PLACEHOLDER);
+        insta::assert_snapshot!(cell.render(), @"    [2m·[0m");
+
+        // Stale placeholder
+        let cell = col.render_cell(&wt_item, &cell_layout(col.clone()), "·");
+        insta::assert_snapshot!(cell.render(), @"    [2m·[0m");
+    }
+
+    #[test]
+    fn test_upstream_placeholder_when_not_loaded() {
+        use super::super::layout::ColumnLayout;
+        use super::super::model::{ListItem, UpstreamStatus};
+        use h0x_wt::styling::{ADDITION, DELETION};
+
+        let col = ColumnLayout {
+            kind: ColumnKind::Upstream,
+            header: std::borrow::Cow::Borrowed("Remote⇅"),
+            start: 0,
+            width: 7,
+            format: ColumnFormat::Diff(DiffColumnConfig {
+                positive_digits: 2,
+                negative_digits: 2,
+                total_width: 7,
+                display: DiffDisplayConfig {
+                    variant: super::super::columns::DiffVariant::UpstreamArrows,
+                    positive_style: ADDITION,
+                    negative_style: DELETION.dimmed(),
+                },
+            }),
+        };
+
+        // upstream: None (not loaded) → placeholder
+        let item = ListItem::new_branch("abc123".into(), "feat".into());
+        assert!(item.upstream.is_none());
+        let cell = col.render_cell(&item, &cell_layout(col.clone()), PLACEHOLDER);
+        insta::assert_snapshot!(cell.render(), @"   [2m·[0m");
+
+        // upstream: Some(default) (loaded, no active upstream) → blank
+        let mut item = ListItem::new_branch("abc123".into(), "feat".into());
+        item.upstream = Some(UpstreamStatus::default());
+        let cell = col.render_cell(&item, &cell_layout(col.clone()), PLACEHOLDER);
+        assert!(
+            cell.render().is_empty(),
+            "no active upstream should be blank"
+        );
+    }
+}

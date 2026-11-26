@@ -18,12 +18,14 @@ mod machine;
 pub(crate) mod output;
 mod session;
 mod update;
+mod worktree;
 use bridge::*;
 use file::*;
 use machine::*;
 use output::*;
 use session::*;
 use update::*;
+use worktree::*;
 
 #[derive(Parser)]
 #[command(name = "h0x-core", version, about = "HyperOx core: terminals for coding agents")]
@@ -86,6 +88,12 @@ enum Cmd {
     Session {
         #[command(subcommand)]
         action: SessionCmd,
+    },
+    /// Git worktrees: list, create, remove, merge (used by the app).
+    #[command(hide = true)]
+    Worktree {
+        #[command(subcommand)]
+        action: WorktreeCmd,
     },
     /// Follow fact changes as they happen (one JSON line each when piped).
     Events(SubscribeParams),
@@ -748,6 +756,7 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
         }
         Cmd::Machine { action } => machine(&paths, action, call)?,
         Cmd::Session { action } => session(action, call)?,
+        Cmd::Worktree { action } => worktree(action, call)?,
         Cmd::Bridge { action } => bridge(&paths, action, asked)?,
         Cmd::File { action } => match file(action, asked, call)? {
             Some(out) => out,
@@ -1074,6 +1083,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("session list", "session.list"),
     ("session resume", "session.resume_argv"),
     ("session trash", "session.trash"),
+    ("worktree list", "worktree.list"),
+    ("worktree create", "worktree.create"),
+    ("worktree remove", "worktree.remove"),
+    ("worktree merge", "worktree.merge"),
     ("events", "events.subscribe"),
     ("templates", "templates.list"),
     ("gate stats", "gate.stats"),
@@ -1313,6 +1326,36 @@ mod tests {
             panic!()
         };
         assert_eq!(to(&p), json!({"agent": "opencode", "id": "ses_1"}), "no `on` here");
+    }
+
+    #[test]
+    fn worktree_commands_become_requests_and_stay_hidden() {
+        let Cmd::Worktree { action: WorktreeCmd::Merge(p) } =
+            parsed(&["worktree", "merge", "/w/x", "--no-squash", "--target", "dev"])
+        else {
+            panic!()
+        };
+        assert_eq!(to(&p), json!({"path": "/w/x", "target": "dev", "squash": false}));
+        let Cmd::Worktree { action: WorktreeCmd::Merge(p) } = parsed(&["worktree", "merge", "/w/x", "--on", "m"])
+        else {
+            panic!()
+        };
+        assert_eq!(to(&p), json!({"path": "/w/x", "squash": true, "on": "m"}));
+        let Cmd::Worktree { action: WorktreeCmd::Create(p) } =
+            parsed(&["worktree", "create", "feat/x", "--base", "main"])
+        else {
+            panic!()
+        };
+        assert_eq!(to(&p), json!({"branch": "feat/x", "folder": ".", "base": "main"}));
+        let Cmd::Worktree { action: WorktreeCmd::Remove(p) } = parsed(&["worktree", "remove", "/w/x", "--force"])
+        else {
+            panic!()
+        };
+        assert_eq!(to(&p), json!({"path": "/w/x", "force": true}));
+        let Cmd::Worktree { action: WorktreeCmd::List(p) } = parsed(&["worktree", "list"]) else { panic!() };
+        assert_eq!(to(&p), json!({"folder": "."}));
+        assert!(Cli::try_parse_from(["h0x-core", "worktree", "remove"]).is_err(), "a path is required");
+        assert!(!command_names().contains(&"worktree".to_string()), "worktree is hidden");
     }
 
     #[test]

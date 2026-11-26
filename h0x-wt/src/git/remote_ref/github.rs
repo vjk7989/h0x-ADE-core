@@ -1,0 +1,264 @@
+//! GitHub PR backend using the `gh` CLI.
+
+use std::path::Path;
+
+use anyhow::{Context, bail};
+use serde::Deserialize;
+
+use super::{
+    CliApiRequest, PlatformData, RemoteRefInfo, cli_api_error, cli_config_value,
+    extract_host_from_html_url, run_cli_api,
+};
+use crate::git::{ForgeKind, Repository};
+use crate::shell_exec::Cmd;
+
+/// Raw JSON response from `gh api repos/{owner}/{repo}/pulls/{number}`.
+#[derive(Debug, Deserialize)]
+struct GhApiPrResponse {
+    title: String,
+    user: GhUser,
+    state: String,
+    #[serde(default)]
+    draft: bool,
+    head: GhPrRef,
+    base: GhPrRef,
+    html_url: String,
+}
+
+/// The status GitHub reports in an API error body.
+///
+/// Not what separates an error from a PR — `gh` exits non-zero for that. This
+/// selects the one failure worth a message of our own (a 404); every other
+/// status forwards, so the struct needs no other field. `status` carries no
+/// `#[serde(default)]` because an error body that omits it isn't the shape this
+/// type describes, and a failed parse and an unmatched status both land on the
+/// same forwarding path.
+#[derive(Debug, Deserialize)]
+struct GhApiErrorResponse {
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhUser {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhPrRef {
+    #[serde(rename = "ref")]
+    ref_name: String,
+    repo: Option<GhPrRepo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhPrRepo {
+    name: String,
+    owner: GhOwner,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhOwner {
+    login: String,
+}
+
+/// Query the default repo configured via `gh repo set-default`.
+///
+/// Returns `Some((owner, repo))` if a default is configured and parseable.
+/// Returns `None` if `gh` is not installed, not configured, or no default is set.
+fn gh_default_repo(repo_root: &Path) -> Option<(String, String)> {
+    let output = Cmd::new("gh")
+        .args(["repo", "set-default", "--view"])
+        .current_dir(repo_root)
+        .env("GH_PROMPT_DISABLED", "1")
+        .run()
+        .ok()
+        .filter(|o| o.status.success())?;
+
+    let slug = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let (owner, repo) = slug.split_once('/')?;
+    Some((owner.to_string(), repo.to_string()))
+}
+
+/// Fetch PR information from GitHub using the `gh` CLI.
+pub(super) fn fetch_pr_info(pr_number: u32, repo: &Repository) -> anyhow::Result<RemoteRefInfo> {
+    let repo_root = repo.repo_path()?;
+
+    // Determine which owner/repo to query. Prefer gh's default repo
+    // (set via `gh repo set-default`) so fork workflows can target the
+    // parent repo without reconfiguring git remotes.
+    let (owner, repo_name, source) = if let Some((owner, name)) = gh_default_repo(repo_root) {
+        (owner, name, "gh default".to_string())
+    } else {
+        // Extract owner/repo from the GitHub remote — which may be a
+        // non-primary remote in a mixed-remote repo (e.g. origin=GitLab,
+        // upstream=GitHub). Uses the raw URL (not effective) because insteadOf
+        // may rewrite to a non-parseable path; SSH aliases only affect the
+        // host, not the path, so owner/repo is always real.
+        let parsed = repo
+            .forge_remote_parsed_url(|u| u.is_github())
+            .ok_or_else(|| anyhow::anyhow!("No GitHub remote configured"))?;
+        (
+            parsed.owner().to_string(),
+            parsed.repo().to_string(),
+            "github remote".to_string(),
+        )
+    };
+
+    let api_path = format!("repos/{}/{}/pulls/{}", owner, repo_name, pr_number);
+
+    // Only pass --hostname when explicitly configured (for GHE / self-hosted).
+    let hostname = repo.forge_hostname();
+
+    let mut args = vec!["api", api_path.as_str()];
+    if let Some(h) = &hostname {
+        args.extend(["--hostname", h.as_str()]);
+    }
+    let output = run_cli_api(CliApiRequest {
+        tool: "gh",
+        args: &args,
+        repo_root,
+        prompt_env: ("GH_PROMPT_DISABLED", "1"),
+        install_hint: "GitHub CLI (gh) not installed; install from https://cli.github.com/",
+        run_context: "Failed to run gh api",
+    })?;
+
+    if !output.status.success() {
+        // A 404 is the one GitHub failure we can describe better than `gh` can:
+        // it answers about the owner/repo *we* picked, and which repo that is —
+        // and where the pick came from — is ours to report, not gh's. Auth,
+        // permissions, and rate limits are forwarded instead, since gh's line
+        // ("gh: Bad credentials (HTTP 401)") carries the status and GitHub's own
+        // message. See the module docs.
+        if serde_json::from_slice::<GhApiErrorResponse>(&output.stdout)
+            .is_ok_and(|error| error.status == "404")
+        {
+            let hint = if source == "gh default" {
+                "Check that `gh repo set-default` points to the correct repository."
+            } else {
+                "If the PR is on a different repository, \
+                 run `gh repo set-default` to set the default \
+                 or configure a different primary remote."
+            };
+            return Err(cli_api_error(
+                ForgeKind::GitHub.ref_type(),
+                format!("PR #{pr_number} not found on {owner}/{repo_name} ({source}). {hint}"),
+                &output,
+            ));
+        }
+
+        return Err(cli_api_error(
+            ForgeKind::GitHub.ref_type(),
+            format!("gh api failed for PR #{}", pr_number),
+            &output,
+        ));
+    }
+
+    let response: GhApiPrResponse = serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "Failed to parse GitHub API response for PR #{}. \
+             This may indicate a GitHub API change.",
+            pr_number
+        )
+    })?;
+
+    if response.head.ref_name.is_empty() {
+        bail!(
+            "PR #{} has empty branch name; the PR may be in an invalid state",
+            pr_number
+        );
+    }
+
+    let base_repo = response.base.repo.context(
+        "PR base repository is null; this is unexpected and may indicate a GitHub API issue",
+    )?;
+
+    let head_repo = response.head.repo.ok_or_else(|| {
+        anyhow::anyhow!(
+            "PR #{} source repository was deleted. \
+             The fork that this PR was opened from no longer exists, \
+             so the branch cannot be checked out.",
+            pr_number
+        )
+    })?;
+
+    let is_cross_repo = !base_repo
+        .owner
+        .login
+        .eq_ignore_ascii_case(&head_repo.owner.login)
+        || !base_repo.name.eq_ignore_ascii_case(&head_repo.name);
+
+    let host = extract_host_from_html_url(&response.html_url)?;
+
+    let fork_push_url =
+        is_cross_repo.then(|| fork_remote_url(&host, &head_repo.owner.login, &head_repo.name));
+
+    Ok(RemoteRefInfo {
+        number: pr_number,
+        title: response.title,
+        author: response.user.login,
+        state: response.state,
+        draft: response.draft,
+        source_branch: response.head.ref_name,
+        is_cross_repo,
+        url: response.html_url,
+        fork_push_url,
+        platform_data: PlatformData::GitHub {
+            host,
+            head_owner: head_repo.owner.login,
+            head_repo: head_repo.name,
+            base_owner: base_repo.owner.login,
+            base_repo: base_repo.name,
+        },
+    })
+}
+
+/// Get the git protocol preference from `gh` (GitHub CLI).
+fn use_ssh_protocol(host: &str) -> bool {
+    cli_config_value("gh", &["git_protocol", "--host", host]).as_deref() == Some("ssh")
+}
+
+/// Whether `gh` has an authentication token configured for `host`.
+///
+/// `gh auth token --hostname <host>` reads from `~/.config/gh/hosts.yml`, the
+/// OS keyring, and `GH_TOKEN` — no network. Returns `false` if `gh` is not
+/// installed.
+pub fn is_authed_for(host: &str) -> bool {
+    Cmd::new("gh")
+        .args(["auth", "token", "--hostname", host])
+        .env("GH_PROMPT_DISABLED", "1")
+        .run()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Construct the remote URL for a fork repository.
+pub fn fork_remote_url(host: &str, owner: &str, repo: &str) -> String {
+    if use_ssh_protocol(host) {
+        format!("git@{}:{}/{}.git", host, owner, repo)
+    } else {
+        format!("https://{}/{}/{}.git", host, owner, repo)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_fork_remote_url_formats() {
+        // Protocol depends on `gh config get git_protocol`, so just check format
+        let url = fork_remote_url("github.com", "contributor", "repo");
+        let valid_urls = [
+            "git@github.com:contributor/repo.git",
+            "https://github.com/contributor/repo.git",
+        ];
+        assert!(valid_urls.contains(&url.as_str()), "unexpected URL: {url}");
+
+        let url = fork_remote_url("github.example.com", "org", "project");
+        let valid_urls = [
+            "git@github.example.com:org/project.git",
+            "https://github.example.com/org/project.git",
+        ];
+        assert!(valid_urls.contains(&url.as_str()), "unexpected URL: {url}");
+    }
+}

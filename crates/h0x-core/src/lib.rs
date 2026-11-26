@@ -44,3 +44,4 @@ pub mod terminals;
 pub mod viewers;
 pub mod wait;
 pub mod wire;
+pub mod worktree;

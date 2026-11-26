@@ -1,0 +1,605 @@
+//! GitLab CI status detection.
+//!
+//! Detects CI status from GitLab MRs and pipelines using the `glab` CLI.
+//!
+//! # Two-Step MR Resolution
+//!
+//! Getting complete MR details (including pipeline status) requires two `glab` calls:
+//!
+//! 1. `glab mr list --source-branch <branch>` - Returns basic MR info including `iid`
+//!    but NOT `head_pipeline` or `pipeline` fields.
+//!
+//! 2. `glab mr view <iid> --output json` - Returns complete MR details including
+//!    `head_pipeline` and `pipeline` fields.
+//!
+//! See: <https://github.com/vjk7989/h0x-ADE-core/issues/764>
+
+use dashmap::DashMap;
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+use h0x_wt::git::Repository;
+
+use super::{
+    CiBranchName, CiSource, CiStatus, MAX_PRS_TO_FETCH, PrRef, PrStatus, ReviewState,
+    non_interactive_cmd, parse_json,
+};
+
+/// Project IDs already resolved in this process, keyed by the worktree root
+/// `glab` was run from.
+///
+/// Keyed by path rather than held in a bare static, matching the path-keyed
+/// process-wide caches in `git::repository`: two `Repository` instances
+/// pointed at the same path see the same answer, and a second repository
+/// resolved in the same process can't inherit the first's. A failed lookup
+/// caches as `None` too — retrying it per row is the cost this exists to
+/// remove — so a transient failure degrades MR detection for the rest of the
+/// process.
+static GITLAB_PROJECT_IDS: LazyLock<DashMap<PathBuf, Option<u64>>> = LazyLock::new(DashMap::new);
+
+/// Get the GitLab project ID for a repository.
+///
+/// Used for client-side filtering of MRs by source project. The GitHub
+/// equivalent is [`branch_owner_repo`](super::branch_owner_repo), which reads
+/// local git config; this one has to ask the GitLab API, so it is memoized for
+/// the process. [`detect_gitlab`] runs once per branch and the project ID is a
+/// repo-level constant, so without that a `wt list --full` over N worktrees
+/// would spend N round trips resolving the same value — and `wt list` cannot
+/// finish until every row's task returns.
+///
+/// The `entry` API holds the shard lock across the fetch, so concurrent rows
+/// sharing the key wait on the first call rather than each spawning their own.
+///
+/// Returns None if glab is not configured for this repo (e.g., non-GitLab
+/// remote, auth issues).
+fn gitlab_project_id(repo: &Repository) -> Option<u64> {
+    let repo_root = repo.current_worktree().root().ok()?;
+    *GITLAB_PROJECT_IDS
+        .entry(repo_root.clone())
+        .or_insert_with(|| fetch_gitlab_project_id(&repo_root))
+}
+
+/// Ask `glab` for this repository's project ID.
+fn fetch_gitlab_project_id(repo_root: &Path) -> Option<u64> {
+    // Use glab repo view to get the project info as JSON
+    // Disable color/pager to avoid ANSI noise in JSON output
+    let output = non_interactive_cmd("glab")
+        .args(["repo", "view", "--output", "json"])
+        .current_dir(repo_root)
+        .env("PAGER", "cat")
+        .run()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    // Parse the JSON to extract the project ID
+    #[derive(Deserialize)]
+    struct RepoInfo {
+        id: u64,
+    }
+
+    serde_json::from_slice::<RepoInfo>(&output.stdout)
+        .ok()
+        .map(|info| info.id)
+}
+
+/// Detect GitLab MR CI status for a branch.
+///
+/// # Filtering Strategy
+///
+/// Similar to GitHub (see `detect_github`), we need to find MRs where the
+/// source branch comes from *our* project, not just MRs we authored.
+///
+/// Since `glab mr list` doesn't support filtering by source project, we:
+/// 1. Get the current project ID via `glab repo view`
+/// 2. Fetch all open MRs with matching branch name (up to 20)
+/// 3. Filter client-side by comparing `source_project_id` to our project ID
+pub(super) fn detect_gitlab(
+    repo: &Repository,
+    branch: &CiBranchName,
+    local_head: &str,
+) -> Option<PrStatus> {
+    let repo_root = repo.current_worktree().root().ok()?;
+
+    // Get current project ID for filtering
+    let project_id = gitlab_project_id(repo);
+    if project_id.is_none() {
+        tracing::debug!("Could not determine GitLab project ID");
+    }
+
+    // Fetch MRs with matching source branch.
+    // IMPORTANT: Use the bare branch name (branch.name), not the full remote ref.
+    // `glab mr list --source-branch origin/feature` won't find anything - it needs just "feature".
+    // Note: glab mr list returns open MRs by default, no --state flag needed.
+    // We filter client-side by source_project_id (numeric project ID comparison).
+    let output = match non_interactive_cmd("glab")
+        .args([
+            "mr",
+            "list",
+            "--source-branch",
+            &branch.name, // Use bare branch name, not "origin/feature"
+            &format!("--per-page={}", MAX_PRS_TO_FETCH),
+            "--output",
+            "json",
+        ])
+        .current_dir(&repo_root)
+        .run()
+    {
+        Ok(output) => output,
+        Err(e) => {
+            tracing::warn!(
+                branch = %branch.full_name,
+                error = %e,
+                "glab mr list failed to execute for branch {}: {}",
+                branch.full_name,
+                e
+            );
+            return None;
+        }
+    };
+
+    if !output.status.success() {
+        return Some(PrStatus::error());
+    }
+
+    // Step 1: Parse mr list output to find matching MR.
+    // Note: glab mr list does NOT return head_pipeline/pipeline fields.
+    let mr_list: Vec<GitLabMrListEntry> =
+        parse_json(&output.stdout, "glab mr list", &branch.full_name)?;
+
+    // Filter to MRs from our project (numeric project ID comparison)
+    let mr_entry = if let Some(proj_id) = project_id {
+        let matched = mr_list
+            .iter()
+            .find(|mr| mr.source_project_id == Some(proj_id));
+        if matched.is_none() && !mr_list.is_empty() {
+            tracing::debug!(
+                count = %mr_list.len(),
+                branch = %branch.full_name,
+                project_id = %proj_id,
+                "Found {} MRs for branch {} but none from project ID {}",
+                mr_list.len(),
+                branch.full_name,
+                proj_id
+            );
+        }
+        matched
+    } else if mr_list.len() == 1 {
+        // If we can't determine project ID but there's only one MR, it's unambiguous
+        mr_list.first()
+    } else if mr_list.is_empty() {
+        // No MRs found
+        None
+    } else {
+        // Multiple MRs exist but we can't determine which project we're in.
+        // Don't guess - return None to avoid showing wrong project's CI status.
+        tracing::debug!(
+            count = %mr_list.len(),
+            branch = %branch.full_name,
+            "Found {} MRs for branch {} but no project ID to filter - skipping to avoid ambiguity",
+            mr_list.len(),
+            branch.full_name
+        );
+        None
+    }?;
+
+    // Step 2: Fetch full MR details to get pipeline status.
+    // This requires a second glab call because mr list doesn't include head_pipeline.
+    let mr_info = fetch_mr_details(mr_entry.iid, &repo_root);
+
+    // Determine CI status using priority: conflicts > running > pipeline status > no_ci
+    // Use mr_entry for basic info (available from list), mr_info for pipeline status
+    //
+    // Note: "ci_must_pass" is a policy constraint ("CI must pass to merge"), NOT a failure
+    // indicator. We let it fall through to the actual pipeline status.
+    let ci_status = if mr_entry.has_conflicts
+        || mr_entry.detailed_merge_status.as_deref() == Some("conflict")
+    {
+        CiStatus::Conflicts
+    } else if mr_entry.detailed_merge_status.as_deref() == Some("ci_still_running") {
+        CiStatus::Running
+    } else if let Some(ref info) = mr_info {
+        info.ci_status()
+    } else {
+        // Found MR but couldn't fetch details - treat as error so it surfaces
+        // (not NoCI, which would imply no MR exists). Carry the MR identity
+        // already in hand: the ⚠ stays clickable and the iid still feeds the
+        // CI column width ratchet.
+        tracing::debug!(iid = %mr_entry.iid, "Could not fetch MR details for !{}", mr_entry.iid);
+        return Some(PrStatus {
+            ci_status: CiStatus::Error,
+            source: CiSource::PullRequest,
+            is_stale: mr_entry.sha != local_head,
+            is_priming: false,
+            url: mr_entry.web_url.clone(),
+            number: Some(PrRef::mr(mr_entry.iid)),
+            review_state: mr_entry.review_state(),
+            title: mr_entry.title.clone(),
+            body: mr_entry.description.clone(),
+            author: mr_entry.author.as_ref().map(|a| a.username.clone()),
+            comment_count: mr_entry.comment_count(),
+            updated_at: None,
+        });
+    };
+
+    let is_stale = mr_entry.sha != local_head;
+
+    Some(PrStatus {
+        ci_status,
+        source: CiSource::PullRequest,
+        is_stale,
+        is_priming: false,
+        url: mr_entry.web_url.clone(),
+        number: Some(PrRef::mr(mr_entry.iid)),
+        review_state: mr_entry.review_state(),
+        title: mr_entry.title.clone(),
+        body: mr_entry.description.clone(),
+        author: mr_entry.author.as_ref().map(|a| a.username.clone()),
+        comment_count: mr_entry.comment_count(),
+        updated_at: None,
+    })
+}
+
+/// Detect GitLab pipeline status for a branch (when no MR exists).
+pub(super) fn detect_gitlab_pipeline(
+    repo: &Repository,
+    branch: &str,
+    local_head: &str,
+) -> Option<PrStatus> {
+    let repo_root = repo.current_worktree().root().ok()?;
+
+    // Get most recent pipeline for the branch using JSON output.
+    // Set cwd to the repo root so `glab` resolves the correct project from
+    // `.git/config` — matches `detect_gitlab` and `fetch_mr_details`.
+    let output = match non_interactive_cmd("glab")
+        .args([
+            "ci",
+            "list",
+            "--ref",
+            branch,
+            "--per-page",
+            "1",
+            "--output",
+            "json",
+        ])
+        .current_dir(&repo_root)
+        .run()
+    {
+        Ok(output) => output,
+        Err(e) => {
+            tracing::warn!(
+                branch = %branch,
+                error = %e,
+                "glab ci list failed to execute for branch {}: {}",
+                branch,
+                e
+            );
+            return None;
+        }
+    };
+
+    if !output.status.success() {
+        return Some(PrStatus::error());
+    }
+
+    let pipelines: Vec<GitLabPipeline> = parse_json(&output.stdout, "glab ci list", branch)?;
+    let pipeline = pipelines.first()?;
+
+    // Check if the pipeline matches our local HEAD commit
+    let is_stale = pipeline
+        .sha
+        .as_ref()
+        .map(|pipeline_sha| pipeline_sha != local_head)
+        .unwrap_or(true); // If no SHA, consider it stale
+
+    let ci_status = pipeline.ci_status();
+
+    Some(PrStatus {
+        ci_status,
+        source: CiSource::Branch,
+        is_stale,
+        is_priming: false,
+        url: pipeline.web_url.clone(),
+        number: None,
+        review_state: None,
+        title: None,
+        body: None,
+        author: None,
+        comment_count: None,
+        updated_at: None,
+    })
+}
+
+/// The `author` object nested in a `glab mr list` entry.
+#[derive(Debug, Default, Deserialize)]
+struct GitLabMrAuthor {
+    #[serde(default)]
+    username: String,
+}
+
+/// Basic MR info from `glab mr list --output json`.
+///
+/// Note: `glab mr list` does NOT return `head_pipeline` or `pipeline` fields.
+/// Use [`fetch_mr_details`] with the `iid` to get complete MR info.
+///
+/// We include `source_project_id` for client-side filtering by source project.
+/// See the `# Filtering Strategy` docs on [`detect_gitlab`] for why we filter by source, not by author.
+#[derive(Debug, Deserialize)]
+struct GitLabMrListEntry {
+    /// The internal MR ID (used to fetch full details via `glab mr view <iid>`)
+    pub iid: u64,
+    pub sha: String,
+    pub has_conflicts: bool,
+    pub detailed_merge_status: Option<String>,
+    /// The source project ID (the project the MR's branch comes from).
+    pub source_project_id: Option<u64>,
+    /// URL to the MR page for clickable links
+    pub web_url: Option<String>,
+    /// Draft/WIP flag (absent in older glab versions)
+    pub draft: Option<bool>,
+    /// MR title; shown in the picker's `pr` preview pane. Rides this call.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// MR author; folded into the row's matcher text. Rides this call.
+    #[serde(default)]
+    pub author: Option<GitLabMrAuthor>,
+    /// MR description; rendered as markdown in the `pr` preview pane.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Count of user (non-system) notes on the MR. GitLab's MR-list response
+    /// carries this directly, so the `comments` line in the `pr` pane rides the
+    /// same call with no extra round-trip.
+    #[serde(default)]
+    pub user_notes_count: Option<u32>,
+}
+
+impl GitLabMrListEntry {
+    /// Map draft + `detailed_merge_status` to a [`ReviewState`].
+    ///
+    /// GitLab has no changes-requested equivalent in MR list data; draft and
+    /// "not_approved" (approvals required but missing) are the available
+    /// signals. Draft wins: a draft is intentionally parked, so its approval
+    /// gap shouldn't demand attention.
+    fn review_state(&self) -> Option<ReviewState> {
+        if self.draft == Some(true) {
+            return Some(ReviewState::Draft);
+        }
+        if self.detailed_merge_status.as_deref() == Some("not_approved") {
+            return Some(ReviewState::Pending);
+        }
+        None
+    }
+
+    /// Comment count for [`PrStatus::comment_count`], zero flattened to `None`
+    /// so an MR with no notes shows nothing in the `pr` pane.
+    fn comment_count(&self) -> Option<u32> {
+        self.user_notes_count.filter(|&n| n > 0)
+    }
+}
+
+/// Full MR info from `glab mr view <iid> --output json`.
+///
+/// This includes pipeline status that isn't available from `glab mr list`.
+/// We only need the pipeline fields here since basic MR info comes from
+/// [`GitLabMrListEntry`].
+#[derive(Debug, Deserialize)]
+pub(super) struct GitLabMrInfo {
+    pub head_pipeline: Option<GitLabPipeline>,
+    pub pipeline: Option<GitLabPipeline>,
+}
+
+impl GitLabMrInfo {
+    pub fn ci_status(&self) -> CiStatus {
+        self.head_pipeline
+            .as_ref()
+            .or(self.pipeline.as_ref())
+            .map(GitLabPipeline::ci_status)
+            .unwrap_or(CiStatus::NoCI)
+    }
+}
+
+/// Fetch full MR details using `glab mr view <iid>`.
+///
+/// This is the second step in the two-step MR resolution process.
+/// Returns None if the command fails or returns invalid JSON.
+fn fetch_mr_details(iid: u64, repo_root: &Path) -> Option<GitLabMrInfo> {
+    let output = non_interactive_cmd("glab")
+        .args(["mr", "view", &iid.to_string(), "--output", "json"])
+        .current_dir(repo_root)
+        .run()
+        .ok()?;
+
+    if !output.status.success() {
+        tracing::debug!(iid = %iid, "glab mr view {} failed", iid);
+        return None;
+    }
+
+    parse_json(&output.stdout, "glab mr view", &iid.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct GitLabPipeline {
+    pub status: Option<String>,
+    /// Only present in `glab ci list` output, not in MR view embedded pipeline
+    #[serde(default)]
+    pub sha: Option<String>,
+    /// URL to the pipeline page for clickable links
+    #[serde(default)]
+    pub web_url: Option<String>,
+}
+
+/// Map a GitLab pipeline `status` to a [`CiStatus`].
+///
+/// The arms cover every value GitLab documents for the field
+/// ([pipelines API](https://docs.gitlab.com/api/pipelines/)): `created`,
+/// `waiting_for_resource`, `preparing`, `waiting_for_callback`, `pending`,
+/// `running`, `success`, `failed`, `canceling`, `canceled`, `skipped`,
+/// `manual`, `scheduled`. Every non-terminal status groups as `Running` — a
+/// pipeline still moving, whatever it's waiting on — so a status GitLab adds
+/// later is the only thing that reaches the `_` fallback.
+fn parse_gitlab_status(status: Option<&str>) -> CiStatus {
+    match status {
+        // Non-terminal. "manual" = waiting for a user to trigger a manual job;
+        // "canceling" = cancellation in flight, not yet the terminal "canceled".
+        Some(
+            "running"
+            | "pending"
+            | "preparing"
+            | "waiting_for_resource"
+            | "waiting_for_callback"
+            | "created"
+            | "scheduled"
+            | "manual"
+            | "canceling",
+        ) => CiStatus::Running,
+        Some("failed" | "canceled") => CiStatus::Failed,
+        Some("success") => CiStatus::Passed,
+        // "skipped" and an absent status carry no signal, as does any status
+        // GitLab introduces after the list above.
+        Some("skipped") | None => CiStatus::NoCI,
+        _ => CiStatus::NoCI,
+    }
+}
+
+impl GitLabPipeline {
+    pub fn ci_status(&self) -> CiStatus {
+        parse_gitlab_status(self.status.as_deref())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mr_list_entry_review_state() {
+        let entry = |draft: Option<bool>, status: Option<&str>| GitLabMrListEntry {
+            iid: 1,
+            sha: "abc".into(),
+            has_conflicts: false,
+            author: None,
+            detailed_merge_status: status.map(Into::into),
+            source_project_id: None,
+            web_url: None,
+            draft,
+            title: None,
+            description: None,
+            user_notes_count: None,
+        };
+
+        // Draft wins over the approval gap
+        assert_eq!(
+            entry(Some(true), Some("not_approved")).review_state(),
+            Some(ReviewState::Draft)
+        );
+        assert_eq!(
+            entry(Some(false), Some("not_approved")).review_state(),
+            Some(ReviewState::Pending)
+        );
+        // Other merge statuses carry no review signal
+        assert_eq!(entry(Some(false), Some("mergeable")).review_state(), None);
+        assert_eq!(entry(None, None).review_state(), None);
+    }
+
+    #[test]
+    fn test_mr_list_entry_comment_count() {
+        let entry = |count: Option<u32>| GitLabMrListEntry {
+            iid: 1,
+            sha: "abc".into(),
+            has_conflicts: false,
+            author: None,
+            detailed_merge_status: None,
+            source_project_id: None,
+            web_url: None,
+            draft: None,
+            title: None,
+            description: None,
+            user_notes_count: count,
+        };
+
+        // Zero (or a missing count) flattens to None so an MR with no notes
+        // shows nothing in the `pr` pane; a positive count carries through.
+        assert_eq!(entry(Some(0)).comment_count(), None);
+        assert_eq!(entry(None).comment_count(), None);
+        assert_eq!(entry(Some(3)).comment_count(), Some(3));
+    }
+
+    #[test]
+    fn test_parse_gitlab_status() {
+        // Non-terminal states. "manual" waits for a user to trigger a job;
+        // "canceling" is cancellation in flight (the terminal form is
+        // "canceled"); "waiting_for_callback" waits on an external system.
+        for status in [
+            "running",
+            "pending",
+            "preparing",
+            "waiting_for_resource",
+            "waiting_for_callback",
+            "created",
+            "scheduled",
+            "manual",
+            "canceling",
+        ] {
+            assert_eq!(
+                parse_gitlab_status(Some(status)),
+                CiStatus::Running,
+                "status={status}"
+            );
+        }
+
+        // Failed states
+        for status in ["failed", "canceled"] {
+            assert_eq!(
+                parse_gitlab_status(Some(status)),
+                CiStatus::Failed,
+                "status={status}"
+            );
+        }
+
+        // Success
+        assert_eq!(parse_gitlab_status(Some("success")), CiStatus::Passed);
+
+        // NoCI states
+        assert_eq!(parse_gitlab_status(Some("skipped")), CiStatus::NoCI);
+        assert_eq!(parse_gitlab_status(None), CiStatus::NoCI);
+        assert_eq!(parse_gitlab_status(Some("unknown")), CiStatus::NoCI);
+    }
+
+    #[test]
+    fn test_gitlab_mr_info_ci_status() {
+        // No pipeline = NoCI
+        let mr = GitLabMrInfo {
+            head_pipeline: None,
+            pipeline: None,
+        };
+        assert_eq!(mr.ci_status(), CiStatus::NoCI);
+
+        // head_pipeline takes precedence
+        let mr = GitLabMrInfo {
+            head_pipeline: Some(GitLabPipeline {
+                status: Some("success".into()),
+                sha: None,
+                web_url: None,
+            }),
+            pipeline: Some(GitLabPipeline {
+                status: Some("failed".into()),
+                sha: None,
+                web_url: None,
+            }),
+        };
+        assert_eq!(mr.ci_status(), CiStatus::Passed);
+
+        // Falls back to pipeline if no head_pipeline
+        let mr = GitLabMrInfo {
+            head_pipeline: None,
+            pipeline: Some(GitLabPipeline {
+                status: Some("running".into()),
+                sha: None,
+                web_url: None,
+            }),
+        };
+        assert_eq!(mr.ci_status(), CiStatus::Running);
+    }
+}

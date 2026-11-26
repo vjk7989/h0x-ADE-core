@@ -859,6 +859,77 @@ pub struct SessionTrashResult {
     pub trashed: Vec<String>,
 }
 
+/// The repository a worktree call is about.
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct WorktreeListParams {
+    /// Any folder of the repository (a worktree or the main checkout): absolute, or from where
+    /// h0x-core runs (through the API, the core's folder; with --on, that machine's home).
+    #[arg(default_value = ".")]
+    pub folder: String,
+    /// On another machine (see `h0x-core machine ls`).
+    #[arg(long, value_name = "MACHINE")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct WorktreeCreateParams {
+    /// The branch to check out in the new worktree: made when it does not exist yet.
+    pub branch: String,
+    /// Any folder of the repository (default: here).
+    #[arg(long, default_value = ".")]
+    #[serde(default = "dot")]
+    pub folder: String,
+    /// Start a new branch from this commit or branch (default: the default branch).
+    #[arg(long)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// On another machine (see `h0x-core machine ls`).
+    #[arg(long, value_name = "MACHINE")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+}
+
+fn dot() -> String {
+    ".".into()
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct WorktreeRemoveParams {
+    /// The worktree's folder.
+    pub path: String,
+    /// Remove it even with uncommitted changes.
+    #[arg(long)]
+    #[serde(default)]
+    pub force: bool,
+    /// On another machine (see `h0x-core machine ls`).
+    #[arg(long, value_name = "MACHINE")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct WorktreeMergeParams {
+    /// The worktree's folder.
+    pub path: String,
+    /// Merge into this branch (default: the default branch).
+    #[arg(long)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Join its commits into one (the default); false rebases it and fast-forwards instead.
+    #[arg(long = "no-squash", action = clap::ArgAction::SetFalse)]
+    #[serde(default = "yes")]
+    pub squash: bool,
+    /// On another machine (see `h0x-core machine ls`).
+    #[arg(long, value_name = "MACHINE")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
 /// An agent session, as its agent stored it.
 #[derive(Serialize, JsonSchema, Debug)]
 pub struct SessionInfo {
