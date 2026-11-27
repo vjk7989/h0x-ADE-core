@@ -164,6 +164,8 @@ fn update_swaps_h0x_wt_keeps_the_old_one_in_previous_and_an_archive_without_it_l
     assert_eq!(std::fs::read_to_string(dir.join("h0x-core-tools/h0x-wt")).unwrap(), "new wt");
     assert_eq!(std::fs::read_to_string(dir.join("previous/h0x-core-tools/h0x-wt")).unwrap(), "old wt");
     drop(r);
+    // The first site's folder (and its stale port file) goes: a second site must announce its own port.
+    std::fs::remove_dir_all(s.root.join("releases")).unwrap();
 
     // A release without the folder: the core is swapped, h0x-wt stays and is kept as it was.
     let r = Releases::new(&s, "9.9.10", &[&here()]);
