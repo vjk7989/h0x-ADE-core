@@ -160,6 +160,11 @@ try {
         Copy-Item -Recurse -Force "$tmp\h0x-core\h0x-core.exe", "$tmp\h0x-core\conpty" $dir
         Write-Host "h0x-core $version installed into $dir."
     }
+    # h0x-wt beside it, when the archive carries it (older archives do not), on an update too:
+    # a core from before h0x-wt does not unpack it.
+    if (Test-Path "$tmp\h0x-core\h0x-core-tools\h0x-wt.exe") {
+        Copy-Item -Recurse -Force "$tmp\h0x-core\h0x-core-tools" $dir
+    }
     Copy-Item -Recurse -Force "$tmp\h0x-core\THIRD-PARTY-NOTICES" $dir -ErrorAction SilentlyContinue
 
     # The raw user PATH, so %VARIABLES% in it stay unexpanded and keep their type.

@@ -195,8 +195,9 @@ pub fn prepend_path(env: &mut BTreeMap<String, String>, bin: &Path) {
     }
 }
 
-/// Create or refresh this core's shim folder: the marker and `claude` and `codex` pointing at the
-/// running program. Unix: a symlink, swapped atomically. Windows: a hardlink `claude.exe` (a copy across
+/// Create or refresh this core's shim folder: the marker, `claude` and `codex` pointing at the
+/// running program, and `h0x-wt` pointing at the one shipped beside it (only when that exists).
+/// Unix: a symlink, swapped atomically. Windows: a hardlink `claude.exe` (a copy across
 /// volumes); a shim that is still running can't be replaced but can be renamed away, and the
 /// renamed ones are removed here at the next start.
 pub fn ensure(paths: &Paths) -> io::Result<()> {
@@ -207,7 +208,29 @@ pub fn ensure(paths: &Paths) -> io::Result<()> {
         std::fs::write(marker, b"")?;
     }
     let exe = crate::client::own_exe().ok_or_else(|| io::Error::other("no path for this program"))?;
-    SHIMS.into_iter().try_for_each(|name| link(&bin, &exe, name))
+    SHIMS.into_iter().try_for_each(|name| link(&bin, &exe, name))?;
+    link_wt(&bin, &exe)
+}
+
+/// `h0x-wt` shipped beside `exe` (`h0x-core-tools/h0x-wt[.exe]`, a regular file) gets its shim; with
+/// none there (an older install, a rollback) an earlier shim is removed, so it never points at nothing.
+fn link_wt(bin: &Path, exe: &Path) -> io::Result<()> {
+    let name = if cfg!(windows) { "h0x-wt.exe" } else { "h0x-wt" };
+    let tool = exe.parent().map(|d| d.join("h0x-core-tools").join(name));
+    match tool {
+        Some(tool) if std::fs::symlink_metadata(&tool).is_ok_and(|m| m.file_type().is_file()) => {
+            link(bin, &tool, "h0x-wt")
+        }
+        _ => {
+            let shim = bin.join(name);
+            if std::fs::symlink_metadata(&shim).is_err() || std::fs::remove_file(&shim).is_ok() {
+                return Ok(());
+            }
+            // Windows: a running shim can't be deleted but can be renamed away (swept by `link`).
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+            std::fs::rename(&shim, bin.join(format!("{name}.old-{}-{nanos}", std::process::id())))
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -224,8 +247,9 @@ fn link(bin: &Path, exe: &Path, name: &str) -> io::Result<()> {
 
 #[cfg(windows)]
 fn link(bin: &Path, exe: &Path, name: &str) -> io::Result<()> {
+    let prefix = format!("{name}.exe.old-");
     for old in std::fs::read_dir(bin)?.flatten() {
-        if old.file_name().to_string_lossy().starts_with(&format!("{name}.exe.old-")) {
+        if old.file_name().to_string_lossy().starts_with(&prefix) {
             let _ = std::fs::remove_file(old.path()); // fails while it still runs: next start
         }
     }
@@ -239,7 +263,7 @@ fn link(bin: &Path, exe: &Path, name: &str) -> io::Result<()> {
             return Ok(());
         }
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
-        let old = bin.join(format!("{name}.exe.old-{}-{nanos}", std::process::id()));
+        let old = bin.join(format!("{prefix}{}-{nanos}", std::process::id()));
         std::fs::rename(&shim, &old)?; // a running exe can be renamed, not deleted
         let _ = std::fs::remove_file(old);
     }
@@ -757,6 +781,51 @@ mod tests {
         let _ = std::fs::remove_dir_all(state);
     }
 
+    /// A fake install in `dir`: the program, and h0x-wt beside it when `with_tool`.
+    fn install_in(dir: &Path, with_tool: bool) -> PathBuf {
+        let exe = dir.join(if cfg!(windows) { "h0x-core.exe" } else { "h0x-core" });
+        std::fs::write(&exe, "core").unwrap();
+        if with_tool {
+            std::fs::create_dir_all(dir.join("h0x-core-tools")).unwrap();
+            std::fs::write(dir.join("h0x-core-tools").join(if cfg!(windows) { "h0x-wt.exe" } else { "h0x-wt" }), "wt")
+                .unwrap();
+        }
+        exe
+    }
+
+    #[test]
+    fn h0x_wt_gets_a_shim_only_when_it_ships_beside_the_core_even_in_a_folder_with_spaces() {
+        let root = scratch("wt");
+        let bin = root.join("shim bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let none = install_in(&root, false);
+        link_wt(&bin, &none).unwrap();
+        assert_eq!(std::fs::read_dir(&bin).unwrap().count(), 0, "an older install has no h0x-wt: no shim");
+
+        let dir = root.join("Program Files").join("H0X Core");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = install_in(&dir, true);
+        link_wt(&bin, &exe).unwrap();
+        let tool = dir.join("h0x-core-tools").join(if cfg!(windows) { "h0x-wt.exe" } else { "h0x-wt" });
+        #[cfg(unix)]
+        assert_eq!(std::fs::read_link(bin.join("h0x-wt")).unwrap(), tool);
+        #[cfg(windows)]
+        assert_eq!(std::fs::read(bin.join("h0x-wt.exe")).unwrap(), std::fs::read(&tool).unwrap());
+        link_wt(&bin, &exe).unwrap(); // a second run changes nothing and does not fail
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_folder_named_h0x_wt_beside_the_core_is_not_the_tool() {
+        let root = scratch("wtdir");
+        let exe = install_in(&root, false);
+        std::fs::create_dir_all(root.join("h0x-core-tools").join(if cfg!(windows) { "h0x-wt.exe" } else { "h0x-wt" }))
+            .unwrap();
+        link_wt(&root, &exe).unwrap();
+        assert!(!root.join(if cfg!(windows) { "h0x-wt.exe" } else { "h0x-wt" }).exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn ensure_keeps_an_existing_marker_and_fails_when_bin_is_a_file() {
         let state = scratch("marker");
@@ -924,6 +993,188 @@ mod tests {
         child.wait().unwrap();
         link(&bin, &build).unwrap();
         assert_eq!(old_ones(&bin), Vec::<String>::new());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    // --- edge cases (WT-S1 test writer) ----------------------------------------------------
+
+    const WT: &str = if cfg!(windows) { "h0x-wt.exe" } else { "h0x-wt" };
+
+    /// Whether `bin` holds an h0x-wt shim (a dangling symlink counts).
+    fn has_wt_shim(bin: &Path) -> bool {
+        std::fs::symlink_metadata(bin.join(WT)).is_ok()
+    }
+
+    /// A rollback (or a reinstall) to a core that ships no h0x-wt: the next start must not leave
+    /// the earlier h0x-wt shim behind, pointing at a tool this core does not have.
+    #[test]
+    fn a_stale_h0x_wt_shim_goes_when_the_core_no_longer_ships_it() {
+        let root = scratch("wt-stale");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = install_in(&root, true);
+        link_wt(&bin, &exe).unwrap();
+        assert!(has_wt_shim(&bin));
+        std::fs::remove_dir_all(root.join("h0x-core-tools")).unwrap();
+        link_wt(&bin, &exe).unwrap();
+        assert!(!has_wt_shim(&bin), "the h0x-wt shim outlived the h0x-wt it points at");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_h0x_core_tools_that_is_a_file_gives_no_shim_and_no_error() {
+        let root = scratch("wt-toolsfile");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = install_in(&root, false);
+        std::fs::write(root.join("h0x-core-tools"), "a file, not the folder").unwrap();
+        link_wt(&bin, &exe).unwrap();
+        assert!(!has_wt_shim(&bin));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_program_with_no_parent_folder_gives_no_h0x_wt_shim() {
+        let root = scratch("wt-noparent");
+        link_wt(&root, Path::new(if cfg!(windows) { r"C:\" } else { "/" })).unwrap();
+        assert!(!has_wt_shim(&root));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The shim is a link to the tool: a symlink in its place (to anything) is not trusted as the tool.
+    #[cfg(unix)]
+    #[test]
+    fn an_h0x_wt_that_is_a_symlink_gets_no_shim() {
+        let root = scratch("wt-symlink");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = install_in(&root, false);
+        std::fs::write(root.join("elsewhere"), "not the tool").unwrap();
+        std::fs::create_dir_all(root.join("h0x-core-tools")).unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere"), root.join("h0x-core-tools/h0x-wt")).unwrap();
+        link_wt(&bin, &exe).unwrap();
+        assert!(!has_wt_shim(&bin), "a symlinked h0x-wt got a shim");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn h0x_wt_gets_a_shim_in_a_unicode_install_folder_and_the_claude_shim_is_untouched() {
+        let root = scratch("wt-unicode");
+        let bin = root.join("shim \u{00fc}");
+        std::fs::create_dir_all(&bin).unwrap();
+        let dir = root.join("Programme \u{65e5}\u{672c} \u{00e9}");
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = install_in(&dir, true);
+        link(&bin, &exe).unwrap();
+        link_wt(&bin, &exe).unwrap();
+        let tool = dir.join("h0x-core-tools").join(WT);
+        #[cfg(unix)]
+        {
+            assert_eq!(std::fs::read_link(bin.join("h0x-wt")).unwrap(), tool);
+            assert_eq!(std::fs::read_link(bin.join("claude")).unwrap(), exe);
+            assert!(!bin.join(".h0x-wt.tmp").exists());
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(std::fs::read(bin.join("h0x-wt.exe")).unwrap(), std::fs::read(&tool).unwrap());
+            assert_eq!(std::fs::read(bin.join("claude.exe")).unwrap(), std::fs::read(&exe).unwrap());
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A plain terminal (not started by a HyperOx core) never gets the shim folder on PATH, so no
+    /// h0x-wt there; a HyperOx terminal gets it first, and another core's shim folder is dropped.
+    #[test]
+    fn only_a_hyperox_terminal_gets_the_shim_folder_holding_h0x_wt() {
+        let root = scratch("wt-plain");
+        let state = root.join("state");
+        let bin = paths(&state).bin_dir();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join(MARKER), "").unwrap();
+        let exe = install_in(&root, true);
+        link_wt(&bin, &exe).unwrap();
+        assert!(bin.starts_with(&state), "the shim folder lives in the core's state, not on a common PATH");
+
+        let foreign = root.join("other-core-bin");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join(MARKER), "").unwrap();
+        std::fs::write(foreign.join(WT), "another core's h0x-wt").unwrap();
+        let plain = path_of(&[Path::new(if cfg!(windows) { r"C:\Windows" } else { "/usr/bin" }), &foreign]);
+        let plain = plain.to_string_lossy().into_owned();
+        assert!(std::env::split_paths(&plain).all(|d| d != bin), "a plain terminal's PATH has no shim folder");
+
+        let mut env = BTreeMap::from([("PATH".to_string(), plain)]);
+        prepend_path(&mut env, &bin);
+        let dirs: Vec<PathBuf> = std::env::split_paths(&env["PATH"]).collect();
+        assert_eq!(dirs[0], bin);
+        assert!(has_wt_shim(&dirs[0]));
+        assert!(!dirs.contains(&foreign), "another core's shim folder (and its h0x-wt) is dropped: {dirs:?}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The `h0x-wt.exe.old-*` names in `bin`, sorted.
+    #[cfg(windows)]
+    fn old_wt_ones(bin: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(bin)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("h0x-wt.exe.old-"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// As claude.exe: a running h0x-wt.exe shim is renamed away, a fresh link takes its name, and the
+    /// renamed one is swept at the next start once it has ended. claude's leftovers are not h0x-wt's.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_a_running_h0x_wt_shim_is_renamed_away_and_swept_and_claudes_are_left() {
+        let root = scratch("wt-running");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let old_build = root.join("old-wt.exe");
+        cmd_copy(&old_build);
+        super::link(&bin, &old_build, "h0x-wt").unwrap();
+        let shim = bin.join("h0x-wt.exe");
+        let mut child = running(&shim);
+
+        std::fs::write(bin.join("claude.exe.old-7-1"), "claude's leftover").unwrap();
+        std::fs::create_dir_all(root.join("core")).unwrap();
+        let exe = install_in(&root.join("core"), true);
+        link_wt(&bin, &exe).unwrap();
+        let renamed = old_wt_ones(&bin);
+        assert!(renamed.len() <= 1, "{renamed:?}");
+        assert!(
+            renamed.iter().all(|n| n.starts_with(&format!("h0x-wt.exe.old-{}-", std::process::id()))),
+            "{renamed:?}"
+        );
+        assert_eq!(std::fs::read(&shim).unwrap(), b"wt");
+        assert!(child.try_wait().unwrap().is_none(), "the running h0x-wt was not disturbed");
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        link_wt(&bin, &exe).unwrap();
+        assert_eq!(old_wt_ones(&bin), Vec::<String>::new(), "swept once it ended");
+        assert!(bin.join("claude.exe.old-7-1").exists(), "h0x-wt's start does not sweep claude's leftovers");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// An h0x-wt.exe shim of the same build (a copy: same size and write time) is left alone.
+    #[cfg(windows)]
+    #[test]
+    fn on_windows_an_h0x_wt_shim_of_the_same_build_is_left_alone() {
+        let root = scratch("wt-same");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = install_in(&root, true);
+        let tool = root.join("h0x-core-tools/h0x-wt.exe");
+        std::fs::copy(&tool, bin.join("h0x-wt.exe")).unwrap();
+        let id = |p: &Path| crate::platform::file_identity(&std::fs::metadata(p).unwrap());
+        let before = id(&bin.join("h0x-wt.exe"));
+        link_wt(&bin, &exe).unwrap();
+        assert_eq!(id(&bin.join("h0x-wt.exe")), before, "not relinked");
+        assert_eq!(old_wt_ones(&bin), Vec::<String>::new());
         let _ = std::fs::remove_dir_all(root);
     }
 }

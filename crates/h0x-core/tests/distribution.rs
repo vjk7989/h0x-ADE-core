@@ -25,6 +25,11 @@ struct Releases {
 
 impl Releases {
     fn new(s: &Session, version: &str, targets: &[&str]) -> Releases {
+        Releases::with_tool(s, version, targets, None)
+    }
+
+    /// As `new`, the archives also holding `h0x-core-tools/h0x-wt` with the content `tool`.
+    fn with_tool(s: &Session, version: &str, targets: &[&str], tool: Option<&str>) -> Releases {
         let root = s.root.join("releases");
         std::fs::create_dir_all(&root).unwrap();
         let ready = root.join("server-port");
@@ -47,19 +52,19 @@ impl Releases {
         let dir = r.root.join("download").join(format!("v{version}"));
         std::fs::create_dir_all(&dir).unwrap();
         let bin_dir = Path::new(BIN).parent().unwrap();
+        let staged = r.root.join("tools-stage");
+        if let Some(content) = tool {
+            std::fs::create_dir_all(staged.join("h0x-core-tools")).unwrap();
+            std::fs::write(staged.join("h0x-core-tools/h0x-wt"), content).unwrap();
+        }
         for t in targets {
             let tar = dir.join(format!("h0x-core-{t}.tar.gz"));
-            assert!(
-                Command::new("tar")
-                    .arg("-czf")
-                    .arg(&tar)
-                    .arg("-C")
-                    .arg(bin_dir)
-                    .arg("h0x-core")
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            let mut cmd = Command::new("tar");
+            cmd.arg("-czf").arg(&tar).arg("-C").arg(bin_dir).arg("h0x-core");
+            if tool.is_some() {
+                cmd.arg("-C").arg(&staged).arg("h0x-core-tools");
+            }
+            assert!(cmd.status().unwrap().success());
         }
         let out = Command::new(format!("{ROOT}/../../scripts/manifest"))
             .arg(&dir)
@@ -119,6 +124,57 @@ fn the_install_script_installs_and_then_updates_without_stopping_anything() {
     assert_ne!(s.json(&["server", "status"])["pid"], pid, "the planned restart");
     s.json(&["send", &t, "still"]);
     wait_until("the terminal kept running", || text(&s, &t).contains("got-still"));
+    drop(r);
+}
+
+#[test]
+fn the_install_script_puts_h0x_wt_beside_a_fresh_core_in_a_folder_with_spaces() {
+    let s = Session::new();
+    let r = Releases::with_tool(&s, THIS, &[&here()], Some("fake wt"));
+    let bin = s.root.join("my bin");
+    let out = s
+        .program("sh")
+        .arg(format!("{ROOT}/../../distribution/install.sh"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("H0X_CORE_RELEASES_URL", &r.url)
+        .env("H0X_CORE_INSTALL_DIR", &bin)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let tool = bin.join("h0x-core-tools/h0x-wt");
+    assert_eq!(std::fs::read_to_string(&tool).unwrap(), "fake wt");
+    let mode = std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&tool).unwrap().permissions());
+    assert_eq!(mode & 0o111, 0o111, "h0x-wt is executable");
+    assert!(bin.join("h0x-core").is_file());
+    drop(r);
+}
+
+#[test]
+fn update_swaps_h0x_wt_keeps_the_old_one_in_previous_and_an_archive_without_it_removes_it() {
+    let mut s = Session::new();
+    let r = Releases::with_tool(&s, NEWER, &[&here()], Some("new wt"));
+    let dir = s.root.join("bin dir");
+    std::fs::create_dir_all(dir.join("h0x-core-tools")).unwrap();
+    std::fs::copy(BIN, dir.join("h0x-core")).unwrap();
+    std::fs::write(dir.join("h0x-core-tools/h0x-wt"), "old wt").unwrap();
+    s.bin = dir.join("h0x-core");
+    s.env.push(("H0X_CORE_RELEASES_URL".into(), r.url.clone()));
+    let up = s.json(&["update"]);
+    assert_eq!(up["release"].as_str(), Some(NEWER), "{up}");
+    assert_eq!(std::fs::read_to_string(dir.join("h0x-core-tools/h0x-wt")).unwrap(), "new wt");
+    assert_eq!(std::fs::read_to_string(dir.join("previous/h0x-core-tools/h0x-wt")).unwrap(), "old wt");
+    drop(r);
+    // The first site's folder (and its stale port file) goes: a second site must announce its own port.
+    std::fs::remove_dir_all(s.root.join("releases")).unwrap();
+
+    // A release without the folder: the core is swapped, the installed h0x-wt is removed and kept in previous.
+    let r = Releases::new(&s, "9.9.10", &[&here()]);
+    s.env.retain(|(k, _)| k != "H0X_CORE_RELEASES_URL");
+    s.env.push(("H0X_CORE_RELEASES_URL".into(), r.url.clone()));
+    let up = s.json(&["update"]);
+    assert_eq!(up["release"].as_str(), Some("9.9.10"), "{up}");
+    assert!(!dir.join("h0x-core-tools/h0x-wt").exists(), "a release without h0x-wt leaves none installed");
+    assert_eq!(std::fs::read_to_string(dir.join("previous/h0x-core-tools/h0x-wt")).unwrap(), "new wt");
     drop(r);
 }
 
@@ -924,4 +980,33 @@ fn a_prerelease_installed_core_is_older_and_the_downloaded_core_verifies() {
         let log = std::fs::read_to_string(&asked).unwrap_or_default();
         assert_eq!(log.trim(), "downloaded", "{version}: {log:?} {}", String::from_utf8_lossy(&out.stderr));
     }
+}
+
+/// An install that already has a core from before h0x-wt shipped: that core's `update` knows
+/// nothing of `h0x-core-tools`, so the install script must still put h0x-wt beside it.
+#[test]
+fn the_install_script_brings_h0x_wt_to_an_install_whose_core_predates_it() {
+    let s = Session::new();
+    let r = Releases::with_tool(&s, THIS, &[&here()], Some("fake wt"));
+    let bin = s.root.join("old bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    // A core from before: its update succeeds and swaps only itself (here: nothing at all).
+    std::fs::write(bin.join("h0x-core"), "#!/bin/sh\nexit 0\n").unwrap();
+    Command::new("chmod").arg("755").arg(bin.join("h0x-core")).status().unwrap();
+    let out = s
+        .program("sh")
+        .arg(format!("{ROOT}/../../distribution/install.sh"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("H0X_CORE_RELEASES_URL", &r.url)
+        .env("H0X_CORE_INSTALL_DIR", &bin)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("updated"));
+    assert_eq!(
+        std::fs::read_to_string(bin.join("h0x-core-tools/h0x-wt")).ok().as_deref(),
+        Some("fake wt"),
+        "updating a pre-h0x-wt core leaves the install without h0x-wt"
+    );
+    drop(r);
 }

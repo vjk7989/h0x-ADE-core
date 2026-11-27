@@ -265,7 +265,7 @@ pub fn spawn_detached(mut cmd: Command, log: std::fs::File) -> io::Result<()> {
 }
 
 /// Puts the h0x-core at `from` where `dest` is: a copy beside it that `works`,
-/// then renamed over it (InvalidData: the copy doesn't run).
+/// then renamed over it (InvalidData: the copy doesn't run). `h0x-core-tools/h0x-wt` beside `from` goes along (none beside it: the installed one is removed).
 pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::Result<()> {
     let tmp = dest.with_file_name(format!(".h0x-core.new.{}", std::process::id()));
     let staged = std::fs::copy(from, &tmp).and_then(|_| make_executable(&tmp));
@@ -274,7 +274,27 @@ pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::R
         staged?;
         return Err(io::ErrorKind::InvalidData.into());
     }
-    std::fs::rename(&tmp, dest)
+    // h0x-wt goes the way the release has it: a regular file replaces the installed one, none removes it.
+    let tool = |base: &Path| base.parent().map(|d| d.join("h0x-core-tools").join("h0x-wt"));
+    let new = tool(from).filter(|t| std::fs::symlink_metadata(t).is_ok_and(|m| m.file_type().is_file()));
+    let to = tool(dest);
+    if let (Some(new), Some(to)) = (&new, &to) {
+        let staged = to.with_file_name(format!(".h0x-wt.new.{}", std::process::id()));
+        let moved = std::fs::create_dir_all(to.parent().unwrap_or(to))
+            .and_then(|_| std::fs::copy(new, &staged))
+            .and_then(|_| make_executable(&staged))
+            .and_then(|_| std::fs::rename(&staged, to));
+        if let Err(e) = moved {
+            let _ = std::fs::remove_file(&staged);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    }
+    std::fs::rename(&tmp, dest)?;
+    if let (None, Some(to)) = (&new, &to) {
+        let _ = std::fs::remove_file(to); // none there: nothing to remove
+    }
+    Ok(())
 }
 
 pub fn parent_pid() -> u32 {
