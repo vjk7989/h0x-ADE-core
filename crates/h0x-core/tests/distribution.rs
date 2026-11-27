@@ -150,7 +150,7 @@ fn the_install_script_puts_h0x_wt_beside_a_fresh_core_in_a_folder_with_spaces() 
 }
 
 #[test]
-fn update_swaps_h0x_wt_keeps_the_old_one_in_previous_and_an_archive_without_it_leaves_it() {
+fn update_swaps_h0x_wt_keeps_the_old_one_in_previous_and_an_archive_without_it_removes_it() {
     let mut s = Session::new();
     let r = Releases::with_tool(&s, NEWER, &[&here()], Some("new wt"));
     let dir = s.root.join("bin dir");
@@ -167,13 +167,13 @@ fn update_swaps_h0x_wt_keeps_the_old_one_in_previous_and_an_archive_without_it_l
     // The first site's folder (and its stale port file) goes: a second site must announce its own port.
     std::fs::remove_dir_all(s.root.join("releases")).unwrap();
 
-    // A release without the folder: the core is swapped, h0x-wt stays and is kept as it was.
+    // A release without the folder: the core is swapped, the installed h0x-wt is removed and kept in previous.
     let r = Releases::new(&s, "9.9.10", &[&here()]);
     s.env.retain(|(k, _)| k != "H0X_CORE_RELEASES_URL");
     s.env.push(("H0X_CORE_RELEASES_URL".into(), r.url.clone()));
     let up = s.json(&["update"]);
     assert_eq!(up["release"].as_str(), Some("9.9.10"), "{up}");
-    assert_eq!(std::fs::read_to_string(dir.join("h0x-core-tools/h0x-wt")).unwrap(), "new wt");
+    assert!(!dir.join("h0x-core-tools/h0x-wt").exists(), "a release without h0x-wt leaves none installed");
     assert_eq!(std::fs::read_to_string(dir.join("previous/h0x-core-tools/h0x-wt")).unwrap(), "new wt");
     drop(r);
 }
